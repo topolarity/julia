@@ -791,7 +791,9 @@ static int64_t write_dependency_list(ios_t *s, jl_array_t* worklist, jl_array_t 
 // Add methods to external (non-worklist-owned) functions
 static void jl_insert_methods(jl_array_t *list)
 {
+    TracyCZoneN(ctx, "jl_insert_methods", true);
     size_t i, l = jl_array_len(list);
+    TracyCZoneValue(ctx, l);
     for (i = 0; i < l; i++) {
         jl_method_t *meth = (jl_method_t*)jl_array_ptr_ref(list, i);
         assert(jl_is_method(meth));
@@ -800,6 +802,7 @@ static void jl_insert_methods(jl_array_t *list)
         assert((jl_value_t*)mt != jl_nothing);
         jl_method_table_insert(mt, meth, NULL);
     }
+    TracyCZoneEnd(ctx);
 }
 
 static void jl_copy_roots(jl_array_t *method_roots_list, uint64_t key)

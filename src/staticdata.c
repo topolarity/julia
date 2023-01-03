@@ -3265,10 +3265,8 @@ static jl_value_t *jl_restore_package_image_from_stream(ios_t *f, jl_image_t *im
 
             // Insert method extensions
             {
-                TracyCZoneN(ctx2, "jl_insert_methods", true);
-                TracyCZoneValue(ctx2, jl_array_len(extext_methods));
+                // TracyC: traced internally
                 jl_insert_methods(extext_methods);
-                TracyCZoneEnd(ctx2);
             }
             // No special processing of `new_specializations` is required because recaching handled it
             // Add roots to methods

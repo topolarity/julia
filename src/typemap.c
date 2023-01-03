@@ -8,6 +8,8 @@
 #include <unistd.h>
 #endif
 #include "julia_assert.h"
+#include <tracy/TracyC.h>
+#include <stdbool.h>
 
 #define MAX_METHLIST_COUNT 12 // this can strongly affect the sysimg size and speed!
 
@@ -473,6 +475,7 @@ static int jl_typemap_intersection_node_visitor(jl_typemap_entry_t *ml, struct t
 int jl_typemap_intersection_visitor(jl_typemap_t *map, int offs,
                                     struct typemap_intersection_env *closure)
 {
+    TracyCZoneN(ctx, "jl_typemap_intersection_visitor", true);
     jl_value_t *ttypes = jl_unwrap_unionall(closure->type);
     assert(jl_is_datatype(ttypes));
     //TODO: fast-path for leaf-type tuples?
@@ -523,7 +526,10 @@ int jl_typemap_intersection_visitor(jl_typemap_t *map, int offs,
                         // direct lookup of leaf types
                         jl_typemap_t *ml = mtcache_hash_lookup(targ, typetype);
                         if (ml != jl_nothing) {
-                            if (!jl_typemap_intersection_visitor(ml, offs+1, closure)) return 0;
+                            if (!jl_typemap_intersection_visitor(ml, offs+1, closure)) {
+                                TracyCZoneEnd(ctx);
+                                return 0;
+                            }
                         }
                     }
                 }
@@ -532,7 +538,10 @@ int jl_typemap_intersection_visitor(jl_typemap_t *map, int offs,
                     // first, fast-path: optimized pre-intersection test to see if `ty` could intersect with any Type
                     if (typetype || !jl_has_empty_intersection((jl_value_t*)jl_type_type, ty)) {
                         targ = jl_atomic_load_relaxed(&cache->targ); // may be GC'd during type-intersection
-                        if (!jl_typemap_intersection_array_visitor(targ, ty, 1, offs, closure)) return 0;
+                        if (!jl_typemap_intersection_array_visitor(targ, ty, 1, offs, closure)) {
+                            TracyCZoneEnd(ctx);
+                            return 0;
+                        }
                     }
                 }
             }
@@ -542,12 +551,18 @@ int jl_typemap_intersection_visitor(jl_typemap_t *map, int offs,
                     // direct lookup of leaf types
                     jl_typemap_t *ml = mtcache_hash_lookup(cachearg1, ty);
                     if (ml != jl_nothing) {
-                        if (!jl_typemap_intersection_visitor(ml, offs+1, closure)) return 0;
+                        if (!jl_typemap_intersection_visitor(ml, offs+1, closure)) {
+                            TracyCZoneEnd(ctx);
+                            return 0;
+                        }
                     }
                 }
                 else {
                     // else an array scan is required to check subtypes
-                    if (!jl_typemap_intersection_array_visitor(cachearg1, ty, 0, offs, closure)) return 0;
+                    if (!jl_typemap_intersection_array_visitor(cachearg1, ty, 0, offs, closure)) {
+                        TracyCZoneEnd(ctx);
+                        return 0;
+                    }
                 }
             }
             jl_array_t *tname = jl_atomic_load_relaxed(&cache->tname);
@@ -566,7 +581,10 @@ int jl_typemap_intersection_visitor(jl_typemap_t *map, int offs,
                             tname = jl_atomic_load_relaxed(&cache->tname); // reload after callback
                             jl_typemap_t *ml = mtcache_hash_lookup(tname, (jl_value_t*)super->name);
                             if (ml != jl_nothing) {
-                                if (!jl_typemap_intersection_visitor(ml, offs+1, closure)) return 0;
+                                if (!jl_typemap_intersection_visitor(ml, offs+1, closure)) {
+                                    TracyCZoneEnd(ctx);
+                                    return 0;
+                                }
                             }
                             if (super == jl_any_type)
                                 break;
@@ -575,7 +593,10 @@ int jl_typemap_intersection_visitor(jl_typemap_t *map, int offs,
                     }
                     else {
                         // consider all of the possible subtypes
-                        if (!jl_typemap_intersection_array_visitor(tname, (jl_value_t*)super, 3, offs, closure)) return 0;
+                        if (!jl_typemap_intersection_array_visitor(tname, (jl_value_t*)super, 3, offs, closure)) {
+                            TracyCZoneEnd(ctx);
+                            return 0;
+                        }
                     }
                 }
                 else {
@@ -583,7 +604,10 @@ int jl_typemap_intersection_visitor(jl_typemap_t *map, int offs,
                     // first, fast-path: optimized pre-intersection test to see if `ty` could intersect with any Type
                     if (name || !jl_has_empty_intersection((jl_value_t*)jl_type_type, ty)) {
                         tname = jl_atomic_load_relaxed(&cache->tname);  // may be GC'd during type-intersection
-                        if (!jl_typemap_intersection_array_visitor(tname, (jl_value_t*)jl_any_type, 3, offs, closure)) return 0;
+                        if (!jl_typemap_intersection_array_visitor(tname, (jl_value_t*)jl_any_type, 3, offs, closure)) {
+                            TracyCZoneEnd(ctx);
+                            return 0;
+                        }
                     }
                 }
             }
@@ -598,7 +622,10 @@ int jl_typemap_intersection_visitor(jl_typemap_t *map, int offs,
                             name1 = jl_atomic_load_relaxed(&cache->name1); // reload after callback
                             jl_typemap_t *ml = mtcache_hash_lookup(name1, (jl_value_t*)super->name);
                             if (ml != jl_nothing) {
-                                if (!jl_typemap_intersection_visitor(ml, offs+1, closure)) return 0;
+                                if (!jl_typemap_intersection_visitor(ml, offs+1, closure)) {
+                                    TracyCZoneEnd(ctx);
+                                    return 0;
+                                }
                             }
                             if (super == jl_any_type)
                                 break;
@@ -607,20 +634,30 @@ int jl_typemap_intersection_visitor(jl_typemap_t *map, int offs,
                     }
                     else {
                         // consider all of the possible subtypes too
-                        if (!jl_typemap_intersection_array_visitor(name1, (jl_value_t*)super, 2, offs, closure)) return 0;
+                        if (!jl_typemap_intersection_array_visitor(name1, (jl_value_t*)super, 2, offs, closure)) {
+                            TracyCZoneEnd(ctx);
+                            return 0;
+                        }
                     }
                 }
                 else {
                     // else an array scan is required to check subtypes
-                    if (!jl_typemap_intersection_array_visitor(name1, (jl_value_t*)jl_any_type, 2, offs, closure)) return 0;
+                    if (!jl_typemap_intersection_array_visitor(name1, (jl_value_t*)jl_any_type, 2, offs, closure)) {
+                        TracyCZoneEnd(ctx);
+                        return 0;
+                    }
                 }
             }
         }
-        if (!jl_typemap_intersection_node_visitor(jl_atomic_load_relaxed(&cache->linear), closure))
+        if (!jl_typemap_intersection_node_visitor(jl_atomic_load_relaxed(&cache->linear), closure)) {
+            TracyCZoneEnd(ctx);
             return 0;
+        }
+        TracyCZoneEnd(ctx);
         return jl_typemap_intersection_visitor(jl_atomic_load_relaxed(&cache->any), offs+1, closure);
     }
     else {
+        TracyCZoneEnd(ctx);
         return jl_typemap_intersection_node_visitor(
             (jl_typemap_entry_t*)map, closure);
     }

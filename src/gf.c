@@ -16,6 +16,8 @@
 #include <unistd.h>
 #endif
 #include "julia_assert.h"
+#include "tracy/TracyC.h"
+#include "stdbool.h"
 
 // The compilation signature is not used to cache the method if the number of overlapping methods is greater than this
 #define MAX_UNSPECIALIZED_CONFLICTS 32
@@ -1813,6 +1815,7 @@ static int jl_type_intersection2(jl_value_t *t1, jl_value_t *t2, jl_value_t **is
 
 JL_DLLEXPORT void jl_method_table_insert(jl_methtable_t *mt, jl_method_t *method, jl_tupletype_t *simpletype)
 {
+    TracyCZoneN(ctx, "jl_method_table_insert", true);
     JL_TIMING(ADD_METHOD);
     assert(jl_is_method(method));
     assert(jl_is_mtable(mt));
@@ -1831,18 +1834,35 @@ JL_DLLEXPORT void jl_method_table_insert(jl_methtable_t *mt, jl_method_t *method
     JL_LOCK(&mt->writelock);
     // first find if we have an existing entry to delete
     struct jl_typemap_assoc search = {(jl_value_t*)type, method->primary_world, NULL, 0, ~(size_t)0};
-    jl_typemap_entry_t *oldentry = jl_typemap_assoc_by_type(jl_atomic_load_relaxed(&mt->defs), &search, /*offs*/0, /*subtype*/0);
+    jl_typemap_entry_t *oldentry;
+    {
+        TracyCZoneN(ctx2, "jl_typemap_assoc_by_type", true);
+        oldentry = jl_typemap_assoc_by_type(jl_atomic_load_relaxed(&mt->defs), &search, /*offs*/0, /*subtype*/0);
+        TracyCZoneEnd(ctx2);
+    }
     // then add our new entry
     newentry = jl_typemap_alloc((jl_tupletype_t*)type, simpletype, jl_emptysvec,
             (jl_value_t*)method, method->primary_world, method->deleted_world);
-    jl_typemap_insert(&mt->defs, (jl_value_t*)mt, newentry, 0);
+    {
+        TracyCZoneN(ctx2, "jl_typemap_insert", true);
+        jl_typemap_insert(&mt->defs, (jl_value_t*)mt, newentry, 0);
+        TracyCZoneEnd(ctx2);
+    }
     if (oldentry) {
         jl_method_t *m = oldentry->func.method;
         method_overwrite(newentry, m);
-        jl_method_table_invalidate(mt, oldentry, m, max_world);
+        {
+            TracyCZoneN(ctx2, "jl_method_table_invalidate", true);
+            jl_method_table_invalidate(mt, oldentry, m, max_world);
+            TracyCZoneEnd(ctx2);
+        }
     }
     else {
-        oldvalue = get_intersect_matches(jl_atomic_load_relaxed(&mt->defs), newentry);
+        {
+            TracyCZoneN(ctx2, "get_intersect_matches", true);
+            oldvalue = get_intersect_matches(jl_atomic_load_relaxed(&mt->defs), newentry);
+            TracyCZoneEnd(ctx2);
+        }
 
         int invalidated = 0;
         jl_method_t **d;
@@ -1863,7 +1883,13 @@ JL_DLLEXPORT void jl_method_table_insert(jl_methtable_t *mt, jl_method_t *method
             for (i = 1; i < na; i += 2) {
                 jl_value_t *backedgetyp = backedges[i - 1];
                 int missing = 0;
-                if (jl_type_intersection2(backedgetyp, (jl_value_t*)type, &isect, &isect2)) {
+                bool intersection = false;
+                {
+                    TracyCZoneN(ctx2, "get_intersect_matches", true);
+                    intersection = jl_type_intersection2(backedgetyp, (jl_value_t*)type, &isect, &isect2) != 0;
+                    TracyCZoneEnd(ctx2);
+                }
+                if (intersection) {
                     // See if the intersection was actually already fully
                     // covered, but that the new method is ambiguous.
                     //  -> no previous method: now there is one, need to update the missing edge
@@ -1890,8 +1916,16 @@ JL_DLLEXPORT void jl_method_table_insert(jl_methtable_t *mt, jl_method_t *method
                 }
                 if (missing) {
                     jl_method_instance_t *backedge = (jl_method_instance_t*)backedges[i];
-                    invalidate_external(backedge, max_world);
-                    invalidate_method_instance(&do_nothing_with_codeinst, backedge, max_world, 0);
+                    {
+                        TracyCZoneN(ctx2, "invalidate_external", true);
+                        invalidate_external(backedge, max_world);
+                        TracyCZoneEnd(ctx2);
+                    }
+                    {
+                        TracyCZoneN(ctx2, "invalidate_external", true);
+                        invalidate_method_instance(&do_nothing_with_codeinst, backedge, max_world, 0);
+                        TracyCZoneEnd(ctx2);
+                    }
                     invalidated = 1;
                     if (_jl_debug_method_invalidation)
                         jl_array_ptr_1d_push(_jl_debug_method_invalidation, (jl_value_t*)backedgetyp);
@@ -1907,6 +1941,7 @@ JL_DLLEXPORT void jl_method_table_insert(jl_methtable_t *mt, jl_method_t *method
                 jl_array_del_end(mt->backedges, na - ins);
         }
         if (oldvalue) {
+            TracyCZoneN(ctx2, "old value stuff", true);
             oldmi = jl_alloc_vec_any(0);
             enum morespec_options {
                 morespec_unknown,
@@ -2018,6 +2053,7 @@ JL_DLLEXPORT void jl_method_table_insert(jl_methtable_t *mt, jl_method_t *method
                     }
                 }
             }
+            TracyCZoneEnd(ctx2);
         }
         if (invalidated && _jl_debug_method_invalidation) {
             jl_array_ptr_1d_push(_jl_debug_method_invalidation, (jl_value_t*)method);
@@ -2028,6 +2064,7 @@ JL_DLLEXPORT void jl_method_table_insert(jl_methtable_t *mt, jl_method_t *method
     }
     JL_UNLOCK(&mt->writelock);
     JL_GC_POP();
+    TracyCZoneEnd(ctx);
 }
 
 static void JL_NORETURN jl_method_error_bare(jl_function_t *f, jl_value_t *args, size_t world)
