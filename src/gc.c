@@ -3,6 +3,8 @@
 #include "gc.h"
 #include "julia_gcext.h"
 #include "julia_assert.h"
+#include "tracy/TracyC.h"
+#include <stdbool.h>
 #ifdef __GLIBC__
 #include <malloc.h> // for malloc_trim
 #endif
@@ -3101,6 +3103,7 @@ JL_DLLEXPORT void jl_gc_collect(jl_gc_collection_t collection)
         return;
     }
     JL_TIMING(GC);
+    TracyCZoneN(ctx, "jl_gc_collect", true);
     int last_errno = errno;
 #ifdef _OS_WINDOWS_
     DWORD last_error = GetLastError();
@@ -3162,6 +3165,7 @@ JL_DLLEXPORT void jl_gc_collect(jl_gc_collection_t collection)
     SetLastError(last_error);
 #endif
     errno = last_errno;
+    TracyCZoneEnd(ctx);
 }
 
 void gc_mark_queue_all_roots(jl_ptls_t ptls, jl_gc_markqueue_t *mq)

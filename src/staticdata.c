@@ -73,6 +73,7 @@ External links:
 #include <string.h>
 #include <stdio.h> // printf
 #include <inttypes.h> // PRIxPTR
+#include "tracy/TracyC.h"
 
 #include "julia.h"
 #include "julia_internal.h"
@@ -2669,6 +2670,7 @@ JL_DLLEXPORT void jl_set_sysimg_so(void *handle)
 // }
 #endif
 
+// TODO: Fully instrument
 static void jl_restore_system_image_from_stream_(ios_t *f, jl_image_t *image, jl_array_t *depmods, uint64_t checksum,
                                 /* outputs */    jl_array_t **restored,         jl_array_t **init_order,
                                                  jl_array_t **extext_methods,
@@ -2676,6 +2678,7 @@ static void jl_restore_system_image_from_stream_(ios_t *f, jl_image_t *image, jl
                                                  jl_array_t **ext_targets, jl_array_t **edges,
                                                  char **base, arraylist_t *ccallable_list, pkgcachesizes *cachesizes) JL_GC_DISABLED
 {
+    TracyCZoneN(ctx, "jl_restore_package_image_from_stream_", true);
     JL_TIMING(SYSIMG_LOAD);
     int en = jl_gc_enable(0);
     ios_t sysimg, const_data, symbols, relocs, gvar_record, fptr_record;
@@ -3180,6 +3183,7 @@ static void jl_restore_system_image_from_stream_(ios_t *f, jl_image_t *image, jl
     uint64_t *build_id_data = (uint64_t*)jl_array_data(jl_build_ids);
     build_id_data[jl_array_len(jl_build_ids)-1] = buildid;
     jl_gc_enable(en);
+    TracyCZoneEnd(ctx);
 }
 
 static jl_value_t *jl_validate_cache_file(ios_t *f, jl_array_t *depmods, uint64_t *checksum, int64_t *dataendpos, int64_t *datastartpos)
@@ -3211,6 +3215,7 @@ static jl_value_t *jl_validate_cache_file(ios_t *f, jl_array_t *depmods, uint64_
 // TODO?: refactor to make it easier to create the "package inspector"
 static jl_value_t *jl_restore_package_image_from_stream(ios_t *f, jl_image_t *image, jl_array_t *depmods, int complete)
 {
+    TracyCZoneN(ctx, "jl_restore_package_image_from_stream", true);
     uint64_t checksum = 0;
     int64_t dataendpos = 0;
     int64_t datastartpos = 0;
@@ -3232,9 +3237,21 @@ static jl_value_t *jl_restore_package_image_from_stream(ios_t *f, jl_image_t *im
         ios_bufmode(f, bm_none);
         JL_SIGATOMIC_BEGIN();
         size_t len = dataendpos - datastartpos;
+
+        TracyCZoneN(ctx_gc, "jl_gc_perm_alloc", true);
         char *sysimg = (char*)jl_gc_perm_alloc(len, 0, 64, 0);
+        TracyCZoneEnd(ctx_gc);
+
         ios_seek(f, datastartpos);
-        if (ios_readall(f, sysimg, len) != len || jl_crc32c(0, sysimg, len) != (uint32_t)checksum) {
+        TracyCZoneN(ctx_ios, "ios_readall", true);
+        bool err_reading = ios_readall(f, sysimg, len) != len;
+        TracyCZoneEnd(ctx_ios);
+        {
+            TracyCZoneN(ctx_crc, "jl_crc32c", true);
+            err_reading = err_reading || jl_crc32c(0, sysimg, len) != (uint32_t)checksum;
+            TracyCZoneEnd(ctx_crc);
+        }
+        if (err_reading) {
             restored = jl_get_exceptionf(jl_errorexception_type, "Error reading system image file.");
             JL_SIGATOMIC_END();
         }
@@ -3247,16 +3264,36 @@ static jl_value_t *jl_restore_package_image_from_stream(ios_t *f, jl_image_t *im
             JL_SIGATOMIC_END();
 
             // Insert method extensions
-            jl_insert_methods(extext_methods);
+            {
+                TracyCZoneN(ctx2, "jl_insert_methods", true);
+                TracyCZoneValue(ctx2, jl_array_len(extext_methods));
+                jl_insert_methods(extext_methods);
+                TracyCZoneEnd(ctx2);
+            }
             // No special processing of `new_specializations` is required because recaching handled it
             // Add roots to methods
-            jl_copy_roots(method_roots_list, jl_worklist_key((jl_array_t*)restored));
+            {
+                TracyCZoneN(ctx2, "jl_copy_roots", true);
+                jl_copy_roots(method_roots_list, jl_worklist_key((jl_array_t*)restored));
+                TracyCZoneEnd(ctx2);
+            }
             // Handle edges
-            jl_insert_backedges((jl_array_t*)edges, (jl_array_t*)ext_targets, (jl_array_t*)new_specializations); // restore external backedges (needs to be last)
+            {
+                // TracyC: traced internally
+                jl_insert_backedges((jl_array_t*)edges, (jl_array_t*)ext_targets, (jl_array_t*)new_specializations); // restore external backedges (needs to be last)
+            }
             // check new CodeInstances and validate any that lack external backedges
-            validate_new_code_instances();
+            {
+                TracyCZoneN(ctx2, "validate_new_code_instances", true);
+                validate_new_code_instances();
+                TracyCZoneEnd(ctx2);
+            }
             // reinit ccallables
-            jl_reinit_ccallable(&ccallable_list, base, NULL);
+            {
+                TracyCZoneN(ctx2, "jl_reinit_ccallable", true);
+                jl_reinit_ccallable(&ccallable_list, base, NULL);
+                TracyCZoneEnd(ctx2);
+            }
             arraylist_free(&ccallable_list);
             htable_free(&new_code_instance_validate);
             if (complete) {
@@ -3276,6 +3313,7 @@ static jl_value_t *jl_restore_package_image_from_stream(ios_t *f, jl_image_t *im
     }
 
     JL_GC_POP();
+    TracyCZoneEnd(ctx);
     return restored;
 }
 
@@ -3296,14 +3334,20 @@ JL_DLLEXPORT jl_value_t *jl_restore_incremental_from_buf(const char *buf, jl_ima
 
 JL_DLLEXPORT jl_value_t *jl_restore_incremental(const char *fname, jl_array_t *depmods, int complete)
 {
+    TracyCZoneN(ctx, "jl_restore_incremental", true);
+    TracyCZoneText(ctx, fname, strlen(fname));
+
     ios_t f;
     if (ios_file(&f, fname, 1, 0, 0, 0) == NULL) {
+        TracyCZoneEnd(ctx);
         return jl_get_exceptionf(jl_errorexception_type,
             "Cache file \"%s\" not found.\n", fname);
     }
     jl_image_t pkgimage = {};
     jl_value_t *ret = jl_restore_package_image_from_stream(&f, &pkgimage, depmods, complete);
     ios_close(&f);
+
+    TracyCZoneEnd(ctx);
     return ret;
 }
 
@@ -3352,7 +3396,12 @@ JL_DLLEXPORT void jl_restore_system_image_data(const char *buf, size_t len)
 
 JL_DLLEXPORT jl_value_t *jl_restore_package_image_from_file(const char *fname, jl_array_t *depmods, int complete)
 {
+    TracyCZoneN(ctx, "jl_restore_package_image_from_file", true);
+    TracyCZoneText(ctx, fname, strlen(fname));
+
+    TracyCZoneN(ctx2, "jl_dlopen", true);
     void *pkgimg_handle = jl_dlopen(fname, JL_RTLD_LAZY);
+    TracyCZoneEnd(ctx2);
     if (!pkgimg_handle) {
 #ifdef _OS_WINDOWS_
         int err;
@@ -3365,28 +3414,58 @@ JL_DLLEXPORT jl_value_t *jl_restore_package_image_from_file(const char *fname, j
         jl_errorf("Error opening package file %s: %s\n", fname, reason);
     }
     const char *pkgimg_data;
-    jl_dlsym(pkgimg_handle, "jl_system_image_data", (void **)&pkgimg_data, 1);
+    {
+        TracyCZoneN(ctx3, "jl_dlsym", true);
+        jl_dlsym(pkgimg_handle, "jl_system_image_data", (void **)&pkgimg_data, 1);
+        TracyCZoneEnd(ctx3);
+    }
     size_t *plen;
-    jl_dlsym(pkgimg_handle, "jl_system_image_size", (void **)&plen, 1);
-
-    jl_image_t pkgimage;
-    pkgimage.fptrs = jl_init_processor_pkgimg(pkgimg_handle);
-    if (!jl_dlsym(pkgimg_handle, "jl_sysimg_gvars_base", (void **)&pkgimage.gvars_base, 0)) {
-        pkgimage.gvars_base = NULL;
+    {
+        TracyCZoneN(ctx3, "jl_dlsym", true);
+        jl_dlsym(pkgimg_handle, "jl_system_image_size", (void **)&plen, 1);
+        TracyCZoneEnd(ctx3);
     }
 
-    jl_dlsym(pkgimg_handle, "jl_sysimg_gvars_offsets", (void **)&pkgimage.gvars_offsets, 1);
+    jl_image_t pkgimage;
+    TracyCZoneN(ctx4, "jl_init_processor_pkgimg", true);
+    pkgimage.fptrs = jl_init_processor_pkgimg(pkgimg_handle);
+    TracyCZoneEnd(ctx4);
+    {
+        TracyCZoneN(ctx3, "jl_dlsym", true);
+        if (!jl_dlsym(pkgimg_handle, "jl_sysimg_gvars_base", (void **)&pkgimage.gvars_base, 0)) {
+            pkgimage.gvars_base = NULL;
+        }
+        TracyCZoneEnd(ctx3);
+    }
+
+    {
+        TracyCZoneN(ctx3, "jl_dlsym", true);
+        jl_dlsym(pkgimg_handle, "jl_sysimg_gvars_offsets", (void **)&pkgimage.gvars_offsets, 1);
+        TracyCZoneEnd(ctx3);
+    }
     pkgimage.gvars_offsets += 1;
 
     void *pgcstack_func_slot;
-    jl_dlsym(pkgimg_handle, "jl_pgcstack_func_slot", &pgcstack_func_slot, 0);
+    {
+        TracyCZoneN(ctx3, "jl_dlsym", true);
+        jl_dlsym(pkgimg_handle, "jl_pgcstack_func_slot", &pgcstack_func_slot, 0);
+        TracyCZoneEnd(ctx3);
+    }
     if (pgcstack_func_slot) { // Empty package images might miss these
         void *pgcstack_key_slot;
-        jl_dlsym(pkgimg_handle, "jl_pgcstack_key_slot", &pgcstack_key_slot, 1);
+        {
+            TracyCZoneN(ctx3, "jl_dlsym", true);
+            jl_dlsym(pkgimg_handle, "jl_pgcstack_key_slot", &pgcstack_key_slot, 1);
+            TracyCZoneEnd(ctx3);
+        }
         jl_pgcstack_getkey((jl_get_pgcstack_func**)pgcstack_func_slot, (jl_pgcstack_key_t*)pgcstack_key_slot);
 
         size_t *tls_offset_idx;
-        jl_dlsym(pkgimg_handle, "jl_tls_offset", (void **)&tls_offset_idx, 1);
+        {
+            TracyCZoneN(ctx3, "jl_dlsym", true);
+            jl_dlsym(pkgimg_handle, "jl_tls_offset", (void **)&tls_offset_idx, 1);
+            TracyCZoneEnd(ctx3);
+        }
         *tls_offset_idx = (uintptr_t)(jl_tls_offset == -1 ? 0 : jl_tls_offset);
     }
 
@@ -3394,16 +3473,24 @@ JL_DLLEXPORT jl_value_t *jl_restore_package_image_from_file(const char *fname, j
         pkgimage.base = (intptr_t)pkgimg_handle;
     #else
         Dl_info dlinfo;
-        if (dladdr((void*)pkgimage.gvars_base, &dlinfo) != 0) {
-            pkgimage.base = (intptr_t)dlinfo.dli_fbase;
-        }
-        else {
-            pkgimage.base = 0;
+        {
+            TracyCZoneN(ctx3, "dladdr", true);
+            if (dladdr((void*)pkgimage.gvars_base, &dlinfo) != 0) {
+                pkgimage.base = (intptr_t)dlinfo.dli_fbase;
+            }
+            else {
+                pkgimage.base = 0;
+            }
+            TracyCZoneEnd(ctx3);
         }
     #endif
 
-    jl_value_t* mod = jl_restore_incremental_from_buf(pkgimg_data, &pkgimage, *plen, depmods, complete);
-
+    jl_value_t* mod;
+    {
+        JL_TIMING(PKG_LOADING);
+        mod = jl_restore_incremental_from_buf(pkgimg_data, &pkgimage, *plen, depmods, complete);
+    }
+    TracyCZoneEnd(ctx);
     return mod;
 }
 
