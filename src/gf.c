@@ -1813,12 +1813,26 @@ static int jl_type_intersection2(jl_value_t *t1, jl_value_t *t2, jl_value_t **is
     return 1;
 }
 
+char method_name_buff[4096 * 10];
 JL_DLLEXPORT void jl_method_table_insert(jl_methtable_t *mt, jl_method_t *method, jl_tupletype_t *simpletype)
 {
     TracyCZoneN(ctx, "jl_method_table_insert", true);
     JL_TIMING(ADD_METHOD);
     assert(jl_is_method(method));
     assert(jl_is_mtable(mt));
+    // TODO: Combine into one string
+    sprintf(method_name_buff, "@ %s:%d", jl_symbol_name(method->file), method->line);
+    TracyCZoneText(ctx, method_name_buff, strlen(method_name_buff));
+    jl_static_show2(method_name_buff, (jl_value_t*)method);
+    {
+        size_t sz = strlen(method_name_buff);
+        if (sz < 80) {
+            TracyCZoneText(ctx, method_name_buff, sz);
+        } else {
+            sprintf(method_name_buff + 77, "...");
+            TracyCZoneText(ctx, method_name_buff, 80);
+        }
+    }
     jl_value_t *type = method->sig;
     jl_value_t *oldvalue = NULL;
     jl_array_t *oldmi = NULL;
@@ -2147,10 +2161,12 @@ JL_DLLEXPORT jl_value_t *jl_matching_methods(jl_tupletype_t *types, jl_value_t *
     if (ambig != NULL)
         *ambig = 0;
     jl_value_t *unw = jl_unwrap_unionall((jl_value_t*)types);
-    if (!jl_is_tuple_type(unw))
+    if (!jl_is_tuple_type(unw)) {
         return (jl_value_t*)jl_an_empty_vec_any;
-    if (unw == (jl_value_t*)jl_emptytuple_type || jl_tparam0(unw) == jl_bottom_type)
+    }
+    if (unw == (jl_value_t*)jl_emptytuple_type || jl_tparam0(unw) == jl_bottom_type){
         return (jl_value_t*)jl_an_empty_vec_any;
+    }
     if (mt == jl_nothing)
         mt = (jl_value_t*)jl_method_table_for(unw);
     if (mt == jl_nothing)
@@ -3143,6 +3159,17 @@ static jl_value_t *ml_matches(jl_methtable_t *mt,
                               int intersections, size_t world, int cache_result,
                               size_t *min_valid, size_t *max_valid, int *ambig)
 {
+    TracyCZoneN(ctx, "ml_matches", true);
+    jl_static_show2(method_name_buff, (jl_value_t*)type);
+    {
+        size_t sz = strlen(method_name_buff);
+        if (sz < 80) {
+            TracyCZoneText(ctx, method_name_buff, sz);
+        } else {
+            sprintf(method_name_buff + 77, "...");
+            TracyCZoneText(ctx, method_name_buff, 80);
+        }
+    }
     int has_ambiguity = 0;
     jl_value_t *unw = jl_unwrap_unionall((jl_value_t*)type);
     assert(jl_is_datatype(unw));
@@ -3192,6 +3219,7 @@ static jl_value_t *ml_matches(jl_methtable_t *mt,
                 if (*max_valid > entry->max_world)
                     *max_valid = entry->max_world;
                 JL_GC_POP();
+                TracyCZoneEnd(ctx);
                 return env.t;
             }
         }
@@ -3218,11 +3246,13 @@ static jl_value_t *ml_matches(jl_methtable_t *mt,
                 if (*max_valid > entry->max_world)
                     *max_valid = entry->max_world;
                 JL_GC_POP();
+                TracyCZoneEnd(ctx);
                 return env.t;
             }
         }
         if (!jl_typemap_intersection_visitor(jl_atomic_load_relaxed(&mt->defs), 0, &env.match)) {
             JL_GC_POP();
+            TracyCZoneEnd(ctx);
             return jl_nothing;
         }
     }
@@ -3230,6 +3260,7 @@ static jl_value_t *ml_matches(jl_methtable_t *mt,
         // else: scan everything
         if (!jl_foreach_reachable_mtable(ml_mtable_visitor, &env.match)) {
             JL_GC_POP();
+            TracyCZoneEnd(ctx);
             return jl_nothing;
         }
     }
@@ -3312,6 +3343,7 @@ static jl_value_t *ml_matches(jl_methtable_t *mt,
                 }
                 else if (lim == 1) {
                     JL_GC_POP();
+                    TracyCZoneEnd(ctx);
                     return jl_nothing;
                 }
             }
@@ -3456,6 +3488,7 @@ static jl_value_t *ml_matches(jl_methtable_t *mt,
                     ndisjoint += 1;
                     if (ndisjoint > lim) {
                         JL_GC_POP();
+                        TracyCZoneEnd(ctx);
                         return jl_nothing;
                     }
                 }
@@ -3603,8 +3636,11 @@ static jl_value_t *ml_matches(jl_methtable_t *mt,
     if (ambig != NULL)
         *ambig = has_ambiguity;
     JL_GC_POP();
-    if (lim >= 0 && len > lim)
+    if (lim >= 0 && len > lim) {
+        TracyCZoneEnd(ctx);
         return jl_nothing;
+    }
+    TracyCZoneEnd(ctx);
     return env.t;
 }
 

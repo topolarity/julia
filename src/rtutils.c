@@ -553,13 +553,30 @@ static size_t jl_show_svec(JL_STREAM *out, jl_svec_t *t, const char *head, const
     return n;
 }
 
+static size_t jl_show2_svec(char *out, jl_svec_t *t, const char *head, const char *opn, const char *cls) JL_NOTSAFEPOINT
+{
+    size_t i, n=0, len = jl_svec_len(t);
+    n += sprintf(out + n, "%s", head);
+    n += sprintf(out + n, "%s", opn);
+    for (i = 0; i < len; i++) {
+        jl_value_t *v = jl_svecref(t,i);
+        n += jl_static_show2(out + n, v);
+        if (i != len-1)
+            n += sprintf(out + n, ", ");
+    }
+    n += sprintf(out + n, "%s", cls);
+    return n;
+}
+
 struct recur_list {
     struct recur_list *prev;
     jl_value_t *v;
 };
 
 static size_t jl_static_show_x(JL_STREAM *out, jl_value_t *v, struct recur_list *depth) JL_NOTSAFEPOINT;
+static size_t jl_static_show2_x(char *out, jl_value_t *v, struct recur_list *depth) JL_NOTSAFEPOINT;
 static size_t jl_static_show_next_(JL_STREAM *out, jl_value_t *v, jl_value_t *prev, struct recur_list *depth) JL_NOTSAFEPOINT;
+static size_t jl_static_show2_next_(char *out, jl_value_t *v, jl_value_t *prev, struct recur_list *depth) JL_NOTSAFEPOINT;
 
 JL_DLLEXPORT int jl_id_start_char(uint32_t wc) JL_NOTSAFEPOINT;
 JL_DLLEXPORT int jl_id_char(uint32_t wc) JL_NOTSAFEPOINT;
@@ -645,6 +662,26 @@ static int is_globfunction(jl_value_t *v, jl_datatype_t *dv, jl_sym_t **globname
         return 1;
     }
     return 0;
+}
+
+static size_t jl_static_show2_x_sym_escaped(char *out, jl_sym_t *name) JL_NOTSAFEPOINT
+{
+    size_t n = 0;
+
+    char *sn = jl_symbol_name(name);
+    int hidden = 0;
+    if (!(jl_is_identifier(sn) || jl_is_operator(sn))) {
+        hidden = 1;
+    }
+
+    if (hidden) {
+        n += sprintf(out + n, "var\"");
+    }
+    n += sprintf(out + n, "%s", sn);
+    if (hidden) {
+        n += sprintf(out + n, "\"");
+    }
+    return n;
 }
 
 static size_t jl_static_show_x_sym_escaped(JL_STREAM *out, jl_sym_t *name) JL_NOTSAFEPOINT
@@ -1249,6 +1286,646 @@ static size_t jl_static_show_next_(JL_STREAM *out, jl_value_t *v, jl_value_t *pr
         p = p->prev;
     }
     return jl_static_show_x_(out, v, (jl_datatype_t*)jl_typeof(v), newdepth);
+}
+
+// `v` might be pointing to a field inlined in a structure therefore
+// `jl_typeof(v)` may not be the same with `vt` and only `vt` should be
+// used to determine the type of the value.
+// This is necessary to make sure that this function doesn't allocate any
+// memory through the Julia GC
+static size_t jl_static_show2_x_(char *out, jl_value_t *v, jl_datatype_t *vt,
+                                struct recur_list *depth) JL_NOTSAFEPOINT
+{
+    size_t n = 0;
+    if ((uintptr_t)vt < 4096U) {
+        n += sprintf(out + n, "<?#%p::%p>", (void*)v, (void*)vt);
+    }
+    else if ((uintptr_t)v < 4096U) {
+        n += sprintf(out + n, "<?#%p::", (void*)v);
+        n += jl_static_show2_x(out + n, (jl_value_t*)vt, depth);
+        n += sprintf(out + n, ">");
+    }
+    else if (vt == (jl_datatype_t*)jl_buff_tag) {
+        n += sprintf(out + n, "<?#%p::jl_buff_tag marked memory>", (void*)v);
+    }
+    else if (vt == (jl_datatype_t*)(uintptr_t)(0xbabababababababaull & ~15)) {
+        n += sprintf(out + n, "<?#%p::baaaaaad>", (void*)v);
+    }
+    // These need to be special cased because they
+    // exist only by pointer identity in early startup
+    else if (v == (jl_value_t*)jl_simplevector_type) {
+        n += sprintf(out + n, "Core.SimpleVector");
+    }
+    else if (v == (jl_value_t*)jl_typename_type) {
+        n += sprintf(out + n, "Core.TypeName");
+    }
+    else if (v == (jl_value_t*)jl_symbol_type) {
+        n += sprintf(out + n, "Symbol");
+    }
+    else if (v == (jl_value_t*)jl_methtable_type) {
+        n += sprintf(out + n, "Core.MethodTable");
+    }
+    else if (v == (jl_value_t*)jl_any_type) {
+        n += sprintf(out + n, "Any");
+    }
+    else if (v == (jl_value_t*)jl_type_type) {
+        n += sprintf(out + n, "Type");
+    }
+    else if (vt == jl_method_type) {
+        jl_method_t *m = (jl_method_t*)v;
+        n += jl_static_show2_func_sig(out + n, m->sig);
+    }
+    else if (vt == jl_method_instance_type) {
+        jl_method_instance_t *li = (jl_method_instance_t*)v;
+        if (jl_is_method(li->def.method)) {
+            n += jl_static_show2_func_sig(out + n, li->specTypes);
+            n += sprintf(out + n, " from ");
+            n += jl_static_show2_func_sig(out + n, li->def.method->sig);
+        }
+        else {
+            n += jl_static_show2_x(out + n, (jl_value_t*)li->def.module, depth);
+            n += sprintf(out + n, ".<toplevel thunk> -> ");
+            n += jl_static_show2_x(out + n, jl_atomic_load_relaxed(&li->uninferred), depth);
+        }
+    }
+    else if (vt == jl_typename_type) {
+        n += jl_static_show2_x(out + n, jl_unwrap_unionall(((jl_typename_t*)v)->wrapper), depth);
+        n += sprintf(out + n, ".name");
+    }
+    else if (vt == jl_simplevector_type) {
+        n += jl_show2_svec(out + n, (jl_svec_t*)v, "svec", "(", ")");
+    }
+    else if (v == (jl_value_t*)jl_unionall_type) {
+        // avoid printing `typeof(Type)` for `UnionAll`.
+        n += sprintf(out + n, "UnionAll");
+    }
+    else if (vt == jl_vararg_type) {
+        jl_vararg_t *vm = (jl_vararg_t*)v;
+        n += sprintf(out + n, "Vararg");
+        if (vm->T) {
+            n += sprintf(out + n, "{");
+            n += jl_static_show2_x(out + n, vm->T, depth);
+            if (vm->N) {
+                n += sprintf(out + n, ", ");
+                n += jl_static_show2_x(out + n, vm->N, depth);
+            }
+            n += sprintf(out + n, "}");
+        }
+    }
+    else if (vt == jl_datatype_type) {
+        // typeof(v) == DataType, so v is a Type object.
+        // Types are printed as a fully qualified name, with parameters, e.g.
+        // `Base.Set{Int}`, and function types are printed as e.g. `typeof(Main.f)`
+        jl_datatype_t *dv = (jl_datatype_t*)v;
+        jl_sym_t *globname;
+        int globfunc = is_globname_binding(v, dv) && is_globfunction(v, dv, &globname);
+        jl_sym_t *sym = globfunc ? globname : dv->name->name;
+        char *sn = jl_symbol_name(sym);
+        size_t quote = 0;
+        if (dv->name == jl_tuple_typename) {
+            if (dv == jl_tuple_type)
+                return sprintf(out + n, "Tuple");
+            int taillen = 1, tlen = jl_nparams(dv), i;
+            for (i = tlen-2; i >= 0; i--) {
+                if (jl_tparam(dv, i) == jl_tparam(dv, tlen-1))
+                    taillen++;
+                else
+                    break;
+            }
+            if (taillen == tlen && taillen > 3) {
+                n += sprintf(out + n, "NTuple{%d, ", tlen);
+                n += jl_static_show2_x(out + n, jl_tparam0(dv), depth);
+                n += sprintf(out + n, "}");
+            }
+            else {
+                n += sprintf(out + n, "Tuple{");
+                for (i = 0; i < (taillen > 3 ? tlen-taillen : tlen); i++) {
+                    if (i > 0)
+                        n += sprintf(out + n, ", ");
+                    n += jl_static_show2_x(out + n, jl_tparam(dv, i), depth);
+                }
+                if (taillen > 3) {
+                    n += sprintf(out + n, ", Vararg{");
+                    n += jl_static_show2_x(out + n, jl_tparam(dv, tlen-1), depth);
+                    n += sprintf(out + n, ", %d}", taillen);
+                }
+                n += sprintf(out + n, "}");
+            }
+            return n;
+        }
+        if (globfunc) {
+            n += sprintf(out + n, "typeof(");
+        }
+        if (jl_core_module && (dv->name->module != jl_core_module || !jl_module_exports_p(jl_core_module, sym))) {
+            n += jl_static_show2_x(out + n, (jl_value_t*)dv->name->module, depth);
+            n += sprintf(out + n, ".");
+            size_t i = 0;
+            if (globfunc && !jl_id_start_char(u8_nextchar(sn, &i))) {
+                n += sprintf(out + n, ":(");
+                quote = 1;
+            }
+        }
+        n += jl_static_show2_x_sym_escaped(out + n, sym);
+        if (globfunc) {
+            n += sprintf(out + n, ")");
+            if (quote) {
+                n += sprintf(out + n, ")");
+            }
+        }
+        if (dv->parameters && (jl_value_t*)dv != dv->name->wrapper) {
+            size_t j, tlen = jl_nparams(dv);
+            if (tlen > 0) {
+                n += sprintf(out + n, "{");
+                for (j = 0; j < tlen; j++) {
+                    jl_value_t *p = jl_tparam(dv,j);
+                    n += jl_static_show2_x(out + n, p, depth);
+                    if (j != tlen-1)
+                        n += sprintf(out + n, ", ");
+                }
+                n += sprintf(out + n, "}");
+            }
+        }
+    }
+    else if (vt == jl_intrinsic_type) {
+        int f = *(uint32_t*)jl_data_ptr(v);
+        n += sprintf(out + n, "#<intrinsic #%d %s>", f, jl_intrinsic_name(f));
+    }
+    else if (vt == jl_int64_type) {
+        n += sprintf(out + n, "%" PRId64, *(int64_t*)v);
+    }
+    else if (vt == jl_int32_type) {
+        n += sprintf(out + n, "%" PRId32, *(int32_t*)v);
+    }
+    else if (vt == jl_int16_type) {
+        n += sprintf(out + n, "%" PRId16, *(int16_t*)v);
+    }
+    else if (vt == jl_int8_type) {
+        n += sprintf(out + n, "%" PRId8, *(int8_t*)v);
+    }
+    else if (vt == jl_uint64_type) {
+        n += sprintf(out + n, "0x%016" PRIx64, *(uint64_t*)v);
+    }
+    else if (vt == jl_uint32_type) {
+        n += sprintf(out + n, "0x%08" PRIx32, *(uint32_t*)v);
+    }
+    else if (vt == jl_uint16_type) {
+        n += sprintf(out + n, "0x%04" PRIx16, *(uint16_t*)v);
+    }
+    else if (vt == jl_uint8_type) {
+        n += sprintf(out + n, "0x%02" PRIx8, *(uint8_t*)v);
+    }
+    else if (jl_pointer_type && jl_is_cpointer_type((jl_value_t*)vt)) {
+#ifdef _P64
+        n += sprintf(out + n, "0x%016" PRIx64, *(uint64_t*)v);
+#else
+        n += sprintf(out + n, "0x%08" PRIx32, *(uint32_t*)v);
+#endif
+    }
+    else if (vt == jl_float32_type) {
+        n += sprintf(out + n, "%gf", *(float*)v);
+    }
+    else if (vt == jl_float64_type) {
+        n += sprintf(out + n, "%g", *(double*)v);
+    }
+    else if (vt == jl_bool_type) {
+        n += sprintf(out + n, "%s", *(uint8_t*)v ? "true" : "false");
+    }
+    else if (v == jl_nothing || (jl_nothing && (jl_value_t*)vt == jl_typeof(jl_nothing))) {
+        n += sprintf(out + n, "nothing");
+    }
+    else if (vt == jl_string_type) {
+        n += sprintf(out + n, "\"");
+        strlcpy(out + n, jl_string_data(v), jl_string_len(v)); n += jl_string_len(v);
+        n += sprintf(out + n, "\"");
+    }
+    else if (v == jl_bottom_type) {
+        n += sprintf(out + n, "Union{}");
+    }
+    else if (vt == jl_uniontype_type) {
+        n += sprintf(out + n, "Union{");
+        while (jl_is_uniontype(v)) {
+            // tail-recurse on b to flatten the printing of the Union structure in the common case
+            n += jl_static_show2_x(out + n, ((jl_uniontype_t*)v)->a, depth);
+            n += sprintf(out + n, ", ");
+            v = ((jl_uniontype_t*)v)->b;
+        }
+        n += jl_static_show2_x(out + n, v, depth);
+        n += sprintf(out + n, "}");
+    }
+    else if (vt == jl_unionall_type) {
+        jl_unionall_t *ua = (jl_unionall_t*)v;
+        n += jl_static_show2_x(out + n, ua->body, depth);
+        n += sprintf(out + n, " where ");
+        n += jl_static_show2_x(out + n, (jl_value_t*)ua->var, depth->prev);
+    }
+    else if (vt == jl_typename_type) {
+        n += sprintf(out + n, "typename(");
+        n += jl_static_show2_x(out + n, jl_unwrap_unionall(((jl_typename_t*)v)->wrapper), depth);
+        n += sprintf(out + n, ")");
+    }
+    else if (vt == jl_tvar_type) {
+        // show type-var bounds only if they aren't going to be printed by UnionAll later
+        jl_tvar_t *var = (jl_tvar_t*)v;
+        struct recur_list *p;
+        int showbounds = 1;
+        for (p = depth; p != NULL; p = p->prev) {
+            if (jl_is_unionall(p->v) && ((jl_unionall_t*)p->v)->var == var) {
+                showbounds = 0;
+                break;
+            }
+        }
+        jl_value_t *lb = var->lb, *ub = var->ub;
+        if (showbounds && lb != jl_bottom_type) {
+            // show type-var lower bound if it is defined
+            int ua = jl_is_unionall(lb);
+            if (ua)
+                n += sprintf(out + n, "(");
+            n += jl_static_show2_x(out + n, lb, depth);
+            if (ua)
+                n += sprintf(out + n, ")");
+            n += sprintf(out + n, "<:");
+        }
+        n += jl_static_show2_x_sym_escaped(out + n, var->name);
+        if (showbounds && (ub != (jl_value_t*)jl_any_type || lb != jl_bottom_type)) {
+            // show type-var upper bound if it is defined, or if we showed the lower bound
+            int ua = jl_is_unionall(ub);
+            n += sprintf(out + n, "<:");
+            if (ua)
+                n += sprintf(out + n, "(");
+            n += jl_static_show2_x(out + n, ub, depth);
+            if (ua)
+                n += sprintf(out + n, ")");
+        }
+    }
+    else if (vt == jl_module_type) {
+        jl_module_t *m = (jl_module_t*)v;
+        if (m->parent != m && m->parent != jl_main_module) {
+            n += jl_static_show2_x(out + n, (jl_value_t*)m->parent, depth);
+            n += sprintf(out + n, ".");
+        }
+        n += sprintf(out + n, "%s", jl_symbol_name(m->name));
+    }
+    else if (vt == jl_symbol_type) {
+        char *sn = jl_symbol_name((jl_sym_t*)v);
+        int quoted = !jl_is_identifier(sn) && jl_operator_precedence(sn) == 0;
+        if (quoted)
+            n += sprintf(out + n, "Symbol(\"");
+        else
+            n += sprintf(out + n, ":");
+        n += sprintf(out + n, "%s", sn);
+        if (quoted)
+            n += sprintf(out + n, "\")");
+    }
+    else if (vt == jl_ssavalue_type) {
+        n += sprintf(out + n, "SSAValue(%" PRIuPTR ")",
+                       (uintptr_t)((jl_ssavalue_t*)v)->id);
+    }
+    else if (vt == jl_globalref_type) {
+        n += jl_static_show2_x(out + n, (jl_value_t*)jl_globalref_mod(v), depth);
+        char *name = jl_symbol_name(jl_globalref_name(v));
+        n += sprintf(out + n, jl_is_identifier(name) ? ".%s" : ".:(%s)", name);
+    }
+    else if (vt == jl_gotonode_type) {
+        n += sprintf(out + n, "goto %" PRIuPTR, jl_gotonode_label(v));
+    }
+    else if (vt == jl_quotenode_type) {
+        jl_value_t *qv = *(jl_value_t**)v;
+        if (!jl_is_symbol(qv)) {
+            n += sprintf(out + n, "quote ");
+        }
+        else {
+            n += sprintf(out + n, ":(");
+        }
+        n += jl_static_show2_x(out + n, qv, depth);
+        if (!jl_is_symbol(qv)) {
+            n += sprintf(out + n, " end");
+        }
+        else {
+            n += sprintf(out + n, ")");
+        }
+    }
+    else if (vt == jl_newvarnode_type) {
+        n += sprintf(out + n, "<newvar ");
+        n += jl_static_show2_x(out + n, *(jl_value_t**)v, depth);
+        n += sprintf(out + n, ">");
+    }
+    else if (vt == jl_linenumbernode_type) {
+        n += sprintf(out + n, "#= ");
+        n += jl_static_show2_x(out + n, jl_linenode_file(v), depth);
+        n += sprintf(out + n, ":%" PRIuPTR " =#", jl_linenode_line(v));
+    }
+    else if (vt == jl_expr_type) {
+        jl_expr_t *e = (jl_expr_t*)v;
+        if (e->head == jl_assign_sym && jl_array_len(e->args) == 2) {
+            n += jl_static_show2_x(out + n, jl_exprarg(e,0), depth);
+            n += sprintf(out + n, " = ");
+            n += jl_static_show2_x(out + n, jl_exprarg(e,1), depth);
+        }
+        else {
+            char sep = ' ';
+            n += sprintf(out + n, "Expr(:%s", jl_symbol_name(e->head));
+            size_t i, len = jl_array_len(e->args);
+            for (i = 0; i < len; i++) {
+                n += sprintf(out + n, ",%c", sep);
+                n += jl_static_show2_x(out + n, jl_exprarg(e,i), depth);
+            }
+            n += sprintf(out + n, ")");
+        }
+    }
+    else if (jl_array_type && jl_is_array_type(vt)) {
+        n += sprintf(out + n, "Array{");
+        n += jl_static_show2_x(out + n, (jl_value_t*)jl_tparam0(vt), depth);
+        n += sprintf(out + n, ", (");
+        size_t i, ndims = jl_array_ndims(v);
+        if (ndims == 1)
+            n += sprintf(out + n, "%" PRIdPTR ",", jl_array_dim0(v));
+        else
+            for (i = 0; i < ndims; i++)
+                n += sprintf(out + n, (i > 0 ? ", %" PRIdPTR : "%" PRIdPTR), jl_array_dim(v, i));
+        n += sprintf(out + n, ")}[");
+        size_t j, tlen = jl_array_len(v);
+        jl_array_t *av = (jl_array_t*)v;
+        jl_value_t *el_type = jl_tparam0(vt);
+        char *typetagdata = (!av->flags.ptrarray && jl_is_uniontype(el_type)) ? jl_array_typetagdata(av) : NULL;
+        int nlsep = 0;
+        if (av->flags.ptrarray) {
+            // print arrays with newlines, unless the elements are probably small
+            for (j = 0; j < tlen; j++) {
+                jl_value_t **ptr = ((jl_value_t**)av->data) + j;
+                jl_value_t *p = *ptr;
+                if (p != NULL && (uintptr_t)p >= 4096U) {
+                    jl_value_t *p_ty = jl_typeof(p);
+                    if ((uintptr_t)p_ty >= 4096U) {
+                        if (!jl_isbits(p_ty)) {
+                            nlsep = 1;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if (nlsep && tlen > 1)
+            n += sprintf(out + n, "\n  ");
+        for (j = 0; j < tlen; j++) {
+            if (av->flags.ptrarray) {
+                jl_value_t **ptr = ((jl_value_t**)av->data) + j;
+                n += jl_static_show2_x(out + n, *ptr, depth);
+            }
+            else {
+                char *ptr = ((char*)av->data) + j * av->elsize;
+                n += jl_static_show2_x_(out + n, (jl_value_t*)ptr,
+                        typetagdata ? (jl_datatype_t*)jl_nth_union_component(el_type, typetagdata[j]) : (jl_datatype_t*)el_type,
+                        depth);
+            }
+            if (j != tlen - 1)
+                n += sprintf(out + n, nlsep ? ",\n  " : ", ");
+        }
+        n += sprintf(out + n, "]");
+    }
+    else if (vt == jl_loaderror_type) {
+        n += sprintf(out + n, "LoadError(at ");
+        n += jl_static_show2_x(out + n, *(jl_value_t**)v, depth);
+        // Access the field directly to avoid allocation
+        n += sprintf(out + n, " line %" PRIdPTR, ((intptr_t*)v)[1]);
+        n += sprintf(out + n, ": ");
+        n += jl_static_show2_x(out + n, ((jl_value_t**)v)[2], depth);
+        n += sprintf(out + n, ")");
+    }
+    else if (vt == jl_errorexception_type) {
+        n += sprintf(out + n, "ErrorException(");
+        n += jl_static_show2_x(out + n, *(jl_value_t**)v, depth);
+        n += sprintf(out + n, ")");
+    }
+    else if (jl_static_is_function_(vt) && is_globname_binding(v, (jl_datatype_t*)vt)) {
+        // v is function instance (an instance of a Function type).
+        jl_datatype_t *dv = (jl_datatype_t*)vt;
+        jl_sym_t *sym;
+        int globfunc = is_globfunction(v, dv, &sym);
+        int quote = 0;
+        if (jl_core_module && (dv->name->module != jl_core_module || !jl_module_exports_p(jl_core_module, sym))) {
+            n += jl_static_show2_x(out + n, (jl_value_t*)dv->name->module, depth);
+            n += sprintf(out + n, ".");
+
+            size_t i = 0;
+            char *sn = jl_symbol_name(sym);
+            if (globfunc && !jl_id_start_char(u8_nextchar(sn, &i))) {
+                n += sprintf(out + n, ":(");
+                quote = 1;
+            }
+        }
+
+        n += jl_static_show2_x_sym_escaped(out + n, sym);
+
+        if (globfunc) {
+            if (quote) {
+                n += sprintf(out + n, ")");
+            }
+        }
+    }
+    else if (jl_datatype_type && jl_is_datatype(vt)) {
+        // typeof(v) isa DataType, so v is an *instance of* a type that is a Datatype,
+        // meaning v is e.g. an instance of a struct. These are printed as a call to a
+        // type constructor, such as e.g. `Base.UnitRange{Int64}(start=1, stop=2)`
+        int istuple = jl_is_tuple_type(vt), isnamedtuple = jl_is_namedtuple_type(vt);
+        size_t tlen = jl_datatype_nfields(vt);
+        if (isnamedtuple) {
+            if (tlen == 0)
+                n += sprintf(out + n, "NamedTuple");
+        }
+        else if (!istuple) {
+            n += jl_static_show2_x(out + n, (jl_value_t*)vt, depth);
+        }
+        n += sprintf(out + n, "(");
+        size_t nb = jl_datatype_size(vt);
+        if (nb > 0 && tlen == 0) {
+            uint8_t *data = (uint8_t*)v;
+            n += sprintf(out + n, "0x");
+            for(int i = nb - 1; i >= 0; --i)
+                n += sprintf(out + n, "%02" PRIx8, data[i]);
+        }
+        else {
+            size_t i = 0;
+            if (vt == jl_typemap_entry_type)
+                i = 1;
+            jl_value_t *names = isnamedtuple ? jl_tparam0(vt) : (jl_value_t*)jl_field_names(vt);
+            for (; i < tlen; i++) {
+                if (!istuple) {
+                    jl_value_t *fname = isnamedtuple ? jl_fieldref_noalloc(names, i) : jl_svecref(names, i);
+                    n += sprintf(out + n, "%s=", jl_symbol_name((jl_sym_t*)fname));
+                }
+                size_t offs = jl_field_offset(vt, i);
+                char *fld_ptr = (char*)v + offs;
+                if (jl_field_isptr(vt, i)) {
+                    n += jl_static_show2_x(out + n, *(jl_value_t**)fld_ptr, depth);
+                }
+                else {
+                    jl_datatype_t *ft = (jl_datatype_t*)jl_field_type_concrete(vt, i);
+                    if (jl_is_uniontype(ft)) {
+                        uint8_t sel = ((uint8_t*)fld_ptr)[jl_field_size(vt, i) - 1];
+                        ft = (jl_datatype_t*)jl_nth_union_component((jl_value_t*)ft, sel);
+                    }
+                    n += jl_static_show2_x_(out + n, (jl_value_t*)fld_ptr, ft, depth);
+                }
+                if ((istuple || isnamedtuple) && tlen == 1)
+                    n += sprintf(out + n, ",");
+                else if (i != tlen - 1)
+                    n += sprintf(out + n, ", ");
+            }
+            if (vt == jl_typemap_entry_type) {
+                n += sprintf(out + n, ", next=↩︎\n  ");
+                jl_value_t *next = (jl_value_t*)jl_atomic_load_relaxed(&((jl_typemap_entry_t*)v)->next);
+                n += jl_static_show2_next_(out + n, next, v, depth);
+            }
+        }
+        n += sprintf(out + n, ")");
+    }
+    else {
+        n += sprintf(out + n, "<?#%p::", (void*)v);
+        n += jl_static_show2_x(out + n, (jl_value_t*)vt, depth);
+        n += sprintf(out + n, ">");
+    }
+    return n;
+}
+
+static size_t jl_static_show2_x(char *out, jl_value_t *v, struct recur_list *depth) JL_NOTSAFEPOINT
+{
+    // show values without calling a julia method or allocating through the GC
+    return jl_static_show2_next_(out, v, NULL, depth);
+}
+
+static size_t jl_static_show2_next_(char *out, jl_value_t *v, jl_value_t *prev, struct recur_list *depth) JL_NOTSAFEPOINT
+{
+    // helper for showing a typemap list by following the next pointers
+    // while being careful about avoiding any recursion due to malformed (circular) references
+    if (v == NULL) {
+        return sprintf(out, "#<null>");
+    }
+    else if ((uintptr_t)v < 4096U) {
+        return sprintf(out, "#<%d>", (int)(uintptr_t)v);
+    }
+    unsigned int dist = 1;
+    struct recur_list this_item = {depth, v},
+                      *newdepth = &this_item,
+                      *p = depth;
+    while (p) {
+        if (jl_typeis(v, jl_typemap_entry_type) && newdepth == &this_item) {
+            jl_value_t *m = p->v;
+            unsigned nid = 1;
+            while (m && jl_typeis(m, jl_typemap_entry_type)) {
+                if (m == v) {
+                    return sprintf(out, "<typemap reference #%u @-%u ", nid, dist) +
+                           jl_static_show2_x(out, (jl_value_t*)((jl_typemap_entry_t*)m)->sig, depth) +
+                           sprintf(out, ">");
+                }
+                if (m == prev) {
+                    newdepth = depth;
+                    break;
+                }
+                // verify that we aren't trying to follow a circular list
+                // by following the list again, and ensuring this is the only link to next
+                jl_value_t *mnext = (jl_value_t*)jl_atomic_load_relaxed(&((jl_typemap_entry_t*)m)->next);
+                jl_value_t *m2 = p->v;
+                if (m2 == mnext)
+                    break;
+                while (m2 && jl_typeis(m2, jl_typemap_entry_type)) {
+                    jl_value_t *mnext2 = (jl_value_t*)jl_atomic_load_relaxed(&((jl_typemap_entry_t*)m2)->next);
+                    if (mnext2 == mnext) {
+                        if (m2 != m)
+                            mnext = NULL;
+                        break;
+                    }
+                    m2 = mnext2;
+                }
+                m = mnext;
+                nid++;
+            }
+        }
+        if (p->v == v)
+            return sprintf(out, "<circular reference @-%u>", dist);
+        dist++;
+        p = p->prev;
+    }
+    return jl_static_show2_x_(out, v, (jl_datatype_t*)jl_typeof(v), newdepth);
+}
+
+JL_DLLEXPORT size_t jl_static_show2(char *out, jl_value_t *v) JL_NOTSAFEPOINT
+{
+    return jl_static_show2_x(out, v, 0);
+}
+
+JL_DLLEXPORT size_t jl_static_show2_func_sig(char *s, jl_value_t *type) JL_NOTSAFEPOINT
+{
+    size_t n = 0;
+    size_t i;
+    jl_value_t *ftype = (jl_value_t*)jl_nth_argument_datatype(type, 1);
+    if (ftype == NULL)
+        return jl_static_show2(s, type);
+    jl_unionall_t *tvars = (jl_unionall_t*)type;
+    int nvars = jl_subtype_env_size(type);
+    struct recur_list *depth = NULL;
+    if (nvars > 0)  {
+        depth = (struct recur_list*)alloca(sizeof(struct recur_list) * nvars);
+        for (i = 0; i < nvars; i++) {
+            depth[i].prev = i == 0 ? NULL : &depth[i - 1];
+            depth[i].v = type;
+            type = ((jl_unionall_t*)type)->body;
+        }
+        depth += nvars - 1;
+    }
+    if (!jl_is_datatype(type)) {
+        n += jl_static_show2(s + n, type);
+        return n;
+    }
+    if ((jl_nparams(ftype) == 0 || ftype == ((jl_datatype_t*)ftype)->name->wrapper) &&
+            ((jl_datatype_t*)ftype)->name->mt != jl_type_type_mt &&
+            ((jl_datatype_t*)ftype)->name->mt != jl_nonfunction_mt) {
+        n += sprintf(s + n, "%s", jl_symbol_name(((jl_datatype_t*)ftype)->name->mt->name));
+    }
+    else {
+        n += sprintf(s + n, "(::");
+        n += jl_static_show2_x(s + n, ftype, depth);
+        n += sprintf(s + n, ")");
+    }
+    size_t tl = jl_nparams(type);
+    n += sprintf(s + n, "(");
+    for (i = 1; i < tl; i++) {
+        jl_value_t *tp = jl_tparam(type, i);
+        if (i != tl - 1) {
+            n += jl_static_show2_x(s + n, tp, depth);
+            n += sprintf(s + n, ", ");
+        }
+        else {
+            if (jl_vararg_kind(tp) == JL_VARARG_UNBOUND) {
+                tp = jl_unwrap_vararg(tp);
+                if (jl_is_unionall(tp))
+                    n += sprintf(s + n, "(");
+                n += jl_static_show2_x(s + n, tp, depth);
+                if (jl_is_unionall(tp))
+                    n += sprintf(s + n, ")");
+                n += sprintf(s + n, "...");
+            }
+            else {
+                n += jl_static_show2_x(s + n, tp, depth);
+            }
+        }
+    }
+    n += sprintf(s + n, ")");
+    if (jl_is_unionall(tvars)) {
+        depth -= nvars - 1;
+        int first = 1;
+        n += sprintf(s + n, " where {");
+        while (jl_is_unionall(tvars)) {
+            if (!first)
+                n += sprintf(s + n, ", ");
+            n += jl_static_show2_x(s + n, (jl_value_t*)tvars->var, first ? NULL : depth);
+            tvars = (jl_unionall_t*)tvars->body;
+            if (!first)
+                depth += 1;
+            first = 0;
+        }
+        n += sprintf(s + n, "}");
+    }
+    return n;
 }
 
 JL_DLLEXPORT size_t jl_static_show(JL_STREAM *out, jl_value_t *v) JL_NOTSAFEPOINT

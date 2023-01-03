@@ -878,12 +878,8 @@ static jl_array_t *jl_verify_edges(jl_array_t *targets)
             assert(jl_is_array(expected));
             int ambig = 0;
             // TODO: possibly need to included ambiguities too (for the optimizer correctness)?
-            {
-                TracyCZoneN(ctx2, "jl_matching_methods", true);
-                matches = jl_matching_methods((jl_tupletype_t*)sig, jl_nothing,
-                        -1, 0, world, &min_valid, &max_valid, &ambig);
-                TracyCZoneEnd(ctx2);
-            }
+            matches = jl_matching_methods((jl_tupletype_t*)sig, jl_nothing,
+                    -1, 0, world, &min_valid, &max_valid, &ambig);
             if (matches == jl_nothing) {
                 valid = 0;
             }

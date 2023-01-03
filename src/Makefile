@@ -15,6 +15,8 @@ JLDFLAGS += $(LDFLAGS)
 #  #define ARGUMENT_TO_OVERRIDE 1
 FLAGS := \
 	-DTRACY_ENABLE \
+        -DTRACY_ONLY_LOCALHOST \
+        -DTRACY_NO_BROADCAST \
 	-D_GNU_SOURCE -I$(BUILDDIR) -I$(SRCDIR) \
 	-I$(SRCDIR)/flisp -I$(SRCDIR)/support \
 	-I$(LIBUV_INC) -I$(build_includedir) \

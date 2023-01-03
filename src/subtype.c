@@ -27,6 +27,8 @@
 #include "julia.h"
 #include "julia_internal.h"
 #include "julia_assert.h"
+#include "tracy/TracyC.h"
+#include <stdbool.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -3767,9 +3769,11 @@ static int might_intersect_concrete(jl_value_t *a)
 // sets *issubty to 1 iff `a` is a subtype of `b`
 jl_value_t *jl_type_intersection_env_s(jl_value_t *a, jl_value_t *b, jl_svec_t **penv, int *issubty)
 {
+    TracyCZoneN(ctx, "jl_type_intersection_env_s", true);
     if (issubty) *issubty = 0;
     if (obviously_disjoint(a, b, 0)) {
         if (issubty && a == jl_bottom_type) *issubty = 1;
+        TracyCZoneEnd(ctx);
         return jl_bottom_type;
     }
     int szb = jl_subtype_env_size(b);
@@ -3854,6 +3858,7 @@ jl_value_t *jl_type_intersection_env_s(jl_value_t *a, jl_value_t *b, jl_svec_t *
     }
  bot:
     JL_GC_POP();
+    TracyCZoneEnd(ctx);
     return *ans;
 }
 

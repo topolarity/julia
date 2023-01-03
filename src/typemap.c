@@ -392,6 +392,7 @@ static int tname_intersection(jl_datatype_t *a, jl_typename_t *bname, unsigned h
 static int jl_typemap_intersection_array_visitor(jl_array_t *a, jl_value_t *ty, int tparam,
                                                  int offs, struct typemap_intersection_env *closure)
 {
+    TracyCZoneN(ctx, "jl_typemap_intersection_array_visitor", true);
     JL_GC_PUSH1(&a);
     size_t i, l = jl_array_len(a);
     _Atomic(jl_typemap_t*) *data = (_Atomic(jl_typemap_t*)*)jl_array_data(a);
@@ -425,10 +426,12 @@ static int jl_typemap_intersection_array_visitor(jl_array_t *a, jl_value_t *ty, 
         }
     }
     JL_GC_POP();
+    TracyCZoneEnd(ctx);
     return 1;
 
 exit:
     JL_GC_POP();
+    TracyCZoneEnd(ctx);
     return 0;
 }
 
@@ -436,6 +439,7 @@ exit:
 // for which type ∩ ml->type != Union{}, until fptr return false
 static int jl_typemap_intersection_node_visitor(jl_typemap_entry_t *ml, struct typemap_intersection_env *closure)
 {
+    TracyCZoneN(ctx, "jl_typemap_intersection_node_visitor", true);
     // slow-path scan everything in ml
     // mark this `register` because (for branch prediction)
     // that can be absolutely critical for speed
@@ -447,8 +451,10 @@ static int jl_typemap_intersection_node_visitor(jl_typemap_entry_t *ml, struct t
                 closure->env = jl_outer_unionall_vars((jl_value_t*)ml->sig);
             closure->ti = closure->type;
             closure->issubty = 1;
-            if (!fptr(ml, closure))
+            if (!fptr(ml, closure)) {
+                TracyCZoneEnd(ctx);
                 return 0;
+            }
         }
         else {
             jl_svec_t **penv = NULL;
@@ -463,12 +469,15 @@ static int jl_typemap_intersection_node_visitor(jl_typemap_entry_t *ml, struct t
                 // For dispatch purposes in such a case we know there's no match. This check
                 // fixes issue #30394.
                 if (closure->issubty || !jl_is_dispatch_tupletype(closure->type))
-                    if (!fptr(ml, closure))
+                    if (!fptr(ml, closure)) {
+                        TracyCZoneEnd(ctx);
                         return 0;
+                    }
             }
         }
         ml = jl_atomic_load_relaxed(&ml->next);
     }
+    TracyCZoneEnd(ctx);
     return 1;
 }
 
