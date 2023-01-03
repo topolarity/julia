@@ -14,6 +14,7 @@ JLDFLAGS += $(LDFLAGS)
 #  #include_next <options.h>
 #  #define ARGUMENT_TO_OVERRIDE 1
 FLAGS := \
+	-DTRACY_ENABLE \
 	-D_GNU_SOURCE -I$(BUILDDIR) -I$(SRCDIR) \
 	-I$(SRCDIR)/flisp -I$(SRCDIR)/support \
 	-I$(LIBUV_INC) -I$(build_includedir) \
@@ -46,7 +47,7 @@ SRCS := \
 	simplevector runtime_intrinsics precompile jloptions \
 	threading partr stackwalk gc gc-debug gc-pages gc-stacks gc-alloc-profiler method \
 	jlapi signal-handling safepoint timing subtype rtutils gc-heap-snapshot \
-	crc32c APInt-C processor ircode opaque_closure codegen-stubs coverage runtime_ccall
+	crc32c APInt-C processor ircode opaque_closure codegen-stubs coverage runtime_ccall TracyClient
 
 RT_LLVMLINK :=
 CG_LLVMLINK :=
