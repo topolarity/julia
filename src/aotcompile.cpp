@@ -369,6 +369,7 @@ void *jl_create_native_impl(jl_array_t *methods, LLVMOrcThreadSafeModuleRef llvm
     size_t offset = gvars.size();
     data->jl_external_to_llvm.resize(params.external_fns.size());
 
+    // TODO: This should *definitely* hook into the codectx_t somehow...
     auto tbaa_const = tbaa_make_child_with_context(*ctxt.getContext(), "jtbaa_const", nullptr, true).first;
     for (auto &extern_fn : params.external_fns) {
         jl_code_instance_t *this_code = std::get<0>(extern_fn.first);

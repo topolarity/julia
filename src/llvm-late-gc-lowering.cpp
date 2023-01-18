@@ -2346,7 +2346,10 @@ bool LateLowerGCFrame::CleanupIR(Function &F, State *S, bool *CFGModified) {
                 // Create a call to the `julia.gc_alloc_bytes` intrinsic, which is like
                 // `julia.gc_alloc_obj` except it doesn't set the tag.
                 auto allocBytesIntrinsic = getOrDeclare(jl_intrinsics::GCAllocBytes);
-                auto ptlsLoad = get_current_ptls_from_task(builder, CI->getArgOperand(0), tbaa_gcframe);
+                //jl_aliasinfo_t aliasinfo(
+                // TODO: This is just bad... How am I supposed to do this correctly?
+                // TODO: jl_aliasinfo_t(ctx, Region::gcframe, nullptr);
+                auto ptlsLoad = get_current_ptls_from_task(builder, CI->getArgOperand(0), jl_aliasinfo_t());  // TODO RIGHT AWAY
                 auto ptls = builder.CreateBitCast(ptlsLoad, Type::getInt8PtrTy(builder.getContext()));
                 auto newI = builder.CreateCall(
                     allocBytesIntrinsic,

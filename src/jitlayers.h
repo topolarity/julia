@@ -1,5 +1,8 @@
 // This file is a part of Julia. License is MIT: https://julialang.org/license
 
+#ifndef JL_JITLAYERS_H
+#define JL_JITLAYERS_H
+
 #include <llvm/ADT/MapVector.h>
 
 #include <llvm/IR/LLVMContext.h>
@@ -577,3 +580,5 @@ static inline bool isIntrinsicFunction(Function *F) JL_NOTSAFEPOINT
 }
 
 CodeGenOpt::Level CodeGenOptLevelFor(int optlevel) JL_NOTSAFEPOINT;
+
+#endif
