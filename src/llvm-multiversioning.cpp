@@ -47,7 +47,7 @@ extern Optional<bool> always_have_fma(Function&);
 
 extern Optional<bool> always_have_fp16();
 
-void replaceUsesWithLoad(Function &F, function_ref<GlobalVariable *(Instruction &I)> should_replace, MDNode *tbaa_const);
+void replaceUsesWithLoad(Function &F, function_ref<GlobalVariable *(Instruction &I)> should_replace, jl_aliasinfo_t aliasinfo);
 
 namespace {
 constexpr uint32_t clone_mask =
@@ -274,7 +274,7 @@ private:
     Constant *emit_offset_table(const std::vector<T*> &vars, StringRef name) const;
     void rewrite_alias(GlobalAlias *alias, Function* F);
 
-    MDNode *tbaa_const;
+    jl_aliasinfo_t const_aliasinfo;
     std::vector<jl_target_spec_t> specs;
     std::vector<Group> groups{};
     std::vector<Function*> fvars;
@@ -337,7 +337,7 @@ static inline std::vector<T*> consume_gv(Module &M, const char *name, bool allow
 
 // Collect basic information about targets and functions.
 CloneCtx::CloneCtx(Module &M, function_ref<LoopInfo&(Function&)> GetLI, function_ref<CallGraph&()> GetCG, bool allow_bad_fvars)
-    : tbaa_const(tbaa_make_child_with_context(M.getContext(), "jtbaa_const", nullptr, true).first),
+    : const_aliasinfo(create_noalias_metadata(M.getContext(), Region::constant, nullptr)), // TODO: TBAA.. maybe?
       specs(jl_get_llvm_clone_targets()),
       fvars(consume_gv<Function>(M, "jl_sysimg_fvars", allow_bad_fvars)),
       gvars(consume_gv<Constant>(M, "jl_sysimg_gvars", false)),
@@ -749,7 +749,8 @@ void CloneCtx::rewrite_alias(GlobalAlias *alias, Function *F)
     IRBuilder<> irbuilder(BB);
 
     auto ptr = irbuilder.CreateLoad(F->getType(), slot);
-    ptr->setMetadata(llvm::LLVMContext::MD_tbaa, tbaa_const);
+    const_aliasinfo.decorateInst(ptr);
+    //TODO: delete?
     ptr->setMetadata(llvm::LLVMContext::MD_invariant_load, MDNode::get(F->getContext(), None));
 
     std::vector<Value *> Args;
@@ -897,7 +898,7 @@ void CloneCtx::fix_inst_uses()
                     tgt.relocs.insert(id);
                 }
                 return slot;
-            }, tbaa_const);
+            }, const_aliasinfo);
         }
     }
 }
@@ -1187,7 +1188,7 @@ static RegisterPass<MultiVersioningLegacy> X("JuliaMultiVersioning", "JuliaMulti
 
 } // anonymous namespace
 
-void replaceUsesWithLoad(Function &F, function_ref<GlobalVariable *(Instruction &I)> should_replace, MDNode *tbaa_const) {
+void replaceUsesWithLoad(Function &F, function_ref<GlobalVariable *(Instruction &I)> should_replace, jl_aliasinfo_t aliasinfo) {
     bool changed;
     do {
         changed = false;
@@ -1201,7 +1202,8 @@ void replaceUsesWithLoad(Function &F, function_ref<GlobalVariable *(Instruction 
             if (auto phi = dyn_cast<PHINode>(use_i))
                 insert_before = phi->getIncomingBlock(*info.use)->getTerminator();
             Instruction *ptr = new LoadInst(F.getType(), slot, "", false, insert_before);
-            ptr->setMetadata(llvm::LLVMContext::MD_tbaa, tbaa_const);
+            aliasinfo.decorateInst(ptr);
+            // TODO: Maybe delete?
             ptr->setMetadata(llvm::LLVMContext::MD_invariant_load, MDNode::get(ptr->getContext(), None));
             use_i->setOperand(info.use->getOperandNo(),
                                 rewrite_inst_use(uses.get_stack(), ptr,

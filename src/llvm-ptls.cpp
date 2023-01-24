@@ -44,8 +44,8 @@ struct LowerPTLS {
 private:
     const bool imaging_mode;
     Module *M;
-    MDNode *tbaa_const{nullptr};
-    MDNode *tbaa_gcframe{nullptr}; // TODO: This is *not* going to work...
+    jl_aliasinfo_t const_aliasinfo{jl_aliasinfo_t()};
+    jl_aliasinfo_t gcframe_aliasinfo{jl_aliasinfo_t()};
     FunctionType *FT_pgcstack_getter{nullptr};
     PointerType *T_pgcstack_getter{nullptr};
     PointerType *T_pppjlvalue{nullptr};
@@ -206,8 +206,8 @@ void LowerPTLS::fix_pgcstack_use(CallInst *pgcstack, Function *pgcstack_getter, 
         // emit fast branch code
         IRBuilder<> builder(fastTerm->getParent());
         fastTerm->removeFromParent();
-        //MDNode *tbaa = tbaa_gcframe; // TODO: jl_aliasinfo_t(ctx, Region::gcframe, nullptr);
-        Value *prior = emit_gc_unsafe_enter(builder, get_current_ptls_from_task(builder, get_current_task_from_pgcstack(builder, pgcstack), jl_aliasinfo_t()), true);
+        jl_aliasinfo_t aliasinfo = gcframe_aliasinfo;
+        Value *prior = emit_gc_unsafe_enter(builder, get_current_ptls_from_task(builder, get_current_task_from_pgcstack(builder, pgcstack), aliasinfo), true);
         builder.Insert(fastTerm);
         phi->addIncoming(pgcstack, fastTerm->getParent());
         // emit pre-return cleanup
@@ -219,8 +219,7 @@ void LowerPTLS::fix_pgcstack_use(CallInst *pgcstack, Function *pgcstack_getter, 
             for (auto &BB : *pgcstack->getParent()->getParent()) {
                 if (isa<ReturnInst>(BB.getTerminator())) {
                     IRBuilder<> builder(BB.getTerminator());
-                    // TODO
-                    emit_gc_unsafe_leave(builder, get_current_ptls_from_task(builder, get_current_task_from_pgcstack(builder, phi), jl_aliasinfo_t()), last_gc_state, true);
+                    emit_gc_unsafe_leave(builder, get_current_ptls_from_task(builder, get_current_task_from_pgcstack(builder, phi), aliasinfo), last_gc_state, true);
                 }
             }
         }
@@ -233,9 +232,7 @@ void LowerPTLS::fix_pgcstack_use(CallInst *pgcstack, Function *pgcstack_getter, 
             // else
             //     pgcstack = getter();    // slow
             auto offset = new LoadInst(getSizeTy(pgcstack->getContext()), pgcstack_offset, "", false, pgcstack);
-            // TODO: Fix this TBAA
-            offset->setMetadata(llvm::LLVMContext::MD_tbaa, tbaa_const);
-            offset->setMetadata(llvm::LLVMContext::MD_invariant_load, MDNode::get(pgcstack->getContext(), None));
+            const_aliasinfo.decorateInst(offset);
             auto cmp = new ICmpInst(pgcstack, CmpInst::ICMP_NE, offset,
                                     Constant::getNullValue(offset->getType()));
             MDBuilder MDB(pgcstack->getContext());
@@ -252,9 +249,7 @@ void LowerPTLS::fix_pgcstack_use(CallInst *pgcstack, Function *pgcstack_getter, 
             pgcstack->replaceAllUsesWith(phi);
             pgcstack->moveBefore(slowTerm);
             auto getter = new LoadInst(T_pgcstack_getter, pgcstack_func_slot, "", false, pgcstack);
-            // TODO: Fix this TBAA
-            getter->setMetadata(llvm::LLVMContext::MD_tbaa, tbaa_const);
-            getter->setMetadata(llvm::LLVMContext::MD_invariant_load, MDNode::get(pgcstack->getContext(), None));
+            const_aliasinfo.decorateInst(getter);
             pgcstack->setCalledFunction(pgcstack->getFunctionType(), getter);
             set_pgcstack_attrs(pgcstack);
 
@@ -268,14 +263,10 @@ void LowerPTLS::fix_pgcstack_use(CallInst *pgcstack, Function *pgcstack_getter, 
         // This way we can bypass the extra indirection in `jl_get_pgcstack`
         // since we may not know which getter function to use ahead of time.
         auto getter = new LoadInst(T_pgcstack_getter, pgcstack_func_slot, "", false, pgcstack);
-        // TODO: Fix this TBAA
-        getter->setMetadata(llvm::LLVMContext::MD_tbaa, tbaa_const);
-        getter->setMetadata(llvm::LLVMContext::MD_invariant_load, MDNode::get(pgcstack->getContext(), None));
+        const_aliasinfo.decorateInst(getter);
 #if defined(_OS_DARWIN_)
         auto key = new LoadInst(getSizeTy(pgcstack->getContext()), pgcstack_key_slot, "", false, pgcstack);
-        // TODO: Fix this TBAA
-        key->setMetadata(llvm::LLVMContext::MD_tbaa, tbaa_const);
-        key->setMetadata(llvm::LLVMContext::MD_invariant_load, MDNode::get(pgcstack->getContext(), None));
+        const_aliasinfo.decorateInst(key);
         auto new_pgcstack = CallInst::Create(FT_pgcstack_getter, getter, {key}, "", pgcstack);
         new_pgcstack->takeName(pgcstack);
         pgcstack->replaceAllUsesWith(new_pgcstack);
@@ -321,8 +312,8 @@ bool LowerPTLS::run(bool *CFGModified)
             return false;
 
         if (need_init) {
-            tbaa_const = tbaa_make_child_with_context(M->getContext(), "jtbaa_const", nullptr, true).first;
-            tbaa_gcframe = tbaa_make_child_with_context(M->getContext(), "jtbaa_gcframe").first;
+            const_aliasinfo = create_noalias_metadata(M->getContext(), Region::constant, nullptr);
+            gcframe_aliasinfo = create_noalias_metadata(M->getContext(), Region::gcframe, nullptr);
 
             FT_pgcstack_getter = pgcstack_getter->getFunctionType();
 #if defined(_OS_DARWIN_)

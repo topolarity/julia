@@ -108,7 +108,7 @@ Value *FinalLowerGC::lowerNewGCFrame(CallInst *target, Function &F)
         ConstantInt::get(Type::getInt1Ty(F.getContext()), 0)}; // volatile
     CallInst *zeroing = CallInst::Create(memset, makeArrayRef(args));
     cast<MemSetInst>(zeroing)->setDestAlignment(Align(16));
-    zeroing->setMetadata(LLVMContext::MD_tbaa, tbaa_gcframe);
+    gcframe_aliasinfo.decorateInst(zeroing);
     zeroing->insertAfter(tempSlot_i8);
 
     return gcframe;
@@ -129,7 +129,7 @@ void FinalLowerGC::lowerPushGCFrame(CallInst *target, Function &F)
                         builder.CreateConstInBoundsGEP1_32(T_prjlvalue, gcframe, 0),
                         getSizeTy(F.getContext())->getPointerTo()),
                 Align(sizeof(void*)));
-    inst->setMetadata(LLVMContext::MD_tbaa, tbaa_gcframe);
+    gcframe_aliasinfo.decorateInst(inst);
     auto T_ppjlvalue = JuliaType::get_ppjlvalue_ty(F.getContext());
     inst = builder.CreateAlignedStore(
             builder.CreateAlignedLoad(T_ppjlvalue, pgcstack, Align(sizeof(void*))),
@@ -137,7 +137,7 @@ void FinalLowerGC::lowerPushGCFrame(CallInst *target, Function &F)
                     builder.CreateConstInBoundsGEP1_32(T_prjlvalue, gcframe, 1),
                     PointerType::get(T_ppjlvalue, 0)),
             Align(sizeof(void*)));
-    inst->setMetadata(LLVMContext::MD_tbaa, tbaa_gcframe);
+    gcframe_aliasinfo.decorateInst(inst);
     inst = builder.CreateAlignedStore(
             gcframe,
             builder.CreateBitCast(pgcstack, PointerType::get(PointerType::get(T_prjlvalue, 0), 0)),
@@ -155,13 +155,13 @@ void FinalLowerGC::lowerPopGCFrame(CallInst *target, Function &F)
     Instruction *gcpop =
         cast<Instruction>(builder.CreateConstInBoundsGEP1_32(T_prjlvalue, gcframe, 1));
     Instruction *inst = builder.CreateAlignedLoad(T_prjlvalue, gcpop, Align(sizeof(void*)));
-    inst->setMetadata(LLVMContext::MD_tbaa, tbaa_gcframe);
+    gcframe_aliasinfo.decorateInst(inst);
     inst = builder.CreateAlignedStore(
         inst,
         builder.CreateBitCast(pgcstack,
             PointerType::get(T_prjlvalue, 0)),
         Align(sizeof(void*)));
-    inst->setMetadata(LLVMContext::MD_tbaa, tbaa_gcframe);
+    gcframe_aliasinfo.decorateInst(inst);
 }
 
 Value *FinalLowerGC::lowerGetGCFrameSlot(CallInst *target, Function &F)

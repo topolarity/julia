@@ -68,7 +68,7 @@ static inline void llvm_dump(llvm::DebugLoc *dbg)
     llvm::dbgs() << "\n";
 }
 
-// TODO: deleteme
+// TODO: deleteme ... maybe not?
 static inline std::pair<llvm::MDNode*,llvm::MDNode*> tbaa_make_child_with_context(llvm::LLVMContext &ctxt, const char *name, llvm::MDNode *parent=nullptr, bool isConstant=false)
 {
     llvm::MDBuilder mbuilder(ctxt);
@@ -78,6 +78,65 @@ static inline std::pair<llvm::MDNode*,llvm::MDNode*> tbaa_make_child_with_contex
     llvm::MDNode *n = mbuilder.createTBAAStructTagNode(scalar, scalar, 0, isConstant);
     return std::make_pair(n, scalar);
 }
+
+struct noalias_metadata_t {
+    MDNode *alias_scope;
+    MDNode *noalias;
+};
+
+// TODO: Merge in jl_aliasinfo_t
+// TODO: *not* static inline, for the love of god
+static inline jl_aliasinfo_t create_noalias_metadata(llvm::LLVMContext &ctxt, jl_aliasinfo_t::Region region, MDNode *tbaa) {
+    if (region == Region::unknown)
+        return jl_aliasinfo_t(tbaa, nullptr, nullptr, nullptr);
+
+    llvm::MDBuilder mbuilder(ctxt);
+    llvm::MDNode *domain = mbuilder.createAliasScopeDomain("jnoalias");
+
+    llvm::MDNode *gcframe = mbuilder.createAliasScope("jnoalias_gcframe", domain);
+    llvm::MDNode *stack = mbuilder.createAliasScope("jnoalias_stack", domain);
+    llvm::MDNode *data = mbuilder.createAliasScope("jnoalias_data", domain);
+    llvm::MDNode *type_metadata = mbuilder.createAliasScope("jnoalias_typemd", domain);
+    llvm::MDNode *constant = mbuilder.createAliasScope("jnoalias_const", domain);
+
+    MDNode *all_scopes[5] = { gcframe, stack, data, type_metadata, constant };
+    MDNode *alias_scope = nullptr;
+    switch (region) {
+        case Region::gcframe:
+            alias_scope = gcframe;
+            break;
+        case Region::stack:
+            alias_scope = stack;
+            break;
+        case Region::data:
+            alias_scope = data;
+            break;
+        case Region::type_metadata:
+            alias_scope = type_metadata;
+            break;
+        case Region::constant:
+            alias_scope = constant;
+            break;
+        case Region::unknown:
+            llvm_unreachable("");
+    }
+
+    int i = 0;
+    Metadata *scopes[1] = { alias_scope };
+    Metadata *noaliases[4];
+    for (auto const &scope: all_scopes) {
+        if (scope == alias_scope) continue;
+        noaliases[i++] = scope;
+    }
+
+    return jl_aliasinfo_t(
+        /* !tbaa */ tbaa,
+        /* !tbaa.struct */ nullptr,
+        /* !alias.scope */ MDNode::get(ctxt, llvm::ArrayRef<Metadata*>(scopes)),
+        /* !noalias */ MDNode::get(ctxt, llvm::ArrayRef<Metadata*>(noaliases))
+    );
+}
+
 // bitcast a value, but preserve its address space when dealing with pointer types
 static inline llvm::Value *emit_bitcast_with_builder(llvm::IRBuilder<> &builder, llvm::Value *v, llvm::Type *jl_value)
 {
@@ -205,8 +264,8 @@ static inline llvm::Value *emit_gc_state_set(llvm::IRBuilder<> &builder, llvm::V
                                            builder.CreateICmpEQ(state, zero8)),
                          passBB, exitBB);
     builder.SetInsertPoint(passBB);
-    //jl_aliasinfo_t aliasinfo(ctx, Region::constant, nullptr); // TODO: TBAA?
-    emit_gc_safepoint(builder, ptls, jl_aliasinfo_t(), final);
+    jl_aliasinfo_t aliasinfo = create_noalias_metadata(builder.getContext(), Region::constant, nullptr); // TODO: TBAA?
+    emit_gc_safepoint(builder, ptls, aliasinfo, final);
     builder.CreateBr(exitBB);
     builder.SetInsertPoint(exitBB);
     return old_state;

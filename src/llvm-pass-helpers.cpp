@@ -21,7 +21,7 @@ using namespace llvm;
 JuliaPassContext::JuliaPassContext()
     : T_prjlvalue(nullptr),
 
-        tbaa_gcframe(nullptr), tbaa_tag(nullptr),
+        gcframe_aliasinfo(), tag_aliasinfo(),
 
         pgcstack_getter(nullptr), adoptthread_func(nullptr), gc_flush_func(nullptr),
         gc_preserve_begin_func(nullptr), gc_preserve_end_func(nullptr),
@@ -36,11 +36,13 @@ void JuliaPassContext::initFunctions(Module &M)
     module = &M;
     LLVMContext &llvmctx = M.getContext();
 
-    tbaa_gcframe = tbaa_make_child_with_context(llvmctx, "jtbaa_gcframe").first;
+    gcframe_aliasinfo = create_noalias_metadata(llvmctx, Region::gcframe, nullptr); // TODO: TBAA?
+    // These seem necessary... TODO: Revisit
     MDNode *tbaa_data;
     MDNode *tbaa_data_scalar;
     std::tie(tbaa_data, tbaa_data_scalar) = tbaa_make_child_with_context(llvmctx, "jtbaa_data");
-    tbaa_tag = tbaa_make_child_with_context(llvmctx, "jtbaa_tag", tbaa_data_scalar).first;
+    MDNode *tbaa_tag = tbaa_make_child_with_context(llvmctx, "jtbaa_tag", tbaa_data_scalar).first;
+    tag_aliasinfo = create_noalias_metadata(llvmctx, Region::data, tbaa_tag);
 
     pgcstack_getter = M.getFunction("julia.get_pgcstack");
     adoptthread_func = M.getFunction("julia.get_pgcstack_or_new");

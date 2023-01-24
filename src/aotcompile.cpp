@@ -261,7 +261,7 @@ static void jl_ci_cache_lookup(const jl_cgparams_t &cgparams, jl_method_instance
     *ci_out = codeinst;
 }
 
-void replaceUsesWithLoad(Function &F, function_ref<GlobalVariable *(Instruction &I)> should_replace, MDNode *tbaa_const);
+void replaceUsesWithLoad(Function &F, function_ref<GlobalVariable *(Instruction &I)> should_replace, jl_aliasinfo_t aliasinfo);
 
 // takes the running content that has collected in the shadow module and dump it to disk
 // this builds the object file portion of the sysimage files for fast startup, and can
@@ -370,7 +370,7 @@ void *jl_create_native_impl(jl_array_t *methods, LLVMOrcThreadSafeModuleRef llvm
     data->jl_external_to_llvm.resize(params.external_fns.size());
 
     // TODO: This should *definitely* hook into the codectx_t somehow...
-    auto tbaa_const = tbaa_make_child_with_context(*ctxt.getContext(), "jtbaa_const", nullptr, true).first;
+    jl_aliasinfo_t const_aliasinfo = create_noalias_metadata(*ctxt.getContext(), Region::constant, nullptr); // TODO: TBAA? It should actually be the TBAA node for the *access* but only *maybe*...
     for (auto &extern_fn : params.external_fns) {
         jl_code_instance_t *this_code = std::get<0>(extern_fn.first);
         bool specsig = std::get<1>(extern_fn.first);
@@ -388,7 +388,7 @@ void *jl_create_native_impl(jl_array_t *methods, LLVMOrcThreadSafeModuleRef llvm
 
 
         // Need to insert load instruction, thus we can't use replace all uses with
-        replaceUsesWithLoad(*F, [GV](Instruction &) { return GV; }, tbaa_const);
+        replaceUsesWithLoad(*F, [GV](Instruction &) { return GV; }, const_aliasinfo);
 
         assert(F->getNumUses() == 0); // declaration counts as use
         GV->takeName(F);

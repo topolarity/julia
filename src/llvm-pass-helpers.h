@@ -11,6 +11,7 @@
 #include <llvm/IR/Type.h>
 #include <llvm/IR/Value.h>
 #include "analyzer_annotations.h"
+#include "codegen.h"
 
 struct JuliaPassContext;
 
@@ -46,8 +47,8 @@ struct JuliaPassContext {
     llvm::PointerType *T_prjlvalue;
 
     // TBAA metadata nodes.
-    llvm::MDNode *tbaa_gcframe;
-    llvm::MDNode *tbaa_tag;
+    jl_aliasinfo_t gcframe_aliasinfo;
+    jl_aliasinfo_t tag_aliasinfo;
 
     // Intrinsics.
     llvm::Function *pgcstack_getter;

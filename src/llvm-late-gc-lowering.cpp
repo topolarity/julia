@@ -1177,6 +1177,8 @@ static bool isTBAA(MDNode *TBAA, std::initializer_list<const char*> const strset
     return false;
 }
 
+// TODO: FIX THIS!!
+
 // Check if this is a load from an immutable value. The easiest
 // way to do so is to look at the tbaa and see if it derives from
 // jtbaa_immut.
@@ -2222,7 +2224,7 @@ Value *LateLowerGCFrame::EmitLoadTag(IRBuilder<> &builder, Value *V)
     auto addr = EmitTagPtr(builder, T_size, V);
     LoadInst *load = builder.CreateAlignedLoad(T_size, addr, Align(sizeof(size_t)));
     load->setOrdering(AtomicOrdering::Unordered);
-    load->setMetadata(LLVMContext::MD_tbaa, tbaa_tag);
+    tag_aliasinfo.decorateInst(load);
     MDBuilder MDB(load->getContext());
     auto *NullInt = ConstantInt::get(T_size, 0);
     // We can be sure that the tag is larger than page size.
@@ -2404,7 +2406,7 @@ bool LateLowerGCFrame::CleanupIR(Function &F, State *S, bool *CFGModified) {
                 StoreInst *store = builder.CreateAlignedStore(
                     tag, EmitTagPtr(builder, tag_type, newI), Align(sizeof(size_t)));
                 store->setOrdering(AtomicOrdering::Unordered);
-                store->setMetadata(LLVMContext::MD_tbaa, tbaa_tag);
+                tag_aliasinfo.decorateInst(store);
 
                 // Replace uses of the call to `julia.gc_alloc_obj` with the call to
                 // `julia.gc_alloc_bytes`.

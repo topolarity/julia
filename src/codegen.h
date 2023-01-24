@@ -7,8 +7,10 @@
 
 #include "julia.h"
 #include "jitlayers.h"
-#include <llvm/IR/Metadata.h>
-#include <llvm/IR/Instruction.h>
+#include "llvm/IR/Metadata.h"
+#include "llvm/IR/Instruction.h"
+#include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/MDBuilder.h"
 
 enum AddressSpace {
     Generic = 0,
@@ -209,6 +211,9 @@ struct jl_debugcache_t {
 struct jl_aliasinfo_t {
     using MDNode = llvm::MDNode;
     using Instruction = llvm::Instruction;
+
+    // TODO: Maybe keep track of const or not
+    //  -> Is this an "access" or a "pointer"?
 
     MDNode *tbaa = nullptr;          // '!tbaa': Struct-path TBAA. TBAA graph forms a tree (indexed by offset).
                                      //          Two pointers do not alias if they are not transitive parents
