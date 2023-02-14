@@ -92,7 +92,7 @@ static void * lookup_symbol(const void * lib_handle, const char * symbol_name) {
 #ifdef _OS_WINDOWS_
     return GetProcAddress((HMODULE) lib_handle, symbol_name);
 #else
-    return dlsym((void *)lib_handle, symbol_name);
+    return dlvsym((void *)lib_handle, symbol_name, JL_SYM_VER);
 #endif
 }
 

@@ -6,6 +6,8 @@
 #include "../src/jl_exported_data.inc"
 #include "../src/jl_exported_funcs.inc"
 
+#define JL_SYM_VER "VER_A"
+
 // Define pointer data as `const void * $(name);`
 #define XX(name)    JL_DLLEXPORT const void * name;
 JL_EXPORTED_DATA_POINTERS(XX)

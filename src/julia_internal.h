@@ -1146,7 +1146,9 @@ extern void *jl_winsock_handle;
 JL_DLLEXPORT void *jl_get_library_(const char *f_lib, int throw_err);
 #define jl_get_library(f_lib) jl_get_library_(f_lib, 1)
 JL_DLLEXPORT void *jl_load_and_lookup(const char *f_lib, const char *f_name, _Atomic(void*) *hnd);
+JL_DLLEXPORT void *jl_load_and_lookupv(const char *f_lib, const char *f_name, const char *f_version, _Atomic(void*) *hnd);
 JL_DLLEXPORT void *jl_lazy_load_and_lookup(jl_value_t *lib_val, const char *f_name);
+JL_DLLEXPORT void *jl_lazy_load_and_lookupv(jl_value_t *lib_val, const char *f_name, const char *f_version);
 JL_DLLEXPORT jl_value_t *jl_get_cfunction_trampoline(
     jl_value_t *fobj, jl_datatype_t *result, htable_t *cache, jl_svec_t *fill,
     void *(*init_trampoline)(void *tramp, void **nval),

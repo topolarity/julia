@@ -931,6 +931,18 @@ static const auto jldlsym_func = new JuliaFunction{
             {getInt8PtrTy(C), getInt8PtrTy(C), PointerType::get(getInt8PtrTy(C), 0)}, false); },
     nullptr,
 };
+static const auto jldlvsym_func = new JuliaFunction{
+    XSTR(jl_load_and_lookupv),
+    [](LLVMContext &C) { return FunctionType::get(JuliaType::get_pvoidfunc_ty(C),
+            {getInt8PtrTy(C), getInt8PtrTy(C), getInt8PtrTy(C), PointerType::get(getInt8PtrTy(C), 0)}, false); },
+    nullptr,
+};
+static const auto jllazydlvsym_func = new JuliaFunction{
+    XSTR(jl_lazy_load_and_lookupv),
+    [](LLVMContext &C) { return FunctionType::get(JuliaType::get_pvoidfunc_ty(C),
+            {JuliaType::get_prjlvalue_ty(C), getInt8PtrTy(C), getInt8PtrTy(C)}, false); },
+    nullptr,
+};
 static const auto jllazydlsym_func = new JuliaFunction{
     XSTR(jl_lazy_load_and_lookup),
     [](LLVMContext &C) { return FunctionType::get(JuliaType::get_pvoidfunc_ty(C),
@@ -8029,6 +8041,7 @@ static void init_jit_functions(void)
     add_named_global(jl_typeof_func, (void*)NULL);
     add_named_global(jl_write_barrier_func, (void*)NULL);
     add_named_global(jldlsym_func, &jl_load_and_lookup);
+    add_named_global(jldlvsym_func, &jl_load_and_lookupv);
     add_named_global(jlgetcfunctiontrampoline_func, &jl_get_cfunction_trampoline);
     add_named_global(jlgetnthfieldchecked_func, &jl_get_nth_field_checked);
     add_named_global(diff_gc_total_bytes_func, &jl_gc_diff_total_bytes);

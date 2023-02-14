@@ -54,6 +54,17 @@ void *jl_get_library_(const char *f_lib, int throw_err)
 }
 
 extern "C" JL_DLLEXPORT
+void *jl_load_and_lookupv(const char *f_lib, const char *f_name, const char *f_version, _Atomic(void*) *hnd)
+{
+    void *handle = jl_atomic_load_acquire(hnd);
+    if (!handle)
+        jl_atomic_store_release(hnd, (handle = jl_get_library(f_lib)));
+    void * ptr;
+    jl_dlvsym(handle, f_name, f_version, &ptr, 1);
+    return ptr;
+}
+
+extern "C" JL_DLLEXPORT
 void *jl_load_and_lookup(const char *f_lib, const char *f_name, _Atomic(void*) *hnd)
 {
     void *handle = jl_atomic_load_acquire(hnd);
@@ -61,6 +72,23 @@ void *jl_load_and_lookup(const char *f_lib, const char *f_name, _Atomic(void*) *
         jl_atomic_store_release(hnd, (handle = jl_get_library(f_lib)));
     void * ptr;
     jl_dlsym(handle, f_name, &ptr, 1);
+    return ptr;
+}
+
+// jl_load_and_lookup, but with library computed at run time on first call
+extern "C" JL_DLLEXPORT
+void *jl_lazy_load_and_lookupv(jl_value_t *lib_val, const char *f_name, const char *f_version)
+{
+    char *f_lib;
+
+    if (jl_is_symbol(lib_val))
+        f_lib = jl_symbol_name((jl_sym_t*)lib_val);
+    else if (jl_is_string(lib_val))
+        f_lib = jl_string_data(lib_val);
+    else
+        jl_type_error("ccall", (jl_value_t*)jl_symbol_type, lib_val);
+    void *ptr;
+    jl_dlvsym(jl_get_library(f_lib), f_name, f_version, &ptr, 1);
     return ptr;
 }
 

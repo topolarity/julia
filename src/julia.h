@@ -1785,6 +1785,9 @@ JL_DLLEXPORT jl_libhandle jl_load_dynamic_library(const char *fname, unsigned fl
 JL_DLLEXPORT jl_libhandle jl_dlopen(const char *filename, unsigned flags) JL_NOTSAFEPOINT;
 JL_DLLEXPORT int jl_dlclose(jl_libhandle handle) JL_NOTSAFEPOINT;
 JL_DLLEXPORT int jl_dlsym(jl_libhandle handle, const char *symbol, void ** value, int throw_err) JL_NOTSAFEPOINT;
+JL_DLLEXPORT int jl_dlvsym(jl_libhandle handle, const char *symbol, const char *version, void ** value, int throw_err) JL_NOTSAFEPOINT;
+
+#define JL_SYM_VER "VER_A"
 
 // evaluation
 JL_DLLEXPORT jl_value_t *jl_toplevel_eval(jl_module_t *m, jl_value_t *v);

@@ -1,4 +1,4 @@
-{
+VER_A {
   global:
     pthread*;
     __stack_chk_guard;

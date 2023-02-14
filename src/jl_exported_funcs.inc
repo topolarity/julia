@@ -114,6 +114,7 @@
     XX(jl_dlclose) \
     XX(jl_dlopen) \
     XX(jl_dlsym) \
+    XX(jl_dlvsym) \
     XX(jl_dump_host_cpu) \
     XX(jl_egal) \
     XX(jl_egal__bits) \
@@ -296,10 +297,12 @@
     XX(jl_is_unary_and_binary_operator) \
     XX(jl_is_unary_operator) \
     XX(jl_lazy_load_and_lookup) \
+    XX(jl_lazy_load_and_lookupv) \
     XX(jl_lisp_prompt) \
     XX(jl_load) \
     XX(jl_load_) \
     XX(jl_load_and_lookup) \
+    XX(jl_load_and_lookupv) \
     XX(jl_load_dynamic_library) \
     XX(jl_load_file_string) \
     XX(jl_lookup_code_address) \

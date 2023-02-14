@@ -282,6 +282,46 @@ done:
     return handle;
 }
 
+JL_DLLEXPORT int jl_dlvsym(void *handle, const char *symbol, const char *version, void ** value, int throw_err) JL_NOTSAFEPOINT
+{
+    int symbol_found = 0;
+
+    /* First, get the symbol value */
+#ifdef _OS_WINDOWS_
+    *value = GetProcAddress((HMODULE) handle, symbol);
+#else
+    *value = dlvsym(handle, symbol, version);
+#endif
+
+    /* Next, check for errors. On Windows, a NULL pointer means the symbol was
+     * not found. On everything else, we can have NULL symbols, so we check for
+     * non-NULL returns from dlerror(). Since POSIX doesn't require `dlerror`
+     * to be implemented safely, FreeBSD doesn't (unlike everyone else, who
+     * realized decades ago that threads are here to stay), so we avoid calling
+     * `dlerror` unless we need to get the error message.
+     * https://github.com/freebsd/freebsd-src/blob/12db51d20823a5e3b9e5f8a2ea73156fe1cbfc28/libexec/rtld-elf/rtld.c#L198
+     */
+    symbol_found = *value != NULL;
+#ifndef _OS_WINDOWS_
+    const char *err = "";
+    if (!symbol_found) {
+        dlerror(); /* Reset error status. */
+        *value = dlsym(handle, symbol);
+        err = dlerror();
+        symbol_found = *value != NULL || err == NULL;
+    }
+#endif
+
+    if (!symbol_found && throw_err) {
+#ifdef _OS_WINDOWS_
+        char err[256];
+        win32_formatmessage(GetLastError(), err, sizeof(err));
+#endif
+        jl_errorf("could not load symbol \"%s\":\n%s", symbol, err);
+    }
+    return symbol_found;
+}
+
 JL_DLLEXPORT int jl_dlsym(void *handle, const char *symbol, void ** value, int throw_err) JL_NOTSAFEPOINT
 {
     int symbol_found = 0;

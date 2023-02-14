@@ -201,6 +201,7 @@ else
 SOMAJOR := $(JULIA_MAJOR_VERSION)
 SOMINOR := $(JULIA_MINOR_VERSION)
 endif
+SOMAJOR := "A"
 
 ifneq ($(NO_GIT), 1)
 JULIA_COMMIT := $(shell git -C $(JULIAHOME) rev-parse --short=10 HEAD)
