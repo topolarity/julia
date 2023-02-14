@@ -873,12 +873,19 @@ JuliaOJIT::JuliaOJIT(TargetMachine &TM, LLVMContext *LLVMCtx)
     addPassesForOptLevel(PM2, *TMs[2], ObjStream, Ctx, 2);
     addPassesForOptLevel(PM3, *TMs[3], ObjStream, Ctx, 3);
 
+    std::string ErrorStr;
+    auto libjulia_internal_dylib = sys::DynamicLibrary::addPermanentLibrary(jl_libjulia_internal_handle, &ErrorStr);
+
     // Make sure SectionMemoryManager::getSymbolAddressInProcess can resolve
     // symbols in the program as well. The nullptr argument to the function
     // tells DynamicLibrary to load the program, not a library.
-    std::string ErrorStr;
     if (sys::DynamicLibrary::LoadLibraryPermanently(nullptr, &ErrorStr))
         report_fatal_error(llvm::Twine("FATAL: unable to dlopen self\n") + ErrorStr);
+
+    GlobalJD.addGenerator(std::make_unique<orc::DynamicLibrarySearchGenerator>(
+		      libjulia_internal_dylib,
+		      DL.getGlobalPrefix(),
+		      orc::DynamicLibrarySearchGenerator::SymbolPredicate()));
 
     GlobalJD.addGenerator(
       cantFail(orc::DynamicLibrarySearchGenerator::GetForCurrentProcess(
