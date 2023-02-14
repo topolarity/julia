@@ -1958,7 +1958,7 @@ jl_cgval_t function_sig_t::emit_a_ccall(
         assert(symarg.f_name != NULL);
         PointerType *funcptype = PointerType::get(functype, 0);
         if (symarg.lib_expr) {
-            llvmf = runtime_sym_lookup(ctx, funcptype, NULL, symarg.lib_expr, symarg.f_name, arg.f_version, ctx.f);
+            llvmf = runtime_sym_lookup(ctx, funcptype, NULL, symarg.lib_expr, symarg.f_name, symarg.f_version, ctx.f);
         }
         else if (imaging_mode) {
             // vararg requires musttail,
