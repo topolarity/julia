@@ -3953,7 +3953,7 @@ static jl_value_t *intersect_all(jl_value_t *x, jl_value_t *y, jl_stenv_t *e)
     free_env(&se);
     JL_GC_POP();
 
-    if (!jl_generating_output()) {
+    if (!jl_generating_output() && 0) {
 
     clock_gettime( CLOCK_MONOTONIC_RAW, &ts );
     int64_t end_time_ns = (int64_t)( ts.tv_sec ) * 1000000000ll + (int64_t)( ts.tv_nsec );
