@@ -2467,9 +2467,9 @@ static void set_bound(jl_value_t **bound, jl_value_t *val, jl_tvar_t *v, jl_sten
     jl_varbinding_t *btemp = e->vars;
     while (btemp != NULL) {
         if (btemp->barrier) {
-            fprintf(stderr, "set_bound hit barrier for ");
-            jl_(btemp->var);
-            fprintf(stderr, "\n");
+            //fprintf(stderr, "set_bound hit barrier for ");
+            //jl_(btemp->var);
+            //fprintf(stderr, "\n");
         }
         btemp->barrier = 0;
         if ((btemp->lb == (jl_value_t*)v || btemp->ub == (jl_value_t*)v) &&
@@ -2861,9 +2861,9 @@ static jl_value_t *finish_unionall(jl_value_t *res JL_MAYBE_UNROOTED, jl_varbind
     btemp = e->vars;
     while (btemp != outermost_updated) {
         if (btemp->barrier) {
-            fprintf(stderr, "finish_unionall hit barrier for ");
-            jl_(btemp->var);
-            fprintf(stderr, "\n");
+            //fprintf(stderr, "finish_unionall hit barrier for ");
+            //jl_(btemp->var);
+            //fprintf(stderr, "\n");
         }
         btemp->barrier = 0;
         btemp = btemp->prev;
@@ -3968,9 +3968,9 @@ static jl_value_t *intersect_all(jl_value_t *x, jl_value_t *y, jl_stenv_t *e)
     if (f == 0) {
         //f = open("/home/topolarity/intersect.log", O_WRONLY | O_APPEND | O_CREAT, 0644);
         f = open("/external/intersect.log", O_WRONLY | O_APPEND | O_CREAT, 0666);
-        if (f < 0) {
-            fprintf(stderr, "ERROR: failed to open /external/intersect.log: \"%s\"\n", strerror(errno));
-        }
+        //if (f < 0) {
+            //fprintf(stderr, "ERROR: failed to open /external/intersect.log: \"%s\"\n", strerror(errno));
+        //}
     }
 
     static JL_STREAM *jf = NULL;
