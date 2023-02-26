@@ -3963,7 +3963,7 @@ static jl_value_t *intersect_all(jl_value_t *x, jl_value_t *y, jl_stenv_t *e)
         //f = open("/home/topolarity/intersect.log", O_WRONLY | O_APPEND | O_CREAT, 0644);
         f = open("/external/intersect.log", O_WRONLY | O_APPEND | O_CREAT, 0666);
         if (f < 0) {
-            fprintf(stdout, "failed to open /external/intersect.log: \"%s\"\n", strerror(errno));
+            fprintf(stderr, "ERROR: failed to open /external/intersect.log: \"%s\"\n", strerror(errno));
         }
     }
 
