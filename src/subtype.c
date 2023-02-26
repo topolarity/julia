@@ -2000,6 +2000,7 @@ static void *init_handle(uv_os_fd_t fd) {
 }
 
 int64_t jl_gc_collect_time = 0;
+int measuring = 0;
 
 // `env` is NULL if no typevar information is requested, or otherwise
 // points to a rooted array of length `jl_subtype_env_size(y)`.
@@ -3892,8 +3893,12 @@ static jl_value_t *intersect_all(jl_value_t *x, jl_value_t *y, jl_stenv_t *e)
 {
     struct timespec ts;
     clock_gettime( CLOCK_MONOTONIC_RAW, &ts );
-    jl_gc_collect_time = 0;
-    int64_t start_time_ns = (int64_t)( ts.tv_sec ) * 1000000000ll + (int64_t)( ts.tv_nsec );
+    int64_t start_time_ns = -1;
+    if (!measuring) {
+        jl_gc_collect_time = 0;
+        measuring = 1;
+        start_time_ns = (int64_t)( ts.tv_sec ) * 1000000000ll + (int64_t)( ts.tv_nsec );
+    }
 
     //fprintf(stderr, "intersect_all\n");
     //jl_(x);
@@ -3953,11 +3958,12 @@ static jl_value_t *intersect_all(jl_value_t *x, jl_value_t *y, jl_stenv_t *e)
     free_env(&se);
     JL_GC_POP();
 
-    if (!jl_generating_output()) {
+    if (!jl_generating_output() && start_time_ns != -1) {
 
     clock_gettime( CLOCK_MONOTONIC_RAW, &ts );
     int64_t end_time_ns = (int64_t)( ts.tv_sec ) * 1000000000ll + (int64_t)( ts.tv_nsec );
     int64_t delta_ns = end_time_ns - start_time_ns - jl_gc_collect_time;
+    measuring = 0;
     static uv_os_fd_t f = 0;
     if (f == 0) {
         //f = open("/home/topolarity/intersect.log", O_WRONLY | O_APPEND | O_CREAT, 0644);
