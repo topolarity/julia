@@ -3961,9 +3961,9 @@ static jl_value_t *intersect_all(jl_value_t *x, jl_value_t *y, jl_stenv_t *e)
     static uv_os_fd_t f = 0;
     if (f == 0) {
         //f = open("/home/topolarity/intersect.log", O_WRONLY | O_APPEND | O_CREAT, 0644);
-        f = open("/output/intersect.log", O_WRONLY | O_APPEND | O_CREAT, 0666);
+        f = open("/external/intersect.log", O_WRONLY | O_APPEND | O_CREAT, 0666);
         if (f < 0) {
-            fprintf(stderr, "failed to open /output/intersect.log\n", f);
+            fprintf(stdout, "failed to open /external/intersect.log: \"%s\"\n", strerror(errno));
         }
     }
 
