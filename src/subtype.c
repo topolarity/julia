@@ -3975,11 +3975,14 @@ static jl_value_t *intersect_all(jl_value_t *x, jl_value_t *y, jl_stenv_t *e)
     }
     if (jf != NULL) {
         if (delta_ns > 1000000) { // > 1ms
+            flock(f, LOCK_EX);
             jl_printf(jf, "%zi\n", delta_ns);
             jl_static_show(jf, x); 
             jl_printf(jf, "\n");
             jl_static_show(jf, y); 
             jl_printf(jf, "\n");
+            jl_uv_flush(jf);
+            flock(f, LOCK_UN);
         }
     }
 
