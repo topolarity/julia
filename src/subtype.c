@@ -3953,7 +3953,7 @@ static jl_value_t *intersect_all(jl_value_t *x, jl_value_t *y, jl_stenv_t *e)
     free_env(&se);
     JL_GC_POP();
 
-    if (!jl_generating_output() && 0) {
+    if (!jl_generating_output()) {
 
     clock_gettime( CLOCK_MONOTONIC_RAW, &ts );
     int64_t end_time_ns = (int64_t)( ts.tv_sec ) * 1000000000ll + (int64_t)( ts.tv_nsec );
@@ -3961,7 +3961,7 @@ static jl_value_t *intersect_all(jl_value_t *x, jl_value_t *y, jl_stenv_t *e)
     static uv_os_fd_t f = 0;
     if (f == 0) {
         //f = open("/home/topolarity/intersect.log", O_WRONLY | O_APPEND | O_CREAT, 0644);
-        f = open("/output/intersect.log", O_WRONLY | O_APPEND | O_CREAT, 0644);
+        f = open("/output/intersect.log", O_WRONLY | O_APPEND | O_CREAT, 0666);
         if (f < 0) {
             fprintf(stderr, "failed to open /output/intersect.log\n", f);
         }
