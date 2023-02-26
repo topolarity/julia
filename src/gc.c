@@ -7,6 +7,11 @@
 #include <malloc.h> // for malloc_trim
 #endif
 
+#ifdef USE_TRACY
+#include "tracy/TracyC.h"
+#include <stdbool.h>
+#endif // USE_TRACY
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -3103,6 +3108,13 @@ JL_DLLEXPORT void jl_gc_collect(jl_gc_collection_t collection)
         return;
     }
     JL_TIMING(GC);
+    struct timespec ts;
+    clock_gettime( CLOCK_MONOTONIC_RAW, &ts );
+    extern int64_t jl_gc_collect_time;
+    int64_t start_time_ns = (int64_t)( ts.tv_sec ) * 1000000000ll + (int64_t)( ts.tv_nsec );
+#ifdef USE_TRACY
+    TracyCZoneN(ctx, "jl_gc_collect", true);
+#endif
     int last_errno = errno;
 #ifdef _OS_WINDOWS_
     DWORD last_error = GetLastError();
@@ -3164,6 +3176,12 @@ JL_DLLEXPORT void jl_gc_collect(jl_gc_collection_t collection)
     SetLastError(last_error);
 #endif
     errno = last_errno;
+#ifdef USE_TRACY
+    TracyCZoneEnd(ctx);
+#endif
+    clock_gettime( CLOCK_MONOTONIC_RAW, &ts );
+    int64_t end_time_ns = (int64_t)( ts.tv_sec ) * 1000000000ll + (int64_t)( ts.tv_nsec );
+    jl_gc_collect_time += end_time_ns - start_time_ns;
 }
 
 void gc_mark_queue_all_roots(jl_ptls_t ptls, jl_gc_markqueue_t *mq)
