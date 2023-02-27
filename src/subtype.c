@@ -21,6 +21,8 @@
 */
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
+#include <sys/file.h>
 #ifdef _OS_WINDOWS_
 #include <malloc.h>
 #endif
@@ -3958,31 +3960,44 @@ static jl_value_t *intersect_all(jl_value_t *x, jl_value_t *y, jl_stenv_t *e)
     free_env(&se);
     JL_GC_POP();
 
-    if (!jl_generating_output() && start_time_ns != -1) {
-
     clock_gettime( CLOCK_MONOTONIC_RAW, &ts );
     int64_t end_time_ns = (int64_t)( ts.tv_sec ) * 1000000000ll + (int64_t)( ts.tv_nsec );
     int64_t delta_ns = end_time_ns - start_time_ns - jl_gc_collect_time;
     measuring = 0;
-    static uv_os_fd_t f = 0;
-    if (f == 0) {
-        //f = open("/home/topolarity/intersect.log", O_WRONLY | O_APPEND | O_CREAT, 0644);
-        f = open("/external/intersect.log", O_WRONLY | O_APPEND | O_CREAT, 0666);
-        //if (f < 0) {
-            //fprintf(stderr, "ERROR: failed to open /external/intersect.log: \"%s\"\n", strerror(errno));
-        //}
-    }
 
-    static JL_STREAM *jf = NULL;
-    if (jf == NULL) {
-        if (f > 0) {
-            jf = init_handle(f);
+    if (!jl_generating_output() && start_time_ns != -1 && delta_ns > 1000000) { // > 1ms
+        static uv_os_fd_t f = 0;
+        if (f == 0) {
+            //f = open("/home/topolarity/intersect.log", O_WRONLY | O_APPEND | O_CREAT, 0644);
+            f = open("/external/intersect.log", O_WRONLY | O_APPEND | O_CREAT, 0666);
+            //if (f < 0) {
+                //fprintf(stderr, "ERROR: failed to open /external/intersect.log: \"%s\"\n", strerror(errno));
+            //}
         }
-    }
-    if (jf != NULL) {
-        if (delta_ns > 1000000) { // > 1ms
+        static char const *current_pkgeval_package_name = NULL;
+        if (current_pkgeval_package_name == NULL && f > 0) {
+            uv_os_fd_t fd = open("/output/package", O_RDONLY, 0666);
+            if (fd > 0) {
+                int len = lseek(fd, 0, SEEK_END);
+                current_pkgeval_package_name = (char const*)mmap(0, len, PROT_READ, MAP_PRIVATE, fd, 0);
+                close(fd);
+            }
+        }
+
+        static JL_STREAM *jf = NULL;
+        if (jf == NULL) {
+            if (f > 0) {
+                jf = init_handle(f);
+            }
+        }
+        if (jf != NULL) {
             flock(f, LOCK_EX);
             jl_printf(jf, "%zi\n", delta_ns);
+            if (current_pkgeval_package_name != NULL) {
+                jl_printf(jf, "%s\n", current_pkgeval_package_name);
+            } else {
+                jl_printf(jf, "\n");
+            }
             jl_static_show(jf, x); 
             jl_printf(jf, "\n");
             jl_static_show(jf, y); 
@@ -3990,8 +4005,6 @@ static jl_value_t *intersect_all(jl_value_t *x, jl_value_t *y, jl_stenv_t *e)
             jl_uv_flush(jf);
             flock(f, LOCK_UN);
         }
-    }
-
     }
 
     return is[0];
