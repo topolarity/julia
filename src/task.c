@@ -1054,6 +1054,9 @@ CFI_NORETURN
     sanitizer_finish_switch_fiber(ptls->previous_task, ct);
     _start_task();
 }
+
+const char* fiber = "task";
+
 STATIC_OR_JS void NOINLINE JL_NORETURN _start_task(void)
 {
 CFI_NORETURN
@@ -1089,8 +1092,14 @@ CFI_NORETURN
                 ptls->defer_signal = 0;
                 jl_sigint_safepoint(ptls);
             }
-            JL_TIMING(ROOT);
-            res = jl_apply(&ct->start, 1);
+//#ifdef USE_TRACY
+            //TracyFiberEnter(fiber);
+//#endif
+            {
+                // TODO: Re-enable
+                //JL_TIMING(ROOT);
+                res = jl_apply(&ct->start, 1);
+            }
         }
         JL_CATCH {
             res = jl_current_exception();
@@ -1099,6 +1108,9 @@ CFI_NORETURN
         }
 skip_pop_exception:;
     }
+//#ifdef USE_TRACY
+    //TracyFiberLeave(fiber);
+//#endif
     ct->result = res;
     jl_gc_wb(ct, ct->result);
     jl_finish_task(ct);
