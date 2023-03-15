@@ -161,7 +161,7 @@ struct jl_timing_block_cpp_t {
 };
 #ifdef USE_TRACY
 #define JL_TIMING(owner) jl_timing_block_cpp_t __timing_block(JL_TIMING_ ## owner); \
-    TracyCZoneN(__tracy_ctx, #owner, strcmp(#owner, "ROOT")); \
+    TracyCZoneNC(__tracy_ctx, #owner, 0xFB7C3C, strcmp(#owner, "ROOT")); \
     __timing_block.block.tracy_ctx = &__tracy_ctx;
 #else
 #define JL_TIMING(owner) jl_timing_block_cpp_t __timing_block(JL_TIMING_ ## owner)
@@ -172,7 +172,7 @@ struct jl_timing_block_cpp_t {
     __attribute__((cleanup(_jl_timing_block_destroy))) \
     jl_timing_block_t __timing_block; \
     _jl_timing_block_ctor(&__timing_block, JL_TIMING_ ## owner); \
-    TracyCZoneN(__tracy_ctx, #owner, 1); \
+    TracyCZoneNC(__tracy_ctx, #owner, 0xFB7C3C, 1); \
     __timing_block.tracy_ctx = &__tracy_ctx;
 #else
 #define JL_TIMING(owner) \

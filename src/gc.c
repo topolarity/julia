@@ -7,6 +7,10 @@
 #include <malloc.h> // for malloc_trim
 #endif
 
+#ifdef USE_TRACY
+#include "tracy/TracyC.h"
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -3113,7 +3117,9 @@ JL_DLLEXPORT void jl_gc_collect(jl_gc_collection_t collection)
     {
         int64_t tb;
         jl_gc_get_total_bytes(&tb);
-        TracyCPlot("Heap size", ((double)tb) / (1024.0 * 1024.0));
+        int64_t live_bytes = jl_gc_live_bytes();
+        TracyCPlot("Heap size (live)", ((double)live_bytes) / (1024.0 * 1024.0));
+        TracyCPlot("Heap size (total)", ((double)tb) / (1024.0 * 1024.0));
     }
 #endif
 {
@@ -3184,7 +3190,9 @@ JL_DLLEXPORT void jl_gc_collect(jl_gc_collection_t collection)
     {
         int64_t tb;
         jl_gc_get_total_bytes(&tb);
-        TracyCPlot("Heap size", ((double)tb) / (1024.0 * 1024.0));
+        int64_t live_bytes = jl_gc_live_bytes();
+        TracyCPlot("Heap size (live)", ((double)live_bytes) / (1024.0 * 1024.0));
+        TracyCPlot("Heap size (total)", ((double)tb) / (1024.0 * 1024.0));
     }
     TracyCFiberLeave;
     TracyCFiberEnter("Main");

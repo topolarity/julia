@@ -1968,15 +1968,229 @@ JL_DLLEXPORT int jl_obvious_subtype(jl_value_t *x, jl_value_t *y, int *subtype)
     return obvious_subtype(x, y, y, subtype);
 }
 
+typedef struct jl_check_varbinding_t {
+    jl_tvar_t *var;
+    uint8_t static_inv;
+    int16_t inv_depth;
+    int16_t union_depth;
+    int16_t occurs;
+    struct jl_check_varbinding_t *prev;
+} jl_check_varbinding_t;
+
+typedef struct {
+    jl_check_varbinding_t *vars;
+    uint8_t nested_union;
+    size_t inv_depth;
+    size_t union_depth;
+} works_check_ctx_t;
+
+static int count_tuples_in_union(jl_value_t *y) {
+    if (jl_is_uniontype(y)) { 
+        jl_uniontype_t *uy = (jl_uniontype_t *)y;
+        return count_tuples_in_union(uy->a) + count_tuples_in_union(uy->b);
+    } else if (jl_is_datatype(y) && jl_is_tuple_type(y)) {
+        return 1;
+    } else {
+        return 0;
+    }
+}
+
+static int simple_subtype_works_rhs(jl_value_t *y, works_check_ctx_t ctx, uint8_t is_rhs)
+{
+    if (jl_is_uniontype(y)) {
+        if (!ctx.nested_union) {
+            // We can't support Union{Tuple{...}, Tuple{...}, ...}
+            // on the RHS until we support distributivity
+            if (is_rhs && (count_tuples_in_union(y) >= 2))
+                return 0;
+        }
+        ctx.nested_union = 1;
+    } else {
+        ctx.nested_union = 0;
+    }
+
+    // Okay, I'd like to allow typevars introduce with an inv_depth > 0
+
+    // Note: This is where we allow RHS existentials
+    //if (jl_typeis(y, jl_tvar_type) && is_rhs) {
+        //// No support for typevars at all yet
+        //return 0;
+    //}
+
+    if (jl_typeis(y, jl_tvar_type)) {
+        jl_check_varbinding_t *vb = ctx.vars;
+        while (vb != NULL) {
+            if (vb->var == (jl_tvar_t *)y) break;
+            vb = vb->prev;
+        }
+        //assert(vb != NULL);
+        if (vb != NULL) {
+            vb->occurs += 1;
+            if (ctx.inv_depth > vb->inv_depth && ctx.union_depth == vb->union_depth) {
+                vb->static_inv = 1;
+            }
+
+            // TODO: This doesn't work because of:
+            //   1. The need to track identities
+            //   2. The need to choose consistent identities through unions
+            //
+            // Support all RHS variables as for-alls, except for the outer-most layer.
+            //if (is_rhs) {
+                //if (vb->inv_depth == 0)
+                    //return 0;
+            //}
+        }
+    } else if (jl_is_unionall(y)) {
+        jl_unionall_t *uay = (jl_unionall_t *)y;
+
+        if (!simple_subtype_works_rhs(uay->var->lb, ctx, is_rhs))
+            return 0;
+        if (!simple_subtype_works_rhs(uay->var->ub, ctx, is_rhs))
+            return 0;
+
+        jl_check_varbinding_t vb = { uay->var, 0, ctx.inv_depth, ctx.union_depth, 0, ctx.vars };
+        ctx.vars = &vb;
+        if (!simple_subtype_works_rhs(uay->body, ctx, is_rhs))
+            return 0;
+        // Variables must be "statically non-diagonal"
+        if (vb.occurs > 1 && !vb.static_inv)
+            return 0;
+    } else if (jl_is_datatype(y)) {
+        if (!jl_is_tuple_type(y))
+            ctx.inv_depth++;
+
+        int result = 1;
+        size_t i;
+        for (i=0; i < jl_nparams(y); i++) {
+            if (!simple_subtype_works_rhs(jl_tparam(y,i), ctx, is_rhs)) {
+                result = 0;
+                break;
+            }
+        }
+
+        if (!jl_is_tuple_type(y))
+            ctx.inv_depth--;
+        if (result == 0)
+            return result;
+    } else if (jl_is_uniontype(y)) {
+        jl_uniontype_t *uy = (jl_uniontype_t *)y;
+        ctx.union_depth += 1;
+
+        if (!simple_subtype_works_rhs(uy->a, ctx, is_rhs))
+            return 0;
+
+        if (!simple_subtype_works_rhs(uy->b, ctx, is_rhs))
+            return 0;
+    } else if (jl_is_vararg(y)) {
+        return 0; // No varargs support yet
+    }
+
+    return 1;
+}
+
+static int simple_subtype_works_os(jl_value_t *t)
+{
+    // We support non-type parameters (including symbols)
+    // We support constructors + Tuples
+    // We support typevars (kind of)
+
+    if (jl_is_type_type(t))
+        return 0; // No Type{T} support yet
+
+    if (jl_is_vararg(t))
+        return 0; // No Varargs support yet
+
+    /**
+     * All of our inductive propagations
+     **/
+    if (jl_is_uniontype(t)) {
+        jl_uniontype_t *ut = (jl_uniontype_t *)t;
+        if (!simple_subtype_works_os(ut->a))
+            return 0;
+        if (!simple_subtype_works_os(ut->b))
+            return 0;
+    } else if (jl_is_vararg(t)) {
+        jl_vararg_t *tm = (jl_vararg_t *)t;
+        if (tm->T) {
+            if (!simple_subtype_works_os(tm->T))
+                return 0;
+        }
+        if (tm->N) {
+            if (!simple_subtype_works_os(tm->N))
+                return 0;
+        }
+    } else if (jl_is_unionall(t)) {
+        jl_unionall_t *uat = (jl_unionall_t*)t;
+        if (!simple_subtype_works_os(uat->body))
+            return 0;
+        if (!simple_subtype_works_os(uat->var->lb))
+            return 0;
+        if (!simple_subtype_works_os(uat->var->ub))
+            return 0;
+    } else if (jl_is_datatype(t)) {
+        size_t i;
+        for (i=0; i < jl_nparams(t); i++) {
+            if (!simple_subtype_works_os(jl_tparam(t,i)))
+                return 0;
+        }
+    }
+
+    return 1;
+}
+
+// What is the difference between this and `subtype_in_env`?
+static int simple_subtype_works(jl_value_t *x, jl_value_t *y,
+        jl_value_t **env, int envsz, int debug)
+{
+    if (env != NULL) {
+        if (debug)
+            fprintf(stderr, "Failed env check\n");
+        return 0;
+    }
+
+    // Basic inductive type checks
+    if (!simple_subtype_works_os(x) || !simple_subtype_works_os(y)) {
+        if (debug)
+            fprintf(stderr, "Failed basic check\n");
+        return 0;
+    }
+
+    works_check_ctx_t ctx = {NULL, 0, 0, 0};
+    if (!simple_subtype_works_rhs(x, ctx, 0) || !simple_subtype_works_rhs(y, ctx, 1)) {
+        if (debug)
+            fprintf(stderr, "Failed diagonal/distributivity check\n");
+        return 0;
+    }
+
+    return 1;
+}
+
+JL_DLLEXPORT int jl_simple_subtype_works_rhs(jl_value_t *y) {
+    works_check_ctx_t ctx = {NULL, 0, 0, 0};
+    return simple_subtype_works_rhs(y, ctx, 1);
+}
+
+
 // `env` is NULL if no typevar information is requested, or otherwise
 // points to a rooted array of length `jl_subtype_env_size(y)`.
 // This will be populated with the values of variables from unionall
 // types at the outer level of `y`.
 JL_DLLEXPORT int jl_subtype_env(jl_value_t *x, jl_value_t *y, jl_value_t **env, int envsz)
 {
+    int simple_result = -1;
+    if (simple_subtype_works(x, y, env, envsz, 0))
+        simple_result = jl_simple_subtype(x, y);
+
     jl_stenv_t e;
-    if (y == (jl_value_t*)jl_any_type || x == jl_bottom_type)
+    if (y == (jl_value_t*)jl_any_type || x == jl_bottom_type) {
+        if (simple_result == 0) {
+            fprintf(stderr, "Got %d expected %d\n", simple_result, 1);
+            jl_(x);
+            jl_(y);
+            exit(-1);
+        }
         return 1;
+    }
     if (x == y ||
         (jl_typeof(x) == jl_typeof(y) &&
          (jl_is_unionall(y) || jl_is_uniontype(y)) &&
@@ -1990,15 +2204,35 @@ JL_DLLEXPORT int jl_subtype_env(jl_value_t *x, jl_value_t *y, jl_value_t **env, 
                 ua = (jl_unionall_t*)ua->body;
             }
         }
+        if (simple_result == 0) {
+            fprintf(stderr, "Got %d expected %d\n", simple_result, 1);
+            jl_(x);
+            jl_(y);
+            exit(-1);
+        }
         return 1;
     }
     int obvious_subtype = 2;
     if (jl_obvious_subtype(x, y, &obvious_subtype)) {
 #ifdef NDEBUG
-        if (obvious_subtype == 0)
+        if (obvious_subtype == 0) {
+            if (simple_result == !obvious_subtype) {
+                fprintf(stderr, "Got %d expected %d\n", simple_result, obvious_subtype);
+                jl_(x);
+                jl_(y);
+                exit(-1);
+            }
             return obvious_subtype;
-        else if (envsz == 0)
+        }
+        else if (envsz == 0) {
+            if (simple_result == !obvious_subtype) {
+                fprintf(stderr, "Got %d expected %d\n", simple_result, obvious_subtype);
+                jl_(x);
+                jl_(y);
+                exit(-1);
+            }
             return obvious_subtype;
+        }
 #endif
     }
     else {
@@ -2020,6 +2254,12 @@ JL_DLLEXPORT int jl_subtype_env(jl_value_t *x, jl_value_t *y, jl_value_t **env, 
             env[i] = fix_inferred_var_bound(var, env[i]);
             ub = (jl_unionall_t*)ub->body;
         }
+    }
+    if (simple_result == !subtype) {
+        fprintf(stderr, "Got %d expected %d\n", simple_result, subtype);
+        jl_(x);
+        jl_(y);
+        exit(-1);
     }
     return subtype;
 }
@@ -2047,6 +2287,13 @@ static int subtype_in_env(jl_value_t *x, jl_value_t *y, jl_stenv_t *e)
 static int subtype_bounds_in_env(jl_value_t *x, jl_value_t *y, jl_stenv_t *e, int R, int d)
 {
     return subtype_in_env_(x, y, e, R ? e->invdepth : d, R ? d : e->Rinvdepth);
+}
+
+JL_DLLEXPORT int jl_subtype_dbg(jl_value_t *x, jl_value_t *y) {
+    if (simple_subtype_works(x, y, NULL, 0, 1))
+        return jl_simple_subtype(x, y);
+
+    return jl_subtype_env(x, y, NULL, 0);
 }
 
 JL_DLLEXPORT int jl_subtype(jl_value_t *x, jl_value_t *y)
