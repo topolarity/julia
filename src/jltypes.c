@@ -2176,6 +2176,7 @@ void jl_init_types(void) JL_GC_DISABLED
     const static uint32_t tvar_constfields[1] = { 0x00000007 }; // all fields are constant, even though TypeVar itself has identity
     jl_tvar_type->name->constfields = tvar_constfields;
 
+
     jl_unionall_type = jl_new_datatype(jl_symbol("UnionAll"), core, type_type, jl_emptysvec,
                                        jl_perm_symsvec(2, "var", "body"),
                                        jl_svec(2, jl_tvar_type, jl_any_type),
@@ -2248,6 +2249,17 @@ void jl_init_types(void) JL_GC_DISABLED
                                         jl_any_type, jl_emptysvec, 8);
     jl_false = jl_permbox8(jl_bool_type, 0);
     jl_true  = jl_permbox8(jl_bool_type, 1);
+
+    /**
+     * UGH! So now I kind of need to allocate tvar_bound_t as well,
+     *      since it refers to our variable chain
+     **/
+    jl_tvar_bound_type = jl_new_datatype(jl_symbol("TypeVarBound"), core, jl_any_type, jl_emptysvec,
+                                         jl_perm_symsvec(4, "id", "is_upper", "bound", "var"),
+                                         jl_svec(4, jl_uint16_type, jl_bool_type, jl_any_type, jl_uint64_type),
+                                         jl_emptysvec, 0, 1, 4);
+    const static uint32_t tvar_bound_constfields[1] = { 0x0000000F };
+    jl_tvar_bound_type->name->constfields = tvar_bound_constfields;
 
     jl_abstractstring_type = jl_new_abstracttype((jl_value_t*)jl_symbol("AbstractString"), core, jl_any_type, jl_emptysvec);
     jl_string_type = jl_new_datatype(jl_symbol("String"), core, jl_abstractstring_type, jl_emptysvec,
@@ -2785,6 +2797,7 @@ void jl_init_types(void) JL_GC_DISABLED
     jl_compute_field_offsets(jl_typename_type);
     jl_compute_field_offsets(jl_uniontype_type);
     jl_compute_field_offsets(jl_tvar_type);
+    jl_compute_field_offsets(jl_tvar_bound_type);
     jl_compute_field_offsets(jl_methtable_type);
     jl_compute_field_offsets(jl_module_type);
     jl_compute_field_offsets(jl_method_instance_type);

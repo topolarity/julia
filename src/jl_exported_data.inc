@@ -103,6 +103,7 @@
     XX(jl_true) \
     XX(jl_tuple_typename) \
     XX(jl_tvar_type) \
+    XX(jl_tvar_bound_type) \
     XX(jl_typeerror_type) \
     XX(jl_typemap_entry_type) \
     XX(jl_typemap_level_type) \

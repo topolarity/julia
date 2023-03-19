@@ -2014,6 +2014,7 @@ void jl_init_primitives(void) JL_GC_DISABLED
     add_builtin("TypeName", (jl_value_t*)jl_typename_type);
     add_builtin("DataType", (jl_value_t*)jl_datatype_type);
     add_builtin("TypeVar", (jl_value_t*)jl_tvar_type);
+    add_builtin("TypeVarBound", (jl_value_t*)jl_tvar_bound_type);
     add_builtin("UnionAll", (jl_value_t*)jl_unionall_type);
     add_builtin("Union", (jl_value_t*)jl_uniontype_type);
     add_builtin("TypeofBottom", (jl_value_t*)jl_typeofbottom_type);

@@ -2035,10 +2035,13 @@ static int simple_subtype_works_rhs(jl_value_t *y, works_check_ctx_t ctx, uint8_
             //   2. The need to choose consistent identities through unions
             //
             // Support all RHS variables as for-alls, except for the outer-most layer.
-            //if (is_rhs) {
+            if (is_rhs) {
+                if (vb->occurs > 1)
+                    return 0;
+
                 //if (vb->inv_depth == 0)
                     //return 0;
-            //}
+            }
         }
     } else if (jl_is_unionall(y)) {
         jl_unionall_t *uay = (jl_unionall_t *)y;
@@ -2142,6 +2145,8 @@ static int simple_subtype_works_os(jl_value_t *t)
 static int simple_subtype_works(jl_value_t *x, jl_value_t *y,
         jl_value_t **env, int envsz, int debug)
 {
+    //return 0; // Do not use at all
+
     if (env != NULL) {
         if (debug)
             fprintf(stderr, "Failed env check\n");
@@ -2181,14 +2186,19 @@ JL_DLLEXPORT int jl_subtype_env(jl_value_t *x, jl_value_t *y, jl_value_t **env, 
     if (simple_subtype_works(x, y, env, envsz, 0))
         simple_result = jl_simple_subtype(x, y);
 
+#ifdef USE_TRACY
+    TracyCZone(ctx, 1);
+#endif
+
     jl_stenv_t e;
     if (y == (jl_value_t*)jl_any_type || x == jl_bottom_type) {
         if (simple_result == 0) {
             fprintf(stderr, "Got %d expected %d\n", simple_result, 1);
             jl_(x);
             jl_(y);
-            exit(-1);
+            jl_errorf("incorrect simple subtype result");
         }
+        TracyCZoneEnd(ctx);
         return 1;
     }
     if (x == y ||
@@ -2208,8 +2218,9 @@ JL_DLLEXPORT int jl_subtype_env(jl_value_t *x, jl_value_t *y, jl_value_t **env, 
             fprintf(stderr, "Got %d expected %d\n", simple_result, 1);
             jl_(x);
             jl_(y);
-            exit(-1);
+            jl_errorf("incorrect simple subtype result");
         }
+        TracyCZoneEnd(ctx);
         return 1;
     }
     int obvious_subtype = 2;
@@ -2220,8 +2231,9 @@ JL_DLLEXPORT int jl_subtype_env(jl_value_t *x, jl_value_t *y, jl_value_t **env, 
                 fprintf(stderr, "Got %d expected %d\n", simple_result, obvious_subtype);
                 jl_(x);
                 jl_(y);
-                exit(-1);
+                jl_errorf("incorrect simple subtype result");
             }
+            TracyCZoneEnd(ctx);
             return obvious_subtype;
         }
         else if (envsz == 0) {
@@ -2229,8 +2241,9 @@ JL_DLLEXPORT int jl_subtype_env(jl_value_t *x, jl_value_t *y, jl_value_t **env, 
                 fprintf(stderr, "Got %d expected %d\n", simple_result, obvious_subtype);
                 jl_(x);
                 jl_(y);
-                exit(-1);
+                jl_errorf("incorrect simple subtype result");
             }
+            TracyCZoneEnd(ctx);
             return obvious_subtype;
         }
 #endif
@@ -2259,8 +2272,9 @@ JL_DLLEXPORT int jl_subtype_env(jl_value_t *x, jl_value_t *y, jl_value_t **env, 
         fprintf(stderr, "Got %d expected %d\n", simple_result, subtype);
         jl_(x);
         jl_(y);
-        exit(-1);
+        jl_errorf("incorrect simple subtype result");
     }
+    TracyCZoneEnd(ctx);
     return subtype;
 }
 

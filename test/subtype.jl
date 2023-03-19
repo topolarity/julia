@@ -2458,3 +2458,20 @@ let S = Tuple{Type{S48695{T, 2, T48695{B, 2, C}}} where {T<:(Union{Missing, A} w
     @test allunique(vars_in_unionall(V))
     @test typeintersect(V, T) != Union{}
 end
+
+# Interesting: 
+#   Julia will allow you to parameterize a type in a way that violates 
+#   the bounds assumptions on it...
+#
+#   which is exactly what my algorithm fails to notice
+#
+# @test <:(Base.KeySet{<:Any, <:IdDict}, Base.KeySet)
+
+
+# TODO:
+# NRef(N, T) = (N == 0) ? T : Ref{NRef(N - 1, T)}
+# julia> T = NRef(30, Int8);
+# julia> U = NRef(30, Union{Int8, Int32});
+# julia> @time T <: U
+ # 99.476201 seconds
+# false

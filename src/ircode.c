@@ -1134,6 +1134,7 @@ void jl_init_serializer(void)
     deser_tag[TAG_STRING] = (jl_value_t*)jl_string_type;
     deser_tag[TAG_MODULE] = (jl_value_t*)jl_module_type;
     deser_tag[TAG_TVAR] = (jl_value_t*)jl_tvar_type;
+    deser_tag[TAG_TVAR_BOUND] = (jl_value_t*)jl_tvar_bound_type;
     deser_tag[TAG_METHOD_INSTANCE] = (jl_value_t*)jl_method_instance_type;
     deser_tag[TAG_METHOD] = (jl_value_t*)jl_method_type;
     deser_tag[TAG_CODE_INSTANCE] = (jl_value_t*)jl_code_instance_type;
