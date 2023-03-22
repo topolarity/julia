@@ -20,6 +20,168 @@ void print_indent() {
     fprintf(stderr, "%*s", indent, "");
 }
 
+/**
+ * Here's the dependency plan:
+ *
+ * The challenge is that we need to consider the possibility that
+ *   Tuple{U{ ... }, U{ ... }, ... } <: U{Tuple{ ... }, Tuple{ ... }}
+ *
+ * Which means when checking that direction we group all of the appropriately-
+ * sized tuples together and feed them into a "hyper-cube" algo.
+ *
+ * This algorithm needs to take a (<:) Union-Union measurement against the 
+ * components of each of the tuples on the RHS.
+ *   - Each LHS component is either not covered, covered, or covered conditionally
+ *
+ * So we have a bit-vector representing our "cubic-AND"
+ *   (i.e. we need to check that the volume is filled based on this sampling)
+ *
+ * This could be done:
+ *   a. eagerly - we measure the tuple in all components, and then immediately
+ *      descend into 2^N hyper-cube comparison (exponentially many *repeated, masked*
+ *      versions of the original problem)
+ *   b. lazily - sample all of the tuples against the LHS, and use some size/volume/
+ *      quantity heuristics for early exit. Main difference is that we can start with
+ *      the tuple that covers the most dimensions (ideally unconditionally) and if
+ *      no dimension is covered completely we give up, etc.
+ *
+ *      - It's exactly equivalent to checking that our 2^N hypercube is covered
+ *        by the OR of RHS options.
+ *
+ *  I'm inclined to say that (b) is the right way to solve the problem, since it's
+ *  conspicuously efficient. (a) seems like to spend a lot of effort recursing into
+ *  partial coverage scenarios when in reality we have no chance to cover. It's also
+ *  very slow for the case that distribution does happen.
+ *
+ *  Okay, that's enough to convince me to do a two-phase, "sample & solve" approach.
+ *
+ *  It's exactly as we had it before, except that we propagate proof obligations.
+ **/
+
+/**
+ * What about the UnionAll/Union Distributivity?
+ *
+ *   -> Is there a similar hyper-cube problem I can cast my situation onto?
+ *   -> Or is it best to think of this as lifting the unioning to the tuple level,
+ *      and matching to "copied"/"repeated" UnionAlls?
+ *
+ * I suspect that both of these interpretations are valid, and are likely
+ * the same thing.
+ *
+ * Union{Tuple{ ... }, Tuple { ... }} where T
+ *
+ * Tuple{x where T, y where U}
+ * Tuple{x, y} where {T, U} <- Cartesian product is already built-in here
+ *
+ * Tuple{Union{Ref{X},Ref{Y}}, ... } <: Tuple{Ref{T}, ... } where T
+ *    <- The biggest deviation from our other problem is that
+ *       the ways UnionAlls can vary is more complicated
+ *
+ * We don't want to expand up by lifting Unions because that is exponential too:
+ *   Tuple{Union{Ref{X},Ref{Y}}, ... } -> Union{Tuple{Ref{X}, ...}, Tuple{Ref{Y}, ...}, ...}
+ *
+ * What I want to do is lower the matching rules "into the hyper-cube"
+ *   -> I can union anything in the tuple as long as they are independently
+ *      compatible with the UnionAll
+ *
+ *      -> So when do I know that "corners" happen (i.e. things vary incompatibly)?
+ *
+ *      -> Canonical example would be:
+ *      Tuple{Union{Ref{Int}, Ref{Bool}}, Union{Ref{Int},Ref{Bool}}, ... } </: Tuple{Ref{T}, Ref{T}, ...} where T
+ *
+ *           -> This is the awkward position we end up in.
+ *           -> We have to know that each solution generated in one part of the tuple is valid
+ *              in Cartesian product with ever other solution generated.
+ *
+ *              -> If I had saved my bounds from the Union, I'd check that their O(N^2) combinations are compatible
+ *                 Which is unfortunately exponential, but I suspect there may not be a lot to reduce that.
+ *
+ *                 For example, I can match T against a lot of `Union` that give loose but informative bounds.
+ *                 Then, I'm allowed 
+ *
+ *
+ *                  Union{Int,Bool,String,Float64}  <: Union{Int,Bool,String,T} 
+ *                  Union{Int,Bool,String,Float32}  <: Union{Int,Bool,String,T} 
+ *
+ *                  -> Float64 <: T <: Union{... }
+ *                  -> Float32 <: T <: Union{... }
+ *                  
+ *                  In another component:
+ *                  Ref{Union{String, Float32}} <: Ref{Union{Float32, Float64, T}}
+ *                  Ref{Union{String, Float64}} <: Ref{Union{Float32, Float64, T}}
+ *
+ *
+ *  Indeed:
+ *     Tuple{Union{Ref{Union{Float64, Float32, Bool}},  Ref{Union{Float64, Float32, Int}}},
+ *           Union{Ref{Union{Int,Bool,String,Float64}}, Ref{Union{Int,Bool,String,Float32}}}}
+ *      <: (Tuple{Ref{Union{Float32,Float64,T}}, Ref{Union{Int,Bool,String,T}}} where T)
+ *
+ *  Why? Because all of the bounds in the first component are compatible with all the bounds
+ *  in the second component.
+ *    -> Another "exponential check" for an initially fast sampling. The unfortunate part
+ *       is that our checks here are much more expensive than the bit-checks for distributing
+ *       over tuples.
+ *    -> This is exactly equivalent to allowing 2^N UnionAlls to be evaluated, except
+ *       that we can compute their bounds as combinations of bounds from each component.
+ *
+ *  Cool! We have an algorithm.
+ *
+ *     Just one TODO: What are the conditions to allow this? Is it all Unions within a tuple
+ *     or is there something special? Do we need to think about the "covariant region" of a
+ *     UnionAll var, and how do we handle bounds generated on other vars if so?
+ *
+ * Side-note: I *think* this problem is one-directional, since distributivity can only happen
+ *            in the covariant region of the UnionAll.
+ *
+ *    TODO: Write out the opposite direction case and see if there's any way to distribute.
+ *
+ *      Tuple{F(T) where T, F(U) where U} <: Union{Tuple{ ... }}
+ *        -> Ah, this is true. F(T) where T might only be covered by multiple RHS tuples.
+ *           but is this the distributivity algorithm we already designed above? I think it is...
+ *
+ *  In *FACT* I need to think carefully about the proof obligations.
+ *     -> It's important that I allow a "point" with a proof obligation to be covered by a point
+ *        without one, but only if it means we might remove that obligation entirely. (complicates the solver)
+ *
+ *  So these are starting to look like two sides of the same coin.
+ *
+ *       <-- TODO list exact action matrix here -->
+ *
+ *
+ *  Every bit in the hyper-cubes we are checking coverage for requires a "compatible bounds check."
+ *    -> This suggests that our proof obligation tree might actually *explode*
+ *  
+ *  Which means... maybe we need to move this *whole* thing to the solve phase?
+ *    -> Expanding the proof obligation tree early sounds like a nightmare.
+ *
+ *    -> Yes, this is the right solution. Just have to think about how to encode
+ *       the hyper-cube options...
+ *
+ *    -> Wow, so we measure all the components only (maybe fail early) and then solve at the end!
+ *       The distributivity problem ended up re-using our tree after all!
+ *
+ *        -> Only early-exit criterion is a basic volume check
+ **/
+
+ /**
+  * What do we want to store from a hyper-cube?
+  *   - It looks kind of like an AND/OR except that we are checking total coverage
+  *     and we sometimes have null-proof terms
+  *
+  * This is enough "interesting data" that it's time to abandon
+  * the GC and allocate everything directly.
+  *
+  * For efficiency, we definitely want to support:
+  *   - Entirely evidence-free hyper-cubes
+  *   - hyper-cubes with independent evidence in a few different dimensions
+  *   - etc.
+  *
+  * So most likely we want:
+  *   - evidence-free + evidence-required bitmasks
+  *   - volume per-sample ?
+  *     -> Nah, the volumes are dynamic anyway
+  **/
+
 // This list fills me with determination.
 
 /**
