@@ -28,6 +28,22 @@ void jl_print_timings(void);
 jl_timing_block_t *jl_pop_timing_block(jl_timing_block_t *cur_block);
 void jl_timing_block_start(jl_timing_block_t *cur_block);
 void jl_timing_block_stop(jl_timing_block_t *cur_block);
+
+// Add the output of `jl_static_show(x)` as a text annotation to the
+// zone corresponding to `ctx`.
+//
+// If larger than IOS_INLSIZE (~80 characters), text is truncated.
+void jl_timing_show(jl_value_t *v, jl_timing_block_t *cur_block);
+
+// TODO: Replace this with an atomic API
+uint64_t jl_timing_get_enable_mask(void);
+void jl_timing_set_enable_mask(uint64_t mask);
+
+// Update the enable bit-mask to enable/disable tracing events for
+// the subsystem in `jl_timing_names` matching the provided string.
+//
+// Returns -1 if no matching sub-system was found.
+int jl_timing_set_enable(const char *subsystem, uint8_t enabled);
 #ifdef __cplusplus
 }
 #endif
@@ -43,6 +59,12 @@ void jl_timing_block_stop(jl_timing_block_t *cur_block);
 #ifndef HAVE_TIMING_SUPPORT
 #define JL_TIMING(owner)
 #else
+
+#ifdef __cplusplus
+#define JL_TIMING_CURRENT_BLOCK (&__timing_block.block)
+#else
+#define JL_TIMING_CURRENT_BLOCK (&__timing_block)
+#endif
 
 #define JL_TIMING_OWNERS          \
         X(ROOT),                  \
@@ -77,6 +99,7 @@ enum jl_timing_owners {
     JL_TIMING_LAST
 };
 
+extern uint64_t jl_timing_enable_mask;
 extern uint64_t jl_timing_data[(int)JL_TIMING_LAST];
 extern const char *jl_timing_names[(int)JL_TIMING_LAST];
 
@@ -161,7 +184,7 @@ struct jl_timing_block_cpp_t {
 };
 #ifdef USE_TRACY
 #define JL_TIMING(owner) jl_timing_block_cpp_t __timing_block(JL_TIMING_ ## owner); \
-    TracyCZoneN(__tracy_ctx, #owner, strcmp(#owner, "ROOT")); \
+    TracyCZoneN(__tracy_ctx, #owner, (jl_timing_enable_mask >> (JL_TIMING_ ## owner)) & 1); \
     __timing_block.block.tracy_ctx = &__tracy_ctx;
 #else
 #define JL_TIMING(owner) jl_timing_block_cpp_t __timing_block(JL_TIMING_ ## owner)
@@ -172,7 +195,7 @@ struct jl_timing_block_cpp_t {
     __attribute__((cleanup(_jl_timing_block_destroy))) \
     jl_timing_block_t __timing_block; \
     _jl_timing_block_ctor(&__timing_block, JL_TIMING_ ## owner); \
-    TracyCZoneN(__tracy_ctx, #owner, 1); \
+    TracyCZoneN(__tracy_ctx, #owner, (jl_timing_enable_mask >> (JL_TIMING_ ## owner)) & 1); \
     __timing_block.tracy_ctx = &__tracy_ctx;
 #else
 #define JL_TIMING(owner) \

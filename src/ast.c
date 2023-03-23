@@ -784,6 +784,11 @@ JL_DLLEXPORT jl_value_t *jl_fl_parse(const char *text, size_t text_len,
                                      size_t offset, jl_value_t *options)
 {
     JL_TIMING(PARSING);
+#ifdef USE_TRACY
+    TracyCZoneText(*__timing_block.tracy_ctx,
+                   jl_string_data(filename),
+                   jl_string_len(filename));
+#endif
     if (offset > text_len) {
         jl_value_t *textstr = jl_pchar_to_string(text, text_len);
         JL_GC_PUSH1(&textstr);

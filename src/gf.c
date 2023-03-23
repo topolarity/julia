@@ -315,6 +315,9 @@ jl_datatype_t *jl_mk_builtin_func(jl_datatype_t *dt, const char *name, jl_fptr_a
 jl_code_info_t *jl_type_infer(jl_method_instance_t *mi, size_t world, int force)
 {
     JL_TIMING(INFERENCE);
+#ifdef USE_TRACY
+    jl_timing_show(mi->specTypes, JL_TIMING_CURRENT_BLOCK);
+#endif
     if (jl_typeinf_func == NULL)
         return NULL;
     jl_task_t *ct = jl_current_task;
@@ -1926,6 +1929,9 @@ JL_DLLEXPORT void jl_method_table_insert(jl_methtable_t *mt, jl_method_t *method
     JL_TIMING(ADD_METHOD);
     assert(jl_is_method(method));
     assert(jl_is_mtable(mt));
+#ifdef USE_TRACY
+    jl_timing_show((jl_value_t *)method, JL_TIMING_CURRENT_BLOCK);
+#endif
     jl_value_t *type = method->sig;
     jl_value_t *oldvalue = NULL;
     jl_array_t *oldmi = NULL;

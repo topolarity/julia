@@ -192,6 +192,8 @@ static jl_callptr_t _jl_compile_codeinst(
         "invalid world for method-instance");
     assert(src && jl_is_code_info(src));
 
+    JL_TIMING(LLVM_MODULE_FINISH);
+
     jl_callptr_t fptr = NULL;
     // emit the code in LLVM IR form
     jl_codegen_params_t params(std::move(context), jl_ExecutionEngine->getDataLayout(), jl_ExecutionEngine->getTargetTriple()); // Locks the context
@@ -245,10 +247,12 @@ static jl_callptr_t _jl_compile_codeinst(
         MaxWorkqueueSize.updateMax(emitted.size());
         IndirectCodeinsts += emitted.size() - 1;
     }
-    JL_TIMING(LLVM_MODULE_FINISH);
 
     for (auto &def : emitted) {
         jl_code_instance_t *this_code = def.first;
+#ifdef USE_TRACY
+        jl_timing_show(this_code->def->specTypes, JL_TIMING_CURRENT_BLOCK);
+#endif
         jl_llvm_functions_t decls = std::get<1>(def.second);
         jl_callptr_t addr;
         bool isspecsig = false;

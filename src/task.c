@@ -640,6 +640,9 @@ JL_DLLEXPORT void jl_switch(void) JL_NOTSAFEPOINT_LEAVE JL_NOTSAFEPOINT_ENTER
         jl_error("cannot switch to task running on another thread");
 
     JL_PROBE_RT_PAUSE_TASK(ct);
+//#ifdef USE_TRACY
+    //TracyCFiberLeave;
+//#endif
 
     // Store old values on the stack and reset
     sig_atomic_t defer_signal = ptls->defer_signal;
@@ -688,6 +691,9 @@ JL_DLLEXPORT void jl_switch(void) JL_NOTSAFEPOINT_LEAVE JL_NOTSAFEPOINT_ENTER
         jl_sigint_safepoint(ptls);
 
     JL_PROBE_RT_RUN_TASK(ct);
+#ifdef USE_TRACY
+    TracyCFiberEnter(ct->name);
+#endif
     jl_gc_unsafe_leave(ptls, gc_state);
 }
 
@@ -1082,6 +1088,23 @@ JL_DLLEXPORT jl_task_t *jl_new_task(jl_function_t *start, jl_value_t *completion
     t->start = start;
     t->result = jl_nothing;
     t->donenotify = completion_future;
+#ifdef USE_TRACY
+    jl_value_t *start_type = jl_typeof(t->start);
+    const char *start_name = "";
+    if (jl_is_datatype(start_type))
+        start_name = jl_symbol_name(((jl_datatype_t *) start_type)->name->name);
+
+    // 16 characters in "Task 65535 (\"\")\0";
+    static uint16_t task_id = 1;
+    size_t fiber_name_len = strlen(start_name) + 16;
+
+    // XXX: Tracy uses this as a handle internally and requires that this
+    // string live forever, so this allocation is intentionally leaked.
+    char *fiber_name = (char *)malloc(fiber_name_len);
+    snprintf(fiber_name, fiber_name_len,  "Task %d (\"%s\")", task_id++, start_name);
+
+    t->name = fiber_name;
+#endif
     jl_atomic_store_relaxed(&t->_isexception, 0);
     // Inherit logger state from parent task
     t->logstate = ct->logstate;
@@ -1237,6 +1260,9 @@ CFI_NORETURN
 
     ct->started = 1;
     JL_PROBE_RT_START_TASK(ct);
+#ifdef USE_TRACY
+    TracyCFiberEnter(ct->name);
+#endif
     if (jl_atomic_load_relaxed(&ct->_isexception)) {
         record_backtrace(ptls, 0);
         jl_push_excstack(&ct->excstack, ct->result,
@@ -1249,14 +1275,9 @@ CFI_NORETURN
                 ptls->defer_signal = 0;
                 jl_sigint_safepoint(ptls);
             }
-//#ifdef USE_TRACY
-            //TracyFiberEnter(fiber);
-//#endif
-            {
-                // TODO: Re-enable
-                //JL_TIMING(ROOT);
-                res = jl_apply(&ct->start, 1);
-            }
+            // TODO: Re-enable
+            //JL_TIMING(ROOT);
+            res = jl_apply(&ct->start, 1);
         }
         JL_CATCH {
             res = jl_current_exception();
@@ -1265,9 +1286,6 @@ CFI_NORETURN
         }
 skip_pop_exception:;
     }
-//#ifdef USE_TRACY
-    //TracyFiberLeave(fiber);
-//#endif
     ct->result = res;
     jl_gc_wb(ct, ct->result);
     jl_finish_task(ct);
@@ -1678,6 +1696,12 @@ jl_task_t *jl_init_root_task(jl_ptls_t ptls, void *stack_lo, void *stack_hi)
         ct->stkbuf = stack;
         ct->bufsz = ssize;
     }
+
+#ifdef USE_TRACY
+    char *unique_string = (char *)malloc(strlen("Root") + 1);
+    strcpy(unique_string, "Root");
+    ct->name = unique_string;
+#endif // USE_TRACY
     ct->started = 1;
     ct->next = jl_nothing;
     ct->queue = jl_nothing;
@@ -1708,6 +1732,10 @@ jl_task_t *jl_init_root_task(jl_ptls_t ptls, void *stack_lo, void *stack_hi)
 #endif
 #ifdef _COMPILER_ASAN_ENABLED_
     ct->ctx.asan_fake_stack = NULL;
+#endif
+
+#ifdef USE_TRACY
+    TracyCFiberEnter(ct->name);
 #endif
 
 #ifdef COPY_STACKS

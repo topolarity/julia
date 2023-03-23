@@ -65,6 +65,10 @@ static jl_function_t *jl_module_get_initializer(jl_module_t *m JL_PROPAGATES_ROO
 void jl_module_run_initializer(jl_module_t *m)
 {
     JL_TIMING(INIT_MODULE);
+#ifdef USE_TRACY
+    const char *module_name = jl_symbol_name(m->name);
+    TracyCZoneText(*__timing_block.tracy_ctx, module_name, strlen(module_name));
+#endif
     jl_function_t *f = jl_module_get_initializer(m);
     if (f == NULL)
         return;

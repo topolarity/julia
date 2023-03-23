@@ -18,6 +18,7 @@ extern "C" {
 #endif
 
 static uint64_t t0;
+JL_DLLEXPORT uint64_t jl_timing_enable_mask = 0xFFFFFFFFFFFFFFFE;
 JL_DLLEXPORT uint64_t jl_timing_data[(int)JL_TIMING_LAST] = {0};
 const char *jl_timing_names[(int)JL_TIMING_LAST] =
     {
@@ -70,6 +71,43 @@ void jl_timing_block_start(jl_timing_block_t *cur_block)
 void jl_timing_block_stop(jl_timing_block_t *cur_block)
 {
     _jl_timing_block_stop(cur_block, cycleclock());
+}
+
+JL_DLLEXPORT void jl_timing_show(jl_value_t *v, jl_timing_block_t *cur_block) {
+#ifdef USE_TRACY
+    ios_t buf;
+    ios_mem(&buf, IOS_INLSIZE);
+    buf.growable = 0; // Restrict to inline buffer to avoid allocation
+
+    jl_static_show((JL_STREAM*)&buf, v);
+    if (buf.size == buf.maxsize)
+        memset(&buf.buf[IOS_INLSIZE - 3], '.', 3);
+
+    TracyCZoneText(*(cur_block->tracy_ctx), buf.buf, buf.size);
+#endif
+}
+
+JL_DLLEXPORT uint64_t jl_timing_get_enable_mask(void) {
+    return jl_timing_enable_mask;
+}
+
+JL_DLLEXPORT void jl_timing_set_enable_mask(uint64_t mask) {
+    jl_timing_enable_mask = mask;
+}
+
+JL_DLLEXPORT int jl_timing_set_enable(const char *subsystem, uint8_t enabled) {
+    for (int i = 0; i < JL_TIMING_LAST; i++) {
+        if (strcmp(subsystem, jl_timing_names[i]) == 0) {
+            uint64_t subsystem_bit = (1ul << i);
+            if (enabled) {
+                jl_timing_enable_mask |= subsystem_bit;
+            } else {
+                jl_timing_enable_mask &= subsystem_bit;
+            }
+            return 0;
+        }
+    }
+    return -1;
 }
 
 #else

@@ -3244,18 +3244,9 @@ JL_DLLEXPORT void jl_gc_collect(jl_gc_collection_t collection)
         return;
     }
 #ifdef USE_TRACY
-    static uint8_t first_time = 1;
-    if (first_time) {
-        first_time = 0;
-        TracyCFiberEnter("Main");
-    }
-    TracyCFiberLeave;
+    //TracyCFiberLeave;
     TracyCFiberEnter("GC");
-    {
-        int64_t tb;
-        jl_gc_get_total_bytes(&tb);
-        TracyCPlot("Heap size", ((double)tb) / (1024.0 * 1024.0));
-    }
+    TracyCPlot("Heap size (MB)", ((double)jl_gc_live_bytes()) / (1024.0 * 1024.0));
 #endif
 {
     JL_TIMING(GC);
@@ -3321,15 +3312,11 @@ JL_DLLEXPORT void jl_gc_collect(jl_gc_collection_t collection)
     SetLastError(last_error);
 #endif
     errno = last_errno;
-}
+} // TODO: Better RAII (maybe use a dummy constructor RAII type)
 #ifdef USE_TRACY
-    {
-        int64_t tb;
-        jl_gc_get_total_bytes(&tb);
-        TracyCPlot("Heap size", ((double)tb) / (1024.0 * 1024.0));
-    }
-    TracyCFiberLeave;
-    TracyCFiberEnter("Main");
+    TracyCPlot("Heap size (MB)", ((double)jl_gc_live_bytes()) / (1024.0 * 1024.0));
+    //TracyCFiberLeave;
+    TracyCFiberEnter(ct->name);
 #endif
 }
 
