@@ -19,7 +19,7 @@ extern "C" {
 typedef enum { bm_none=1000, bm_line, bm_block, bm_mem } bufmode_t;
 typedef enum { bst_none, bst_rd, bst_wr } bufstate_t;
 
-#define IOS_INLSIZE 54
+#define IOS_INLSIZE 83
 #define IOS_BUFSIZE 32768
 
 #ifdef _P64
@@ -36,10 +36,8 @@ JL_ATTRIBUTE_ALIGN_PTRSIZE(typedef struct {
     // in general, you can do any operation in any state.
     char *buf;        // start of buffer
 
-    int errcode;
-
-    ON_P64(int _pad_bm;)      // put bm at same offset as type field of uv_stream_s
-    bufmode_t bm;     //
+    int64_t userdata;
+    bufmode_t bm;
     bufstate_t state;
 
     int64_t maxsize;    // space allocated to buffer
@@ -54,6 +52,8 @@ JL_ATTRIBUTE_ALIGN_PTRSIZE(typedef struct {
     // pointer-size integer to support platforms where it might have
     // to be a pointer
     long fd;
+
+    int errcode;
 
     unsigned char readable:1;
     unsigned char writable:1;
@@ -74,7 +74,10 @@ JL_ATTRIBUTE_ALIGN_PTRSIZE(typedef struct {
     // request durable writes (fsync)
     // unsigned char durable:1;
 
-    int64_t userdata;
+    // this declares that the buffer should not be (re-)alloc'd when 
+    // attempting to write beyond its current maxsize.
+    unsigned char growable:1;
+
     char local[IOS_INLSIZE];
 } ios_t);
 
