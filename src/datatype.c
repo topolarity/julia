@@ -97,6 +97,7 @@ jl_datatype_t *jl_new_uninitialized_datatype(void)
     jl_task_t *ct = jl_current_task;
     jl_datatype_t *t = (jl_datatype_t*)jl_gc_alloc(ct->ptls, sizeof(jl_datatype_t), jl_datatype_type);
     t->hash = 0;
+    t->super_depth = -2;
     t->hasfreetypevars = 0;
     t->isdispatchtuple = 0;
     t->isbitstype = 0;

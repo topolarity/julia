@@ -2012,10 +2012,10 @@ static int simple_subtype_works_rhs(jl_value_t *y, works_check_ctx_t ctx, uint8_
     // Okay, I'd like to allow typevars introduce with an inv_depth > 0
 
     // Note: This is where we allow RHS existentials
-    //if (jl_typeis(y, jl_tvar_type) && is_rhs) {
-        //// No support for typevars at all yet
-        //return 0;
-    //}
+    if (jl_typeis(y, jl_tvar_type) && is_rhs) {
+        // No support for typevars at all yet
+        return 0;
+    }
 
     if (jl_typeis(y, jl_tvar_type)) {
         jl_check_varbinding_t *vb = ctx.vars;
@@ -2145,7 +2145,7 @@ static int simple_subtype_works_os(jl_value_t *t)
 static int simple_subtype_works(jl_value_t *x, jl_value_t *y,
         jl_value_t **env, int envsz, int debug)
 {
-    //return 0; // Do not use at all
+    return 0; // Do not use at all
 
     if (env != NULL) {
         if (debug)
@@ -2198,7 +2198,9 @@ JL_DLLEXPORT int jl_subtype_env(jl_value_t *x, jl_value_t *y, jl_value_t **env, 
             jl_(y);
             jl_errorf("incorrect simple subtype result");
         }
+#ifdef USE_TRACY
         TracyCZoneEnd(ctx);
+#endif
         return 1;
     }
     if (x == y ||
@@ -2220,7 +2222,9 @@ JL_DLLEXPORT int jl_subtype_env(jl_value_t *x, jl_value_t *y, jl_value_t **env, 
             jl_(y);
             jl_errorf("incorrect simple subtype result");
         }
+#ifdef USE_TRACY
         TracyCZoneEnd(ctx);
+#endif
         return 1;
     }
     int obvious_subtype = 2;
@@ -2233,7 +2237,9 @@ JL_DLLEXPORT int jl_subtype_env(jl_value_t *x, jl_value_t *y, jl_value_t **env, 
                 jl_(y);
                 jl_errorf("incorrect simple subtype result");
             }
+#ifdef USE_TRACY
             TracyCZoneEnd(ctx);
+#endif
             return obvious_subtype;
         }
         else if (envsz == 0) {
@@ -2243,7 +2249,9 @@ JL_DLLEXPORT int jl_subtype_env(jl_value_t *x, jl_value_t *y, jl_value_t **env, 
                 jl_(y);
                 jl_errorf("incorrect simple subtype result");
             }
+#ifdef USE_TRACY
             TracyCZoneEnd(ctx);
+#endif
             return obvious_subtype;
         }
 #endif
@@ -2274,7 +2282,9 @@ JL_DLLEXPORT int jl_subtype_env(jl_value_t *x, jl_value_t *y, jl_value_t **env, 
         jl_(y);
         jl_errorf("incorrect simple subtype result");
     }
+#ifdef USE_TRACY
     TracyCZoneEnd(ctx);
+#endif
     return subtype;
 }
 
@@ -3378,6 +3388,9 @@ static jl_value_t *intersect_invariant(jl_value_t *x, jl_value_t *y, jl_stenv_t 
     if (!jl_has_free_typevars(x) && !jl_has_free_typevars(y)) {
         return (jl_subtype(x,y) && jl_subtype(y,x)) ? y : NULL;
     }
+    /**
+     * We intersect first??
+     **/
     e->invdepth++;
     e->Rinvdepth++;
     jl_value_t *ii = intersect(x, y, e, 2);
@@ -3405,6 +3418,10 @@ static jl_value_t *intersect_invariant(jl_value_t *x, jl_value_t *y, jl_stenv_t 
     jl_savedenv_t se;
     JL_GC_PUSH2(&ii, &root);
     save_env(e, &root, &se);
+    /**
+     * So this does full subtyping, but treating all the (existing)
+     * variables as existential, just like we expected.
+     **/
     if (!subtype_in_env_existential(x, y, e, 0, e->invdepth))
         ii = NULL;
     else {
@@ -3863,6 +3880,8 @@ static jl_value_t *intersect_all(jl_value_t *x, jl_value_t *y, jl_stenv_t *e)
 
 // type intersection entry points
 
+int jl_simple_nonempty_intersection(jl_value_t *x, jl_value_t *y);
+
 static jl_value_t *intersect_types(jl_value_t *x, jl_value_t *y, int emptiness_only)
 {
     jl_stenv_t e;
@@ -3879,7 +3898,18 @@ static jl_value_t *intersect_types(jl_value_t *x, jl_value_t *y, int emptiness_o
     init_stenv(&e, NULL, 0);
     e.intersection = e.ignore_free = 1;
     e.emptiness_only = emptiness_only;
-    return intersect_all(x, y, &e);
+    jl_value_t *result = intersect_all(x, y, &e);
+    {
+        uint8_t empty = (result == jl_bottom_type);
+        int simple_empty = jl_simple_nonempty_intersection(x, y);
+        if ((simple_empty != -1) && ((empty && !simple_empty) || (!empty && simple_empty))) {
+            fprintf(stderr, "Got %d expected %d\n", simple_empty, empty);
+            jl_(x);
+            jl_(y);
+            jl_errorf("incorrect simple non-empty intersection result");
+        }
+    }
+    return result;
 }
 
 JL_DLLEXPORT jl_value_t *jl_intersect_types(jl_value_t *x, jl_value_t *y)
@@ -4016,7 +4046,7 @@ static int might_intersect_concrete(jl_value_t *a)
 }
 
 // sets *issubty to 1 iff `a` is a subtype of `b`
-jl_value_t *jl_type_intersection_env_s(jl_value_t *a, jl_value_t *b, jl_svec_t **penv, int *issubty)
+jl_value_t *jl_type_intersection_env_s(jl_value_t *a, jl_value_t *b, jl_svec_t **penv, int *issubty, uint8_t emptiness_only)
 {
     if (issubty) *issubty = 0;
     if (obviously_disjoint(a, b, 0)) {
@@ -4050,11 +4080,22 @@ jl_value_t *jl_type_intersection_env_s(jl_value_t *a, jl_value_t *b, jl_svec_t *
         jl_stenv_t e;
         init_stenv(&e, NULL, 0);
         e.intersection = e.ignore_free = 1;
+        e.emptiness_only = emptiness_only;
         e.envout = env;
         if (szb)
             memset(env, 0, szb*sizeof(void*));
         e.envsz = szb;
         *ans = intersect_all(a, b, &e);
+        {
+            uint8_t empty = (*ans == jl_bottom_type);
+            int simple_empty = jl_simple_nonempty_intersection(a, b);
+            if ((simple_empty != -1) && ((empty && !simple_empty) || (!empty && simple_empty))) {
+                fprintf(stderr, "Got %d expected %d\n", simple_empty, empty);
+                jl_(a);
+                jl_(b);
+                jl_errorf("incorrect simple non-empty intersection result");
+            }
+        }
         if (*ans == jl_bottom_type) goto bot;
         // TODO: code dealing with method signatures is not able to handle unions, so if
         // `a` and `b` are both tuples, we need to be careful and may not return a union,
@@ -4110,7 +4151,7 @@ jl_value_t *jl_type_intersection_env_s(jl_value_t *a, jl_value_t *b, jl_svec_t *
 
 jl_value_t *jl_type_intersection_env(jl_value_t *a, jl_value_t *b, jl_svec_t **penv)
 {
-    return jl_type_intersection_env_s(a, b, penv, NULL);
+    return jl_type_intersection_env_s(a, b, penv, NULL, 0);
 }
 
 JL_DLLEXPORT jl_value_t *jl_type_intersection(jl_value_t *a, jl_value_t *b)

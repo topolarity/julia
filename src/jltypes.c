@@ -377,13 +377,72 @@ STATIC_INLINE int cmp_(int a, int b) JL_NOTSAFEPOINT
     return a < b ? -1 : a > b;
 }
 
-// a/b are jl_datatype_t* & not NULL
+static int super_depth(jl_datatype_t *dv) {
+    int depth = 0;
+    while (dv != jl_any_type) {
+        dv = dv->super;
+        depth++;
+    }
+    return depth;
+}
+
+/**
+ * TODO: Add super-depth as an attribute on the type,
+ *       which will make comparison substantially faster.
+ *       
+ *       -> In order to know whether you're before or after me
+ *          in the order, I need to know your super-depth.
+ *
+ **/
+
+// sort by super-depth, then sort singletons first, then DataTypes (isbits, then !isbits),
+// then UnionAlls, ties broken alphabetically including module name & type parameters
 static int datatype_name_cmp(jl_value_t *a, jl_value_t *b) JL_NOTSAFEPOINT
 {
-    if (!jl_is_datatype(a))
-        return jl_is_datatype(b) ? 1 : 0;
-    if (!jl_is_datatype(b))
+    if (a == NULL && b == NULL)
+        return 0;
+    if (a == NULL && b != NULL)
+        return 1; // TODO: When does this happen?
+    if (a != NULL && b == NULL)
         return -1;
+
+    // Ignore all UnionAlls
+    if (jl_is_unionall(a) || jl_is_unionall(b))
+        return datatype_name_cmp(jl_unwrap_unionall(a), jl_unwrap_unionall(b));
+    
+    /*// Unions are opaque*/
+    /*if (jl_is_union_type(a) || jl_is_union_type(b))*/
+        /*return 0;*/
+
+    if (jl_isbits(a) && !jl_isbits(b))
+        return -1;
+    if (!jl_isbits(a) && jl_isbits(b))
+        return 1;
+
+    if (!jl_is_datatype(a) && !jl_is_datatype(b)) {
+        // TODO: compare egal properly!
+        return 0;
+    }
+    if (jl_is_datatype(a) && !jl_is_datatype(b))
+        return -1;
+    if (!jl_is_datatype(a) && jl_is_datatype(b))
+        return 1;
+
+    jl_datatype_t *da = (jl_datatype_t *)a;
+    jl_datatype_t *db = (jl_datatype_t *)b;
+
+    assert(da->super_depth > 0); // Should not be Bottom or uninit
+    assert(db->super_depth > 0); // Should not be Bottom or uninit
+    if (da->super_depth > db->super_depth)
+        return -1;
+    if (da->super_depth < db->super_depth)
+        return 1;
+
+    if (jl_is_datatype_singleton(da) && !jl_is_datatype_singleton(db))
+        return -1;
+    if (!jl_is_datatype_singleton(da) && jl_is_datatype_singleton(db))
+        return 1;
+
     int cmp = strcmp(str_(datatype_module_name(a)), str_(datatype_module_name(b)));
     if (cmp != 0)
         return cmp;
@@ -393,69 +452,60 @@ static int datatype_name_cmp(jl_value_t *a, jl_value_t *b) JL_NOTSAFEPOINT
     cmp = cmp_(jl_nparams(a), jl_nparams(b));
     if (cmp != 0)
         return cmp;
-    // compare up to 3 type parameters
-    for (int i = 0; i < 3 && i < jl_nparams(a); i++) {
+
+    for (int i = 0; i < jl_nparams(a); i++) {
         jl_value_t *ap = jl_tparam(a, i);
         jl_value_t *bp = jl_tparam(b, i);
         if (ap == bp) {
             continue;
         }
-        else if (jl_is_datatype(ap) && jl_is_datatype(bp)) {
-            cmp = datatype_name_cmp(ap, bp);
-            if (cmp != 0)
-                return cmp;
-        }
-        else if (jl_is_unionall(ap) && jl_is_unionall(bp)) {
-            cmp = datatype_name_cmp(jl_unwrap_unionall(ap), jl_unwrap_unionall(bp));
-            if (cmp != 0)
-                return cmp;
-        }
-        else {
-            // give up
-            cmp = 0;
-        }
+        cmp = datatype_name_cmp(ap, bp);
+        if (cmp != 0)
+            return cmp;
     }
     return cmp;
 }
 
-// sort singletons first, then DataTypes, then UnionAlls,
-// ties broken alphabetically including module name & type parameters
-static int union_sort_cmp(jl_value_t *a, jl_value_t *b) JL_NOTSAFEPOINT
-{
-    if (a == NULL)
-        return b == NULL ? 0 : 1;
-    if (b == NULL)
-        return -1;
-    if (jl_is_datatype(a)) {
-        if (!jl_is_datatype(b))
-            return -1;
-        if (jl_is_datatype_singleton((jl_datatype_t*)a)) {
-            if (jl_is_datatype_singleton((jl_datatype_t*)b))
-                return datatype_name_cmp(a, b);
-            return -1;
-        }
-        else if (jl_is_datatype_singleton((jl_datatype_t*)b)) {
-            return 1;
-        }
-        else if (jl_isbits(a)) {
-            if (jl_isbits(b))
-                return datatype_name_cmp(a, b);
-            return -1;
-        }
-        else if (jl_isbits(b)) {
-            return 1;
-        }
-        else {
-            return datatype_name_cmp(a, b);
-        }
-    }
-    else {
-        if (jl_is_datatype(b))
-            return 1;
-        return datatype_name_cmp(jl_unwrap_unionall(a), jl_unwrap_unionall(b));
-    }
-}
+//static int union_sort_cmp(jl_value_t *a, jl_value_t *b) JL_NOTSAFEPOINT
+//{
+    //if (a == NULL)
+        //return b == NULL ? 0 : 1;
+    //if (b == NULL)
+        //return -1;
+    //if (jl_is_datatype(a)) {
+        //if (!jl_is_datatype(b))
+            //return -1;
+        //if (jl_is_datatype_singleton((jl_datatype_t*)a)) {
+            //if (jl_is_datatype_singleton((jl_datatype_t*)b))
+                //return datatype_name_cmp(a, b);
+            //return -1;
+        //}
+        //else if (jl_is_datatype_singleton((jl_datatype_t*)b)) {
+            //return 1;
+        //}
+        //else if (jl_isbits(a)) {
+            //if (jl_isbits(b))
+                //return datatype_name_cmp(a, b);
+            //return -1;
+        //}
+        //else if (jl_isbits(b)) {
+            //return 1;
+        //}
+        //else {
+            //return datatype_name_cmp(a, b);
+        //}
+    //}
+    //else {
+        //if (jl_is_datatype(b))
+            //return 1;
+        //return datatype_name_cmp(jl_unwrap_unionall(a), jl_unwrap_unionall(b));
+    //}
+//}
 
+/**
+ * Great, we can use this in intersection!
+ *   -> Just need to update the sort to be recursive
+ **/
 static void isort_union(jl_value_t **a, size_t len) JL_NOTSAFEPOINT
 {
     size_t i, j;
@@ -463,7 +513,7 @@ static void isort_union(jl_value_t **a, size_t len) JL_NOTSAFEPOINT
         jl_value_t *x = a[i];
         for (j = i; j > 0; j--) {
             jl_value_t *y = a[j - 1];
-            if (!(union_sort_cmp(x, y) < 0))
+            if (!(datatype_name_cmp(x, y) < 0))
                 break;
             a[j] = y;
         }
@@ -1600,9 +1650,11 @@ static jl_value_t *inst_datatype_inner(jl_datatype_t *dt, jl_svec_t *p, jl_value
 
     if (istuple || isnamedtuple) {
         ndt->super = jl_any_type;
+        ndt->super_depth = 1;
     }
     else if (dt->super) {
         ndt->super = (jl_datatype_t*)inst_type_w_((jl_value_t*)dt->super, env, stack, 1);
+        ndt->super_depth = super_depth(ndt);
         jl_gc_wb(ndt, ndt->super);
     }
     jl_svec_t *ftypes = dt->types;
@@ -1997,6 +2049,7 @@ void jl_reinstantiate_inner_types(jl_datatype_t *t) // can throw!
             env[i].val = jl_svecref(ndt->parameters, i);
 
         ndt->super = (jl_datatype_t*)inst_type_w_((jl_value_t*)t->super, &env[n - 1], &top, 1);
+        ndt->super_depth = super_depth(ndt);
         jl_gc_wb(ndt, ndt->super);
     }
 
@@ -2043,6 +2096,7 @@ void jl_init_types(void) JL_GC_DISABLED
 
     jl_any_type = (jl_datatype_t*)jl_new_abstracttype((jl_value_t*)jl_symbol("Any"), core, NULL, jl_emptysvec);
     jl_any_type->super = jl_any_type;
+    jl_any_type->super_depth = 0;
     jl_nonfunction_mt = jl_any_type->name->mt;
     jl_any_type->name->mt = NULL;
 
@@ -2057,8 +2111,8 @@ void jl_init_types(void) JL_GC_DISABLED
     jl_datatype_type->name->wrapper = (jl_value_t*)jl_datatype_type;
     jl_datatype_type->super = (jl_datatype_t*)jl_type_type;
     jl_datatype_type->parameters = jl_emptysvec;
-    jl_datatype_type->name->n_uninitialized = 8 - 3;
-    jl_datatype_type->name->names = jl_perm_symsvec(8,
+    jl_datatype_type->name->n_uninitialized = 9 - 3;
+    jl_datatype_type->name->names = jl_perm_symsvec(9,
             "name",
             "super",
             "parameters",
@@ -2066,8 +2120,10 @@ void jl_init_types(void) JL_GC_DISABLED
             "instance",
             "layout",
             "hash",
-            "flags"); // "hasfreetypevars", "isconcretetype", "isdispatchtuple", "isbitstype", "zeroinit", "has_concrete_subtype", "cached_by_hash"
-    jl_datatype_type->types = jl_svec(8,
+            "flags",
+            "super_depth"
+            ); // "hasfreetypevars", "isconcretetype", "isdispatchtuple", "isbitstype", "zeroinit", "has_concrete_subtype", "cached_by_hash"
+    jl_datatype_type->types = jl_svec(9,
             jl_typename_type,
             jl_datatype_type,
             jl_simplevector_type,
@@ -2075,7 +2131,9 @@ void jl_init_types(void) JL_GC_DISABLED
             jl_any_type, // instance
             jl_any_type /*jl_voidpointer_type*/,
             jl_any_type /*jl_int32_type*/,
-            jl_any_type /*jl_uint16_type*/);
+            jl_any_type /*jl_uint16_type*/,
+            jl_any_type /*jl_int16_type*/
+            );
     const static uint32_t datatype_constfields[1] = { 0x00000057 }; // (1<<0)|(1<<1)|(1<<2)|(1<<4)|(1<<6)
     const static uint32_t datatype_atomicfields[1] = { 0x00000028 }; // (1<<3)|(1<<5)
     jl_datatype_type->name->constfields = datatype_constfields;
@@ -2208,24 +2266,29 @@ void jl_init_types(void) JL_GC_DISABLED
     ((jl_datatype_t*)jl_type_type->body)->ismutationfree = 1;
 
     jl_typeofbottom_type->super = jl_wrap_Type(jl_bottom_type);
+    jl_typeofbottom_type->super_depth = -1;
 
     jl_emptytuple_type = jl_apply_tuple_type(jl_emptysvec);
     jl_emptytuple = jl_gc_permobj(0, jl_emptytuple_type);
     jl_emptytuple_type->instance = jl_emptytuple;
 
     // non-primitive definitions follow
+    jl_int8_type = jl_new_primitivetype((jl_value_t*)jl_symbol("Int8"), core,
+                                         jl_any_type, jl_emptysvec, 8);
+    jl_int16_type = jl_new_primitivetype((jl_value_t*)jl_symbol("Int16"), core,
+                                         jl_any_type, jl_emptysvec, 16);
     jl_int32_type = jl_new_primitivetype((jl_value_t*)jl_symbol("Int32"), core,
                                          jl_any_type, jl_emptysvec, 32);
     jl_int64_type = jl_new_primitivetype((jl_value_t*)jl_symbol("Int64"), core,
                                          jl_any_type, jl_emptysvec, 64);
-    jl_uint32_type = jl_new_primitivetype((jl_value_t*)jl_symbol("UInt32"), core,
-                                          jl_any_type, jl_emptysvec, 32);
-    jl_uint64_type = jl_new_primitivetype((jl_value_t*)jl_symbol("UInt64"), core,
-                                          jl_any_type, jl_emptysvec, 64);
     jl_uint8_type = jl_new_primitivetype((jl_value_t*)jl_symbol("UInt8"), core,
                                          jl_any_type, jl_emptysvec, 8);
     jl_uint16_type = jl_new_primitivetype((jl_value_t*)jl_symbol("UInt16"), core,
                                           jl_any_type, jl_emptysvec, 16);
+    jl_uint32_type = jl_new_primitivetype((jl_value_t*)jl_symbol("UInt32"), core,
+                                          jl_any_type, jl_emptysvec, 32);
+    jl_uint64_type = jl_new_primitivetype((jl_value_t*)jl_symbol("UInt64"), core,
+                                          jl_any_type, jl_emptysvec, 64);
 
     jl_ssavalue_type = jl_new_datatype(jl_symbol("SSAValue"), core, jl_any_type, jl_emptysvec,
                                        jl_perm_symsvec(1, "id"),
@@ -2770,6 +2833,7 @@ void jl_init_types(void) JL_GC_DISABLED
     jl_svecset(jl_datatype_type->types, 5, jl_voidpointer_type);
     jl_svecset(jl_datatype_type->types, 6, jl_int32_type);
     jl_svecset(jl_datatype_type->types, 7, jl_uint16_type);
+    jl_svecset(jl_datatype_type->types, 8, jl_int16_type);
     jl_svecset(jl_typename_type->types, 1, jl_module_type);
     jl_svecset(jl_typename_type->types, 3, jl_voidpointer_type);
     jl_svecset(jl_typename_type->types, 4, jl_voidpointer_type);

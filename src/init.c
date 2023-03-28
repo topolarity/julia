@@ -350,7 +350,7 @@ JL_DLLEXPORT void jl_atexit_hook(int exitcode) JL_NOTSAFEPOINT_ENTER
 
     jl_destroy_timing(); // cleans up the current timing_stack for noreturn
 #ifdef ENABLE_TIMINGS
-    jl_print_timings();
+    //jl_print_timings();
 #endif
     jl_teardown_codegen(); // prints stats
 }
@@ -879,12 +879,19 @@ static jl_value_t *core(const char *name)
     return jl_get_global(jl_core_module, jl_symbol(name));
 }
 
+static int super_depth(jl_datatype_t *dv) {
+    int depth = 0;
+    while (dv != jl_any_type) {
+        dv = dv->super;
+        depth++;
+    }
+    return depth;
+}
+
 // fetch references to things defined in boot.jl
 static void post_boot_hooks(void)
 {
     jl_char_type    = (jl_datatype_t*)core("Char");
-    jl_int8_type    = (jl_datatype_t*)core("Int8");
-    jl_int16_type   = (jl_datatype_t*)core("Int16");
     jl_float16_type = (jl_datatype_t*)core("Float16");
     jl_float32_type = (jl_datatype_t*)core("Float32");
     jl_float64_type = (jl_datatype_t*)core("Float64");
@@ -895,12 +902,27 @@ static void post_boot_hooks(void)
     jl_datatype_t *jl_integer_type = (jl_datatype_t*)core("Integer");
 
     jl_bool_type->super = jl_integer_type;
+    jl_bool_type->super_depth = super_depth(jl_bool_type);
+
     jl_uint8_type->super = jl_unsigned_type;
     jl_uint16_type->super = jl_unsigned_type;
     jl_uint32_type->super = jl_unsigned_type;
     jl_uint64_type->super = jl_unsigned_type;
+
+    jl_uint8_type->super_depth = super_depth(jl_uint8_type);
+    jl_uint16_type->super_depth = super_depth(jl_uint16_type);
+    jl_uint32_type->super_depth = super_depth(jl_uint32_type);
+    jl_uint64_type->super_depth = super_depth(jl_uint64_type);
+
+    jl_int8_type->super = jl_signed_type;
+    jl_int16_type->super = jl_signed_type;
     jl_int32_type->super = jl_signed_type;
     jl_int64_type->super = jl_signed_type;
+
+    jl_int8_type->super_depth = super_depth(jl_int8_type);
+    jl_int16_type->super_depth = super_depth(jl_int16_type);
+    jl_int32_type->super_depth = super_depth(jl_int32_type);
+    jl_int64_type->super_depth = super_depth(jl_int64_type);
 
     jl_errorexception_type = (jl_datatype_t*)core("ErrorException");
     jl_stackovf_exception  = jl_new_struct_uninit((jl_datatype_t*)core("StackOverflowError"));

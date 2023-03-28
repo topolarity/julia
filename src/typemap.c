@@ -332,6 +332,9 @@ static int jl_typemap_node_visitor(jl_typemap_entry_t *ml, jl_typemap_visitor_fp
 
 int jl_typemap_visitor(jl_typemap_t *cache, jl_typemap_visitor_fptr fptr, void *closure)
 {
+    /**
+     * TODO: Understand why we split differently in this way
+     **/
     if (jl_typeof(cache) == (jl_value_t*)jl_typemap_level_type) {
         jl_typemap_level_t *node = (jl_typemap_level_t*)cache;
         jl_array_t *a;
@@ -380,6 +383,16 @@ static unsigned jl_supertype_height(jl_datatype_t *dt)
 // return true if a and b might intersect in the type domain (over just their type-names)
 static int tname_intersection(jl_datatype_t *a, jl_typename_t *bname, unsigned ha)
 {
+    /**
+     * Climb b:
+     *   If it equals a, return 1
+     *
+     *   If that fails and a was deeper than b, we climb a
+     *   until it equals b.
+     *
+    // `wrapper` is either the only instantiation of the type (if no parameters)
+    // or a UnionAll accepting parameters to make an instantiation.
+     **/
     jl_datatype_t *b = (jl_datatype_t*)jl_unwrap_unionall(bname->wrapper);
     unsigned hb = 1;
     while (b != jl_any_type) {
@@ -480,7 +493,7 @@ static int jl_typemap_intersection_node_visitor(jl_typemap_entry_t *ml, struct t
                 closure->env = jl_emptysvec;
                 penv = &closure->env;
             }
-            closure->ti = jl_type_intersection_env_s(closure->type, (jl_value_t*)ml->sig, penv, &closure->issubty);
+            closure->ti = jl_type_intersection_env_s(closure->type, (jl_value_t*)ml->sig, penv, &closure->issubty, closure->emptiness_only);
             if (closure->ti != (jl_value_t*)jl_bottom_type) {
                 // In some corner cases type intersection is conservative and returns something
                 // for intersect(A, B) even though A is a dispatch tuple and !(A <: B).

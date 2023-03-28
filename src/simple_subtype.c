@@ -6,19 +6,39 @@
 #include "julia.h"
 #include "julia_internal.h"
 #include "julia_assert.h"
+#include <stdbool.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 // To disable debug printing
-#define fprintf(...)
-#define jl_(...)
+//#define st_fprintf(...) fprintf(__VA_ARGS__)
+#define st_fprintf(...)
+//#define jl_(...)
 
 size_t indent = 0;
 void print_indent() {
-    fprintf(stderr, "%*s", indent, "");
+    st_fprintf(stderr, "%*s", indent, "");
 }
+
+/**
+ *
+ * TODO: The reality of the matter is that 99.99% of tuple
+ * checks are going to be handled correctly based on:
+ *   (1) volume check
+ *   (2) separable coverage check (no gaps)
+ *   (3) total coverage check (best alternative)
+ *   (4) zero-volume pruning
+ *
+ *   My code should try to handle these correctly, rather
+ *   than dedicating a tone of extra effort to efficiently
+ *   solving the case where all 4 of these are wrong.
+ *     -> Accept your fate, Cody.
+ *
+ *  REWRITE this code to be simpler, accepting this.
+ *   
+ **/
 
 /**
  * Here's the dependency plan:
@@ -180,7 +200,33 @@ void print_indent() {
   *   - evidence-free + evidence-required bitmasks
   *   - volume per-sample ?
   *     -> Nah, the volumes are dynamic anyway
+  * 
+  * So let's figure out how we want to do this allocation...
+  *   1. I need a way to identify the object type, now that
+  *      it won't include the object bits
+  *   2. I want to binarize the AND node so that it is efficient
+  *      to merge
+  *   3. We will use pointers for now and can switch to indices
+  *      later
+  *   4. I need some kind of "union-hyper-cube" data structure
+  *
+  * I will probably treat these as an efficiently-allocated sum type.
+  *   -> Padding is unfortunate
+  *
+  *   -> Can also store the type with the pointer
+  *
   **/
+
+typedef struct jl_stbound_t {
+    struct jl_stbound_t *prev;
+    enum { UPPER, LOWER } kind;
+    jl_value_t *bound;
+} jl_stbound_t;
+
+
+//typedef struct {
+//} jl_union_hypercube_t;
+
 
 // This list fills me with determination.
 
@@ -303,11 +349,62 @@ typedef struct {
     jl_linear_alloc_t *alloc;
 } jl_stenv_t;
 
-typedef enum {
-    FALSE,
-    INDETERMINATE,
-    TRUE
-} jl_maybe_bool_t;
+/**
+ * TODO:
+ *   1. Add obligation encoding (ugly)
+ *   2. Add solver
+ *   3. Add variable constraints, etc.
+ *   4. Test 
+ **/
+
+/**
+ * Layout:
+ *   (1) Compute maximum bit size up-front and use that to size
+ *       all of our bit-vectors.
+ *
+ *       We'll then have simply
+ *
+ *       int16_t bvec_sz;
+ *       int16_t n_alts;
+ *       int16_t n_dims;
+ *       int16_t *dims;               // dims[n_dims]
+ *       uint64_t *subtype;           // subtype[n_alts][n_dims][bvec_sz]
+ *       uint64_t *indeterminate;     // indeterminate[n_alts][n_dims][bvec_sz]
+ *       jl_value_t *evidence_chain;  // evidence_chain[n_alts][n_dims]
+ **/
+
+struct jl_stsample_t;
+
+typedef struct jl_stobligation2_t {
+    struct jl_stsample_t *lhs;
+    struct jl_stsample_t *rhs;
+    struct jl_stobligation2_t *next;
+} jl_stobligation2_t;
+
+typedef struct jl_stsample_t {
+    uint16_t subtree_sz;
+    uint16_t bvec_sz;
+    uint16_t n_alts;
+    uint16_t n_dims;
+
+    uint16_t *dims;                     // dims[n_dims]   TODO: Remove
+    uint64_t *subtype;                  // subtype[n_alts][n_dims][bvec_sz]
+    uint64_t *indeterminate;            // indeterminate[n_alts][n_dims][bvec_sz]
+    struct jl_stsample_t **subtrees;    // subtrees[n_alts][n_dims][subtree_sz]
+    jl_stobligation2_t **obligations;   // obligations[n_alts][n_dims]
+} jl_stsample_t;
+
+typedef struct {
+    int16_t inv_depth;
+    uint16_t var_cnt;
+    jl_linear_alloc_t *alloc;
+} jl_stenv2_t;
+
+enum maybe_bool {
+    FALSE = 1,
+    INDETERMINATE = 2,
+    TRUE = 0,
+};
 
 typedef struct {
     jl_value_t *required;
@@ -315,7 +412,7 @@ typedef struct {
 } jl_stobligation_t;
 
 typedef struct {
-    jl_maybe_bool_t result;
+    enum maybe_bool result;
     jl_stobligation_t condition;
 } jl_stresult_t;
 
@@ -326,6 +423,112 @@ typedef struct {
 
 
 JL_DLLEXPORT jl_stresult_t jl_simple_subtype_env(jl_value_t *x, jl_value_t *y, jl_varenv_t x_env, jl_varenv_t y_env, jl_stenv_t *env);
+
+
+    /**
+     *
+     *  With an invariant, all alternatives are effectively isolated
+     *    -> Which means that our bit-mask must be complete
+     *    -> Which means that we *must* combine all RHS bounds
+     *    -> So it is an AND, but it's a lazy AND
+     *    -> Do we just resolve it early into a chain?
+     *        -> Absolutely we can
+     *
+     *    -> Inv{Union{ ... }, ... } <: Union{Inv{Union{ ... }, ... }
+     *        -> ((bi-directional union) AND (bi-directional union) AND ...)  OR (alternative 2...)
+     *           This is an OR-AND-"equals" structure
+     *
+     *    -> So what we really want to do is reduce this to N alternatives, each of which is a "merged bounds-chain"
+     *        -> We knew we wanted to delete the bitmask structure in this case anyway, and now we see why.
+     *           There's only a single bit inhabited if we reduce eagerly.
+     *
+     *    -> Let's do a vectorized OR, since that should re-use more code
+     *
+     *    -> OR-DEFERRED-AND + distributivity
+     *
+     *        -> Does this work for double-nesting?
+     *           Tuple{Tuple{Union{Int,Bool}}} <: Union{Tuple{Tuple{Int}},Tuple{Tuple{Bool}}}
+     *           Tuple{Tuple{Union{Int,Bool}, String}, Bool} <: Union{Tuple{Tuple{Int, String},Bool},Tuple{Tuple{Bool, String},Bool}}
+     *            -> TODO: Add test
+     *
+     *            -> We handle this as a chain of tuple matches (as usual) and the
+     *               solver handles those chains specially.
+     *                 TODO: Check that we *only* encounter this chain in this circumstance
+     *
+                 * Example:
+                 *   Pair{Tuple{ ... }, Int} <: Pair{Tuple{Ref{T}, T}, U} where T <: U
+                 *
+                 *    -> So now, when I match against T and check its
+                 *       upper bound, I end up inheriting an obligation
+                 *       to compare against Int as well.
+                 *
+                 * TODO:
+                 *   Turn into subtype test (or verify coverage)
+     *
+     *  With the standard one, I have a single type that might be covered
+     *  by a union of top-level tuples. In this case, the story is the same
+     *  but the "union" on the RHS is a UnionAll
+     *
+     *    Tuple{Union{Ref{X},Ref{Y}}, ... } <: Tuple{Ref{T}, ... } where T
+     *
+     **/
+
+/**
+ * Same as `jl_count_union_components` except that
+ * it also unwraps unionall.
+ *
+ * TODO: rename
+ **/
+JL_DLLEXPORT size_t jl_count_nontuples(jl_value_t *v) {
+    v = jl_unwrap_unionall(v);
+    if (jl_is_uniontype(v)) { 
+        jl_uniontype_t *uv = (jl_uniontype_t *)v;
+        return jl_count_nontuples(uv->a) + jl_count_nontuples(uv->b);
+    } else if (jl_is_datatype(v) && jl_is_tuple_type(v)) {
+        return 0;
+    } else {
+        return 1;
+    }
+}
+
+JL_DLLEXPORT size_t jl_count_tuples(jl_value_t *v) {
+    v = jl_unwrap_unionall(v);
+    if (jl_is_uniontype(v)) { 
+        jl_uniontype_t *uv = (jl_uniontype_t *)v;
+        return jl_count_tuples(uv->a) + jl_count_tuples(uv->b);
+    } else if (jl_is_datatype(v) && jl_is_tuple_type(v)) {
+        return 1;
+    } else {
+        return 0;
+    }
+}
+
+
+/**
+ * This is for matching a tuple/invariant datatype against a general RHS (which may be union/unionall-wrapped)
+ *
+ *  Proposal:
+ *       -> Linked list for bounds-chains
+ *       -> Degenerate tuple for top-level unions (and Invariants)
+ *           -> Just a "vectorized" OR of bounds-chains
+ *
+ *  Special cases:
+ *       -> Invariant constructors create a "vectorized" OR of bounds-chains (no bitmasks at all)
+ *       -> Complete coverage (w/o obligations) by any alternative is an early TRUE
+ *       -> Insufficient coverage (by volume, w/ obligations) by all alternatives is an early FALSE
+ *       -> If no LHS inner unions, collapse like invariant (nothing to distribute)
+ *       -> If no RHS outer unions, collapse like invariant (nothing to distribute)
+ *
+ *  One interesting note:
+ *       -> It can be profitable to delay AND-merging (since that is N^2) until we know that all of
+ *          the components can be covered (ignoring conditions)
+ *       -> Of course, there are examples in the opposite direction too. I'm not sure which is better.
+ *       -> TODO: Make a note and save for benchmarking
+ *
+ * Supporting re-allocs: One *big* TODO is that we need to handle "tearing"
+ *   -> Either we support reallocing and moving this whole thing
+ *   -> OR, we always read it as a stream
+ **/
 
 jl_varbinding_t *lookup(jl_varbinding_t *vars, jl_tvar_t *tv) {
     jl_varbinding_t *vb = vars;
@@ -340,6 +543,202 @@ jl_varbinding_t *lookup(jl_varbinding_t *vars, jl_tvar_t *tv) {
 static inline size_t align_forward(size_t addr, size_t align) {
     return (addr + (align - 1)) & ~(align - 1);
 }
+
+/**
+ * So, I got the inductive part wrong (sort of)
+ *   -> The major problem is that we can complete a "cube" arbitrarily deep
+ *      from the top level. But the way I was planning on doing this, you'd
+ *      have to "stitch together the cubes again after the fact
+ *
+ *      -> What we *actually* need is the ability to replace individual "pixels"
+ *         with their inductive split
+ *         TODO: Think about how to allocate these.
+ *
+ *         -> One thing that would definitely work would be to allocate these
+ *            separately (i.e. "true", "indeterminate", "cubic")
+ *             -> The key thing is to have all the RHS alternatives contribute
+ *                to the same "cubic set"
+ *
+ *             -> Since this is a function of the LHS types, we can also
+ *                preallocate all of the bit-sets sequentially
+ *
+ *                 -> In this case, instead of allocating a pixel, we allocate
+ *                    an entire bitset? That might work...
+ *
+ *                      -> It does need to *function* like its old pixel though
+ *                         (i.e. it contributes to higher-level cubes)
+ *
+ *  This definitely feels like the right continuation of our theory, at least.
+ *
+ *  Okay, here's my idea:
+ *    - Flags at the top to indicate whether there is any evidence preset and
+ *      any higher-level unions (almost always false).
+ *    - Higher-order unions are stored as a bit-set + pointers to the higher-
+ *      order cube just like our evidence propagation is stored.
+ *
+ *  Overall, it is very much like typical evidence except that it's not so
+ *  alternative-specific. Is there a better indexing that can recover this
+ *  inductive structure?
+ *
+ *    -> For one pixel, I still sample across the RHS alternatives as usual.
+ *       With the caveat that:
+ *         (1) New alternatives can appear:
+ *                  Union{
+ *                      Tuple{..., ..., ...} <- Suddenly, we are breaking down these unions
+ *                  Union{Tuple{Union{Tuple{Int, Bool}, Tuple{Bool, Bool}}, Int}, ... }
+ *                    -> One alternative got mapped to two more
+ *
+ *         (2) Each alternative needs to be considered as a separate "cubic bit-sample"
+ *
+ *    -> So we must re-index the # of alternatives
+ *    -> The # of LHS components is totally un-related to before
+ *    -> And so it the # of components
+ *
+ *         -> It's an entirely new cube. What makes it harder is that
+ *            we don't iterate other RHS alternatives in the inner loop,
+ *            so it's hard to predict how many alternatives there will be
+ *            up-front. (i.e. I can't "seal" it)
+ *
+ *    -> Okay, so we're providing a new "grid"
+ *         -> Technically the solver _could_ identify this special evidence and
+ *            (a) correlate it across (redundant) entries, or (b) expect it to be
+ *            allocated once
+ *
+ *  These options are worth thinking about.
+ *    (a) means that we can potentially think about this more as a general "deferral"
+ *        -> the RHS is going to naturally measure against the LHS tuple basis (deferring AND-ing)
+ *           and then that cubic set is deferred upward yet again
+ *  
+ *  Of course, the concept is separate from the way it's stored really. No matter
+ *  what I'll have to look up all the bit-masks (and evidence) for all the samples
+ *  in the solver.
+ *     -> And that is all LHS-determined so it's consistent structure
+ *
+ *  Maybe we should focus less on bit-packing. How would I do this in Julia?
+ *     -> Basically the same TBH. Only thing I might switch up is how to look-up
+ *        the higher-order cube.
+ *
+ *     -> Wait. the higher-order behavior is associated with the *LHS*
+ *     -> We can either add a list of (comp_i, rhs_alt_i, bit_index) (i,j,k)
+ *        OR we can add a bitmask and a list of entries 
+ *          -> This can actually be developed as part of our initial scan
+ *
+ *     -> So at the beginning we scan through all unions & tuples and get
+ *        the "tree-basis" that we are forced to sample on.
+ *          -> If it weren't for the different # of alternatives, we could
+ *             almost just allocate extra bits for the basis
+ *
+ *     -> Okay, so we lay out these trees contiguously following the first one.
+ *         -> Now, can we make the construction order follow a stack-discipline?
+ *            -> Not easily. We'd have to do the structural recursion on the RHS
+ *               in an *outer* loop.
+ *
+ *            -> We *can* however measure the number of alternatives up-front.
+ *               along with all of our other properties.
+ *
+ *               So we can indeed allocate correctly.
+ *
+ *
+ *            -> Unfortunately, we do need to know the # of RHS alternatives
+ *               before we know the size of the first cubic tree, so we can't allocate
+ *               the trailing headers immediately.
+ *                 -> Our structural recursion problem again.
+ *
+ *     -> Alternative would be to describe the tree structure up front,
+ *        (or to put all of their headers first) followed by the
+ *        actual tree data afterward
+ *
+ *          -> This also plays better with our allocation structure
+ *             (although copy and realloc really isn't so bad)
+ *
+ *  Okay, so we have:
+ *  # is_complete, dims, dims...
+ *
+ *  if the tree continues, then it has a bitmask set
+ *  (just like usual) representing the pixels that have
+ *  their own sub-trees
+ *
+ *  Goal is to be able to sample at all depth levels in O(1) pass.
+ *
+ *  Following the "dims tree" we have the "samples"
+ *     -> This works like normal for complete trees
+ *     -> For "complex trees", we expect samples to be laid out
+ *        in exactly the order predicted by the bit-sets in the
+ *        dims trees 
+ *  
+ *
+ *  void *alternatives;
+ *  uint16_t n_alts;
+ *  uint16_t n_dims; // If this has high-bit set, bit-sets follow
+ *  uint16_t dims[n_dims];
+ *  uint64_t descend_bitsets[]; // This is sized depending on dims
+ *
+ *  // Which means I don't know where to put the follow-ons...
+ *  // until after I've finished the "level-1" recursion
+ *
+ *   // (a) we could build another stack of follow-ons to resume from
+ *   // (b) or we can suck it up and do this in two phases
+ *           (i) measure all of the dims, notice whether there are any Tuples
+ *           (ii) if there are Tuples (w/ unions in them anywhere), then we
+ *                append all of our bitsets and do a second sweep descending
+ *                into tuples and measuring their bases.
+ *
+ *   How does the solver use this information?
+ *     - If we have this kind of situation, there's a chance that:
+ *          First of all, the usual early-exits: Esp. total coverage (w/o obligations)
+ *             by any RHS alternative means that we could remove the cubic sub-tree
+ *
+ *          NOTE 1: It'd be really nice to support this cancellation in the "usual" way
+ *                  where we just pop off the contributions we thought we needed from the
+ *                  stack
+ *
+ *                  Unfortunately, that does go against the structural grouping of the RHS
+ *
+ *          NOTE 2: The solver will go through these, and look for missing coverage. It needs
+ *                  to be able to accurately correlate the RHS bits with their related bits
+ *                  from the upper-level.
+ *
+ *                  This implies two things:
+ *                    (1) We cannot just lump together all of the RHS alternatives for the 
+ *                        inductive problem.
+ *                    (2) It might be worth it just to "expand" our LHS basis to include these
+ *                        extra bits.
+ *                           -> The challenge is to get the right inductive structure
+ *
+ *   The basic algorithm is that we take a large cube, then:
+ *      (i) split it into n-tants
+ *      (ii) recursively try to cover those n-tants
+ *
+ *   Wow, I forget how simple our algorithm was. It's super nice,
+ *   and my initial intuition was correct. We can just induct
+ *   (carefully) in the solver.
+ *
+ *   What does the inductive algorithm look like?
+ *      (i) start with a good guess
+ *      (ii) a sub-problem expands to its pixel when it is covered.
+ *           -> So when diving into the complement of this component,
+ *              I'd be trying to prove coverage of the whole "sub-pixel"
+ *               -> This becomes another exponential problem of its own
+ *
+ *   So as usual, we take these complementing masks in different combinations.
+ *     -> *Every* time we try to solve one of the top-level sub-problems, we descend
+ *        into the lower lower problem and try to prove coverage either of the
+ *        thing or its complement. 
+ *
+ *         -> I *think* we do this for each *candidate* solution.
+ *
+ *         -> So is the original solution actually correct?
+ *            -> We just have to be able to correlate the bases so that I
+ *               can mask away the proof obligations handled by another alternative
+ *
+ *         -> I think maybe our original idea was best! 
+ *            -> I just have to make sure the masks I use handle the induction correctly
+ *
+ **/
+
+/**
+ * TODO: Create debug print-out for our obligations
+ **/
 
 // pop/push
 // or save/restore
@@ -364,6 +763,814 @@ static int linear_alloc_init(void *buffer, size_t sz, jl_linear_alloc_t *alloc) 
     return 0;
 }
 
+
+typedef struct {
+    size_t length;
+    void *buffer;
+} buffer_t;
+
+typedef struct {
+    enum maybe_bool status;
+    jl_stobligation2_t obligations; // TODO: Try to use more data types if we can
+} jl_stresult2_t;
+
+//typedef struct jl_stobl_ll_t {
+    //void *obligation;
+    //struct jl_stobl_ll_t *next;
+//} jl_stobl_ll_t;
+
+jl_stresult2_t subtype_datatype(jl_value_t *x, jl_value_t *y, jl_varenv_t x_env, jl_varenv_t y_env, jl_stenv2_t *env);
+
+void flip_dim(uint32_t *inout, uint32_t *patt, size_t sz, size_t *volume) {
+    //size_t old_popcnt = 0;
+    //size_t new_popcnt = 0;
+    //for (size_t i = 0; i < sz; i++) {
+        //old_popcnt += __builtin_popcount(inout[i]);
+        //inout[i] = inout[i] ^ patt[i];
+        //new_popcnt += __builtin_popcount(inout[i]);
+    //}
+    //*volume /= old_popcnt;
+    //*volume *= new_popcnt;
+}
+
+int check_coverage(jl_stsample_t *lhs, jl_stsample_t *rhs, jl_stobligation2_t *obligations, jl_stenv2_t *env);
+
+int print_sample_tree(jl_stsample_t *lhs, int indent) {
+    uint16_t n_dims = lhs->n_dims;
+    uint16_t n_alts = lhs->n_alts;
+    uint16_t bvec_sz = lhs->bvec_sz;
+    uint16_t subtree_sz = lhs->subtree_sz;
+    for (int a = 0; a < n_alts; a++) {
+        fprintf(stderr, "%*s", indent, "");
+        fprintf(stderr, "alt %d:\n", a);
+        for (int d = 0; d < n_dims; d++) {
+            fprintf(stderr, "%*s", indent, "");
+            fprintf(stderr, "  dim %d: ", d);
+            for (int i = bvec_sz; i-- > 0;) {
+                fprintf(stderr, "%08lx", lhs->subtype[a * bvec_sz * n_dims + d * bvec_sz + i]);
+            }
+            fprintf(stderr, "\n");
+            for (int s = 0; s < subtree_sz; s++) {
+                if (lhs->subtrees[a * n_dims * subtree_sz + d * subtree_sz + s] == NULL)
+                    continue;
+                    //break;
+
+                fprintf(stderr, "\n%*s", indent, "");
+                fprintf(stderr, "    subtree %d: \n", s);
+                print_sample_tree(lhs->subtrees[a * n_dims * subtree_sz + d * subtree_sz + s], indent + 6);
+            }
+        }
+    }
+}
+
+int solve_obligations(jl_stobligation2_t *obligations, jl_stenv2_t *env) {
+
+    // Holy cow! I'm finally at the solving stage!
+    jl_stsample_t *sample = obligations->rhs;
+
+    uint16_t n_dims = sample->n_dims;
+    uint16_t n_alts = sample->n_alts;
+    uint16_t bvec_sz = sample->bvec_sz;
+    fprintf(stderr, "%d dims %d alts (%d bvec_sz)\n", n_dims, n_alts, bvec_sz);
+
+    // demand_bitset[n_dims][bvec_sz]
+    uint64_t *demand_bitset = obligations->lhs->subtype;
+
+    // Great, now we're off to the races!
+
+    fprintf(stderr, "checking coverage for LHS:\n");
+    print_sample_tree(obligations->lhs, 2);
+    fprintf(stderr, "sampled:\n");
+    print_sample_tree(obligations->rhs, 2);
+
+    return check_coverage(obligations->lhs, obligations->rhs, obligations, env);
+}
+
+static inline void bitset_xor(uint64_t *dst, uint64_t *a, uint64_t *b, size_t sz) {
+    for (int i = 0; i < sz; i++) {
+        dst[i] = a[i] ^ b[i];
+    }
+}
+
+static inline void bitset_and(uint64_t *dst, uint64_t *a, uint64_t *b, size_t sz) {
+    for (int i = 0; i < sz; i++) {
+        dst[i] = a[i] & b[i];
+    }
+}
+
+static inline bool bitset_equal(uint64_t *a, uint64_t *b, size_t sz) {
+    for (int i = 0; i < sz; i++) {
+        if (a[i] != b[i])
+            return false;
+    }
+    return true;
+}
+
+static inline size_t bitset_popcount(uint64_t *a, size_t sz) {
+    size_t count = 0;
+    for (int i = 0; i < sz; i++) {
+        count += __builtin_popcount(a[i]);
+    }
+    return count;
+}
+
+/**
+ * This is... quite a bit of code now with the higher-order support...
+ *
+ * TODO: If we had a way to disable alternatives, we could simplify this
+ *       check dramatically (we'd no longer rely on it for steering the
+ *       search).
+ **/
+size_t best_alternative(jl_stsample_t *lhs, jl_stsample_t *rhs, uint16_t *best_alt, uint64_t *bset) {
+
+    uint16_t n_alts = rhs->n_alts;
+    uint16_t n_dims = lhs->n_dims;
+    uint16_t bvec_sz = lhs->bvec_sz;
+    uint16_t subtree_sz = lhs->subtree_sz;
+
+    if (n_alts == 0)
+        return 0;
+
+    size_t max_volume = 0;
+    for (int a = 0; a < n_alts; a++) {
+        size_t volume = 1; // TODO: float?
+        for (int d = 0; d < n_dims; d++) {
+            uint64_t *subtype_bset = &rhs->subtype[a * n_dims * bvec_sz + d * bvec_sz];
+            bitset_and(bset, subtype_bset, &lhs->subtype[d * bvec_sz], bvec_sz);
+            size_t dim_volume = bitset_popcount(bset, bvec_sz);
+
+            for (int s = 0; s < subtree_sz; s++) {
+                jl_stsample_t *lhs_subtree = lhs->subtrees[d * subtree_sz + s];
+                jl_stsample_t *rhs_subtree = rhs->subtrees[a * n_dims * subtree_sz + d * subtree_sz + s];
+
+                if (lhs_subtree == NULL || rhs_subtree == NULL)
+                    continue;
+
+                uint16_t sub_a; // discarded
+                dim_volume += best_alternative(lhs_subtree, rhs_subtree, &sub_a, bset);
+            }
+            volume *= dim_volume;
+        }
+        if (volume > max_volume) {
+            max_volume = volume;
+            *best_alt = a;
+        }
+    }
+    return max_volume;
+}
+
+int check_coverage(jl_stsample_t *lhs, jl_stsample_t *rhs, jl_stobligation2_t *obligations, jl_stenv2_t *env) {
+    jl_stsample_t *sample = rhs;
+    uint64_t *demand_bitset = lhs->subtype;
+
+    uint16_t n_dims = lhs->n_dims;
+    uint16_t n_alts = sample->n_alts;
+    uint16_t bvec_sz = lhs->bvec_sz;
+    uint16_t subtree_sz = lhs->subtree_sz;
+
+    uint64_t *bset = (uint64_t *)linear_alloc(bvec_sz * sizeof(uint64_t), alignof(uint64_t), env->alloc);
+
+    uint16_t best_alt;
+    size_t max_volume = best_alternative(lhs, rhs, &best_alt, bset);
+
+    // TODO: total_volume optimization
+    // TODO: Any incompletely covered dimension optimization (done at top-level only)
+
+    if (max_volume == 0 && lhs == obligations->lhs)
+        return 0; // Base case
+
+    jl_stsample_t **saved_subtrees = (jl_stsample_t **)linear_alloc(
+        subtree_sz * sizeof(jl_stsample_t *), alignof(jl_stsample_t *), env->alloc);
+
+    /**
+     * TODO: Re-factor this to some kind of useful bit-vector struct?
+     **/
+    for (int d = 0; d < n_dims; d++) {
+        memcpy(saved_subtrees, &lhs->subtrees[d * subtree_sz], subtree_sz * sizeof(jl_stsample_t *));
+        memset(&lhs->subtrees[d * subtree_sz], 0, subtree_sz * sizeof(jl_stsample_t *));
+
+        uint64_t *subtype_bset = &sample->subtype[best_alt * n_dims * bvec_sz + d * bvec_sz];
+        uint64_t *demand_bset = &demand_bitset[d * bvec_sz];
+        bitset_and(bset, subtype_bset, demand_bset, bvec_sz);
+        if (!bitset_equal(bset, demand_bset, bvec_sz)) {
+
+            // Check that the complement of the dimension is covered.
+            bitset_xor(demand_bset, demand_bset, bset, bvec_sz);
+            // TODO: This bitset_xor is the higher-level one
+
+            // TODO: The demand_bitset here is always the top-level one
+            if (!check_coverage(obligations->lhs, obligations->rhs, obligations, env))
+                return 0;
+
+            // Undo complement operation to restore full dimension
+            bitset_xor(demand_bset, demand_bset, bset, bvec_sz);
+        }
+        // TODO: Do half-plane, quarter-plane instead
+        // TODO: Clean up this sloppy masking
+
+        memcpy(&lhs->subtrees[d * subtree_sz], saved_subtrees, subtree_sz * sizeof(jl_stsample_t *));
+        memcpy(bset, demand_bset, bvec_sz * sizeof(uint64_t));
+        memset(demand_bset, 0, bvec_sz * sizeof(uint64_t));
+
+        /**
+         * Our problem is that when I recurse over the bit-sets above, I technically
+         * want to exclude the subtrees that I'm handling here
+         **/
+        for (int i = 0; i < subtree_sz; i++) {
+            if (lhs->subtrees[d * subtree_sz + i] == NULL)
+                continue;
+                //break;
+
+            if (!check_coverage(lhs->subtrees[d * subtree_sz + i],
+                        rhs->subtrees[best_alt * n_dims * subtree_sz + d * subtree_sz + i], obligations, env))
+                return 0;
+        }
+        memcpy(demand_bset, bset, bvec_sz * sizeof(uint64_t));
+    }
+
+    return 1; // Coverage was proven!
+}
+
+/**
+ *
+ * Next steps:
+ *   1. Higher-order bits trees -> DONE
+ *   2. Type-vars
+ *   3. Invariant datatypes
+ *
+ *   -> That's basically all we need for subtyping.
+ *
+ * The plan now is to keep the messy-ness and hack together
+ * enough structure to see what we need for general type-vars.
+ *
+ * Then, once that's clear, we start doing major rip-up to:
+ *   (1) Fix our inductive subtyping organization
+ *   (2) Plug up any bugs that I didn't think about/test carefully
+ *           (esp. allocation, masking, etc.)
+ *   (3) Simplify/reduce the code.
+ *
+ * One candidate we should *strongly* consider is a uniform
+ * data-structure that represents sub-trees and dimensions 
+ * the same.
+ *
+ * I'm not sure how much that simplifies our existing code, since
+ * the HO is in the structure of the problem, but we could:
+ *   -> Adopt a very dumb strategy for how we walk alternatives, e.g. by "bit"
+ *   -> Save a lot of effort once we start adding "indeterminate" solutions
+ *
+ **/
+
+/**
+ * Gives an out buffer
+ */
+JL_DLLEXPORT jl_stresult2_t jl_subtype_datatype(jl_value_t *x, jl_value_t *y) {
+    static const size_t CAPACITY = 4096;
+    char *buffer = (char *)malloc(CAPACITY);
+    jl_linear_alloc_t alloc;
+    linear_alloc_init(buffer, CAPACITY, &alloc);
+
+    jl_stenv2_t env = { 0, 0, &alloc };
+    jl_varenv_t x_env = { NULL, RIGID };
+    jl_varenv_t y_env = { NULL, FLEXIBLE };
+    
+    jl_stresult2_t result = subtype_datatype(x, y, x_env, y_env, &env);
+    if (result.status == INDETERMINATE) {
+        /**
+         * TODO: Apply solver (gray code induction)
+         **/
+        int is_subtype = solve_obligations(&result.obligations, &env);
+        result.status = (is_subtype) ? TRUE : FALSE;
+    }
+
+    fprintf(stderr, "Allocated %zu bytes\n", alloc.sz);
+
+    return result;
+}
+
+// bvec[rhs_alt_i][param_j][lhs_alt_k]
+typedef struct {
+    uint16_t i;
+    uint16_t j;
+    uint16_t k;
+    uint16_t subtree;
+} jl_stsample_index_t;
+
+void allocate_sample_tree(jl_stsample_t *sample, jl_datatype_t *dx, jl_value_t *y, jl_stenv2_t *env);
+void sample_tuple_subtype(jl_datatype_t *dx, jl_value_t *y, jl_stsample_t *lhs, jl_stsample_t *rhs,
+                          jl_varenv_t x_env, jl_varenv_t y_env, jl_stenv2_t *env);
+
+/**
+ * Sample LHS will unwrap the LHS unions and do the actual sampling
+ *
+ * i = the component
+ * j = the RHS alternative
+ * k = the alternative of the LHS component
+ *
+ * TODO: Would this be simpler if we didn't group by RHS alternative at the top?
+ * TODO: Full recursion (with simple identity check for grounding)
+ *
+ * As terrible as this was to write, it's actually quite decent structurally.
+ **/
+void sample_lhs(jl_stsample_t *lhs, jl_stsample_t *rhs, jl_stsample_index_t *i, jl_value_t *xi, jl_value_t *yi,
+                jl_varenv_t x_env, jl_varenv_t y_env, jl_stenv2_t *env) {
+    if (jl_is_uniontype(xi)) {
+        jl_uniontype_t *uxi = (jl_uniontype_t *)xi;
+        sample_lhs(lhs, rhs, i, uxi->a, yi, x_env, y_env, env);
+        sample_lhs(lhs, rhs, i, uxi->b, yi, x_env, y_env, env);
+        return;
+    } else if (jl_is_unionall(xi)) {
+        // TODO: pop depending on results
+        jl_unionall_t *uaxi = (jl_unionall_t *)xi;
+        jl_varbinding_t *vb = (jl_varbinding_t *)linear_alloc(
+            sizeof(jl_varbinding_t), alignof(jl_varbinding_t), env->alloc);
+        *vb = (jl_varbinding_t) {
+            /* var */ uaxi->var,
+            /* id */ 0, // does not count toward var_cnt
+            /* kind */ RIGID,
+            /* inv_depth */ env->inv_depth,
+            /* prev */ x_env.vars,
+        };
+        x_env.vars = vb;
+        return sample_lhs(lhs, rhs, i, uaxi->body, yi, x_env, y_env, env);
+    }
+
+    if (jl_is_datatype(xi) && jl_is_tuple_type(xi)) {
+        /**
+         * Always allocate the LHS tree, regardless
+         * of whether we use it - TODO: optimize
+         **/
+        jl_datatype_t *dxi = (jl_datatype_t *)xi;
+        uint16_t subtree_sz = lhs->subtree_sz;
+        jl_stsample_t **lhs_subtrees = &lhs->subtrees[i->j * subtree_sz];
+        if (lhs_subtrees[i->subtree] == NULL) {
+            lhs_subtrees[i->subtree] = (jl_stsample_t *)linear_alloc(
+                    sizeof(jl_stsample_t), alignof(jl_stsample_t), env->alloc);
+
+            allocate_sample_tree(lhs_subtrees[i->subtree], dxi, NULL, env); 
+        }
+
+        /**
+         * TODO: It'd be preferable *not* to always allocate this
+         *       but that'd require a smarter check_coverage that
+         *       knows a NULL RHS covers an empty LHS
+         **/
+        uint16_t n_dims = lhs->n_dims;
+
+        jl_stsample_t **rhs_subtrees = &rhs->subtrees[i->i * n_dims * subtree_sz + i->j * subtree_sz];
+        if (rhs_subtrees[i->subtree] == NULL) {
+            rhs_subtrees[i->subtree] = (jl_stsample_t *)linear_alloc(
+                sizeof(jl_stsample_t), alignof(jl_stsample_t), env->alloc);
+
+            allocate_sample_tree(rhs_subtrees[i->subtree], dxi, yi, env); 
+        }
+
+        if (jl_is_datatype(yi) && jl_is_tuple_type(yi)) {
+            if (jl_nparams(xi) != jl_nparams(yi))
+                return; // TODO: Be very mindful of this.
+
+            fprintf(stderr, "HIGHER ORDER sampling (%d, %d, %d) subtree: %d\n", i->i, i->j, i->k, i->subtree);
+            jl_(xi);
+            jl_(yi);
+
+
+            /**
+             * Hooray! That's the higher-order sampling written.
+             *
+             * Follow-up with:
+             *   (1) For-all variables + Thoughts about ground types, etc.
+             *   (2) Solve over existential variables
+             *   (3) Solve for "diagonality"
+             *
+             * Okay, so sub-typing is proving *complicated*. I think it is _solvably_ complicated
+             * for Wednesday (maybe), but intersection is almost certainly going to push me into
+             * next week.
+             *
+             * That might be okay... But I *really* wanted to land this in March.
+             *    A. Land sub-typing without intersection improvements
+             *    B. Wait to reveal sub-typing until we have intersection *and*
+             *       jl_verify_timings improvements?
+             *
+             * The fact of the matter is there's simply quite a bit of work left
+             * to massage this thing into place.
+             *
+             *  -> Intersection does *not* care about distributivity, but the type-var mess is
+             *     even worse, I think.
+             **/
+            sample_tuple_subtype(dxi, (jl_value_t *)yi,
+                                 lhs_subtrees[i->subtree], rhs_subtrees[i->subtree],
+                                 x_env, y_env, env);
+        }
+
+        i->subtree++;
+        return;
+    }
+
+    fprintf(stderr, "\n\nsample_lhs (%d, %d, %d)\n", i->i, i->j, i->k) ;
+    jl_(xi);
+    jl_(yi);
+
+    // Don't recurse on conspicuously mis-matched pairs, since we
+    // don't handle those correctly yet.
+    //
+    // TODO: Un-fold of our subtyping logic correctly.
+    if ((jl_is_datatype(xi) && jl_is_tuple_type(xi)) || (jl_is_datatype(yi) && jl_is_tuple_type(yi)))
+        return;
+
+    jl_stresult2_t result = subtype_datatype(xi, yi, x_env, y_env, env);
+
+    // TODO: Maybe zero any 0-dimension tuples
+    //        -> Ideally this would happen *before* our separability check
+    // TODO: Don't forget about the "full coverage" fast path
+
+    /**
+     * If samples is adjusted to be at the beginning of the right period,
+     * then it's this
+     **/
+    if (result.status == TRUE) {
+        uint16_t bvec_sz = rhs->bvec_sz;
+        uint16_t n_dims = rhs->n_dims;
+        uint64_t *bvec = &rhs->subtype[i->i * n_dims * bvec_sz + i->j * bvec_sz]; // &out->subtype[i.i][i.j][0]
+
+        bvec[i->k / 64] |= (1ull << (i->k % 64));
+
+        uint64_t *bvec2 = &lhs->subtype[i->j * bvec_sz]; // &out->subtype[i.j][0]
+        bvec2[i->k / 64] |= (1ull << (i->k % 64));
+    } else if (result.status == INDETERMINATE) {
+        //// TODO: Re-factor
+        //uint16_t bvec_sz = out->bvec_sz;
+        //uint16_t n_dims = out->n_dims;
+        //uint64_t *bvec = &out->indeterminate[i->i * n_dims * bvec_sz + i->j * bvec_sz]; // &out->subtype[i.i][i.j][0]
+        //bvec[i->k / 64] |= (1ull << (i->k % 64));
+
+        //jl_stobligation2_t **obligation_tail = &out->obligations[i->i * n_dims + i->j];
+        //while (*obligation_tail != NULL) {
+            //// TODO: This is O(N^2) instead of O(N)
+            //obligation_tail = &(*obligation_tail)->next;
+        //}
+        //*obligation_tail = (jl_stobligation2_t *)linear_alloc(
+                //sizeof(jl_stobligation2_t), alignof(jl_stobligation2_t), env->alloc);
+
+        //// TODO: This is kind of silly, because the top-level subtyping never returns
+        ////       this with a link.
+        //**obligation_tail = result.obligations;
+    }
+
+    i->k += 1;
+}
+
+/**
+ * TODO: I'm pretty this definition is broken for
+ *       Union-Union comparisons so I need to figure out
+ *       how to flatten all of these functions into one.
+ *
+ *       -> Thinking about what I would do if I had
+ *       closures might help with that.
+ **/
+
+
+/**
+ * Honestly, we could probably give a closure to count_union_components
+ *
+ * i = the component
+ * j = the RHS alternative
+ * k = the alternative of the LHS component
+ **/
+void sample_rhs(jl_stsample_t *lhs, jl_stsample_t *rhs,
+        jl_stsample_index_t *i, jl_datatype_t *dx,
+        jl_value_t *y, jl_varenv_t x_env, jl_varenv_t y_env, jl_stenv2_t *env) {
+    //fprintf(stderr, "\n\nsampling rhs\n");
+    //jl_(dx);
+    //jl_(y);
+
+    if (jl_is_uniontype(y)) {
+        jl_uniontype_t *uy = (jl_uniontype_t *)y;
+        sample_rhs(lhs, rhs, i, dx, uy->a, x_env, y_env, env);
+        sample_rhs(lhs, rhs, i, dx, uy->b, x_env, y_env, env);
+        return;
+    } else if (jl_is_unionall(y)) {
+        // TODO: pop depending on results
+        jl_unionall_t *uay = (jl_unionall_t *)y;
+        jl_varbinding_t *vb = (jl_varbinding_t *)linear_alloc(
+            sizeof(jl_varbinding_t), alignof(jl_varbinding_t), env->alloc);
+        *vb = (jl_varbinding_t) {
+            /* var */ uay->var,
+            /* id */ env->var_cnt++,
+            /* kind */ FLEXIBLE,
+            /* inv_depth */ env->inv_depth,
+            /* prev */ y_env.vars,
+        };
+        y_env.vars = vb;
+        return sample_rhs(lhs, rhs, i, dx, uay->body, x_env, y_env, env);
+    } else if (jl_is_datatype(y) && jl_is_tuple_type(y)) {
+        if (jl_nparams(dx) != jl_nparams(y)) {
+            // TODO: This can leave the LHS un-allocated *sigh*
+            //          -> For example, if the RHS has no alternatives at all...
+            i->i += 1;
+            return; // TODO: Varargs, etc. - also index more carefully
+        }
+
+        /**
+         * TODO: Lift dims to outer-level?
+         **/
+        for ((i->j)=0; (i->j) < rhs->n_dims; (i->j)++) {
+            jl_value_t *xi = jl_tparam(dx, i->j);
+            jl_value_t *yi = jl_tparam(y, i->j);
+
+            i->k = 0;
+            i->subtree = 0;
+            sample_lhs(lhs, rhs, i, xi, yi, x_env, y_env, env); // This could do advancing if it had a bit *and* word index
+        }
+
+        // If not a union type, then we increment when done
+        i->i += 1;
+    } else {
+        // Ignore types that don't match
+    }
+}
+
+/**
+ *
+ * I want to check right before entering the recursive
+ * function that I have the right arrays allocated
+ *   -> LHS in particular may not need allocation.
+ *
+ **/
+/**
+ * If y is provided, this returns a tree sized appropriately for
+ * sampling its alternatives
+ *
+ *  TODO: Optimize for reduced case when n_alts = 1?
+ *  TODO: Optimize by allocating/filling both trees together?
+ *           -> Maybe strip some data from the RHS
+ *              that's already in the LHS
+ **/
+void allocate_sample_tree(jl_stsample_t *sample, jl_datatype_t *dx, jl_value_t *y, jl_stenv2_t *env) {
+    // TODO: Maybe pull allocation of header in
+
+    uint16_t n_dims = jl_nparams(dx);
+    uint16_t n_alts = y ? jl_count_tuples(y) : 1;
+
+    /**
+     * TODO: Remove `dims`, and check for coverage at some point instead?
+     **/
+    sample->dims = (uint16_t *)linear_alloc(
+            n_dims * sizeof(uint16_t), alignof(uint16_t), env->alloc);
+
+    uint16_t max_dim = 0;
+    uint16_t subtree_sz = 0;
+    for (int i=0; i < n_dims; i++) {
+        uint16_t dim = jl_count_nontuples(jl_tparam(dx, i));
+        if (dim > max_dim)
+            max_dim = dim;
+        sample->dims[i] = dim;
+
+        size_t subtrees = jl_count_tuples(jl_tparam(dx, i));
+        if (subtrees > subtree_sz)
+            subtree_sz = subtrees;
+    }
+    uint16_t bvec_sz = (max_dim + 63) / 64;
+
+    sample->n_dims = n_dims;
+    sample->n_alts = n_alts;
+    sample->bvec_sz = bvec_sz;
+    sample->subtree_sz = subtree_sz;
+
+    sample->subtype = (uint64_t *)linear_alloc(
+            n_alts * n_dims * bvec_sz * sizeof(uint64_t), alignof(uint64_t), env->alloc);
+    memset(sample->subtype, 0,
+           n_alts * n_dims * bvec_sz * sizeof(uint64_t));
+
+    sample->subtrees = (jl_stsample_t **)linear_alloc(
+            n_alts * n_dims * subtree_sz * sizeof(jl_stsample_t *), alignof(jl_stsample_t *), env->alloc);
+    memset(sample->subtrees, 0,
+            n_alts * n_dims * subtree_sz * sizeof(jl_stsample_t *));
+
+    //return sample;
+}
+
+/**
+ * TODO: We could easily change iteration order here without breaking anything
+ **/
+
+/**
+ * Output is a LHS sampling tree
+ * and a RHS sampling tree
+ **/
+void sample_tuple_subtype(jl_datatype_t *dx, jl_value_t *y, jl_stsample_t *lhs, jl_stsample_t *rhs,
+                          jl_varenv_t x_env, jl_varenv_t y_env, jl_stenv2_t *env) {
+    //fprintf(stderr, "\n\nsample_tuple_subtype on\n");
+    //jl_(dx);
+    //jl_(y);
+
+    jl_stsample_index_t i = { 0, 0, 0, 0 };
+    sample_rhs(lhs, rhs, &i, dx, y, x_env, y_env, env);
+}
+
+bool lhs_covered(jl_stsample_t *lhs) {
+    uint16_t n_dims = lhs->n_dims;
+    uint16_t bvec_sz = lhs->bvec_sz;
+    uint16_t subtree_sz = lhs->subtree_sz;
+
+    for (int i = 0; i < n_dims; i++) {
+        uint16_t n_bits = lhs->dims[i];
+
+        // Verify that all dimensions were fully sampled
+        for (int b = 0; b < bvec_sz; b++) {
+            int first_zero = __builtin_ffsll(~lhs->subtype[i * bvec_sz + b]);
+            first_zero = (first_zero == 0) ? 64 : first_zero - 1;
+            //fprintf(stderr, "first_zero: %d n_bits: %d\n", first_zero, n_bits);
+            if (first_zero < n_bits)
+                return false;
+            n_bits -= 64;
+        }
+        
+        // Verify that all sub-trees have been fully sampled
+        for (int s = 0; s < subtree_sz; s++) {
+            jl_stsample_t *subtree = lhs->subtrees[i * subtree_sz + s];
+            if (subtree == NULL) 
+                continue;
+                //break; // TODO: fix
+            if (!lhs_covered(subtree))
+                return false;
+        }
+    }
+    return true;
+}
+
+jl_stresult2_t subtype_datatype(jl_value_t *x, jl_value_t *y, jl_varenv_t x_env, jl_varenv_t y_env, jl_stenv2_t *env) {
+
+    /**
+     * TODO for tomorrow:
+     *   I need to make this entry-point accept separate inputs/outputs
+     *   for the LHS tree vs. RHS tree. Either:
+     *     A. Pre-allocate -> Turn all of the pre-measurement functions
+     *        into their recursive versions.
+     *     B. Allocate on-the-fly -> Requires weird behavior where the
+     *        the LHS is allocated by the first RHS sample
+     *
+     *   Then, I need to verify that we have full coverage on our
+     *   "demand" vector.
+     *
+     **/
+    if (!jl_is_datatype(x) || jl_nparams(x) == 0) {
+        // TODO: Proper induction, etc.
+        //       (a.k.a. handling "degenerate" unions)
+        if (jl_is_uniontype(y)) {
+            jl_uniontype_t *uy = (jl_uniontype_t *)y;
+            if (subtype_datatype(x, uy->a, x_env, y_env, env).status == TRUE)
+                return (jl_stresult2_t) { TRUE, {} };
+
+            if (subtype_datatype(x, uy->b, x_env, y_env, env).status == TRUE)
+                return (jl_stresult2_t) { TRUE, {} };
+
+            return (jl_stresult2_t) { FALSE, {} };
+        }
+        /**
+         * Right now I ignore almost everything
+         **/
+        if ((jl_value_t *)x == y)
+            return (jl_stresult2_t) { TRUE, {} };
+        else
+            return (jl_stresult2_t) { FALSE, {} };
+    }
+    jl_datatype_t *dx = (jl_datatype_t *)x;
+
+    //uint16_t n_dims = jl_nparams(dx);
+    //uint16_t n_alts = jl_count_tuples(y);
+
+    //if (n_alts == 1) {
+        //// TODO: Special case - nothing to distribute
+    //}
+
+    //jl_stsample_t *sample = (jl_stsample_t *)linear_alloc(
+            //sizeof(jl_stsample_t), alignof(jl_stsample_t), env->alloc);
+
+    //sample->n_alts = n_alts;
+    //sample->n_dims = n_dims;
+    //sample->dims = (uint16_t *)linear_alloc(
+            //n_dims * sizeof(uint16_t), alignof(uint16_t), env->alloc);
+
+    //uint16_t max_dim = 0;
+    //size_t subtree_sz = 0;
+    //for (int i=0; i < n_dims; i++) {
+        //sample->dims[i] = jl_count_nontuples(jl_tparam(dx, i));
+        //if (sample->dims[i] > max_dim)
+            //max_dim = sample->dims[i];
+
+        //size_t subtrees = jl_count_tuples(jl_tparam(dx, i));
+        //if (subtrees > subtree_sz)
+            //subtree_sz = subtrees;
+    //}
+
+    //uint16_t bvec_sz = (max_dim + 63) / 64;
+    //sample->bvec_sz = bvec_sz;
+    //sample->subtree_sz = subtree_sz;
+
+    /**
+     * Allocate and zero bit-vectors
+     **/
+
+    //sample->subtype = (uint64_t *)linear_alloc(
+            //n_alts * n_dims * bvec_sz * sizeof(uint64_t), alignof(uint64_t), env->alloc);
+    //memset(sample->subtype, 0,
+            //n_alts * n_dims * bvec_sz * sizeof(uint64_t));
+
+    //sample->indeterminate = (uint64_t *)linear_alloc(
+            //n_alts * n_dims * bvec_sz * sizeof(uint64_t), alignof(uint64_t), env->alloc);
+    //memset(sample->indeterminate, 0,
+            //n_alts * n_dims * bvec_sz * sizeof(uint64_t));
+
+    /**
+     * Allocate and zero our obligation chains
+     **/
+
+    //sample->obligations = (jl_stobligation2_t **)linear_alloc(
+            //n_alts * n_dims * sizeof(jl_stobligation2_t *), alignof(jl_stobligation2_t *), env->alloc);
+    //memset(sample->obligations, 0,
+            //n_alts * n_dims * sizeof(jl_stobligation2_t *));
+
+    /**
+     * Great, time to sample
+     **/
+
+    jl_stsample_t *lhs = (jl_stsample_t *)linear_alloc(
+            sizeof(jl_stsample_t), alignof(jl_stsample_t), env->alloc);
+    jl_stsample_t *rhs = (jl_stsample_t *)linear_alloc(
+            sizeof(jl_stsample_t), alignof(jl_stsample_t), env->alloc);
+
+    allocate_sample_tree(lhs, dx, NULL, env); 
+    allocate_sample_tree(rhs, dx, y, env); 
+
+    sample_tuple_subtype(dx, y, lhs, rhs, x_env, y_env, env);
+
+    // Fast path:
+    //   Check that LHS was covered separably
+    if (!lhs_covered(lhs))
+        return (jl_stresult2_t) { FALSE, {} };
+
+    // TODO: Volume fast path
+    // TODO: Free allocations if proving non-result early
+
+    /**
+     * TODO: This now needs to stitch together the lhs and rhs
+     **/
+
+    return (jl_stresult2_t) {
+        INDETERMINATE, (jl_stobligation2_t) { lhs, rhs, NULL } };
+
+
+    /**
+     * Okay, no eager flattening. We will traverse over-and-over.
+     *
+     * I need to know:
+     *   (a) # of outside RHS unions (alternatives)
+     *       -> these solutions will end up in a vector
+     *   (b) # of inside LHS unions (for tuples only)
+     *   (c) store "volumes" as we go along (again, for tuples only)
+     *
+     *  We will store this as
+     *
+     *  struct {
+     *      uint64_t free_bitmasks[computed_bitmask_len(dims, n)];
+     *      uint64_t conditional_bitmasks[computed_bitmask_len(dims, n)];
+     *      jl_value_t **bounds;
+     *  } alts[k];
+     * 
+     * We:
+     *   1. Scan LHS to get n_dims and dims - Fill in header
+     *   2. Scan RHS and get k - allocate space for bitmasks
+     *   3. Sample RHS against LHS
+     *       -> Within each RHS, for evidence do we want to scan ahead and over-alloc OR not?
+     *           i. If we scan ahead 
+     **/
+
+/**
+ * UNION node
+ *
+ *   0. number of RHS alternatives
+ *   1. sizes/dimensions of each part of cube
+ *   2. bitmasks for evidence-free components
+ *   3. bitmasks for evidence-based components
+ *   4. evidence for evidence-based components
+ *
+ *    - (0) -> (1) -> (2 & 3) -> (4)
+ *
+ *
+ *  Which makes this fairly efficient for the common case that
+ *  our hyper-cube is evidence-free.
+ *
+ *  One potential optimization is to skip the conditional bitmasks if
+ *  we are completely evidence-free.
+ *  
+ **/
+
+    /**
+     * Okay, either I flatten into a temporary stack-like buffer
+     *   or I build a bit-vector to iterate
+     *   or we count before-hand and then just let our stack do
+     *   the bit-vectoring for us.
+     **/
+}
 
 /**
  * Let's start planning our "tree":
@@ -502,10 +1709,10 @@ jl_stresult_t merge_results(jl_stresult_t a, jl_stresult_t b) {
     if (a.result == TRUE) return b;
     if (b.result == TRUE) return a;
     
-    //fprintf(stderr, "MERGING\n");
+    //stfprintf(stderr, "MERGING\n");
     //jl_(a.condition.required);
     //jl_(b.condition.required);
-    //fprintf(stderr, "\n");
+    //st_fprintf(stderr, "\n");
 
     /*assert(a.result == INDETERMINATE);*/
     /*assert(b.result == INDETERMINATE);*/
@@ -644,10 +1851,10 @@ jl_stresult_t merge_results(jl_stresult_t a, jl_stresult_t b) {
                     }
                     if (result.result == FALSE) {
                         print_indent();
-                        fprintf(stderr, "Failed during merging.\n"); 
+                        st_fprintf(stderr, "Failed during merging.\n"); 
                         jl_(a.condition.required);
                         jl_(b.condition.required);
-                        //fprintf(stderr, "FAILED: :(<:)(\n");
+                        //st_fprintf(stderr, "FAILED: :(<:)(\n");
                         //jl_(a_data[i]->bound);
                         //jl_(b_data[j]->bound);
                         JL_GC_POP();
@@ -716,12 +1923,12 @@ jl_stresult_t merge_AND_results(jl_stresult_t a, jl_stresult_t b) {
 JL_DLLEXPORT jl_stresult_t jl_simple_subtype_env(jl_value_t *x, jl_value_t *y, jl_varenv_t x_env, jl_varenv_t y_env, jl_stenv_t *env) {
     indent += 2;
     print_indent();
-    fprintf(stderr, "subtyping simply for (equal: %d):\n", x == y);
+    st_fprintf(stderr, "subtyping simply for (equal: %d):\n", x == y);
     print_indent();
     jl_(x);
     print_indent();
     jl_(y);
-    fprintf(stderr, "\n");
+    st_fprintf(stderr, "\n");
 
     if ((x == y) && !(jl_typeis(x, jl_tvar_type) && jl_typeis(y, jl_tvar_type))) {
         indent -= 2;
@@ -751,15 +1958,14 @@ JL_DLLEXPORT jl_stresult_t jl_simple_subtype_env(jl_value_t *x, jl_value_t *y, j
      * TODO: For variables declared *within* an invariant section,
      *       we should be able to make them all \forall variables right?
      **/
-    int8_t tvar_R = 0;
-    if (jl_typeis(x, jl_tvar_type) && jl_typeis(y, jl_tvar_type)) {
+    //if (jl_typeis(x, jl_tvar_type) && jl_typeis(y, jl_tvar_type)) {
         /**
          * TODO: Re-factor to make smaller
          **/
-        jl_varbinding_t *x_vb = lookup(x_env.vars, (jl_tvar_t *)x);
-        jl_varbinding_t *y_vb = lookup(y_env.vars, (jl_tvar_t *)y);
+        //jl_varbinding_t *x_vb = lookup(x_env.vars, (jl_tvar_t *)x);
+        //jl_varbinding_t *y_vb = lookup(y_env.vars, (jl_tvar_t *)y);
 
-        if (x_vb && y_vb) {
+        //if (x_vb && y_vb) {
             /**
              * TODO: Think about outside-ness very carefully, *and* the way we
              *       introduce type-vars multiple different ways.
@@ -768,21 +1974,21 @@ JL_DLLEXPORT jl_stresult_t jl_simple_subtype_env(jl_value_t *x, jl_value_t *y, j
              * always RIGID-ly, as long as didn't match them against any
              * FLEXIBLE typevars. Why did that work?
              **/
-            //fprintf(stderr, "Checking for outside-ness (x=%s (%p) depth=%d RIGID=%d) (y=%s (%p) depth=%d RIGID=%d)\n",
-                            //(const char*)jl_symbol_name(x_vb->var->name), x_vb, x_vb->inv_depth, x_vb->kind == RIGID,
-                            //(const char*)jl_symbol_name(y_vb->var->name), y_vb, y_vb->inv_depth, y_vb->kind == RIGID
-                            //);
-        }
-        if (x_vb == y_vb) {
-            indent -= 2;
-            return (jl_stresult_t) { TRUE, {} };
-        }
+            ////st_fprintf(stderr, "Checking for outside-ness (x=%s (%p) depth=%d RIGID=%d) (y=%s (%p) depth=%d RIGID=%d)\n",
+                            ////(const char*)jl_symbol_name(x_vb->var->name), x_vb, x_vb->inv_depth, x_vb->kind == RIGID,
+                            ////(const char*)jl_symbol_name(y_vb->var->name), y_vb, y_vb->inv_depth, y_vb->kind == RIGID
+                            ////);
+        //}
+        //if (x_vb == y_vb) {
+            //indent -= 2;
+            //return (jl_stresult_t) { TRUE, {} };
+        //}
 
         /**
          * TODO: Re-factor
          **/
-        if ((y_vb != NULL) && (y_vb->kind == FLEXIBLE))
-            tvar_R = 1;
+        //if ((y_vb != NULL) && (y_vb->kind == FLEXIBLE))
+            //tvar_R = 1;
 
         /*
          * So "outside-ness" is a function of FLEXIBLE being outside of RIGID
@@ -831,44 +2037,44 @@ JL_DLLEXPORT jl_stresult_t jl_simple_subtype_env(jl_value_t *x, jl_value_t *y, j
         //}
 
 
-        if (x_vb && y_vb &&
-             ((x_vb->kind == FLEXIBLE) && (y_vb->kind == RIGID) && (x_vb->inv_depth < y_vb->inv_depth))) {
+        //if (x_vb && y_vb &&
+             //((x_vb->kind == FLEXIBLE) && (y_vb->kind == RIGID) && (x_vb->inv_depth < y_vb->inv_depth))) {
 
-            //fprintf(stderr, "Outside-ness detected\n");
+            ////st_fprintf(stderr, "Outside-ness detected\n");
 
-            _Alignas(max_align_t) char buffer[4096];
-            jl_linear_alloc_t alloc;
-            linear_alloc_init(buffer, sizeof(buffer), &alloc);
+            //_Alignas(max_align_t) char buffer[4096];
+            //jl_linear_alloc_t alloc;
+            //linear_alloc_init(buffer, sizeof(buffer), &alloc);
 
-            // -1 to disable all covariant early-exits
-            //  TODO: I'm rather dissatisfied with this. It seems
-            //        like it should be possible to match a covariant
-            //        variable against an invariant RHS variable, in
-            //        which case this will be incorrect (but
-            //        only if T has a meaningful LB)
-            //
-            //  It *also* seems like this will be straight up wrong
-            //  for any newly-introduced typevars
-            jl_stenv_t env = { 1000, 0, &alloc };
+            //// -1 to disable all covariant early-exits
+            ////  TODO: I'm rather dissatisfied with this. It seems
+            ////        like it should be possible to match a covariant
+            ////        variable against an invariant RHS variable, in
+            ////        which case this will be incorrect (but
+            ////        only if T has a meaningful LB)
+            ////
+            ////  It *also* seems like this will be straight up wrong
+            ////  for any newly-introduced typevars
+            //jl_stenv_t env = { 1000, 0, &alloc };
 
-            size_t old_sz = env.alloc->sz;
-            jl_stresult_t result;
-            //if (x_vb->kind == RIGID)
-                //result = jl_simple_subtype_env(x_vb->var->ub, x_vb->var->lb, x_env, x_env, &env);
-            //else
-            result = jl_simple_subtype_env(y_vb->var->ub, y_vb->var->lb, y_env, y_env, &env);
+            //size_t old_sz = env.alloc->sz;
+            //jl_stresult_t result;
+            ////if (x_vb->kind == RIGID)
+                ////result = jl_simple_subtype_env(x_vb->var->ub, x_vb->var->lb, x_env, x_env, &env);
+            ////else
+            //result = jl_simple_subtype_env(y_vb->var->ub, y_vb->var->lb, y_env, y_env, &env);
 
-            if (result.result == FALSE) {
-                indent -= 2;
-                return result;
-            }
+            //if (result.result == FALSE) {
+                //indent -= 2;
+                //return result;
+            //}
             
-            //fprintf(stderr, "LHS variable is constant, no problem.\n");
+            ////st_fprintf(stderr, "LHS variable is constant, no problem.\n");
 
-            if (result.result == INDETERMINATE) {
-                jl_errorf("Unexpected indeterminate result.");
-            }
-        }
+            //if (result.result == INDETERMINATE) {
+                //jl_errorf("Unexpected indeterminate result.");
+            //}
+        //}
 
         /**
          * Now, right down here I want to handle the RIGID/FLEXIBLE case?
@@ -892,17 +2098,17 @@ JL_DLLEXPORT jl_stresult_t jl_simple_subtype_env(jl_value_t *x, jl_value_t *y, j
          *
          **/
 
-        if (x_vb->inv_depth < y_vb->inv_depth) {
+        //if (x_vb->inv_depth < y_vb->inv_depth) {
             /**
              * TODO: Think about flexibility here.
              **/
 
-            // Ok, I'm officially fried and making no progress.
-            // Let's grab some food and go home, and then pick this up again.
-            //
-            // I think we need to get this working and then think really
-            // carefully about our inductive assumptions, flexibility, etc.
-            //
+            //// Ok, I'm officially fried and making no progress.
+            //// Let's grab some food and go home, and then pick this up again.
+            ////
+            //// I think we need to get this working and then think really
+            //// carefully about our inductive assumptions, flexibility, etc.
+            ////
 
             /**
              * TODO: Does this return indeterminate?
@@ -917,31 +2123,21 @@ JL_DLLEXPORT jl_stresult_t jl_simple_subtype_env(jl_value_t *x, jl_value_t *y, j
              *       subtyping calls
              **/
 
-            //jl_simple_subtype_env(x, tv->lb, x_env, y_env, env);
-        }
+            ////jl_simple_subtype_env(x, tv->lb, x_env, y_env, env);
+        //}
 
         /**
          * TODO: Implement the whole thing here to prevent redundant lookups
          **/
 
-    } else if (jl_typeis(x, jl_tvar_type) || jl_typeis(y, jl_tvar_type)) {
+    //} else if (jl_typeis(x, jl_tvar_type) || jl_typeis(y, jl_tvar_type)) {
         /**
          * TODO: Re-factor
          **/
-        tvar_R = jl_typeis(y, jl_tvar_type);
-    }
+    //}
 
     if (jl_typeis(x, jl_tvar_type) || jl_typeis(y, jl_tvar_type)) {
-        // Prefer resolving FLEXIBLE variables *first*
-        //   (TODO: I don't think this definition is strictly correct)
-        //
-        // TODO: I need to add the R_L rule here, which will handle this correctly
-        //       (along with \forall-exists)
-        //
-        
-        /**
-         * TODO: This rule is wrong
-         **/
+        int8_t tvar_R = jl_typeis(y, jl_tvar_type);
         jl_tvar_t *tv = (jl_tvar_t *)(tvar_R ? y : x);
         jl_varbinding_t *vb;
         if (tvar_R) {
@@ -949,14 +2145,14 @@ JL_DLLEXPORT jl_stresult_t jl_simple_subtype_env(jl_value_t *x, jl_value_t *y, j
         } else {
             vb = lookup(x_env.vars, (jl_tvar_t *)x);
         }
-        //fprintf(stderr, "Checking against typevar: RIGID? %d", vb->kind == RIGID); 
+        //st_fprintf(stderr, "Checking against typevar: RIGID? %d", vb->kind == RIGID); 
         jl_varkind_t kind = vb ? vb->kind : RIGID; //(R ? y_kind : x_kind); // TODO: RIGID when NULL?
         if (vb == NULL) {
             /**
              * This case is minimally covered, with just 1 test case.
              * (when x is RIGID)
              **/
-            //fprintf(stderr, "null example %d %d (RIGID: %d)\n", y_kind, x_kind, kind == RIGID);
+            //st_fprintf(stderr, "null example %d %d (RIGID: %d)\n", y_kind, x_kind, kind == RIGID);
             //jl_(tv);
         }
 
@@ -964,16 +2160,8 @@ JL_DLLEXPORT jl_stresult_t jl_simple_subtype_env(jl_value_t *x, jl_value_t *y, j
          * RIGID variables always act like their bounds
          **/
         if (kind == RIGID) {
-            //fprintf(stderr, "Handling RIGID typevar!\n");
+            //st_fprintf(stderr, "Handling RIGID typevar!\n");
             if (tvar_R) {
-                if ((vb != NULL) && (vb->inv_depth >= env->inv_depth)) {
-                    // TODO: Why do we need this, when the paper's rules do not?
-                    // TODO: Remove
-                    fprintf(stderr, "Covariant position early-exit (%d >= %d)\n", vb->inv_depth, env->inv_depth);
-                    indent -= 2;
-                    return (jl_stresult_t) { TRUE, (jl_stobligation_t) { NULL, NULL } };
-                }
-
                 indent -= 2;
                 return jl_simple_subtype_env(x, tv->lb, x_env, y_env, env);
             } else {
@@ -981,6 +2169,7 @@ JL_DLLEXPORT jl_stresult_t jl_simple_subtype_env(jl_value_t *x, jl_value_t *y, j
                 return jl_simple_subtype_env(tv->ub, y, x_env, y_env, env);
             }
         } else if (kind == FLEXIBLE) {
+            //jl_errorf("We're not ready for FLEXIBLE typevars");
             /**
              * TODO: It's probably not worth adding a bound
              *       when the bound you're supplementing is already tighter
@@ -992,7 +2181,7 @@ JL_DLLEXPORT jl_stresult_t jl_simple_subtype_env(jl_value_t *x, jl_value_t *y, j
              *
              *       e.g. where a variable is used exactly once
              **/
-            //fprintf(stderr, "Handling EXISTENTIAL typevar!\n");
+            //st_fprintf(stderr, "Handling EXISTENTIAL typevar!\n");
             // TODO: We hit this branch way more often than we should have to
             //       for something as simple as Tuple{Ref{Number}, Int32} <: Tuple{Ref{T}, T} where T
 
@@ -1330,7 +2519,7 @@ JL_DLLEXPORT jl_stresult_t jl_simple_subtype_env(jl_value_t *x, jl_value_t *y, j
              *     drop them when we drop them for TRUE/FALSE
              **/
         } else {
-            //fprintf(stderr, "*not* popping %zu bytes\n", env->alloc->sz - prev_alloc_sz);
+            //st_fprintf(stderr, "*not* popping %zu bytes\n", env->alloc->sz - prev_alloc_sz);
         }
 
         // TODO: Maybe "try" to close scope here?
@@ -1378,7 +2567,7 @@ JL_DLLEXPORT jl_stresult_t jl_simple_subtype_env(jl_value_t *x, jl_value_t *y, j
             jl_value_t *xi = jl_tparam(dx, i);
             jl_value_t *yi = jl_tparam(dy, i);
 
-            //fprintf(stderr, "checking component %d\n", i);
+            //st_fprintf(stderr, "checking component %d\n", i);
             //jl_(xi);
             //jl_(yi);
             if (jl_is_tuple_type(dx)) {
@@ -1421,10 +2610,10 @@ JL_DLLEXPORT jl_stresult_t jl_simple_subtype_env(jl_value_t *x, jl_value_t *y, j
             if (result.result == FALSE)
                 break;
 
-            //fprintf(stderr, "env after (%zu, <:):\n", i);
+            //st_fprintf(stderr, "env after (%zu, <:):\n", i);
             //jl_(result.condition.required);
-            //fprintf(stderr, "\n\n");
-            //fprintf(stderr, "backwards check for component %d\n", i);
+            //st_fprintf(stderr, "\n\n");
+            //st_fprintf(stderr, "backwards check for component %d\n", i);
 
             //jl_kind_t old_y_kind = y_env.kind;
             //jl_kind_t old_x_kind = x_env.kind;
@@ -1432,9 +2621,9 @@ JL_DLLEXPORT jl_stresult_t jl_simple_subtype_env(jl_value_t *x, jl_value_t *y, j
             //x_env.kind = RIGID;
 
 
-            //fprintf(stderr, "env after (%zu, >:):\n", i);
+            //st_fprintf(stderr, "env after (%zu, >:):\n", i);
             //jl_(result.condition.required);
-            //fprintf(stderr, "\n\n");
+            //st_fprintf(stderr, "\n\n");
 
             // TODO: forall_exists_equal is an optimization the main
             //       algorithm has (i.e. equality)
@@ -1493,7 +2682,7 @@ JL_DLLEXPORT int jl_simple_subtype(jl_value_t *x, jl_value_t *y) {
     }
 
     if (res.result == INDETERMINATE) {
-        fprintf(stderr, "ALERT: Verification needed for choice-tree\n");
+        st_fprintf(stderr, "ALERT: Verification needed for choice-tree\n");
         jl_(res.condition.choice_tree);
     }
 

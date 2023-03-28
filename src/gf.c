@@ -1184,7 +1184,7 @@ static jl_method_instance_t *cache_method(
         // although for some cases, (notably Varargs)
         // we might choose a replacement type that's preferable but not strictly better
         int issubty;
-        temp = jl_type_intersection_env_s(temp2, (jl_value_t*)definition->sig, &newparams, &issubty);
+        temp = jl_type_intersection_env_s(temp2, (jl_value_t*)definition->sig, &newparams, &issubty, 0);
         assert(temp != (jl_value_t*)jl_bottom_type); (void)temp;
         if (jl_egal((jl_value_t*)newparams, (jl_value_t*)sparams)) {
             cache_with_orig = !issubty;
@@ -1382,6 +1382,9 @@ struct matches_env {
 };
 static int get_intersect_visitor(jl_typemap_entry_t *oldentry, struct typemap_intersection_env *closure0)
 {
+    /**
+     * We don't inspect the match at all!?
+     **/
     struct matches_env *closure = container_of(closure0, struct matches_env, match);
     if (oldentry == closure->newentry)
         return 1;
@@ -1410,7 +1413,7 @@ static jl_value_t *get_intersect_matches(jl_typemap_t *defs, jl_typemap_entry_t 
             va = NULL;
     }
     struct matches_env env = {{get_intersect_visitor, (jl_value_t*)type, va,
-            /* .ti = */ NULL, /* .env = */ jl_emptysvec, /* .issubty = */ 0},
+          /* emptiness_only */ 1,  /* .ti = */ NULL, /* .env = */ jl_emptysvec, /* .issubty = */ 0},
         /* .newentry = */ newentry, /* .shadowed */ NULL};
     JL_GC_PUSH3(&env.match.env, &env.match.ti, &env.shadowed);
     jl_typemap_intersection_visitor(defs, 0, &env.match);
@@ -1794,7 +1797,7 @@ static int jl_type_intersection2(jl_value_t *t1, jl_value_t *t2, jl_value_t **is
 {
     *isect2 = NULL;
     int is_subty = 0;
-    *isect = jl_type_intersection_env_s(t1, t2, NULL, &is_subty);
+    *isect = jl_type_intersection_env_s(t1, t2, NULL, &is_subty, 0);
     if (*isect == jl_bottom_type)
         return 0;
     if (is_subty)
@@ -3087,6 +3090,9 @@ static jl_method_match_t *make_method_match(jl_tupletype_t *spec_types, jl_svec_
     return match;
 }
 
+/**
+ * Ah, okay. ml_matches _does_ use the intersected type
+ **/
 static int ml_matches_visitor(jl_typemap_entry_t *ml, struct typemap_intersection_env *closure0)
 {
     struct ml_matches_env *closure = container_of(closure0, struct ml_matches_env, match);
@@ -3164,7 +3170,7 @@ static jl_value_t *ml_matches(jl_methtable_t *mt,
             va = NULL;
     }
     struct ml_matches_env env = {{ml_matches_visitor, (jl_value_t*)type, va,
-            /* .ti = */ NULL, /* .env = */ jl_emptysvec, /* .issubty = */ 0},
+            /* .emptiness_only = */ 0, /* .ti = */ NULL, /* .env = */ jl_emptysvec, /* .issubty = */ 0},
         intersections, world, lim, /* .t = */ jl_an_empty_vec_any,
         /* .min_valid = */ *min_valid, /* .max_valid = */ *max_valid, /* .matc = */ NULL};
     struct jl_typemap_assoc search = {(jl_value_t*)type, world, jl_emptysvec, 1, ~(size_t)0};

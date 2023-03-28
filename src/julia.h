@@ -552,6 +552,11 @@ typedef struct _jl_datatype_t {
     uint16_t isprimitivetype:1; // whether this is declared with 'primitive type' keyword (sized, no fields, and immutable)
     uint16_t ismutationfree:1; // whether any mutable memory is reachable through this type (in the type or via fields)
     uint16_t isidentityfree:1; // whether this type or any object reachable through its fields has non-content-based identity
+
+    // TODO: Why must this go... last?
+    //       Maybe a bit-field weirdness?
+    // TODO: rename to subtype_depth, supertype_height, or similar
+    int16_t super_depth;       // depth from Any
 } jl_datatype_t;
 
 typedef struct _jl_vararg_t {
