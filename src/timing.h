@@ -34,6 +34,7 @@ void jl_timing_block_stop(jl_timing_block_t *cur_block);
 //
 // If larger than IOS_INLSIZE (~80 characters), text is truncated.
 void jl_timing_show(jl_value_t *v, jl_timing_block_t *cur_block);
+void jl_timing_show_func_sig(jl_value_t *v, jl_timing_block_t *cur_block);
 
 // TODO: Replace this with an atomic API
 uint64_t jl_timing_get_enable_mask(void);
@@ -142,6 +143,8 @@ STATIC_INLINE uint64_t _jl_timing_block_init(jl_timing_block_t *block, int owner
     _jl_timing_block_start(block, t);
     return t;
 }
+
+// TODO: Add macro to get context from timing_stack
 
 STATIC_INLINE void _jl_timing_block_ctor(jl_timing_block_t *block, int owner) JL_NOTSAFEPOINT {
     uint64_t t = _jl_timing_block_init(block, owner);

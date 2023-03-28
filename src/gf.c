@@ -316,7 +316,13 @@ jl_code_info_t *jl_type_infer(jl_method_instance_t *mi, size_t world, int force)
 {
     JL_TIMING(INFERENCE);
 #ifdef USE_TRACY
-    jl_timing_show(mi->specTypes, JL_TIMING_CURRENT_BLOCK);
+    jl_timing_show_func_sig(mi->specTypes, JL_TIMING_CURRENT_BLOCK);
+    ios_t buf;
+    ios_mem(&buf, IOS_INLSIZE);
+    buf.growable = 0; // Restrict to inline buffer to avoid allocation
+
+    jl_printf((JL_STREAM*)&buf, "%s:%d in %s", basename(jl_symbol_name(mi->def.method->file)), mi->def.method->line, jl_symbol_name(mi->def.method->module->name));
+    TracyCZoneText(*(JL_TIMING_CURRENT_BLOCK->tracy_ctx), buf.buf, buf.size);
 #endif
     if (jl_typeinf_func == NULL)
         return NULL;

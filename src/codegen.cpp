@@ -8423,8 +8423,8 @@ jl_llvm_functions_t jl_emit_code(
 {
     JL_TIMING(CODEGEN);
 #ifdef USE_TRACY
-    jl_timing_show((jl_value_t *)li->specTypes,
-                   JL_TIMING_CURRENT_BLOCK);
+    jl_timing_show_func_sig((jl_value_t *)li->specTypes,
+                            JL_TIMING_CURRENT_BLOCK);
 #endif
     // caller must hold codegen_lock
     jl_llvm_functions_t decls = {};
@@ -8469,8 +8469,17 @@ jl_llvm_functions_t jl_emit_codeinst(
 {
     JL_TIMING(CODEGEN);
 #ifdef USE_TRACY
-    jl_timing_show((jl_value_t *)codeinst->def->specTypes,
-                   JL_TIMING_CURRENT_BLOCK);
+    jl_timing_show_func_sig((jl_value_t *)codeinst->def->specTypes,
+                            JL_TIMING_CURRENT_BLOCK);
+
+    ios_t buf;
+    ios_mem(&buf, IOS_INLSIZE);
+    buf.growable = 0; // Restrict to inline buffer to avoid allocation
+
+    jl_method_instance_t *mi = codeinst->def;
+
+    jl_printf((JL_STREAM*)&buf, "%s:%d in %s", basename(jl_symbol_name(mi->def.method->file)), mi->def.method->line, jl_symbol_name(mi->def.method->module->name));
+    TracyCZoneText(*(JL_TIMING_CURRENT_BLOCK->tracy_ctx), buf.buf, buf.size);
 #endif
     JL_GC_PUSH1(&src);
     if (!src) {

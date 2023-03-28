@@ -18,7 +18,23 @@ extern "C" {
 #endif
 
 static uint64_t t0;
-JL_DLLEXPORT uint64_t jl_timing_enable_mask = 0xFFFFFFFFFFFFFFFE;
+#ifdef USE_TRACY
+/**
+ * These sources often generate millions of events / minute. Although Tracy
+ * can keep up with that just fine, those events also bloat the saved ".tracy"
+ * files, so we disable them by default.
+ **/
+JL_DLLEXPORT uint64_t jl_timing_enable_mask = 0xFFFFFFFFFFFFFFFF &
+                                              ~(1ull << JL_TIMING_ROOT) &
+                                              ~(1ull << JL_TIMING_TYPE_CACHE_LOOKUP) &
+                                              ~(1ull << JL_TIMING_METHOD_MATCH) &
+                                              ~(1ull << JL_TIMING_METHOD_LOOKUP_FAST) &
+                                              ~(1ull << JL_TIMING_AST_COMPRESS) &
+                                              ~(1ull << JL_TIMING_AST_UNCOMPRESS);
+#else
+JL_DLLEXPORT uint64_t jl_timing_enable_mask = 0xFFFFFFFFFFFFFFFF;
+#endif
+
 JL_DLLEXPORT uint64_t jl_timing_data[(int)JL_TIMING_LAST] = {0};
 const char *jl_timing_names[(int)JL_TIMING_LAST] =
     {
@@ -80,6 +96,20 @@ JL_DLLEXPORT void jl_timing_show(jl_value_t *v, jl_timing_block_t *cur_block) {
     buf.growable = 0; // Restrict to inline buffer to avoid allocation
 
     jl_static_show((JL_STREAM*)&buf, v);
+    if (buf.size == buf.maxsize)
+        memset(&buf.buf[IOS_INLSIZE - 3], '.', 3);
+
+    TracyCZoneText(*(cur_block->tracy_ctx), buf.buf, buf.size);
+#endif
+}
+
+JL_DLLEXPORT void jl_timing_show_func_sig(jl_value_t *v, jl_timing_block_t *cur_block) {
+#ifdef USE_TRACY
+    ios_t buf;
+    ios_mem(&buf, IOS_INLSIZE);
+    buf.growable = 0; // Restrict to inline buffer to avoid allocation
+
+    jl_static_show_func_sig((JL_STREAM*)&buf, v);
     if (buf.size == buf.maxsize)
         memset(&buf.buf[IOS_INLSIZE - 3], '.', 3);
 

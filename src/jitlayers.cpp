@@ -251,7 +251,7 @@ static jl_callptr_t _jl_compile_codeinst(
     for (auto &def : emitted) {
         jl_code_instance_t *this_code = def.first;
 #ifdef USE_TRACY
-        jl_timing_show(this_code->def->specTypes, JL_TIMING_CURRENT_BLOCK);
+        jl_timing_show_func_sig(this_code->def->specTypes, JL_TIMING_CURRENT_BLOCK);
 #endif
         jl_llvm_functions_t decls = std::get<1>(def.second);
         jl_callptr_t addr;

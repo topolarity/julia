@@ -1096,12 +1096,20 @@ JL_DLLEXPORT jl_task_t *jl_new_task(jl_function_t *start, jl_value_t *completion
 
     // 16 characters in "Task 65535 (\"\")\0";
     static uint16_t task_id = 1;
-    size_t fiber_name_len = strlen(start_name) + 16;
 
     // XXX: Tracy uses this as a handle internally and requires that this
     // string live forever, so this allocation is intentionally leaked.
-    char *fiber_name = (char *)malloc(fiber_name_len);
-    snprintf(fiber_name, fiber_name_len,  "Task %d (\"%s\")", task_id++, start_name);
+    char *fiber_name;
+    if (start_name[0] == '#') {
+        jl_method_instance_t *mi = jl_method_lookup(&t->start, 1, jl_get_world_counter());
+        size_t fiber_name_len = strlen(jl_symbol_name(mi->def.method->file)) + 21;
+        fiber_name = (char *)malloc(fiber_name_len);
+        snprintf(fiber_name, fiber_name_len,  "Task %d (%s:%d)", task_id++, jl_symbol_name(mi->def.method->file), mi->def.method->line);
+    } else {
+        size_t fiber_name_len = strlen(start_name) + 16;
+        fiber_name = (char *)malloc(fiber_name_len);
+        snprintf(fiber_name, fiber_name_len,  "Task %d (\"%s\")", task_id++, start_name);
+    }
 
     t->name = fiber_name;
 #endif
@@ -1275,8 +1283,7 @@ CFI_NORETURN
                 ptls->defer_signal = 0;
                 jl_sigint_safepoint(ptls);
             }
-            // TODO: Re-enable
-            //JL_TIMING(ROOT);
+            JL_TIMING(ROOT);
             res = jl_apply(&ct->start, 1);
         }
         JL_CATCH {
