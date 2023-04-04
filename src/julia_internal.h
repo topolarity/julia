@@ -1678,6 +1678,10 @@ JL_DLLEXPORT uint32_t jl_crc32c(uint32_t crc, const char *buf, size_t len);
 //        JL_PROBE_GC_STOP_THE_WORLD();
 
 #else
+/**
+ * TODO: Add an implementation switch here
+ **/
+
 // define a dummy version of the probe functions
 #define JL_PROBE_GC_BEGIN(collection) do ; while (0)
 #define JL_PROBE_GC_STOP_THE_WORLD() do ; while (0)

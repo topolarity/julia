@@ -156,6 +156,8 @@ typedef struct {
     arraylist_t *remset;
     arraylist_t *last_remset;
 
+    //const char *name;
+
     // variables for allocating objects from pools
 #ifdef _P64
 #  define JL_GC_N_POOLS 49

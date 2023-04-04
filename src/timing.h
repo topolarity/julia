@@ -34,6 +34,8 @@ void jl_timing_block_stop(jl_timing_block_t *cur_block);
 //
 // If larger than IOS_INLSIZE (~80 characters), text is truncated.
 void jl_timing_show(jl_value_t *v, jl_timing_block_t *cur_block);
+void jl_timing_show_filename(const char *path, jl_timing_block_t *cur_block);
+void jl_timing_show_method_instance(jl_method_instance_t *mi, jl_timing_block_t *cur_block);
 void jl_timing_show_func_sig(jl_value_t *v, jl_timing_block_t *cur_block);
 
 // TODO: Replace this with an atomic API

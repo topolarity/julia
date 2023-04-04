@@ -89,6 +89,12 @@ void jl_timing_block_stop(jl_timing_block_t *cur_block)
     _jl_timing_block_stop(cur_block, cycleclock());
 }
 
+static inline const char *gnu_basename(const char *path)
+{
+    char *base = strrchr(path, '/');
+    return base ? base+1 : path;
+}
+
 JL_DLLEXPORT void jl_timing_show(jl_value_t *v, jl_timing_block_t *cur_block) {
 #ifdef USE_TRACY
     ios_t buf;
@@ -99,6 +105,29 @@ JL_DLLEXPORT void jl_timing_show(jl_value_t *v, jl_timing_block_t *cur_block) {
     if (buf.size == buf.maxsize)
         memset(&buf.buf[IOS_INLSIZE - 3], '.', 3);
 
+    TracyCZoneText(*(cur_block->tracy_ctx), buf.buf, buf.size);
+#endif
+}
+
+JL_DLLEXPORT void jl_timing_show_filename(const char *path, jl_timing_block_t *cur_block) {
+#ifdef USE_TRACY
+    const char *filename = gnu_basename(path);
+    TracyCZoneText(*(cur_block->tracy_ctx), filename, strlen(filename));
+#endif
+}
+
+JL_DLLEXPORT void jl_timing_show_method_instance(jl_method_instance_t *mi, jl_timing_block_t *cur_block) {
+#ifdef USE_TRACY
+    jl_timing_show_func_sig(mi->specTypes, cur_block);
+    ios_t buf;
+    ios_mem(&buf, IOS_INLSIZE);
+    buf.growable = 0; // Restrict to inline buffer to avoid allocation
+
+    jl_method_t *def = mi->def.method;
+    jl_printf((JL_STREAM*)&buf, "%s:%d in %s",
+              gnu_basename(jl_symbol_name(def->file)),
+              def->line,
+              jl_symbol_name(def->module->name));
     TracyCZoneText(*(cur_block->tracy_ctx), buf.buf, buf.size);
 #endif
 }

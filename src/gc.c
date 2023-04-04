@@ -2942,8 +2942,7 @@ static int _jl_gc_collect(jl_ptls_t ptls, jl_gc_collection_t collection)
     combine_thread_gc_counts(&gc_num);
 
 #ifdef USE_TRACY
-    TracyCPlot("Heap size (MB)",
-            ((double)live_bytes + gc_num.allocd) / (1024.0 * 1024.0));
+    TracyCPlot("Heap size", live_bytes + gc_num.allocd);
 #endif
 
     jl_gc_markqueue_t *mq = &ptls->mark_queue;
@@ -2951,6 +2950,7 @@ static int _jl_gc_collect(jl_ptls_t ptls, jl_gc_collection_t collection)
     uint64_t gc_start_time = jl_hrtime();
     int64_t last_perm_scanned_bytes = perm_scanned_bytes;
     JL_PROBE_GC_MARK_BEGIN();
+    TracyCZoneN(gc_mark_timing_ctx, "Mark", 1);
     uint64_t start_mark_time = jl_hrtime();
 
     // 1. fix GC bits of objects in the remset.
@@ -3021,6 +3021,7 @@ static int _jl_gc_collect(jl_ptls_t ptls, jl_gc_collection_t collection)
     mark_reset_age = 0;
 
     JL_PROBE_GC_MARK_END(scanned_bytes, perm_scanned_bytes);
+    TracyCZoneEnd(gc_mark_timing_ctx);
     gc_settime_premark_end();
     gc_time_mark_pause(gc_start_time, scanned_bytes, perm_scanned_bytes);
     uint64_t end_mark_time = jl_hrtime();
@@ -3084,16 +3085,6 @@ static int _jl_gc_collect(jl_ptls_t ptls, jl_gc_collection_t collection)
         }
     }
 
-    // TODO: Color based on sweep type here
-    jl_task_t *ct = jl_current_task;
-    jl_timing_block_t **prevp = &ct->ptls->timing_stack;
-    if (sweep_full) {
-        TracyCZoneColor(*((*prevp)->tracy_ctx), 0xFFA500);
-    //} else {
-        //TracyCZoneColor(*((*prevp)->tracy_ctx), 0x00FF00);
-    }
-
-
     // If the live data outgrows the suggested max_total_memory
     // we keep going with minimum intervals and full gcs until
     // we either free some space or get an OOM error.
@@ -3117,6 +3108,10 @@ static int _jl_gc_collect(jl_ptls_t ptls, jl_gc_collection_t collection)
     scanned_bytes = 0;
     // 6. start sweeping
     uint64_t start_sweep_time = jl_hrtime();
+    // TODO: Enable/disable mask + other stuff
+    TracyCZoneN(gc_sweep_timing_ctx, "Sweep", 1);
+    if (sweep_full)
+        TracyCZoneColor(gc_sweep_timing_ctx, 0xFFA500);
     JL_PROBE_GC_SWEEP_BEGIN(sweep_full);
     sweep_weak_refs();
     sweep_stack_pools();
@@ -3128,6 +3123,7 @@ static int _jl_gc_collect(jl_ptls_t ptls, jl_gc_collection_t collection)
     if (sweep_full)
         gc_sweep_perm_alloc();
     JL_PROBE_GC_SWEEP_END();
+    TracyCZoneEnd(gc_sweep_timing_ctx);
 
     uint64_t gc_end_time = jl_hrtime();
     uint64_t pause = gc_end_time - gc_start_time;
@@ -3183,7 +3179,7 @@ static int _jl_gc_collect(jl_ptls_t ptls, jl_gc_collection_t collection)
     if (collection == JL_GC_AUTO) {
         //If we aren't freeing enough or are seeing lots and lots of pointers let it increase faster
         if(!not_freed_enough || large_frontier) {
-            int64_t tot = 2 * (live_bytes + gc_num.since_sweep) / 3;
+            int64_t tot = 2 * (live_bytes + gc_num.allocd) / 3;
             if (gc_num.interval > tot) {
                 gc_num.interval = tot;
                 last_long_collect_interval = tot;
@@ -3231,6 +3227,13 @@ static int _jl_gc_collect(jl_ptls_t ptls, jl_gc_collection_t collection)
 
 JL_DLLEXPORT void jl_gc_collect(jl_gc_collection_t collection)
 {
+#ifdef USE_TRACY
+    TracyCFiberEnter("GC");
+    fprintf(stderr, "Collect on thread %s", jl_current_task->name);
+#endif
+{
+    // TODO: Fix this.
+    //JL_TIMING(GC);
     JL_PROBE_GC_BEGIN(collection);
 
     jl_task_t *ct = jl_current_task;
@@ -3240,6 +3243,7 @@ JL_DLLEXPORT void jl_gc_collect(jl_gc_collection_t collection)
         jl_atomic_store_relaxed(&ptls->gc_num.allocd, -(int64_t)gc_num.interval);
         static_assert(sizeof(_Atomic(uint64_t)) == sizeof(gc_num.deferred_alloc), "");
         jl_atomic_fetch_add((_Atomic(uint64_t)*)&gc_num.deferred_alloc, localbytes);
+        TracyCFiberEnter(ct->name);
         return;
     }
     jl_gc_debug_print();
@@ -3252,13 +3256,9 @@ JL_DLLEXPORT void jl_gc_collect(jl_gc_collection_t collection)
     if (!jl_safepoint_start_gc()) {
         // Multithread only. See assertion in `safepoint.c`
         jl_gc_state_set(ptls, old_state, JL_GC_STATE_WAITING);
+        TracyCFiberEnter(ct->name);
         return;
     }
-{
-#ifdef USE_TRACY
-    TracyCFiberEnter("GC");
-#endif
-    JL_TIMING(GC);
 
     int last_errno = errno;
 #ifdef _OS_WINDOWS_
@@ -3278,6 +3278,7 @@ JL_DLLEXPORT void jl_gc_collect(jl_gc_collection_t collection)
     gc_all_tls_states = jl_atomic_load_relaxed(&jl_all_tls_states);
     jl_gc_wait_for_the_world(gc_all_tls_states, gc_n_threads);
     JL_PROBE_GC_STOP_THE_WORLD();
+    // TODO: Probe this
 
     uint64_t t1 = jl_hrtime();
     uint64_t duration = t1 - t0;
@@ -3312,7 +3313,9 @@ JL_DLLEXPORT void jl_gc_collect(jl_gc_collection_t collection)
     // Doing this on all threads is racy (it's impossible to check
     // or wait for finalizers on other threads without dead lock).
     if (!ptls->finalizers_inhibited && ptls->locks.len == 0) {
+        TracyCZoneN(gc_run_finalizers_ctx, "Finalizers", 1);
         run_finalizers(ct);
+        TracyCZoneEnd(gc_run_finalizers_ctx);
     }
     JL_PROBE_GC_FINALIZER();
 
@@ -3322,12 +3325,11 @@ JL_DLLEXPORT void jl_gc_collect(jl_gc_collection_t collection)
     SetLastError(last_error);
 #endif
     errno = last_errno;
-} // TODO: Better RAII (maybe use a dummy constructor RAII type)
 #ifdef USE_TRACY
-    TracyCPlot("Heap size (MB)", ((double)jl_gc_live_bytes()) / (1024.0 * 1024.0));
-    //TracyCFiberLeave;
+    TracyCPlot("Heap size", jl_gc_live_bytes());
     TracyCFiberEnter(ct->name);
 #endif
+} // TODO: Better RAII (maybe use a dummy constructor RAII type)
 }
 
 void gc_mark_queue_all_roots(jl_ptls_t ptls, jl_gc_markqueue_t *mq)
@@ -3428,6 +3430,10 @@ void jl_gc_init(void)
 #endif
     if (jl_options.heap_size_hint)
         jl_gc_set_max_memory(jl_options.heap_size_hint);
+
+#ifdef USE_TRACY
+    TracyCPlotConfig("Heap size", TracyPlotFormatMemory, /* rectilinear */ 0, /* fill */ 1, /* color */ 0);
+#endif
 
     t_start = jl_hrtime();
 }
