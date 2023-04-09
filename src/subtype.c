@@ -2012,10 +2012,10 @@ static int simple_subtype_works_rhs(jl_value_t *y, works_check_ctx_t ctx, uint8_
     // Okay, I'd like to allow typevars introduce with an inv_depth > 0
 
     // Note: This is where we allow RHS existentials
-    if (jl_typeis(y, jl_tvar_type) && is_rhs) {
-        // No support for typevars at all yet
-        return 0;
-    }
+    //if (jl_typeis(y, jl_tvar_type) && is_rhs) {
+        //// No support for typevars at all yet
+        //return 0;
+    //}
 
     if (jl_typeis(y, jl_tvar_type)) {
         jl_check_varbinding_t *vb = ctx.vars;
@@ -2093,9 +2093,17 @@ static int simple_subtype_works_rhs(jl_value_t *y, works_check_ctx_t ctx, uint8_
 
 static int simple_subtype_works_os(jl_value_t *t)
 {
-    // We support non-type parameters (including symbols)
-    // We support constructors + Tuples
+    // We support Tuples
     // We support typevars (kind of)
+    
+    if (jl_is_typevar(t))
+        return 0; // no type-vars yet
+
+    if (!jl_is_type(t))
+        return 0; // no non-type parameters (including symbols) yet
+
+    if (jl_is_datatype(t) && jl_is_tuple_type(t))
+        return 0; // no invariant constructor support yet
 
     if (jl_is_type_type(t))
         return 0; // No Type{T} support yet

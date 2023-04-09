@@ -28,8 +28,10 @@ void print_indent() {
  * checks are going to be handled correctly based on:
  *   (1) volume check
  *   (2) separable coverage check (no gaps)
+ *        -> Both handled at top-level, when exiting tuple
  *   (3) total coverage check (best alternative)
  *   (4) zero-volume pruning
+ *        -> Both handled eagerly, by tuple aggregator
  *
  *   My code should try to handle these correctly, rather
  *   than dedicating a tone of extra effort to efficiently
@@ -795,7 +797,7 @@ void flip_dim(uint32_t *inout, uint32_t *patt, size_t sz, size_t *volume) {
 
 int check_coverage(jl_stsample_t *lhs, jl_stsample_t *rhs, jl_stobligation2_t *obligations, jl_stenv2_t *env);
 
-int print_sample_tree(jl_stsample_t *lhs, int indent) {
+static void print_sample_tree(jl_stsample_t *lhs, int indent) {
     uint16_t n_dims = lhs->n_dims;
     uint16_t n_alts = lhs->n_alts;
     uint16_t bvec_sz = lhs->bvec_sz;
@@ -805,7 +807,7 @@ int print_sample_tree(jl_stsample_t *lhs, int indent) {
         fprintf(stderr, "alt %d:\n", a);
         for (int d = 0; d < n_dims; d++) {
             fprintf(stderr, "%*s", indent, "");
-            fprintf(stderr, "  dim %d: ", d);
+            fprintf(stderr, "  dim %d (%d): ", d, lhs->dims[d]);
             for (int i = bvec_sz; i-- > 0;) {
                 fprintf(stderr, "%08lx", lhs->subtype[a * bvec_sz * n_dims + d * bvec_sz + i]);
             }
@@ -814,6 +816,8 @@ int print_sample_tree(jl_stsample_t *lhs, int indent) {
                 if (lhs->subtrees[a * n_dims * subtree_sz + d * subtree_sz + s] == NULL)
                     continue;
                     //break;
+
+                // TODO: Why are our trees... empty sometimes?
 
                 fprintf(stderr, "\n%*s", indent, "");
                 fprintf(stderr, "    subtree %d: \n", s);
@@ -833,11 +837,7 @@ int solve_obligations(jl_stobligation2_t *obligations, jl_stenv2_t *env) {
     uint16_t bvec_sz = sample->bvec_sz;
     fprintf(stderr, "%d dims %d alts (%d bvec_sz)\n", n_dims, n_alts, bvec_sz);
 
-    // demand_bitset[n_dims][bvec_sz]
-    uint64_t *demand_bitset = obligations->lhs->subtype;
-
     // Great, now we're off to the races!
-
     fprintf(stderr, "checking coverage for LHS:\n");
     print_sample_tree(obligations->lhs, 2);
     fprintf(stderr, "sampled:\n");
@@ -1020,6 +1020,27 @@ int check_coverage(jl_stsample_t *lhs, jl_stsample_t *rhs, jl_stobligation2_t *o
  *
  **/
 
+
+// bvec[rhs_alt_i][param_j][lhs_alt_k]
+typedef struct {
+    uint16_t i;
+    uint16_t j;
+    uint16_t k;
+    uint16_t subtree;
+} jl_stsample_index_t;
+
+jl_stresult2_t nonunion_subtype(jl_value_t *x, jl_value_t *y, jl_stsample_t *lhs, jl_stsample_t *rhs,
+                                jl_stsample_index_t *i,
+                                jl_varenv_t x_env, jl_varenv_t y_env, jl_stenv2_t *env);
+jl_stresult2_t unwrap_lhs(jl_value_t *x, jl_value_t *y, jl_stsample_t *lhs, jl_stsample_t *rhs,
+                          jl_stsample_index_t *i,
+                          jl_varenv_t x_env, jl_varenv_t y_env, jl_stenv2_t *env);
+jl_stresult2_t unwrap_rhs(jl_value_t *x, jl_value_t *y, jl_stsample_t *lhs, jl_stsample_t *rhs,
+                          jl_stsample_index_t *i,
+                          jl_varenv_t x_env, jl_varenv_t y_env, jl_stenv2_t *env);
+
+bool lhs_covered(jl_stsample_t *lhs);
+
 /**
  * Gives an out buffer
  */
@@ -1033,8 +1054,10 @@ JL_DLLEXPORT jl_stresult2_t jl_subtype_datatype(jl_value_t *x, jl_value_t *y) {
     jl_varenv_t x_env = { NULL, RIGID };
     jl_varenv_t y_env = { NULL, FLEXIBLE };
     
-    jl_stresult2_t result = subtype_datatype(x, y, x_env, y_env, &env);
+    jl_stresult2_t result = unwrap_lhs(x, y, NULL, NULL, NULL, x_env, y_env, &env);
+    /*jl_stresult2_t result = subtype_datatype(x, y, x_env, y_env, &env);*/
     if (result.status == INDETERMINATE) {
+        fprintf(stderr, "Solving obligations...\n");
         /**
          * TODO: Apply solver (gray code induction)
          **/
@@ -1047,17 +1070,48 @@ JL_DLLEXPORT jl_stresult2_t jl_subtype_datatype(jl_value_t *x, jl_value_t *y) {
     return result;
 }
 
-// bvec[rhs_alt_i][param_j][lhs_alt_k]
-typedef struct {
-    uint16_t i;
-    uint16_t j;
-    uint16_t k;
-    uint16_t subtree;
-} jl_stsample_index_t;
-
 void allocate_sample_tree(jl_stsample_t *sample, jl_datatype_t *dx, jl_value_t *y, jl_stenv2_t *env);
 void sample_tuple_subtype(jl_datatype_t *dx, jl_value_t *y, jl_stsample_t *lhs, jl_stsample_t *rhs,
                           jl_varenv_t x_env, jl_varenv_t y_env, jl_stenv2_t *env);
+
+/**
+ * Okay, we need to collapse the sampling hierarchy.
+ *
+ * Right now, I do this:
+ *
+ *   - We unwrap the LHS union eagerly (AND - LHS)
+ *      - Sample each RHS *alternative* (OR - RHS)
+ *          - in each component (AND - both sides)
+ *             - against each LHS alternative (AND - LHS)
+ *
+ * This works, but the down-side is that there are wrappers
+ * in the tuple that we have to deal with (UnionAlls).
+ *
+ * It's also awkward because the data-flow is distributive.
+ *
+ * In principle, what happens is that at the deeper level I
+ * sample ALL of the LHS components against ALL of the RHS
+ * components in the usual way, except that I record these
+ * into a bit-sample-tree as things go along.
+ * 
+ *   -> This is exactly distributive reasoning.
+ *   -> We relax that requirement that ALL LHS samples are
+ *      covered, instead allowing for any "useful" sub-set
+ *      of samples to accumulate.
+ *   -> If we get full-coverage we just report TRUE.
+ *   -> All other ordering stays the same.
+ *
+ * So, we should pass down a "distribution allowed" flag and
+ * a sub-tree + indexing objects, then we pass back a volume
+ * and a set of samples. Nice!
+ * 
+ *    Sounds correct to me!
+ **/
+
+/**
+ * Next thing to reflect on:
+ *    - Whether to pre-allocate LHS/RHS tree or not
+ **/
 
 /**
  * Sample LHS will unwrap the LHS unions and do the actual sampling
@@ -1073,6 +1127,9 @@ void sample_tuple_subtype(jl_datatype_t *dx, jl_value_t *y, jl_stsample_t *lhs, 
  **/
 void sample_lhs(jl_stsample_t *lhs, jl_stsample_t *rhs, jl_stsample_index_t *i, jl_value_t *xi, jl_value_t *yi,
                 jl_varenv_t x_env, jl_varenv_t y_env, jl_stenv2_t *env) {
+    /**
+     * Sample across the LHS alternatives
+     **/
     if (jl_is_uniontype(xi)) {
         jl_uniontype_t *uxi = (jl_uniontype_t *)xi;
         sample_lhs(lhs, rhs, i, uxi->a, yi, x_env, y_env, env);
@@ -1095,6 +1152,11 @@ void sample_lhs(jl_stsample_t *lhs, jl_stsample_t *rhs, jl_stsample_index_t *i, 
     }
 
     if (jl_is_datatype(xi) && jl_is_tuple_type(xi)) {
+        /**
+         * This is actually a copy of the `sample_rhs` logic, if
+         * we do it properly.
+         **/
+
         /**
          * Always allocate the LHS tree, regardless
          * of whether we use it - TODO: optimize
@@ -1242,6 +1304,10 @@ void sample_rhs(jl_stsample_t *lhs, jl_stsample_t *rhs,
     //jl_(dx);
     //jl_(y);
 
+
+    /**
+     * This is splitting at a RHS leaf (among alternatives)
+     **/
     if (jl_is_uniontype(y)) {
         jl_uniontype_t *uy = (jl_uniontype_t *)y;
         sample_rhs(lhs, rhs, i, dx, uy->a, x_env, y_env, env);
@@ -1262,6 +1328,11 @@ void sample_rhs(jl_stsample_t *lhs, jl_stsample_t *rhs,
         y_env.vars = vb;
         return sample_rhs(lhs, rhs, i, dx, uay->body, x_env, y_env, env);
     } else if (jl_is_datatype(y) && jl_is_tuple_type(y)) {
+        /**
+         * Then in our datatype confirmation we
+         * recurse with our special tree-sampling.
+         **/
+
         if (jl_nparams(dx) != jl_nparams(y)) {
             // TODO: This can leave the LHS un-allocated *sigh*
             //          -> For example, if the RHS has no alternatives at all...
@@ -1303,6 +1374,9 @@ void sample_rhs(jl_stsample_t *lhs, jl_stsample_t *rhs,
  *  TODO: Optimize by allocating/filling both trees together?
  *           -> Maybe strip some data from the RHS
  *              that's already in the LHS
+ *
+ *  TODO: I *hate* this function because it has to be incredibly
+ *        predictive over distant parts of the code.
  **/
 void allocate_sample_tree(jl_stsample_t *sample, jl_datatype_t *dx, jl_value_t *y, jl_stenv2_t *env) {
     // TODO: Maybe pull allocation of header in
@@ -1348,14 +1422,6 @@ void allocate_sample_tree(jl_stsample_t *sample, jl_datatype_t *dx, jl_value_t *
     //return sample;
 }
 
-/**
- * TODO: We could easily change iteration order here without breaking anything
- **/
-
-/**
- * Output is a LHS sampling tree
- * and a RHS sampling tree
- **/
 void sample_tuple_subtype(jl_datatype_t *dx, jl_value_t *y, jl_stsample_t *lhs, jl_stsample_t *rhs,
                           jl_varenv_t x_env, jl_varenv_t y_env, jl_stenv2_t *env) {
     //fprintf(stderr, "\n\nsample_tuple_subtype on\n");
@@ -1364,6 +1430,274 @@ void sample_tuple_subtype(jl_datatype_t *dx, jl_value_t *y, jl_stsample_t *lhs, 
 
     jl_stsample_index_t i = { 0, 0, 0, 0 };
     sample_rhs(lhs, rhs, &i, dx, y, x_env, y_env, env);
+}
+
+jl_stresult2_t unwrap_rhs(jl_value_t *x, jl_value_t *y, jl_stsample_t *lhs, jl_stsample_t *rhs,
+                          jl_stsample_index_t *i,
+                          jl_varenv_t x_env, jl_varenv_t y_env, jl_stenv2_t *env) {
+    if (jl_is_unionall(y)) {
+
+        /** from sample_rhs (1) **/ 
+
+        // TODO: pop depending on results
+        jl_unionall_t *uay = (jl_unionall_t *)y;
+        jl_varbinding_t *vb = (jl_varbinding_t *)linear_alloc(
+            sizeof(jl_varbinding_t), alignof(jl_varbinding_t), env->alloc);
+        *vb = (jl_varbinding_t) {
+            /* var */ uay->var,
+            /* id */ env->var_cnt++,
+            /* kind */ FLEXIBLE,
+            /* inv_depth */ env->inv_depth,
+            /* prev */ y_env.vars,
+        };
+        y_env.vars = vb;
+        return unwrap_rhs(x, uay->body, lhs, rhs, i, x_env, y_env, env);
+    } else if (jl_is_uniontype(y)) {
+        jl_uniontype_t *uy = (jl_uniontype_t *)y;
+
+        /** from subtype_datatype (0) - if !datatype(x) || nparams == 0 **/
+        jl_stresult2_t a_result = unwrap_rhs(x, uy->a, lhs, rhs, i, x_env, y_env, env);
+        if (a_result.status == TRUE) return a_result;
+
+        jl_stresult2_t b_result = unwrap_rhs(x, uy->b, lhs, rhs, i, x_env, y_env, env);
+        if (b_result.status == TRUE) return b_result;
+
+        if (a_result.status == INDETERMINATE) return a_result;
+        if (b_result.status == INDETERMINATE) return b_result;
+
+        return (jl_stresult2_t) { FALSE, {} };
+    }
+
+    jl_stresult2_t result = nonunion_subtype(x, y, lhs, rhs, i, x_env, y_env, env);
+    /**
+     * TODO: Allow returning a TRUE result when all the components of an
+     *       alternative are covered. For now, we only support INDETERMINATE.
+     **/
+
+    if (result.status == INDETERMINATE) 
+        i->i += 1; // Indeterminate result was stored in our tree (implicitly)
+
+    /**
+     *
+     * TODO: Support "pixel" optimization(s), with either the caller or callee doing
+     *       sampling clean-up, if necessary.
+     *
+     **/
+
+    return result;
+}
+
+// unwrap_lhs -> unwrap_rhs -> subtype
+
+jl_stresult2_t unwrap_lhs(jl_value_t *x, jl_value_t *y, jl_stsample_t *lhs, jl_stsample_t *rhs,
+                          jl_stsample_index_t *i,
+                          jl_varenv_t x_env, jl_varenv_t y_env, jl_stenv2_t *env) {
+    if (jl_is_unionall(x)) {
+        /** from sample_lhs (2) **/
+
+        // TODO: pop depending on results
+        jl_unionall_t *uax = (jl_unionall_t *)x;
+        jl_varbinding_t *vb = (jl_varbinding_t *)linear_alloc(
+            sizeof(jl_varbinding_t), alignof(jl_varbinding_t), env->alloc);
+        *vb = (jl_varbinding_t) {
+            /* var */ uax->var,
+            /* id */ 0, // does not count toward var_cnt
+            /* kind */ RIGID,
+            /* inv_depth */ env->inv_depth,
+            /* prev */ x_env.vars,
+        };
+        x_env.vars = vb;
+        return unwrap_lhs(uax->body, y, lhs, rhs, i, x_env, y_env, env);
+    } else if (jl_is_uniontype(x)) {
+        /** from sample_lhs (2) **/
+        jl_uniontype_t *ux = (jl_uniontype_t *)x;
+
+        /**
+         * Our out-going recursion sets INDETERMINATE whenever it did sampling, so we
+         * short-circuit here in the usual way.
+         **/
+        jl_stresult2_t a_result = unwrap_lhs(ux->a, y, lhs, rhs, i, x_env, y_env, env);
+        if (a_result.status == FALSE) return a_result;
+        jl_stresult2_t b_result = unwrap_lhs(ux->b, y, lhs, rhs, i, x_env, y_env, env);
+        if (b_result.status == FALSE) return b_result;
+
+        if (a_result.status == INDETERMINATE) return a_result;
+        if (b_result.status == INDETERMINATE) return b_result;
+
+        return (jl_stresult2_t){ TRUE, {} };
+    }
+
+    /**
+     * The LHS is a tuple and the RHS is a union-of-tuples
+     *
+     * Tuple distributivity: Allocate a "sample-tree" to record the coverage
+     * of the tuples components by various RHS alternatives.
+     *
+     * TODO: Factor out into separate function
+     **/
+    if (jl_is_datatype(x) && jl_is_tuple_type(x)) { //&& jl_is_uniontype(y)) {
+
+        /**
+         * TODO: If just one (compatible) tuple, we can return TRUE directly.
+         **/
+
+        bool is_root = !lhs;
+
+        jl_datatype_t *dx = (jl_datatype_t *)x;
+        if (lhs && (lhs->subtrees[i->j * lhs->subtree_sz + i->subtree] != NULL)) {
+            lhs = lhs->subtrees[i->j * lhs->subtree_sz + i->subtree];
+        } else {
+            jl_stsample_t *new_lhs = (jl_stsample_t *)linear_alloc(
+                    sizeof(jl_stsample_t), alignof(jl_stsample_t), env->alloc);
+            allocate_sample_tree(new_lhs, dx, NULL, env); 
+
+            if (lhs)
+                lhs->subtrees[i->j * lhs->subtree_sz + i->subtree] = new_lhs;
+            lhs = new_lhs;
+        }
+
+        if (rhs && (rhs->subtrees[i->i * rhs->n_dims * rhs->subtree_sz + i->j * rhs->subtree_sz + i->subtree] != NULL)) {
+            rhs = rhs->subtrees[i->i * rhs->n_dims * rhs->subtree_sz + i->j * rhs->subtree_sz + i->subtree];
+        } else {
+            jl_stsample_t *new_rhs = (jl_stsample_t *)linear_alloc(
+                    sizeof(jl_stsample_t), alignof(jl_stsample_t), env->alloc);
+            allocate_sample_tree(new_rhs, dx, y, env); 
+
+            if (rhs)
+                rhs->subtrees[i->i * rhs->n_dims * rhs->subtree_sz + i->j * rhs->subtree_sz + i->subtree] = new_rhs;
+            rhs = new_rhs;
+        }
+
+        // TODO: If this sample wasn't used, pop the allocation
+        jl_stsample_index_t index = { 0, 0, 0, 0 };
+        jl_stresult2_t result = unwrap_rhs(x, y, lhs, rhs, &index, x_env, y_env, env);
+
+        if (i)
+            i->subtree += 1;
+
+        //if (is_root) {
+            //fprintf(stderr, "Covered? %d\n", lhs_covered(lhs));
+            //print_sample_tree(lhs, 2);
+            //print_sample_tree(rhs, 2);
+        //}
+
+        // Fast path: Check that LHS was covered separably
+        if (is_root && !lhs_covered(lhs))
+            return (jl_stresult2_t) { FALSE, {} }; // TODO: De-allocate - and support sub-roots
+
+        result.obligations = (jl_stobligation2_t) { lhs, rhs, NULL };
+
+        // If there was an "obvious" mis-match then we still might do a "pixel-mark",
+        // so paper over that here. TODO proper "pixel" support.
+        if (!is_root)
+            result.status = INDETERMINATE;
+
+        return result;
+    }
+
+    jl_stresult2_t result = unwrap_rhs(x, y, lhs, rhs, i, x_env, y_env, env);
+
+    /**
+     * If we have something to sample into and we're *not* sampling a tuple.
+     **/
+    if (lhs && i) {
+        assert(result.status != INDETERMINATE);
+        if (result.status == TRUE) {
+            uint16_t bvec_sz = rhs->bvec_sz;
+            uint16_t n_dims = rhs->n_dims;
+            uint64_t *bvec = &rhs->subtype[i->i * n_dims * bvec_sz + i->j * bvec_sz]; // &out->subtype[i.i][i.j][0]
+            uint64_t *bvec2 = &lhs->subtype[i->j * bvec_sz]; // &out->subtype[i.j][0]
+            bvec[i->k / 64] |= (1ull << (i->k % 64));
+            bvec2[i->k / 64] |= (1ull << (i->k % 64));
+        }
+        //fprintf(stderr, "Ground sample @ bit %d\n", i->k);
+        //jl_(x);
+        //jl_(y);
+        i->k += 1;
+        return (jl_stresult2_t){ INDETERMINATE, {} };
+    }
+
+    return result;
+}
+
+/**
+ * Output is a LHS sampling tree
+ * and a RHS sampling tree
+ *
+ *  -> And this is just our usual top-level
+ **/
+jl_stresult2_t nonunion_subtype(jl_value_t *x, jl_value_t *y, jl_stsample_t *lhs, jl_stsample_t *rhs,
+                                jl_stsample_index_t *i,
+                                jl_varenv_t x_env, jl_varenv_t y_env, jl_stenv2_t *env) {
+    /**
+     * This function is *only* responsible for T <: U, where neither T nor U are
+     * wrapped by Unions nor UnionAlls
+     *
+     * Currently: 
+     *   - Tuple & Tuple
+     *   - Ground & Ground
+     **/
+
+    /** from sample_rhs (1) **/
+    if (jl_is_datatype(x) && jl_is_tuple_type(x) && jl_is_datatype(y) && jl_is_tuple_type(y)) {
+        /**
+         * Then in our datatype confirmation we
+         * recurse with our special tree-sampling.
+         **/
+
+        if (jl_nparams(x) != jl_nparams(y)) {
+            // TODO: This can leave the LHS un-allocated *sigh*
+            //          -> For example, if the RHS has no alternatives at all...
+            //
+            // TODO: Fix this immediately
+            return (jl_stresult2_t) { FALSE, {} }; // TODO: Varargs, etc. - also index more carefully
+        }
+
+        for (int j=0; j < rhs->n_dims; j++) {
+            jl_value_t *xi = jl_tparam(x, j);
+            jl_value_t *yi = jl_tparam(y, j);
+
+            if (i) {
+                i->k = 0;
+                i->subtree = 0;
+                i->j = j;
+            }
+
+            /** Now, we call into our main entry point, as usual (which is just unwrap_lhs). **/
+            jl_stresult2_t c_result = unwrap_lhs(xi, yi, lhs, rhs, i, x_env, y_env, env);
+
+            // Intentionally neglect the result, so that it can be handled in our
+            // solver instead. Is this stupid? Yes.
+            //
+            // Can be improved by returning early and trimming at the caller.
+
+            //if (c_result.status == FALSE)
+                //return c_result;
+
+            /**
+             * XXX: Awkward that the return value here isn't terribly meaningful.
+             *      I'm measuring a Union{ ... } against a Union{ ... }
+             *         -> That could either return INDETERMINATE (meaning partial coverage)
+             *              -> But there's no actual result for it to return, since it's
+             *                 embedded in the sub-tree
+             *
+             *         -> or it could return FALSE is absolutely no samples were covered
+             *            or TRUE if they were all covered.
+             *
+             * -> OR, make it the caller's responsibility to clean-up any sampled values
+             *
+             **/
+        }
+        return (jl_stresult2_t) { INDETERMINATE, {} };
+    }
+
+    /**
+     * Ground type handling - extremely basic for now
+     **/
+    if ((jl_value_t *)x == y)
+        return (jl_stresult2_t) { TRUE, {} };
+    else
+        return (jl_stresult2_t) { FALSE, {} };
 }
 
 bool lhs_covered(jl_stsample_t *lhs) {
@@ -1379,8 +1713,10 @@ bool lhs_covered(jl_stsample_t *lhs) {
             int first_zero = __builtin_ffsll(~lhs->subtype[i * bvec_sz + b]);
             first_zero = (first_zero == 0) ? 64 : first_zero - 1;
             //fprintf(stderr, "first_zero: %d n_bits: %d\n", first_zero, n_bits);
-            if (first_zero < n_bits)
+            if (first_zero < n_bits) {
+                fprintf(stderr, "expected %d bits but first_zero at %d\n", n_bits, first_zero);
                 return false;
+            }
             n_bits -= 64;
         }
         
