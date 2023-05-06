@@ -18,7 +18,7 @@ extern "C" {
 //#define jl_(...)
 
 size_t indent = 0;
-void print_indent() {
+void print_indent( void ) {
     st_fprintf(stderr, "%*s", indent, "");
 }
 
@@ -30,7 +30,13 @@ void print_indent() {
  *   (2) separable coverage check (no gaps)
  *        -> Both handled at top-level, when exiting tuple
  *   (3) total coverage check (best alternative)
+ *        -> I think the idea here is that we make sure all the
+ *           mask bits are covered by some alternative
+ *           that has non-zero area...
+ *        -> Can't quite remember though. Might be worth
+ *           some brainstorming.
  *   (4) zero-volume pruning
+ *        (any empty component is just an overall FAIL)
  *        -> Both handled eagerly, by tuple aggregator
  *
  *   My code should try to handle these correctly, rather
@@ -396,6 +402,113 @@ typedef struct jl_stsample_t {
     jl_stobligation2_t **obligations;   // obligations[n_alts][n_dims]
 } jl_stsample_t;
 
+// TODO: Replace explicit enum types or switch to C++ (lol)
+// TODO: We can allocate in words, for simplicity (and even use 32-bit indices instead?)
+
+typedef struct jl_small_result_t jl_small_result_t;
+typedef struct jl_agg_result_t jl_agg_result_t;
+typedef struct jl_bound_t jl_bound_t;
+
+enum small_result_type {
+    _FALSE = 0, _TRUE = 1,
+    _INDETERMINATE_AGGREGATE = 2,
+    _INDETERMINATE_BOUND = 3,
+};
+
+// Here's the new result:
+struct jl_small_result_t { uintptr_t bits; };
+
+// And then the AND/OR structure:
+struct jl_agg_result_t {
+    uint32_t size;
+    enum : uint8_t { AND, OR } type;
+    uint8_t is_distributive_tuple : 1;
+    uint8_t is_distributive_tuple_root : 1;
+    jl_small_result_t results[0];
+};
+
+// TODO: Try to improve our flag situation.
+//       Maybe even replace with a top-level wrapper or two.
+//
+        // The tuple root flag is because AND/OR eagerly reduce
+        // The tuple contents flag is because non-distributive components eagerly reduce
+        // The tuple root flag would be because tuples eagerly collapse their dimensions
+        //    (and we might need another for the middle AND)
+
+// And the bounds:
+struct jl_bound_t {
+    uint32_t var_id;
+    enum : bool { SUB, SUPER } type;
+    jl_varbinding_t *env;
+    jl_value_t *bound;
+}; // Pretty much identical to before
+
+static inline bool is_true(jl_small_result_t r) { return (r.bits & 0x3) == _TRUE; }
+static inline bool is_false(jl_small_result_t r) { return (r.bits & 0x3) == _FALSE; }
+static inline bool is_bound(jl_small_result_t r) { return (r.bits & 0x3) == _INDETERMINATE_BOUND; }
+static inline bool is_aggregate(jl_small_result_t r) { return (r.bits & 0x3) == _INDETERMINATE_AGGREGATE; }
+static inline bool is_determinate(jl_small_result_t r) { return !(r.bits & 0x2); }
+
+static inline jl_agg_result_t *unwrap_aggregate(jl_small_result_t r)
+{
+    if ((r.bits & 0x3) != _INDETERMINATE_AGGREGATE)
+        return NULL;
+
+    return (jl_agg_result_t *)(r.bits & ~(uintptr_t)0x3);
+}
+
+static inline jl_bound_t *unwrap_bound(jl_small_result_t r)
+{
+    if ((r.bits & 0x3) != _INDETERMINATE_BOUND)
+        return NULL;
+
+    return (jl_bound_t *)(r.bits & ~(uintptr_t)0x3);
+}
+
+static inline bool unwrap_boolean_unsafe(jl_small_result_t r, size_t *sz)
+{
+    assert(is_determinate(r));
+    if (sz != NULL) *sz = (r.bits >> 2);
+    return r.bits & 0x1;
+}
+
+static inline jl_small_result_t wrap_boolean_result(bool b, uintptr_t size)
+{
+    jl_small_result_t result = { .bits = b ? _TRUE : _FALSE };
+    result.bits |= size << 2;
+    return result;
+}
+
+static inline jl_small_result_t wrap_aggregate_result(jl_agg_result_t *agg)
+{
+    jl_small_result_t result = { .bits = _INDETERMINATE_AGGREGATE };
+    result.bits |= (uintptr_t)agg;
+    return result;
+}
+
+static inline jl_small_result_t wrap_bound_result(jl_bound_t *bound)
+{
+    jl_small_result_t result = { .bits = _INDETERMINATE_BOUND };
+    result.bits |= (uintptr_t)bound;
+    return result;
+}
+
+/**
+ * Nice! Type-safe wrappers around our small result types!
+ **/
+
+
+/**
+ * "Simple" tuples are a *major* loss in this scheme, since they now need 64 times the amount of storage for single bits.
+ * But I *think* this is the right way to do things anyway. More homogeneous.
+ **/
+
+// All aligned at 8-byte boundary, as expected
+
+//char (*__kaboom1)[sizeof(jl_small_result_t)][sizeof(jl_agg_result_t)][sizeof(jl_bound_t)] = -1;
+//char (*__kaboom2)[alignof(jl_small_result_t)][alignof(jl_agg_result_t)][alignof(jl_bound_t)] = -1;
+// - just making sure the sizes are good
+
 typedef struct {
     int16_t inv_depth;
     uint16_t var_cnt;
@@ -403,9 +516,9 @@ typedef struct {
 } jl_stenv2_t;
 
 enum maybe_bool {
-    FALSE = 1,
+    FALSE = 0,
+    TRUE = 1,
     INDETERMINATE = 2,
-    TRUE = 0,
 };
 
 typedef struct {
@@ -919,6 +1032,139 @@ size_t best_alternative(jl_stsample_t *lhs, jl_stsample_t *rhs, uint16_t *best_a
     return max_volume;
 }
 
+static inline bool getbit(uint64_t *bvec, size_t i)
+{
+    return bvec[i / 64] & (1ull << (i % 64));
+}
+
+static inline bool setbit(uint64_t *bvec, size_t i, bool value)
+{
+    bool old_value = bvec[i / 64] & (1ull << (i % 64));
+    if (value)
+        bvec[i / 64] |= (1ull << (i % 64));
+    else
+        bvec[i / 64] &= ~(1ull << (i % 64));
+    return old_value;
+}
+
+// TODO: Provide optimized implementation
+static inline void setbits(uint64_t *bvec, size_t start, size_t end, bool value)
+{
+    for (size_t i = start; i < end; i++)
+        setbit(bvec, i, value);
+}
+
+// TODO: Provide optimized implementation
+static inline void copybits(uint64_t *dst, uint64_t *src, size_t start, size_t end)
+{
+    for (size_t i = start; i < end; i++)
+        setbit(dst, i, getbit(src, i));
+}
+
+
+        // Okay we've given up both tuple elision and sub-pixel optimization,
+        // which I think is for the best.
+        //
+        // TODO: Let's make sure that we have a graceful reduction for non-distributive
+        // tuples. We probably need to detect these up-front that we encountered no
+        // LHS unions that we need to distribute over.
+
+
+
+// TODO: Make sure that we can still reduce the tuple
+//       properly when there are either no LHS union (inner) alternatives
+//       or no RHS union alternatives (outer)
+
+/**
+ * Rules for elision:
+ *   - Tuples with non-distributive dimensions have these eagerly reduced and
+ *     they are *not* marked as distributive tuple aggregates
+ *   - These also do not participate in the bit-vector for the hyper-cube
+ *   - Any *distributive* dimensions of the tuple are represented in full
+ **/
+
+/**
+ * Step 1: Chose best alternative
+ *         -> How is this computed?
+ *            We have a new mask, and we need to go through all alternatives and pick the best
+ *            one based on volume. This is not complicated by sub-trees (we just need to copy
+ *            the result out from the best sub-tree).
+ *
+ * Step 2: Allocate new mask and copy the bvec from the
+ *         best alternative
+ *
+ * Step 3: while(...) {
+ *             take_nth_cartesian_complement();
+ *             recursion_entry_point(complement);
+ *         }
+ *         return true;
+ *
+ *
+ *  TODO: *fuck* I just realized incomplete_dims are a function of the mask
+ *             -> so we can't have that pre-computed (volume either)
+ **/
+
+/**
+ * TODO: Re-write this to:
+ *   1. Use our new aggregate vectors - DONE
+ *   2. Use a half-plane, quarter-plane algorithm - DONE
+ *   3. Use a dimensional index for computing half-planes - DONE
+ *
+ * Hopefully, things will stay pretty simple even with those improvements.
+ * It certainly simplifies the recursion.
+ *
+ * Wow, even with my memcpy hacks this function is actually *beautiful*
+ * Let's see if we can retain the beauty in our new version
+ **/
+bool take_nth_cartesian_complement(size_t n, uint64_t *bvec, uint64_t *mask, jl_agg_result_t *rhs, size_t *bit_offset)
+{
+    // mask == C
+    rhs = unwrap_aggregate(rhs->results[0]);
+    assert(rhs);
+
+    // in_progress = complement_taken
+    bool in_progress = false, restore_mask = false;
+    for (int i = 0; i < rhs->size; i++) {
+        jl_agg_result_t *component = unwrap_aggregate(rhs->results[i]);
+        if (!(component && component->is_distributive_tuple && !component->is_distributive_tuple_root))
+            continue; // non-distributive dimension
+
+        const size_t component_offset = *bit_offset;
+        size_t start = *bit_offset;
+        for (int b = 0; b < component->size; b++) {
+            size_t end = *bit_offset;
+            jl_agg_result_t *subtree = unwrap_aggregate(component->results[b]);
+            bool bit_in_progress = false;
+            if (subtree && subtree->is_distributive_tuple && !subtree->is_distributive_tuple_root)
+                bit_in_progress = take_nth_cartesian_complement(n - dim, bvec, subtree, bit_offset);
+            else if (!getbit(mask, *bit_offset))
+                bit_in_progress = getbit(bvec, *bit_offset++); // Something set in !C
+            else if (!getbit(bvec, *bit_offset++))
+                restore_mask = true;
+
+            if (bit_in_progress) {
+                setbits(bvec, start, end, false);
+                start = *bit_offset;
+                in_progress = true;
+            }
+        }
+
+        if (!in_progress && restore_mask)
+            copybits(bvec, mask, component_offset, *bit_offset);
+        if (in_progress || restore_mask)
+            return in_progress;
+    }
+    return false;
+}
+
+/**
+ * TODO: Possibly re-create this for the new scheme
+ *       The queue-based design is just rather... bulky
+ *
+ *       Separating on all sub-trees really isn't so bad.
+ *       And neither is "cheating" and using the stack for our queue.
+ *       I just needed to see what the "correct" answer would look like.
+ **/
 int check_coverage(jl_stsample_t *lhs, jl_stsample_t *rhs, jl_stobligation2_t *obligations, jl_stenv2_t *env) {
     jl_stsample_t *sample = rhs;
     uint64_t *demand_bitset = lhs->subtype;
@@ -1029,13 +1275,19 @@ typedef struct {
     uint16_t subtree;
 } jl_stsample_index_t;
 
-jl_stresult2_t nonunion_subtype(jl_value_t *x, jl_value_t *y, jl_stsample_t *lhs, jl_stsample_t *rhs,
+/**
+ * Next TODO is to make all of these return our new result type
+ *
+ *      and to decide how we're going to handle that pesky hyper-cube vector for TUPLE's
+ **/
+
+jl_small_result_t nonunion_subtype(jl_value_t *x, jl_value_t *y, jl_stsample_t *lhs, jl_stsample_t *rhs,
                                 jl_stsample_index_t *i,
                                 jl_varenv_t x_env, jl_varenv_t y_env, jl_stenv2_t *env);
-jl_stresult2_t unwrap_lhs(jl_value_t *x, jl_value_t *y, jl_stsample_t *lhs, jl_stsample_t *rhs,
+jl_small_result_t unwrap_lhs(jl_value_t *x, jl_value_t *y, jl_stsample_t *lhs, jl_stsample_t *rhs,
                           jl_stsample_index_t *i,
                           jl_varenv_t x_env, jl_varenv_t y_env, jl_stenv2_t *env);
-jl_stresult2_t unwrap_rhs(jl_value_t *x, jl_value_t *y, jl_stsample_t *lhs, jl_stsample_t *rhs,
+jl_small_result_t unwrap_rhs(jl_value_t *x, jl_value_t *y, jl_stsample_t *lhs, jl_stsample_t *rhs,
                           jl_stsample_index_t *i,
                           jl_varenv_t x_env, jl_varenv_t y_env, jl_stenv2_t *env);
 
@@ -1044,7 +1296,7 @@ bool lhs_covered(jl_stsample_t *lhs);
 /**
  * Gives an out buffer
  */
-JL_DLLEXPORT jl_stresult2_t jl_subtype_datatype(jl_value_t *x, jl_value_t *y) {
+JL_DLLEXPORT jl_small_result_t jl_subtype_datatype(jl_value_t *x, jl_value_t *y) {
     static const size_t CAPACITY = 4096;
     char *buffer = (char *)malloc(CAPACITY);
     jl_linear_alloc_t alloc;
@@ -1054,15 +1306,16 @@ JL_DLLEXPORT jl_stresult2_t jl_subtype_datatype(jl_value_t *x, jl_value_t *y) {
     jl_varenv_t x_env = { NULL, RIGID };
     jl_varenv_t y_env = { NULL, FLEXIBLE };
     
-    jl_stresult2_t result = unwrap_lhs(x, y, NULL, NULL, NULL, x_env, y_env, &env);
+    jl_small_result_t result = unwrap_lhs(x, y, NULL, NULL, NULL, x_env, y_env, &env);
     /*jl_stresult2_t result = subtype_datatype(x, y, x_env, y_env, &env);*/
-    if (result.status == INDETERMINATE) {
+    if (!is_determinate(result)) {
         fprintf(stderr, "Solving obligations...\n");
         /**
          * TODO: Apply solver (gray code induction)
+         * TODO RIGHT NOW fix obligations
          **/
-        int is_subtype = solve_obligations(&result.obligations, &env);
-        result.status = (is_subtype) ? TRUE : FALSE;
+        //int is_subtype = solve_obligations(&result.obligations, &env);
+        //result.status = (is_subtype) ? TRUE : FALSE;
     }
 
     fprintf(stderr, "Allocated %zu bytes\n", alloc.sz);
@@ -1432,7 +1685,7 @@ void sample_tuple_subtype(jl_datatype_t *dx, jl_value_t *y, jl_stsample_t *lhs, 
     sample_rhs(lhs, rhs, &i, dx, y, x_env, y_env, env);
 }
 
-jl_stresult2_t unwrap_rhs(jl_value_t *x, jl_value_t *y, jl_stsample_t *lhs, jl_stsample_t *rhs,
+jl_small_result_t unwrap_rhs(jl_value_t *x, jl_value_t *y, jl_stsample_t *lhs, jl_stsample_t *rhs,
                           jl_stsample_index_t *i,
                           jl_varenv_t x_env, jl_varenv_t y_env, jl_stenv2_t *env) {
     if (jl_is_unionall(y)) {
@@ -1456,25 +1709,26 @@ jl_stresult2_t unwrap_rhs(jl_value_t *x, jl_value_t *y, jl_stsample_t *lhs, jl_s
         jl_uniontype_t *uy = (jl_uniontype_t *)y;
 
         /** from subtype_datatype (0) - if !datatype(x) || nparams == 0 **/
-        jl_stresult2_t a_result = unwrap_rhs(x, uy->a, lhs, rhs, i, x_env, y_env, env);
-        if (a_result.status == TRUE) return a_result;
+        jl_small_result_t a_result = unwrap_rhs(x, uy->a, lhs, rhs, i, x_env, y_env, env);
+        if (is_true(a_result)) return a_result;
 
-        jl_stresult2_t b_result = unwrap_rhs(x, uy->b, lhs, rhs, i, x_env, y_env, env);
-        if (b_result.status == TRUE) return b_result;
+        jl_small_result_t b_result = unwrap_rhs(x, uy->b, lhs, rhs, i, x_env, y_env, env);
+        if (is_true(b_result)) return b_result;
 
-        if (a_result.status == INDETERMINATE) return a_result;
-        if (b_result.status == INDETERMINATE) return b_result;
+        if (!is_determinate(a_result)) return a_result;
+        if (!is_determinate(b_result)) return b_result;
 
-        return (jl_stresult2_t) { FALSE, {} };
+        return wrap_boolean_result(true, 0); // TODO: Size
+        //return (jl_stresult2_t) { FALSE, {} };
     }
 
-    jl_stresult2_t result = nonunion_subtype(x, y, lhs, rhs, i, x_env, y_env, env);
+    jl_small_result_t result = nonunion_subtype(x, y, lhs, rhs, i, x_env, y_env, env);
     /**
      * TODO: Allow returning a TRUE result when all the components of an
      *       alternative are covered. For now, we only support INDETERMINATE.
      **/
 
-    if (result.status == INDETERMINATE) 
+    if (!is_determinate(result)) 
         i->i += 1; // Indeterminate result was stored in our tree (implicitly)
 
     /**
@@ -1489,7 +1743,7 @@ jl_stresult2_t unwrap_rhs(jl_value_t *x, jl_value_t *y, jl_stsample_t *lhs, jl_s
 
 // unwrap_lhs -> unwrap_rhs -> subtype
 
-jl_stresult2_t unwrap_lhs(jl_value_t *x, jl_value_t *y, jl_stsample_t *lhs, jl_stsample_t *rhs,
+jl_small_result_t unwrap_lhs(jl_value_t *x, jl_value_t *y, jl_stsample_t *lhs, jl_stsample_t *rhs,
                           jl_stsample_index_t *i,
                           jl_varenv_t x_env, jl_varenv_t y_env, jl_stenv2_t *env) {
     if (jl_is_unionall(x)) {
@@ -1516,15 +1770,15 @@ jl_stresult2_t unwrap_lhs(jl_value_t *x, jl_value_t *y, jl_stsample_t *lhs, jl_s
          * Our out-going recursion sets INDETERMINATE whenever it did sampling, so we
          * short-circuit here in the usual way.
          **/
-        jl_stresult2_t a_result = unwrap_lhs(ux->a, y, lhs, rhs, i, x_env, y_env, env);
-        if (a_result.status == FALSE) return a_result;
-        jl_stresult2_t b_result = unwrap_lhs(ux->b, y, lhs, rhs, i, x_env, y_env, env);
-        if (b_result.status == FALSE) return b_result;
+        jl_small_result_t a_result = unwrap_lhs(ux->a, y, lhs, rhs, i, x_env, y_env, env);
+        if (is_false(a_result)) return a_result;
+        jl_small_result_t b_result = unwrap_lhs(ux->b, y, lhs, rhs, i, x_env, y_env, env);
+        if (is_false(b_result)) return b_result;
 
-        if (a_result.status == INDETERMINATE) return a_result;
-        if (b_result.status == INDETERMINATE) return b_result;
+        if (!is_determinate(a_result)) return a_result;
+        if (!is_determinate(b_result)) return b_result;
 
-        return (jl_stresult2_t){ TRUE, {} };
+        return wrap_boolean_result(true, 0); // TODO: Size
     }
 
     /**
@@ -1570,7 +1824,7 @@ jl_stresult2_t unwrap_lhs(jl_value_t *x, jl_value_t *y, jl_stsample_t *lhs, jl_s
 
         // TODO: If this sample wasn't used, pop the allocation
         jl_stsample_index_t index = { 0, 0, 0, 0 };
-        jl_stresult2_t result = unwrap_rhs(x, y, lhs, rhs, &index, x_env, y_env, env);
+        jl_small_result_t result = unwrap_rhs(x, y, lhs, rhs, &index, x_env, y_env, env);
 
         if (i)
             i->subtree += 1;
@@ -1583,26 +1837,27 @@ jl_stresult2_t unwrap_lhs(jl_value_t *x, jl_value_t *y, jl_stsample_t *lhs, jl_s
 
         // Fast path: Check that LHS was covered separably
         if (is_root && !lhs_covered(lhs))
-            return (jl_stresult2_t) { FALSE, {} }; // TODO: De-allocate - and support sub-roots
+            return wrap_boolean_result(false, 0); // TODO: De-allocate - and support sub-roots
 
-        result.obligations = (jl_stobligation2_t) { lhs, rhs, NULL };
+        // TODO RIGHT NOW -> translate obligations
+        //result.obligations = (jl_stobligation2_t) { lhs, rhs, NULL };
 
-        // If there was an "obvious" mis-match then we still might do a "pixel-mark",
-        // so paper over that here. TODO proper "pixel" support.
-        if (!is_root)
-            result.status = INDETERMINATE;
+        //// If there was an "obvious" mis-match then we still might do a "pixel-mark",
+        //// so paper over that here. TODO proper "pixel" support.
+        //if (!is_root)
+            //result.status = INDETERMINATE;
 
         return result;
     }
 
-    jl_stresult2_t result = unwrap_rhs(x, y, lhs, rhs, i, x_env, y_env, env);
+    jl_small_result_t result = unwrap_rhs(x, y, lhs, rhs, i, x_env, y_env, env);
 
     /**
      * If we have something to sample into and we're *not* sampling a tuple.
      **/
     if (lhs && i) {
-        assert(result.status != INDETERMINATE);
-        if (result.status == TRUE) {
+        assert(is_determinate(result));
+        if (is_true(result)) {
             uint16_t bvec_sz = rhs->bvec_sz;
             uint16_t n_dims = rhs->n_dims;
             uint64_t *bvec = &rhs->subtype[i->i * n_dims * bvec_sz + i->j * bvec_sz]; // &out->subtype[i.i][i.j][0]
@@ -1614,7 +1869,10 @@ jl_stresult2_t unwrap_lhs(jl_value_t *x, jl_value_t *y, jl_stsample_t *lhs, jl_s
         //jl_(x);
         //jl_(y);
         i->k += 1;
-        return (jl_stresult2_t){ INDETERMINATE, {} };
+        // TODO: Return a real result...
+        //       Think about what's actually going on here.
+        return wrap_aggregate_result((jl_agg_result_t*) NULL);
+        //return (jl_stresult2_t){ INDETERMINATE, {} };
     }
 
     return result;
@@ -1626,7 +1884,7 @@ jl_stresult2_t unwrap_lhs(jl_value_t *x, jl_value_t *y, jl_stsample_t *lhs, jl_s
  *
  *  -> And this is just our usual top-level
  **/
-jl_stresult2_t nonunion_subtype(jl_value_t *x, jl_value_t *y, jl_stsample_t *lhs, jl_stsample_t *rhs,
+jl_small_result_t nonunion_subtype(jl_value_t *x, jl_value_t *y, jl_stsample_t *lhs, jl_stsample_t *rhs,
                                 jl_stsample_index_t *i,
                                 jl_varenv_t x_env, jl_varenv_t y_env, jl_stenv2_t *env) {
     /**
@@ -1650,7 +1908,9 @@ jl_stresult2_t nonunion_subtype(jl_value_t *x, jl_value_t *y, jl_stsample_t *lhs
             //          -> For example, if the RHS has no alternatives at all...
             //
             // TODO: Fix this immediately
-            return (jl_stresult2_t) { FALSE, {} }; // TODO: Varargs, etc. - also index more carefully
+
+            // TODO: Size?
+            return wrap_boolean_result(false, 0); // TODO: Varargs, etc. - also index more carefully
         }
 
         for (int j=0; j < rhs->n_dims; j++) {
@@ -1664,7 +1924,7 @@ jl_stresult2_t nonunion_subtype(jl_value_t *x, jl_value_t *y, jl_stsample_t *lhs
             }
 
             /** Now, we call into our main entry point, as usual (which is just unwrap_lhs). **/
-            jl_stresult2_t c_result = unwrap_lhs(xi, yi, lhs, rhs, i, x_env, y_env, env);
+            jl_small_result_t c_result = unwrap_lhs(xi, yi, lhs, rhs, i, x_env, y_env, env);
 
             // Intentionally neglect the result, so that it can be handled in our
             // solver instead. Is this stupid? Yes.
@@ -1688,18 +1948,28 @@ jl_stresult2_t nonunion_subtype(jl_value_t *x, jl_value_t *y, jl_stsample_t *lhs
              *
              **/
         }
-        return (jl_stresult2_t) { INDETERMINATE, {} };
+        return wrap_aggregate_result((jl_agg_result_t *)NULL);
+        //return (jl_stresult2_t) { INDETERMINATE, {} };
     }
 
     /**
      * Ground type handling - extremely basic for now
      **/
     if ((jl_value_t *)x == y)
-        return (jl_stresult2_t) { TRUE, {} };
+        return wrap_boolean_result(true, 0); // TODO: Size?
     else
-        return (jl_stresult2_t) { FALSE, {} };
+        return wrap_boolean_result(false, 0); // TODO: Size?
 }
 
+/**
+ * This also becomes a simple bit check, which is super nice!
+ *
+ * The pathway is becoming clear...
+ *
+ * We're about to finally have a tuple + (first-order) bounds
+ * solver and then we'll just have to add higher-order bounds
+ * and all the 'miscellanea' (varargs, Type{T}, etc.)
+ **/
 bool lhs_covered(jl_stsample_t *lhs) {
     uint16_t n_dims = lhs->n_dims;
     uint16_t bvec_sz = lhs->bvec_sz;
