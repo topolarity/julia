@@ -4785,6 +4785,7 @@ static jl_cgval_t emit_call_specfun_other(jl_codectx_t &ctx, bool is_opaque_clos
     case jl_returninfo_t::Boxed:
     case jl_returninfo_t::Register:
     case jl_returninfo_t::Ghosts:
+    case jl_returninfo_t::UnionNoSRet:
         break;
     case jl_returninfo_t::SRet:
         result = emit_static_alloca(ctx, getAttributeAtIndex(returninfo.attrs, 1, Attribute::StructRet).getValueAsType());
@@ -4890,16 +4891,22 @@ static jl_cgval_t emit_call_specfun_other(jl_codectx_t &ctx, bool is_opaque_clos
             assert(result);
             retval = mark_julia_slot(result, jlretty, NULL, ctx.tbaa().tbaa_stack);
             break;
+        case jl_returninfo_t::UnionNoSRet:
         case jl_returninfo_t::Union: {
             Value *box = ctx.builder.CreateExtractValue(call, 0);
             Value *tindex = ctx.builder.CreateExtractValue(call, 1);
-            Value *derived = ctx.builder.CreateSelect(
-                ctx.builder.CreateICmpEQ(
-                        ctx.builder.CreateAnd(tindex, ConstantInt::get(getInt8Ty(ctx.builder.getContext()), UNION_BOX_MARKER)),
-                        ConstantInt::get(getInt8Ty(ctx.builder.getContext()), 0)),
-                decay_derived(ctx, ctx.builder.CreateBitCast(argvals[0], ctx.types().T_pjlvalue)),
-                decay_derived(ctx, box)
-            );
+            Value *derived = nullptr;
+            if (returninfo.cc == jl_returninfo_t::Union) {
+                derived = ctx.builder.CreateSelect(
+                    ctx.builder.CreateICmpEQ(
+                            ctx.builder.CreateAnd(tindex, ConstantInt::get(getInt8Ty(ctx.builder.getContext()), UNION_BOX_MARKER)),
+                            ConstantInt::get(getInt8Ty(ctx.builder.getContext()), 0)),
+                    decay_derived(ctx, ctx.builder.CreateBitCast(argvals[0], ctx.types().T_pjlvalue)),
+                    decay_derived(ctx, box)
+                );
+            } else {
+                derived = decay_derived(ctx, box);
+            }
             retval = mark_julia_slot(derived,
                                      jlretty,
                                      tindex,
@@ -6655,6 +6662,7 @@ static void emit_cfunc_invalidate(
         ctx.builder.CreateRetVoid();
         break;
     }
+    case jl_returninfo_t::UnionNoSRet:
     case jl_returninfo_t::Union: {
         Type *retty = gf_thunk->getReturnType();
         Value *gf_retval = UndefValue::get(retty);
@@ -7151,15 +7159,22 @@ static Function* gen_cfun_wrapper(
             case jl_returninfo_t::SRet:
                 retval = mark_julia_slot(result, astrt, NULL, ctx.tbaa().tbaa_stack);
                 break;
+            case jl_returninfo_t::UnionNoSRet:
             case jl_returninfo_t::Union: {
                 Value *box = ctx.builder.CreateExtractValue(call, 0);
                 Value *tindex = ctx.builder.CreateExtractValue(call, 1);
-                Value *derived = ctx.builder.CreateSelect(
-                    ctx.builder.CreateICmpEQ(
-                            ctx.builder.CreateAnd(tindex, ConstantInt::get(getInt8Ty(ctx.builder.getContext()), UNION_BOX_MARKER)),
-                            ConstantInt::get(getInt8Ty(ctx.builder.getContext()), 0)),
-                    decay_derived(ctx, ctx.builder.CreateBitCast(result, ctx.types().T_pjlvalue)),
-                    decay_derived(ctx, box));
+                Value *derived = nullptr;
+                if (returninfo.cc == jl_returninfo_t::Union) {
+                    derived = ctx.builder.CreateSelect(
+                        ctx.builder.CreateICmpEQ(
+                                ctx.builder.CreateAnd(tindex, ConstantInt::get(getInt8Ty(ctx.builder.getContext()), UNION_BOX_MARKER)),
+                                ConstantInt::get(getInt8Ty(ctx.builder.getContext()), 0)),
+                        decay_derived(ctx, ctx.builder.CreateBitCast(result, ctx.types().T_pjlvalue)),
+                        decay_derived(ctx, box)
+                    );
+                } else {
+                    derived = decay_derived(ctx, box);
+                }
                 retval = mark_julia_slot(derived,
                                          astrt,
                                          tindex,
@@ -7503,6 +7518,7 @@ static Function *gen_invoke_wrapper(jl_method_instance_t *lam, jl_value_t *jlret
     case jl_returninfo_t::Boxed:
     case jl_returninfo_t::Register:
     case jl_returninfo_t::Ghosts:
+    case jl_returninfo_t::UnionNoSRet:
         break;
     case jl_returninfo_t::SRet:
         assert(cast<PointerType>(ftype->getParamType(0))->isOpaqueOrPointeeTypeMatches(getAttributeAtIndex(f.attrs, 1, Attribute::StructRet).getValueAsType()));
@@ -7592,6 +7608,7 @@ static Function *gen_invoke_wrapper(jl_method_instance_t *lam, jl_value_t *jlret
         case jl_returninfo_t::SRet:
             retval = mark_julia_slot(result, jlretty, NULL, ctx.tbaa().tbaa_stack);
             break;
+        case jl_returninfo_t::UnionNoSRet:
         case jl_returninfo_t::Union:
             // result is technically not right here, but `boxed` will only look at it
             // for the unboxed values, so it's ok.
@@ -7629,20 +7646,20 @@ static jl_returninfo_t get_specsig_function(jl_codectx_t &ctx, Module *M, Value 
     else if (jl_is_uniontype(jlrettype)) {
         bool allunbox;
         union_alloca_type((jl_uniontype_t*)jlrettype, allunbox, props.union_bytes, props.union_align, props.union_minalign);
-        if (props.union_bytes) {
-            props.cc = jl_returninfo_t::Union;
-            Type *AT = ArrayType::get(getInt8Ty(ctx.builder.getContext()), props.union_bytes);
-            fsig.push_back(AT->getPointerTo());
-            argnames.push_back("union_bytes_return");
-            Type *pair[] = { ctx.types().T_prjlvalue, getInt8Ty(ctx.builder.getContext()) };
-            rt = StructType::get(ctx.builder.getContext(), ArrayRef<Type*>(pair));
-        }
-        else if (allunbox) {
+        if (allunbox && props.union_bytes == 0) {
             props.cc = jl_returninfo_t::Ghosts;
             rt = getInt8Ty(ctx.builder.getContext());
-        }
-        else {
-            rt = ctx.types().T_prjlvalue;
+        } else {
+            if (props.union_bytes > 0) {
+                props.cc = jl_returninfo_t::Union;
+                Type *AT = ArrayType::get(getInt8Ty(ctx.builder.getContext()), props.union_bytes);
+                fsig.push_back(AT->getPointerTo());
+                argnames.push_back("union_bytes_return");
+            } else {
+                props.cc = jl_returninfo_t::UnionNoSRet;
+            }
+            Type *pair[] = { ctx.types().T_prjlvalue, getInt8Ty(ctx.builder.getContext()) };
+            rt = StructType::get(ctx.builder.getContext(), ArrayRef<Type*>(pair));
         }
     }
     else if (!deserves_retbox(jlrettype)) {
@@ -9015,6 +9032,7 @@ static jl_llvm_functions_t
             case jl_returninfo_t::SRet:
                 retval = NULL;
                 break;
+            case jl_returninfo_t::UnionNoSRet:
             case jl_returninfo_t::Union: {
                 Value *data, *tindex;
                 if (retvalinfo.TIndex) {

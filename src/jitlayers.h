@@ -190,7 +190,8 @@ struct jl_returninfo_t {
         Register,
         SRet,
         Union,
-        Ghosts
+        UnionNoSRet,
+        Ghosts,
     } cc;
     size_t union_bytes;
     size_t union_align;
