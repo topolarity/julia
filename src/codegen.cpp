@@ -4817,6 +4817,7 @@ static jl_cgval_t emit_call_specfun_other(jl_codectx_t &ctx, bool is_opaque_clos
 
     if (returninfo.return_roots) {
         AllocaInst *return_roots = emit_static_alloca(ctx, ArrayType::get(ctx.types().T_prjlvalue, returninfo.return_roots));
+        setName(ctx.emission_context, return_roots, "return_roots");
         argvals[idx] = return_roots;
         idx++;
     }
@@ -7666,15 +7667,11 @@ static jl_returninfo_t get_specsig_function(jl_codectx_t &ctx, Module *M, Value 
         if (allunbox && props.union_bytes == 0) {
             props.cc = jl_returninfo_t::Ghosts;
             rt = getInt8Ty(ctx.builder.getContext());
-        } else {
-            if (props.union_bytes > 0) {
-                props.cc = jl_returninfo_t::Union;
-                Type *AT = ArrayType::get(getInt8Ty(ctx.builder.getContext()), props.union_bytes);
-                fsig.push_back(AT->getPointerTo());
-                argnames.push_back("union_bytes_return");
-            } else {
-                props.cc = jl_returninfo_t::UnionNoSRet;
-            }
+        } else if (props.union_bytes > 0) {
+            props.cc = jl_returninfo_t::Union;
+            Type *AT = ArrayType::get(getInt8Ty(ctx.builder.getContext()), props.union_bytes);
+            fsig.push_back(AT->getPointerTo());
+            argnames.push_back("union_bytes_return");
             Type *pair[] = { ctx.types().T_prjlvalue, getInt8Ty(ctx.builder.getContext()) };
             rt = StructType::get(ctx.builder.getContext(), ArrayRef<Type*>(pair));
         }
