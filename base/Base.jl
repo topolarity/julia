@@ -498,6 +498,9 @@ using .MathConstants: ℯ, π, pi
 # metaprogramming
 include("meta.jl")
 
+# dates
+include("dates.jl")
+
 # Stack frames and traces
 include("stacktraces.jl")
 using .StackTraces
