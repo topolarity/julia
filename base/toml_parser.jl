@@ -7,28 +7,7 @@ TOML.jl standard library instead (by `import TOML` or `using TOML`).
 """
 module TOML
 
-using Base: IdSet
-
-# In case we do not have the Dates stdlib available
-# we parse DateTime into these internal structs,
-# note that these do not do any argument checking
-struct Date
-    year::Int
-    month::Int
-    day::Int
-end
-struct Time
-    hour::Int
-    minute::Int
-    second::Int
-    ms::Int
-end
-struct DateTime
-    date::Date
-    time::Time
-end
-DateTime(y, m, d, h, mi, s, ms) =
-    DateTime(Date(y,m,d), Time(h, mi, s, ms))
+using Base: IdSet, Date, Time, DateTime, validargs
 
 const EOF_CHAR = typemax(Char)
 
@@ -84,12 +63,7 @@ mutable struct Parser
 
     # Filled in in case we are parsing a file to improve error messages
     filepath::Union{String, Nothing}
-
-    # Gets populated with the Dates stdlib if it exists
-    Dates::Union{Module, Nothing}
 end
-
-const DATES_PKGID = Base.PkgId(Base.UUID("ade2ca70-3891-5945-98fb-dc099432e06a"), "Dates")
 
 function Parser(str::String; filepath=nothing)
     root = TOMLDict()
@@ -109,7 +83,6 @@ function Parser(str::String; filepath=nothing)
             IdSet{TOMLDict}(),    # defined_tables
             root,
             filepath,
-            isdefined(Base, :maybe_root_module) ? Base.maybe_root_module(DATES_PKGID) : nothing,
         )
     startup(l)
     return l
@@ -1011,33 +984,17 @@ function parse_datetime(l)
     end
 
     # The DateTime parser verifies things like leap year for us
-    return try_return_datetime(l, year, month, day, h, m, s, ms)
-end
-
-function try_return_datetime(p, year, month, day, h, m, s, ms)
-    Dates = p.Dates
-    if Dates !== nothing
-        try
-            return Dates.DateTime(year, month, day, h, m, s, ms)
-        catch
-            return ParserError(ErrParsingDateTime)
-        end
-    else
-        return DateTime(year, month, day, h, m, s, ms)
+    if validargs(DateTime, year, month, day, h, m, s, ms) !== nothing
+        return ParserError(ErrParsingDateTime)
     end
+    return DateTime(year, month, day, h, m, s, ms)
 end
 
 function try_return_date(p, year, month, day)
-    Dates = p.Dates
-    if Dates !== nothing
-        try
-            return Dates.Date(year, month, day)
-        catch
-            return ParserError(ErrParsingDateTime)
-        end
-    else
-        return Date(year, month, day)
+    if validargs(Date, year, month, day) !== nothing
+        return ParserError(ErrParsingDateTime)
     end
+    return Date(year, month, day)
 end
 
 function parse_local_time(l::Parser)
@@ -1046,20 +1003,10 @@ function parse_local_time(l::Parser)
     _, m, s, ms = @try _parse_local_time(l, true)
     # TODO: Could potentially parse greater accuracy for the
     # fractional seconds here.
-    return try_return_time(l, h, m, s, ms)
-end
-
-function try_return_time(p, h, m, s, ms)
-    Dates = p.Dates
-    if Dates !== nothing
-        try
-            return Dates.Time(h, m, s, ms)
-        catch
-            return ParserError(ErrParsingDateTime)
-        end
-    else
-        return Time(h, m, s, ms)
+    if validargs(Time, h, m, s, ms) !== nothing
+        return ParserError(ErrParsingDateTime)
     end
+    return Time(h, m, s, ms)
 end
 
 function _parse_local_time(l::Parser, skip_hour=false)::Err{NTuple{4, Int64}}
