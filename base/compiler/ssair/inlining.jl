@@ -545,7 +545,8 @@ function ir_inline_unionsplit!(compact::IncrementalCompact, idx::Int, argexprs::
                 aft <: mft && continue
                 # Generate isa check
                 isa_expr = Expr(:call, isa, argexprs[i], mft)
-                ssa = insert_node_here!(compact, NewInstruction(isa_expr, Bool, line))
+                flag = IR_FLAG_REFINED
+                ssa = insert_node_here!(compact, NewInstruction(isa_expr, Bool, NoCallInfo(), line, flag))
                 if cond === true
                     cond = ssa
                 else
@@ -565,8 +566,9 @@ function ir_inline_unionsplit!(compact::IncrementalCompact, idx::Int, argexprs::
                 (isa(argex, SSAValue) || isa(argex, Argument)) || continue
                 aft, mft = fieldtype(atype, i), fieldtype(mtype, i)
                 if !(aft <: mft)
+                    flag = IR_FLAG_REFINED
                     argexprs′[i] = insert_node_here!(compact,
-                        NewInstruction(PiNode(argex, mft), mft, line))
+                        NewInstruction(PiNode(argex, mft), mft, NoCallInfo(), line, flag))
                 end
             end
         end
