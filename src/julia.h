@@ -2212,6 +2212,8 @@ JL_DLLEXPORT int jl_printf(struct uv_stream_s *s, const char *format, ...)
     _JL_FORMAT_ATTR(printf, 2, 3);
 JL_DLLEXPORT int jl_vprintf(struct uv_stream_s *s, const char *format, va_list args)
     _JL_FORMAT_ATTR(printf, 2, 0);
+JL_DLLEXPORT void jl_safe_fprintf(ios_t *s, const char *str, ...) JL_NOTSAFEPOINT
+    _JL_FORMAT_ATTR(printf, 2, 3);
 JL_DLLEXPORT void jl_safe_printf(const char *str, ...) JL_NOTSAFEPOINT
     _JL_FORMAT_ATTR(printf, 1, 2);
 
