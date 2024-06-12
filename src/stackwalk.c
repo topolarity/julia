@@ -614,22 +614,22 @@ JL_DLLEXPORT jl_value_t *jl_lookup_code_address(void *ip, int skipC)
     return rs;
 }
 
-static void jl_safe_print_codeloc(const char* func_name, const char* file_name,
-                                  int line, int inlined) JL_NOTSAFEPOINT
+static void jl_safe_fprint_codeloc(ios_t *s, const char* func_name, const char* file_name,
+                                   int line, int inlined) JL_NOTSAFEPOINT
 {
     const char *inlined_str = inlined ? " [inlined]" : "";
     if (line != -1) {
-        jl_safe_printf("%s at %s:%d%s\n", func_name, file_name, line, inlined_str);
+        jl_safe_fprintf(s, "%s at %s:%d%s\n", func_name, file_name, line, inlined_str);
     }
     else {
-        jl_safe_printf("%s at %s (unknown line)%s\n", func_name, file_name, inlined_str);
+        jl_safe_fprintf(s, "%s at %s (unknown line)%s\n", func_name, file_name, inlined_str);
     }
 }
 
 // Print function, file and line containing native instruction pointer `ip` by
 // looking up debug info. Prints multiple such frames when `ip` points to
 // inlined code.
-void jl_print_native_codeloc(uintptr_t ip) JL_NOTSAFEPOINT
+void jl_print_native_codeloc(ios_t *s, uintptr_t ip) JL_NOTSAFEPOINT
 {
     // This function is not allowed to reference any TLS variables since
     // it can be called from an unmanaged thread on OSX.
@@ -641,10 +641,10 @@ void jl_print_native_codeloc(uintptr_t ip) JL_NOTSAFEPOINT
     for (i = 0; i < n; i++) {
         jl_frame_t frame = frames[i];
         if (!frame.func_name) {
-            jl_safe_printf("unknown function (ip: %p)\n", (void*)ip);
+            jl_safe_fprintf(s, "unknown function (ip: %p)\n", (void*)ip);
         }
         else {
-            jl_safe_print_codeloc(frame.func_name, frame.file_name, frame.line, frame.inlined);
+            jl_safe_fprint_codeloc(s, frame.func_name, frame.file_name, frame.line, frame.inlined);
             free(frame.func_name);
             free(frame.file_name);
         }
@@ -653,10 +653,10 @@ void jl_print_native_codeloc(uintptr_t ip) JL_NOTSAFEPOINT
 }
 
 // Print code location for backtrace buffer entry at *bt_entry
-void jl_print_bt_entry_codeloc(jl_bt_element_t *bt_entry) JL_NOTSAFEPOINT
+void jl_print_bt_entry_codeloc(ios_t *s, jl_bt_element_t *bt_entry) JL_NOTSAFEPOINT
 {
     if (jl_bt_is_native(bt_entry)) {
-        jl_print_native_codeloc(bt_entry[0].uintptr);
+        jl_print_native_codeloc(s, bt_entry[0].uintptr);
     }
     else if (jl_bt_entry_tag(bt_entry) == JL_BT_INTERP_FRAME_TAG) {
         size_t ip = jl_bt_entry_header(bt_entry);
@@ -682,7 +682,7 @@ void jl_print_bt_entry_codeloc(jl_bt_element_t *bt_entry) JL_NOTSAFEPOINT
                     method = (jl_value_t*)((jl_method_t*)method)->name;
                 if (jl_is_symbol(method))
                     func_name = jl_symbol_name((jl_sym_t*)method);
-                jl_safe_print_codeloc(func_name, jl_symbol_name(locinfo->file),
+                jl_safe_fprint_codeloc(s, func_name, jl_symbol_name(locinfo->file),
                                       locinfo->line, locinfo->inlined_at);
                 debuginfoloc = locinfo->inlined_at;
             }
@@ -690,12 +690,12 @@ void jl_print_bt_entry_codeloc(jl_bt_element_t *bt_entry) JL_NOTSAFEPOINT
         else {
             // If we're using this function something bad has already happened;
             // be a bit defensive to avoid crashing while reporting the crash.
-            jl_safe_printf("No code info - unknown interpreter state!\n");
+            jl_safe_fprintf(s, "No code info - unknown interpreter state!\n");
         }
     }
     else {
-        jl_safe_printf("Non-native bt entry with tag and header bits 0x%" PRIxPTR "\n",
-                       bt_entry[1].uintptr);
+        jl_safe_fprintf(s, "Non-native bt entry with tag and header bits 0x%" PRIxPTR "\n",
+                        bt_entry[1].uintptr);
     }
 }
 
@@ -1108,27 +1108,37 @@ static void jl_rec_backtrace(jl_task_t *t) JL_NOTSAFEPOINT
 
 JL_DLLEXPORT void jl_gdblookup(void* ip)
 {
-    jl_print_native_codeloc((uintptr_t)ip);
+    jl_print_native_codeloc(ios_stderr, (uintptr_t)ip);
 }
 
 // Print backtrace for current exception in catch block
-JL_DLLEXPORT void jlbacktrace(void) JL_NOTSAFEPOINT
+JL_DLLEXPORT void jl_fprint_backtrace(ios_t *s) JL_NOTSAFEPOINT
 {
     jl_task_t *ct = jl_current_task;
     if (ct->ptls == NULL)
         return;
-    jl_excstack_t *s = ct->excstack;
-    if (!s)
+    jl_excstack_t *stack = ct->excstack;
+    if (!stack)
         return;
-    size_t i, bt_size = jl_excstack_bt_size(s, s->top);
-    jl_bt_element_t *bt_data = jl_excstack_bt_data(s, s->top);
+    size_t i, bt_size = jl_excstack_bt_size(stack, stack->top);
+    jl_bt_element_t *bt_data = jl_excstack_bt_data(stack, stack->top);
     for (i = 0; i < bt_size; i += jl_bt_entry_size(bt_data + i)) {
-        jl_print_bt_entry_codeloc(bt_data + i);
+        jl_print_bt_entry_codeloc(s, bt_data + i);
     }
 }
 
-// Print backtrace for specified task to jl_safe_printf stderr
-JL_DLLEXPORT void jlbacktracet(jl_task_t *t) JL_NOTSAFEPOINT
+JL_DLLEXPORT void jlbacktrace(void) JL_NOTSAFEPOINT
+{
+    jl_fprint_backtrace(ios_stderr);
+}
+
+JL_DLLEXPORT void jl_print_backtrace(void) JL_NOTSAFEPOINT
+{
+    jl_fprint_backtrace(ios_stderr);
+}
+
+// Print backtrace for specified task to `s`
+JL_DLLEXPORT void jl_fprint_backtracet(ios_t *s, jl_task_t *t) JL_NOTSAFEPOINT
 {
     jl_task_t *ct = jl_current_task;
     jl_ptls_t ptls = ct->ptls;
@@ -1136,17 +1146,17 @@ JL_DLLEXPORT void jlbacktracet(jl_task_t *t) JL_NOTSAFEPOINT
     size_t i, bt_size = ptls->bt_size;
     jl_bt_element_t *bt_data = ptls->bt_data;
     for (i = 0; i < bt_size; i += jl_bt_entry_size(bt_data + i)) {
-        jl_print_bt_entry_codeloc(bt_data + i);
+        jl_print_bt_entry_codeloc(s, bt_data + i);
     }
 }
 
-JL_DLLEXPORT void jl_print_backtrace(void) JL_NOTSAFEPOINT
+JL_DLLEXPORT void jlbacktracet(jl_task_t *t) JL_NOTSAFEPOINT
 {
-    jlbacktrace();
+    jl_fprint_backtracet(ios_stderr, t);
 }
 
-// Print backtraces for all live tasks, for all threads, to jl_safe_printf stderr
-JL_DLLEXPORT void jl_print_task_backtraces(int show_done) JL_NOTSAFEPOINT
+// Print backtraces for all live tasks, for all threads
+JL_DLLEXPORT void jl_fprint_task_backtraces(ios_t *s, int show_done) JL_NOTSAFEPOINT
 {
     size_t nthreads = jl_atomic_load_acquire(&jl_n_threads);
     jl_ptls_t *allstates = jl_atomic_load_relaxed(&jl_all_tls_states);
@@ -1161,22 +1171,22 @@ JL_DLLEXPORT void jl_print_task_backtraces(int show_done) JL_NOTSAFEPOINT
         jl_task_t *t = ptls2->root_task;
         if (t != NULL)
             t_state = jl_atomic_load_relaxed(&t->_state);
-        jl_safe_printf("==== Thread %d created %zu live tasks\n",
+        jl_safe_fprintf(s, "==== Thread %d created %zu live tasks\n",
                 ptls2->tid + 1, n + (t_state != JL_TASK_STATE_DONE));
         if (show_done || t_state != JL_TASK_STATE_DONE) {
-            jl_safe_printf("     ---- Root task (%p)\n", ptls2->root_task);
+            jl_safe_fprintf(s, "     ---- Root task (%p)\n", ptls2->root_task);
             if (t != NULL) {
-                jl_safe_printf("          (sticky: %d, started: %d, state: %d, tid: %d)\n",
+                jl_safe_fprintf(s, "          (sticky: %d, started: %d, state: %d, tid: %d)\n",
                         t->sticky, t->started, t_state,
                         jl_atomic_load_relaxed(&t->tid) + 1);
                 if (t->stkbuf != NULL) {
-                    jlbacktracet(t);
+                    jl_fprint_backtracet(s, t);
                 }
                 else {
-                    jl_safe_printf("      no stack\n");
+                    jl_safe_fprintf(s, "      no stack\n");
                 }
             }
-            jl_safe_printf("     ---- End root task\n");
+            jl_safe_fprintf(s, "     ---- End root task\n");
         }
 
         for (size_t j = 0; j < n; j++) {
@@ -1186,20 +1196,28 @@ JL_DLLEXPORT void jl_print_task_backtraces(int show_done) JL_NOTSAFEPOINT
             int t_state = jl_atomic_load_relaxed(&t->_state);
             if (!show_done && t_state == JL_TASK_STATE_DONE)
                 continue;
-            jl_safe_printf("     ---- Task %zu (%p)\n", j + 1, t);
+            jl_safe_fprintf(s, "     ---- Task %zu (%p)\n", j + 1, t);
             // n.b. this information might not be consistent with the stack printing after it, since it could start running or change tid, etc.
-            jl_safe_printf("          (sticky: %d, started: %d, state: %d, tid: %d)\n",
+            jl_safe_fprintf(s, "          (sticky: %d, started: %d, state: %d, tid: %d)\n",
                     t->sticky, t->started, t_state,
                     jl_atomic_load_relaxed(&t->tid) + 1);
-            if (t->stkbuf != NULL)
-                jlbacktracet(t);
-            else
-                jl_safe_printf("      no stack\n");
-            jl_safe_printf("     ---- End task %zu\n", j + 1);
+            if (t->stkbuf != NULL) {
+                jl_fprint_backtracet(ios_stderr, t);
+            }
+            else {
+                jl_safe_fprintf(s, "      no stack\n");
+            }
+            jl_safe_fprintf(s, "     ---- End task %zu\n", j + 1);
         }
-        jl_safe_printf("==== End thread %d\n", ptls2->tid + 1);
+        jl_safe_fprintf(s, "==== End thread %d\n", ptls2->tid + 1);
     }
-    jl_safe_printf("==== Done\n");
+    jl_safe_fprintf(s, "==== Done\n");
+}
+
+// Print backtraces for all live tasks, for all threads, to jl_safe_printf stderr
+JL_DLLEXPORT void jl_print_task_backtraces(int show_done) JL_NOTSAFEPOINT
+{
+    jl_fprint_task_backtraces(ios_stderr, show_done);
 }
 
 #ifdef __cplusplus

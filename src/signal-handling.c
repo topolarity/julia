@@ -441,7 +441,7 @@ void jl_critical_error(int sig, int si_code, bt_context_t *context, jl_task_t *c
     size_t *bt_size = ct ? &ct->ptls->bt_size : NULL;
     size_t i, n = ct ? *bt_size : 0;
     if (sig) {
-        // kill this task, so that we cannot get back to it accidentally (via an untimely ^C or jlbacktrace in jl_exit)
+        // kill this task, so that we cannot get back to it accidentally (via an untimely ^C or jl_fprint_backtrace in jl_exit)
         jl_task_frame_noreturn(ct);
 #ifndef _OS_WINDOWS_
         sigset_t sset;
@@ -475,7 +475,7 @@ void jl_critical_error(int sig, int si_code, bt_context_t *context, jl_task_t *c
         *bt_size = n = rec_backtrace_ctx(bt_data, JL_MAX_BT_SIZE, context, NULL);
     }
     for (i = 0; i < n; i += jl_bt_entry_size(bt_data + i)) {
-        jl_print_bt_entry_codeloc(bt_data + i);
+        jl_print_bt_entry_codeloc(ios_stderr, bt_data + i);
     }
     jl_gc_debug_print_status();
     jl_gc_debug_critical_error();
