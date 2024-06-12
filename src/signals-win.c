@@ -328,7 +328,11 @@ LONG WINAPI jl_exception_handler(struct _EXCEPTION_POINTERS *ExceptionInfo)
         jl_safe_printf("UNKNOWN"); break;
     }
     jl_safe_printf(" at 0x%Ix -- ", (size_t)ExceptionInfo->ExceptionRecord->ExceptionAddress);
-    jl_print_native_codeloc((uintptr_t)ExceptionInfo->ExceptionRecord->ExceptionAddress);
+
+    ios_t s;
+    ios_fd(&s, STDERR_FILENO, /* isfile */ 0, /* own */ 0);
+    jl_print_native_codeloc(&s, (uintptr_t)ExceptionInfo->ExceptionRecord->ExceptionAddress);
+    ios_close(&s);
 
     jl_critical_error(0, 0, ExceptionInfo->ContextRecord, ct);
     static int recursion = 0;

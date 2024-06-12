@@ -1006,9 +1006,12 @@ static void *signal_listener(void *arg)
 
             jl_safe_printf("\nsignal (%d): %s\n", sig, strsignal(sig));
             size_t i;
+            ios_t s;
+            ios_fd(&s, STDERR_FILENO, /* isfile */ 0, /* own */ 0);
             for (i = 0; i < bt_size; i += jl_bt_entry_size(bt_data + i)) {
-                jl_print_bt_entry_codeloc(bt_data + i);
+                jl_print_bt_entry_codeloc(&s, bt_data + i);
             }
+            ios_close(&s);
         }
     }
     return NULL;

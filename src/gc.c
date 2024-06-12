@@ -303,7 +303,11 @@ static void run_finalizer(jl_task_t *ct, void *o, void *ff)
         jl_printf((JL_STREAM*)STDERR_FILENO, "error in running finalizer: ");
         jl_static_show((JL_STREAM*)STDERR_FILENO, jl_current_exception(ct));
         jl_printf((JL_STREAM*)STDERR_FILENO, "\n");
-        jlbacktrace(); // written to STDERR_FILENO
+
+        ios_t s;
+        ios_fd(&s, STDERR_FILENO, /* isfile */ 0, /* own */ 0);
+        jlbacktrace(&s);
+        ios_close(&s);
     }
 }
 
@@ -489,7 +493,11 @@ JL_DLLEXPORT void jl_gc_enable_finalizers(jl_task_t *ct, int on)
             static int backtrace_printed = 0;
             if (backtrace_printed == 0) {
                 backtrace_printed = 1;
-                jlbacktrace(); // written to STDERR_FILENO
+
+                ios_t s;
+                ios_fd(&s, STDERR_FILENO, /* isfile */ 0, /* own */ 0);
+                jlbacktrace(&s);
+                ios_close(&s);
             }
         }
         return;

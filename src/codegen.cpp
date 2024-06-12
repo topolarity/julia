@@ -9781,7 +9781,11 @@ jl_llvm_functions_t jl_emit_code(
         jl_printf((JL_STREAM*)STDERR_FILENO, "Internal error: encountered unexpected error during compilation of %s:\n", mname.c_str());
         jl_static_show((JL_STREAM*)STDERR_FILENO, jl_current_exception(jl_current_task));
         jl_printf((JL_STREAM*)STDERR_FILENO, "\n");
-        jlbacktrace(); // written to STDERR_FILENO
+
+        ios_t s;
+        ios_fd(&s, STDERR_FILENO, /* isfile */ 0, /* own */ 0);
+        jlbacktrace(&s);
+        ios_close(&s);
     }
 
     return decls;

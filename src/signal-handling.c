@@ -491,9 +491,12 @@ void jl_critical_error(int sig, int si_code, bt_context_t *context, jl_task_t *c
         // is properly rooted.
         *bt_size = n = rec_backtrace_ctx(bt_data, JL_MAX_BT_SIZE, context, NULL);
     }
+    ios_t s;
+    ios_fd(&s, STDERR_FILENO, /* isfile */ 0, /* own */ 0);
     for (i = 0; i < n; i += jl_bt_entry_size(bt_data + i)) {
-        jl_print_bt_entry_codeloc(bt_data + i);
+        jl_print_bt_entry_codeloc(&s, bt_data + i);
     }
+    ios_close(&s);
     jl_gc_debug_print_status();
     jl_gc_debug_critical_error();
 }

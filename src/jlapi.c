@@ -877,7 +877,12 @@ static int exec_program(char *program)
             jl_static_show((JL_STREAM*)STDERR_FILENO, exc);
             jl_printf((JL_STREAM*)STDERR_FILENO, "\n");
         }
-        jl_print_backtrace(); // written to STDERR_FILENO
+
+        ios_t s;
+        ios_fd(&s, STDERR_FILENO, /* isfile */ 0, /* own */ 0);
+        jl_print_backtrace(&s);
+        ios_close(&s);
+
         jl_printf((JL_STREAM*)STDERR_FILENO, "\n");
         return 1;
     }
@@ -950,7 +955,11 @@ static NOINLINE int true_main(int argc, char *argv[])
             jl_printf((JL_STREAM*)STDERR_FILENO, "\nparser error:\n");
             jl_static_show((JL_STREAM*)STDERR_FILENO, jl_current_exception(ct));
             jl_printf((JL_STREAM*)STDERR_FILENO, "\n");
-            jl_print_backtrace(); // written to STDERR_FILENO
+
+            ios_t s;
+            ios_fd(&s, STDERR_FILENO, /* isfile */ 0, /* own */ 0);
+            jl_print_backtrace(&s);
+            ios_close(&s);
         }
     }
     return 0;

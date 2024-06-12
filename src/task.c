@@ -692,7 +692,12 @@ JL_DLLEXPORT JL_NORETURN void jl_no_exc_handler(jl_value_t *e, jl_task_t *ct)
     jl_printf((JL_STREAM*)STDERR_FILENO, "fatal: error thrown and no exception handler available.\n");
     jl_static_show((JL_STREAM*)STDERR_FILENO, e);
     jl_printf((JL_STREAM*)STDERR_FILENO, "\n");
-    jlbacktrace(); // written to STDERR_FILENO
+
+    ios_t s;
+    ios_fd(&s, STDERR_FILENO, /* isfile */ 0, /* own */ 0);
+    jlbacktrace(&s);
+    ios_close(&s);
+
     if (ct == NULL)
         jl_raise(6);
     jl_exit(1);
