@@ -97,7 +97,7 @@ void jl_call_tracer(tracer_cb callback, jl_value_t *tracee)
         jl_printf((JL_STREAM*)STDERR_FILENO, "WARNING: tracer callback function threw an error:\n");
         jl_static_show((JL_STREAM*)STDERR_FILENO, jl_current_exception(ct));
         jl_printf((JL_STREAM*)STDERR_FILENO, "\n");
-        jlbacktrace(); // written to STDERR_FILENO
+        jl_fprint_backtrace(ios_stderr);
     }
 }
 
@@ -405,7 +405,7 @@ jl_code_instance_t *jl_type_infer(jl_method_instance_t *mi, size_t world, int fo
             jl_printf((JL_STREAM*)STDERR_FILENO, "unexpected error in runtime:\n");
             jl_static_show((JL_STREAM*)STDERR_FILENO, e);
             jl_printf((JL_STREAM*)STDERR_FILENO, "\n");
-            jlbacktrace(); // written to STDERR_FILENO
+            jl_fprint_backtrace(ios_stderr);
         }
         ci = NULL;
 #ifndef JL_NDEBUG
