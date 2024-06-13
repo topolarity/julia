@@ -496,9 +496,9 @@ void jl_critical_error(int sig, int si_code, bt_context_t *context, jl_task_t *c
     for (i = 0; i < n; i += jl_bt_entry_size(bt_data + i)) {
         jl_print_bt_entry_codeloc(&s, bt_data + i);
     }
+    jl_gc_debug_print_status(&s);
+    jl_gc_debug_critical_error(&s);
     ios_close(&s);
-    jl_gc_debug_print_status();
-    jl_gc_debug_critical_error();
 }
 
 #ifdef __cplusplus

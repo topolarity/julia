@@ -106,7 +106,12 @@ void jl_safepoint_init(void)
 #endif
     if (addr == NULL) {
         jl_printf(JL_STDERR, "could not allocate GC synchronization page\n");
-        jl_gc_debug_critical_error();
+
+        ios_t s;
+        ios_fd(&s, STDERR_FILENO, /* isfile */ 0, /* own */ 0);
+        jl_gc_debug_critical_error(&s);
+        ios_close(&s);
+
         abort();
     }
 //    // If we able to skip past the faulting safepoint instruction conditionally,
