@@ -988,6 +988,24 @@ ios_t *ios_file(ios_t *s, const char *fname, int rd, int wr, int create, int tru
     return NULL;
 }
 
+#ifdef _OS_WINDOWS_
+const wchar_t *ios_utf8_to_wchar(const char *str) {
+    /* Fast-path empty strings, as MultiByteToWideChar() returns zero for them. */
+    if (str[0] == '\0') {
+        wchar_t *wstr = (wchar_t *)malloc(sizeof(wchar_t));
+        wstr[0] = L'\0';
+        return wstr;
+    }
+    size_t len = MultiByteToWideChar(CP_UTF8, 0, str, -1, NULL, 0);
+    if (!len)
+        return NULL;
+    wchar_t *wstr = (wchar_t *)malloc(len * sizeof(wchar_t));
+    if (!wstr || !MultiByteToWideChar(CP_UTF8, 0, str, -1, wstr, len))
+        return NULL;
+    return wstr;
+}
+#endif // _OS_WINDOWS_
+
 // Portable ios analogue of mkstemp: modifies fname to replace
 // trailing XXXX's with unique ID and returns the file handle s
 // for writing and reading.
