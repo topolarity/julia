@@ -323,7 +323,7 @@ void JL_NORETURN jl_finish_task(jl_task_t *t)
             jl_no_exc_handler(jl_current_exception(), ct);
         }
     }
-    jl_gc_debug_critical_error();
+    jl_gc_debug_fprint_critical_error(ios_stderr);
     abort();
 }
 
@@ -1271,7 +1271,7 @@ skip_pop_exception:;
     ct->result = res;
     jl_gc_wb(ct, ct->result);
     jl_finish_task(ct);
-    jl_gc_debug_critical_error();
+    jl_gc_debug_fprint_critical_error(ios_stderr);
     abort();
 }
 
