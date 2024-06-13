@@ -515,7 +515,7 @@ static void jl_try_deliver_sigint(void)
 static void JL_NORETURN jl_exit_thread0_cb(int signo)
 {
 CFI_NORETURN
-    jl_critical_error(signo, 0, NULL, jl_current_task);
+    jl_fprint_critical_error(ios_stderr, signo, 0, NULL, jl_current_task);
     jl_atexit_hook(128);
     jl_raise(signo);
 }
