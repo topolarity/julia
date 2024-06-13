@@ -494,8 +494,8 @@ void jl_critical_error(int sig, int si_code, bt_context_t *context, jl_task_t *c
     for (i = 0; i < n; i += jl_bt_entry_size(bt_data + i)) {
         jl_fprint_bt_entry_codeloc(ios_stderr, bt_data + i);
     }
-    jl_gc_debug_print_status();
-    jl_gc_debug_critical_error();
+    jl_gc_debug_fprint_status(ios_stderr);
+    jl_gc_debug_fprint_critical_error(ios_stderr);
 }
 
 #ifdef __cplusplus
