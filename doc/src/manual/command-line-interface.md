@@ -140,7 +140,12 @@ The following is a complete list of command-line switches available when launchi
 |`--output-bc <name>`                   |Generate LLVM bitcode (.bc)|
 |`--output-asm <name>`                  |Generate an assembly file (.s)|
 |`--output-incremental={yes\|no*}`      |Generate an incremental output file (rather than complete)|
+<<<<<<< HEAD
 |`--trace-compile={stderr,name}`        |Print precompile statements for methods compiled during execution or save to a path|
+=======
+|`--trace-compile={stderr\|name}`       |Print precompile statements for methods compiled during execution or save to a path|
+|`--trace-compile-timing`               |If --trace-compile is enabled show how long each took to compile in ms|
+>>>>>>> 0ae5b321b3 (add `--trace-compile-timing` arg to add compile timing comments (#54662))
 |`--image-codegen`                      |Force generate code in imaging mode|
 |`--heap-size-hint=<size>`              |Forces garbage collection if memory usage is higher than that value. The memory hint might be specified in megabytes (e.g., 500M) or gigabytes (e.g., 1G)|
 
