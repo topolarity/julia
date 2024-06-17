@@ -26,9 +26,9 @@ extern "C" {
 #endif
 
 // current line number in a file
-JL_DLLEXPORT int jl_lineno = 0; // need to update jl_critical_error if this is TLS
+JL_DLLEXPORT int jl_lineno = 0; // need to update jl_fprint_critical_error if this is TLS
 // current file name
-JL_DLLEXPORT const char *jl_filename = "none"; // need to update jl_critical_error if this is TLS
+JL_DLLEXPORT const char *jl_filename = "none"; // need to update jl_fprint_critical_error if this is TLS
 
 htable_t jl_current_modules;
 jl_mutex_t jl_modules_mutex;

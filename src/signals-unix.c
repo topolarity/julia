@@ -228,8 +228,8 @@ static void sigdie_handler(int sig, siginfo_t *info, void *context)
     signal(sig, SIG_DFL);
     uv_tty_reset_mode();
     if (sig == SIGILL)
-        jl_show_sigill(context);
-    jl_critical_error(sig, info->si_code, jl_to_bt_context(context), jl_get_current_task());
+        jl_fprint_sigill(ios_stderr, context);
+    jl_fprint_critical_error(ios_stderr, sig, info->si_code, jl_to_bt_context(context), jl_get_current_task());
     if (info->si_code == 0 ||
         info->si_code == SI_USER ||
 #ifdef SI_KERNEL
@@ -475,7 +475,7 @@ static int thread0_exit_signo = 0;
 static void JL_NORETURN jl_exit_thread0_cb(void)
 {
 CFI_NORETURN
-    jl_critical_error(thread0_exit_signo, 0, NULL, jl_current_task);
+    jl_fprint_critical_error(ios_stderr, thread0_exit_signo, 0, NULL, jl_current_task);
     jl_atexit_hook(128);
     jl_raise(thread0_exit_signo);
 }
