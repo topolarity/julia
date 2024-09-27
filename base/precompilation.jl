@@ -395,14 +395,13 @@ function precompilepkgs(pkgs::Vector{String}=String[];
     # in the current environment (i.e. their triggers are present)
     parent_to_exts = Dict{Base.PkgId, Vector{Base.PkgId}}()
     # inverse map of `parent_to_ext` above (ext → parent)
-    ext_to_parent_name = Dict{Base.PkgId, String}()
+    ext_to_parent = Dict{Base.PkgId, Base.PkgId}()
 
     for (dep, deps) in env.deps
         pkg = Base.PkgId(dep, env.names[dep])
         Base.in_sysimage(pkg) && continue
         deps = [Base.PkgId(x, env.names[x]) for x in deps]
         direct_deps[pkg] = filter!(!Base.in_sysimage, deps)
-        pkg_exts = Dict{Base.PkgId, Vector{Base.PkgId}}()
         for (ext_name, trigger_uuids) in env.extensions[dep]
             triggers = Base.PkgId[] # triggers for `ext`
             push!(triggers, pkg) # depends on parent package
@@ -421,12 +420,13 @@ function precompilepkgs(pkgs::Vector{String}=String[];
             ext = Base.PkgId(ext_uuid, ext_name)
             filter!(!Base.in_sysimage, triggers)
 
+            if !haskey(parent_to_exts, pkg)
+                parent_to_exts[pkg] = Base.PkgId[]
+            end
+
             direct_deps[ext] = triggers
-            ext_to_parent_name[ext] = pkg.name
-            pkg_exts[ext] = triggers
-        end
-        if !isempty(pkg_exts)
-            parent_to_exts[pkg] = collect(keys(pkg_exts))
+            ext_to_parent[ext] = pkg
+            push!(parent_to_exts[pkg], ext)
         end
     end
 
@@ -436,7 +436,7 @@ function precompilepkgs(pkgs::Vector{String}=String[];
     ]
 
     # consider exts of project deps to be project deps so that errors are reported
-    append!(project_deps, keys(filter(d->last(d) in keys(env.project_deps), ext_to_parent_name)))
+    append!(project_deps, keys(filter(d->last(d).name in keys(env.project_deps), ext_to_parent)))
 
     @debug "precompile: deps collected"
     # this loop must be run after the full direct_deps map has been populated
@@ -444,7 +444,7 @@ function precompilepkgs(pkgs::Vector{String}=String[];
         # find any packages that depend on the extension(s)'s deps and replace those deps in their deps list with the extension(s),
         # basically injecting the extension into the precompile order in the graph, to avoid race to precompile extensions
         for (_pkg, deps) in direct_deps # for each manifest dep
-            if !in(_pkg, keys(ext_to_parent_name)) && pkg in deps # if not an extension and depends on pkg
+            if !in(_pkg, keys(ext_to_parent)) && pkg in deps # if not an extension and depends on pkg
                 append!(deps, pkg_exts) # add the package extensions to deps
                 filter!(!isequal(pkg), deps) # remove the pkg from deps
             end
@@ -542,7 +542,7 @@ function precompilepkgs(pkgs::Vector{String}=String[];
                 collect_all_deps(direct_deps, dep_pkgid, keep)
             end
         end
-        for ext in keys(ext_to_parent_name)
+        for ext in keys(ext_to_parent)
             if issubset(collect_all_deps(direct_deps, ext), keep) # if all extension deps are kept
                 push!(keep, ext)
             end
@@ -691,7 +691,7 @@ function precompilepkgs(pkgs::Vector{String}=String[];
                         for pkg_config in pkg_queue_show
                             dep, config = pkg_config
                             loaded = warn_loaded && haskey(Base.loaded_modules, dep)
-                            _name = haskey(ext_to_parent_name, dep) ? string(ext_to_parent_name[dep], " → ", dep.name) : dep.name
+                            _name = haskey(ext_to_parent, dep) ? string(ext_to_parent[dep].name, " → ", dep.name) : dep.name
                             name = dep in project_deps ? _name : string(color_string(_name, :light_black))
                             if nconfigs > 1 && !isempty(config[1])
                                 config_str = "$(join(config[1], " "))"
@@ -784,7 +784,7 @@ function precompilepkgs(pkgs::Vector{String}=String[];
                         std_pipe = Base.link_pipe!(Pipe(); reader_supports_async=true, writer_supports_async=true)
                         t_monitor = @async monitor_std(pkg_config, std_pipe; single_requested_pkg)
 
-                        _name = haskey(ext_to_parent_name, pkg) ? string(ext_to_parent_name[pkg], " → ", pkg.name) : pkg.name
+                        _name = haskey(ext_to_parent, pkg) ? string(ext_to_parent[pkg].name, " → ", pkg.name) : pkg.name
                         name = is_project_dep ? _name : string(color_string(_name, :light_black))
                         if nconfigs > 1 && !isempty(flags)
                             config_str = "$(join(flags, " "))"
@@ -809,7 +809,7 @@ function precompilepkgs(pkgs::Vector{String}=String[];
                             t = @elapsed ret = precompile_pkgs_maybe_cachefile_lock(io, print_lock, fancyprint, pkg_config, pkgspidlocked, hascolor) do
                                 Base.with_logger(Base.NullLogger()) do
                                     # The false here means we ignore loaded modules, so precompile for a fresh session
-                                    Base.compilecache(pkg, sourcepath, std_pipe, std_pipe, false; flags, cacheflags, isext = haskey(ext_to_parent_name, pkg))
+                                    Base.compilecache(pkg, sourcepath, std_pipe, std_pipe, false; flags, cacheflags, isext = haskey(ext_to_parent, pkg))
                                 end
                             end
                             if ret isa Base.PrecompilableError
@@ -920,7 +920,7 @@ function precompilepkgs(pkgs::Vector{String}=String[];
                     else
                         join(split(strip(err), "\n"), color_string("\n│  ", Base.warn_color()))
                     end
-                    name = haskey(ext_to_parent_name, pkg) ? string(ext_to_parent_name[pkg], " → ", pkg.name) : pkg.name
+                    name = haskey(ext_to_parent, pkg) ? string(ext_to_parent[pkg].name, " → ", pkg.name) : pkg.name
                     print(iostr, color_string("\n┌ ", Base.warn_color()), name, color_string("\n│  ", Base.warn_color()), err, color_string("\n└  ", Base.warn_color()))
                 end
             end
