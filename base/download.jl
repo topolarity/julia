@@ -23,3 +23,17 @@ function do_download(url::AbstractString, path::Union{AbstractString, Nothing})
     depwarn("Base.download is deprecated; use Downloads.download instead", :download)
     invokelatest(Downloads().download, url, path)
 end
+
+module DownloadsHooks
+
+"""
+`EASY_HOOK` is a modifable global hook to used as the default `easy_hook` on
+new `Downloader` objects. This supplies a mechanism to set options for the
+`Downloader` via `Curl.setopt`
+
+It is expected to be function taking two arguments: an `Easy` struct and an
+`info` NamedTuple with names `url`, `method` and `headers`.
+"""
+const EASY_HOOK = Ref{Union{Function, Nothing}}(nothing)
+
+end # module
