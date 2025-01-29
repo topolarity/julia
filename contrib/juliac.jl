@@ -1,6 +1,11 @@
 # Julia compiler wrapper script
 # NOTE: The interface and location of this script are considered unstable/experimental
 
+module JuliaConfig
+    include(joinpath(@__DIR__, "julia-config.jl"))
+end
+using JuliaConfig: allflags
+
 cmd = Base.julia_cmd()
 cmd = `$cmd --startup-file=no --history-file=no`
 output_type = nothing  # exe, sharedlib, sysimage
@@ -57,8 +62,8 @@ isnothing(file) && error("No input file specified")
 absfile = abspath(file)
 cflags = readchomp(`$(cmd) $(joinpath(Sys.BINDIR, Base.DATAROOTDIR,"julia", "julia-config.jl")) --cflags `)
 cflags = Base.shell_split(cflags)
-allflags = readchomp(`$(cmd) $(joinpath(Sys.BINDIR, Base.DATAROOTDIR,"julia", "julia-config.jl")) --allflags`)
-allflags = Base.shell_split(allflags)
+allflags = allflags(; framework=false, rpath=false)
+rpath = Sys.isapple() ? "-Wl,-rpath,'@loader_path/julia:@loader_path'" : "-Wl,-rpath,'\$ORIGIN/julia:\$ORIGIN'"
 tmpdir = mktempdir(cleanup=false)
 initsrc_path = joinpath(tmpdir, "init.c")
 init_path = joinpath(tmpdir, "init.a")
@@ -97,9 +102,9 @@ end
 julia_libs = Base.shell_split(Base.isdebugbuild() ? "-ljulia-debug -ljulia-internal-debug" : "-ljulia -ljulia-internal")
 try
     if output_type == "--output-lib"
-        run(`cc $(allflags) -o $outname -shared -Wl,$(Base.Linking.WHOLE_ARCHIVE) $img_path  -Wl,$(Base.Linking.NO_WHOLE_ARCHIVE) $init_path  $(julia_libs)`)
+        run(`cc $(allflags) $(rpath) -o $outname -shared -Wl,$(Base.Linking.WHOLE_ARCHIVE) $img_path  -Wl,$(Base.Linking.NO_WHOLE_ARCHIVE) $init_path  $(julia_libs)`)
     elseif output_type == "--output-sysimage"
-        run(`cc $(allflags) -o $outname -shared -Wl,$(Base.Linking.WHOLE_ARCHIVE) $img_path  -Wl,$(Base.Linking.NO_WHOLE_ARCHIVE)             $(julia_libs)`)
+        run(`cc $(allflags) $(rpath) -o $outname -shared -Wl,$(Base.Linking.WHOLE_ARCHIVE) $img_path  -Wl,$(Base.Linking.NO_WHOLE_ARCHIVE)             $(julia_libs)`)
     else
         run(`cc $(allflags) -o $outname -Wl,$(Base.Linking.WHOLE_ARCHIVE) $img_path -Wl,$(Base.Linking.NO_WHOLE_ARCHIVE) $init_path $(julia_libs)`)
     end
