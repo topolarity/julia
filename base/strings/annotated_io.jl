@@ -2,16 +2,17 @@
 
 ## AnnotatedIOBuffer
 
-struct AnnotatedIOBuffer <: AbstractPipe
+struct AnnotatedIOBuffer{A} <: AbstractPipe
     io::IOBuffer
-    annotations::Vector{RegionAnnotation}
+    annotations::Vector{RegionAnnotation(A)}
 end
 
-AnnotatedIOBuffer(io::IOBuffer) = AnnotatedIOBuffer(io, Vector{RegionAnnotation}())
-AnnotatedIOBuffer() = AnnotatedIOBuffer(IOBuffer())
+AnnotatedIOBuffer{A}(io::IOBuffer) where A = AnnotatedIOBuffer(io, Vector{RegionAnnotation(A)}())
+AnnotatedIOBuffer{A}() where A = AnnotatedIOBuffer{A}(IOBuffer())
+# AnnotatedIOBuffer() = AnnotatedIOBuffer{Any}(IOBuffer())
 
 function show(io::IO, aio::AnnotatedIOBuffer)
-    show(io, AnnotatedIOBuffer)
+    show(io, typeof(aio))
     size = filesize(aio.io)
     print(io, '(', size, " byte", ifelse(size == 1, "", "s"), ", ",
           length(aio.annotations), " annotation", ifelse(length(aio.annotations) == 1, "", "s"), ")")
@@ -29,14 +30,14 @@ copy(io::AnnotatedIOBuffer) = AnnotatedIOBuffer(copy(io.io), copy(io.annotations
 
 annotations(io::AnnotatedIOBuffer) = io.annotations
 
-annotate!(io::AnnotatedIOBuffer, range::UnitRange{Int}, label::Symbol, @nospecialize(val::Any)) =
+annotate!(io::AnnotatedIOBuffer{A}, range::UnitRange{Int}, label::Symbol, @nospecialize(val::A)) where A =
     (_annotate!(io.annotations, range, label, val); io)
 
-function write(io::AnnotatedIOBuffer, astr::Union{AnnotatedString, SubString{<:AnnotatedString}})
+function write(io::AnnotatedIOBuffer{A}, astr::Union{AnnotatedString, SubString{<:AnnotatedString}}) where A
     astr = AnnotatedString(astr)
     offset = position(io.io)
     eof(io) || _clear_annotations_in_region!(io.annotations, offset+1:offset+ncodeunits(astr))
-    _insert_annotations!(io, astr.annotations)
+    _insert_annotations!(io, convert(Vector{RegionAnnotation(A)}, astr.annotations))
     write(io.io, String(astr))
 end
 
@@ -46,14 +47,16 @@ write(io::AnnotatedIOBuffer, x::AbstractString) = write(io.io, x)
 write(io::AnnotatedIOBuffer, s::Union{SubString{String}, String}) = write(io.io, s)
 write(io::AnnotatedIOBuffer, b::UInt8) = write(io.io, b)
 
-function write(dest::AnnotatedIOBuffer, src::AnnotatedIOBuffer)
+function write(dest::AnnotatedIOBuffer{A}, src::AnnotatedIOBuffer) where A
     destpos = position(dest)
     isappending = eof(dest)
     srcpos = position(src)
     nb = write(dest.io, src.io)
     isappending || _clear_annotations_in_region!(dest.annotations, destpos:destpos+nb)
-    srcannots = [setindex(annot, max(1 + srcpos, first(annot.region)):last(annot.region), :region)
-                 for annot in src.annotations if first(annot.region) >= srcpos]
+    srcannots = RegionAnnotation(A)[
+        setindex(annot, max(1 + srcpos, first(annot.region)):last(annot.region), :region)
+        for annot in src.annotations if first(annot.region) >= srcpos
+    ]
     _insert_annotations!(dest, srcannots, destpos - srcpos)
     nb
 end
@@ -77,26 +80,29 @@ function write(io::AbstractPipe, c::AnnotatedChar)
     end::Int
 end
 
-function read(io::AnnotatedIOBuffer, ::Type{AnnotatedString{T}}) where {T <: AbstractString}
+function read(io::AnnotatedIOBuffer, ::Type{AnnotatedString{A,T}}) where {A, T <: AbstractString}
     if (start = position(io)) == 0
-        AnnotatedString(read(io.io, T), copy(io.annotations))
+        AnnotatedString{A,T}(read(io.io, T), copy(io.annotations))
     else
         annots = [setindex(annot, UnitRange{Int}(max(1, first(annot.region) - start), last(annot.region)-start), :region)
                   for annot in io.annotations if last(annot.region) > start]
-        AnnotatedString(read(io.io, T), annots)
+        AnnotatedString{A,T}(read(io.io, T), annots)
     end
 end
-read(io::AnnotatedIOBuffer, ::Type{AnnotatedString{AbstractString}}) = read(io, AnnotatedString{String})
-read(io::AnnotatedIOBuffer, ::Type{AnnotatedString}) = read(io, AnnotatedString{String})
+# TODO: is transforming AbstractString -> String justified here?
+read(io::AnnotatedIOBuffer, ::Type{AnnotatedString{A,AbstractString}}) where A = read(io, AnnotatedString{A,String})
+read(io::AnnotatedIOBuffer, ::Type{AnnotatedString{A}}) where A = read(io, AnnotatedString{A,String})
+read(io::AnnotatedIOBuffer{A}, ::Type{AnnotatedString}) where A = read(io, AnnotatedString{A,String})
 
-function read(io::AnnotatedIOBuffer, ::Type{AnnotatedChar{T}}) where {T <: AbstractChar}
+function read(io::AnnotatedIOBuffer, ::Type{AnnotatedChar{A,T}}) where {A, T <: AbstractChar}
     pos = position(io)
     char = read(io.io, T)
     annots = [NamedTuple{(:label, :value)}(annot) for annot in io.annotations if pos+1 in annot.region]
-    AnnotatedChar(char, annots)
+    AnnotatedChar{A,T}(char, annots)
 end
-read(io::AnnotatedIOBuffer, ::Type{AnnotatedChar{AbstractChar}}) = read(io, AnnotatedChar{Char})
-read(io::AnnotatedIOBuffer, ::Type{AnnotatedChar}) = read(io, AnnotatedChar{Char})
+read(io::AnnotatedIOBuffer, ::Type{AnnotatedChar{A,AbstractChar}}) where A = read(io, AnnotatedChar{A,Char})
+read(io::AnnotatedIOBuffer, ::Type{AnnotatedChar{A}}) where A = read(io, AnnotatedChar{A,Char})
+read(io::AnnotatedIOBuffer{A}, ::Type{AnnotatedChar}) where A = read(io, AnnotatedChar{A,Char})
 
 function truncate(io::AnnotatedIOBuffer, size::Integer)
     truncate(io.io, size)
@@ -115,10 +121,10 @@ This operates by removing all elements of `annotations` that are entirely
 contained in `span`, truncating ranges that partially overlap, and splitting
 annotations that subsume `span` to just exist either side of `span`.
 """
-function _clear_annotations_in_region!(annotations::Vector{RegionAnnotation}, span::UnitRange{Int})
+function _clear_annotations_in_region!(annotations::Vector{RegionAnnotation(A)}, span::UnitRange{Int}) where A
     # Clear out any overlapping pre-existing annotations.
     filter!(ann -> first(ann.region) < first(span) || last(ann.region) > last(span), annotations)
-    extras = Tuple{Int, RegionAnnotation}[]
+    extras = Tuple{Int, RegionAnnotation(A)}[]
     for i in eachindex(annotations)
         annot = annotations[i]
         region = annot.region
@@ -163,7 +169,7 @@ This is implemented so that one can say write an `AnnotatedString` to an
 `AnnotatedIOBuffer` one character at a time without needlessly producing a
 new annotation for each character.
 """
-function _insert_annotations!(io::AnnotatedIOBuffer, annotations::Vector{RegionAnnotation}, offset::Int = position(io))
+function _insert_annotations!(io::AnnotatedIOBuffer{A}, annotations::Vector{RegionAnnotation(A)}, offset::Int = position(io)) where A
     run = 0
     if !isempty(io.annotations) && last(last(io.annotations).region) == offset
         for i in reverse(axes(annotations, 1))

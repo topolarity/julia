@@ -445,13 +445,13 @@ function match(re::Regex, str::Union{SubString{String}, String}, idx::Integer,
     return result
 end
 
-function _annotatedmatch(m::RegexMatch{S}, str::AnnotatedString{S}) where {S<:AbstractString}
-    RegexMatch{AnnotatedString{S}}(
-        (@inbounds SubString{AnnotatedString{S}}(
+function _annotatedmatch(m::RegexMatch{S}, str::AnnotatedString{A,S}) where {A,S<:AbstractString}
+    RegexMatch{AnnotatedString{A,S}}(
+        (@inbounds SubString{AnnotatedString{A,S}}(
             str, m.match.offset, m.match.ncodeunits, Val(:noshift))),
-        Union{Nothing,SubString{AnnotatedString{S}}}[
+        Union{Nothing,SubString{AnnotatedString{A,S}}}[
             if !isnothing(cap)
-                (@inbounds SubString{AnnotatedString{S}}(
+                (@inbounds SubString{AnnotatedString{A,S}}(
                     str, cap.offset, cap.ncodeunits, Val(:noshift)))
             end for cap in m.captures],
         m.offset, m.offsets, m.regex)
@@ -726,8 +726,8 @@ struct RegexMatchIterator{S <: AbstractString}
 
     RegexMatchIterator(regex::Regex, string::AbstractString, ovr::Bool=false) =
         new{String}(regex, String(string), ovr)
-    RegexMatchIterator(regex::Regex, string::AnnotatedString, ovr::Bool=false) =
-        new{AnnotatedString{String}}(regex, AnnotatedString(String(string.string), string.annotations), ovr)
+    RegexMatchIterator(regex::Regex, string::AnnotatedString{A}, ovr::Bool=false) where A =
+        new{AnnotatedString{A,String}}(regex, AnnotatedString(String(string.string), string.annotations), ovr)
 end
 compile(itr::RegexMatchIterator) = (compile(itr.regex); itr)
 eltype(::Type{<:RegexMatchIterator}) = RegexMatch

@@ -354,7 +354,8 @@ function _join_preserve_annotations(iterator, args...)
     if isconcretetype(et) && !_isannotated(et) && !any(_isannotated, args)
         sprint(join, iterator, args...)
     else
-        io = AnnotatedIOBuffer()
+        Annotation = annotationtype(et)
+        io = AnnotatedIOBuffer{Annotation}()
         join(io, iterator, args...)
         # If we know (from compile time information, or dynamically in the case
         # of iterators with a non-concrete eltype), that the result is annotated
@@ -362,7 +363,7 @@ function _join_preserve_annotations(iterator, args...)
         # a plain `String` from `io`.
         if isconcretetype(et) || !isempty(io.annotations)
             seekstart(io)
-            read(io, AnnotatedString{String})
+            read(io, AnnotatedString{Annotation,String})
         else
             String(take!(io.io))
         end
