@@ -198,13 +198,22 @@ static void jl_compile_all_defs(jl_array_t *mis, int all)
 static int precompile_enq_specialization_(jl_method_instance_t *mi, void *closure)
 {
     assert(jl_is_method_instance(mi));
+    int is_precompiled_mi = jl_atomic_load_relaxed(&mi->flags) & JL_MI_FLAGS_MASK_PRECOMPILED;
+    int is_external_mi = jl_is_method(mi->def.method) && jl_object_in_image(mi->def.method->module);
+    if (is_precompiled_mi) {// && is_external_mi) { // both: 48 MB
+        jl_array_ptr_1d_push((jl_array_t*)closure, (jl_value_t*)mi);
+        return 1;
+    }
+
     jl_code_instance_t *codeinst = jl_atomic_load_relaxed(&mi->cache);
     while (codeinst) {
         int do_compile = 0;
+        uint8_t specsigflags = jl_atomic_load_relaxed(&codeinst->specsigflags);
+        int is_external = (specsigflags & 0b0100) != 0; // in_image
         if (codeinst->owner != jl_nothing) {
             // TODO(vchuravy) native code caching for foreign interpreters
         }
-        else if (jl_atomic_load_relaxed(&codeinst->invoke) != jl_fptr_const_return) {
+        else if (!is_external && jl_atomic_load_relaxed(&codeinst->invoke) != jl_fptr_const_return) {
             jl_value_t *inferred = jl_atomic_load_relaxed(&codeinst->inferred);
             if (inferred &&
                 (jl_options.compile_enabled == JL_OPTIONS_COMPILE_ALL || inferred == jl_nothing ||
@@ -214,6 +223,9 @@ static int precompile_enq_specialization_(jl_method_instance_t *mi, void *closur
             else if (jl_atomic_load_relaxed(&codeinst->invoke) != NULL || jl_atomic_load_relaxed(&codeinst->precompile)) {
                 do_compile = 1;
             }
+            /*else if (inferred && is_precompiled_mi && is_external_mi) {*/
+                /*do_compile = 1;*/
+            /*}*/
         }
         if (do_compile) {
             jl_array_ptr_1d_push((jl_array_t*)closure, (jl_value_t*)mi);
@@ -229,7 +241,9 @@ static int precompile_enq_all_specializations__(jl_typemap_entry_t *def, void *c
     jl_method_t *m = def->func.method;
     if (m->external_mt)
         return 1;
-    if ((m->name == jl_symbol("__init__") || m->ccallable) && jl_is_dispatch_tupletype(m->sig)) {
+
+    int is_external = jl_object_in_image(m->module);
+    if (!is_external && (m->name == jl_symbol("__init__") || m->ccallable) && jl_is_dispatch_tupletype(m->sig)) {
         // ensure `__init__()` and @ccallables get strongly-hinted, specialized, and compiled
         jl_method_instance_t *mi = jl_specializations_get_linfo(m, m->sig, jl_emptysvec);
         jl_array_ptr_1d_push((jl_array_t*)closure, (jl_value_t*)mi);
@@ -248,7 +262,7 @@ static int precompile_enq_all_specializations__(jl_typemap_entry_t *def, void *c
             }
         }
     }
-    if (m->ccallable)
+    if (m->ccallable && !is_external)
         jl_array_ptr_1d_push((jl_array_t*)closure, (jl_value_t*)m->ccallable);
     return 1;
 }
@@ -302,7 +316,7 @@ JL_DLLEXPORT void jl_suppress_precompile(int suppress)
     suppress_precompile = suppress;
 }
 
-static void *jl_precompile_worklist(jl_array_t *worklist, jl_array_t *extext_methods)
+static void *jl_precompile_worklist(jl_array_t *worklist, jl_array_t *extext_methods, jl_array_t *mod_array)
 {
     if (!worklist)
         return NULL;
@@ -311,9 +325,9 @@ static void *jl_precompile_worklist(jl_array_t *worklist, jl_array_t *extext_met
     jl_array_t *m = jl_alloc_vec_any(0);
     JL_GC_PUSH1(&m);
     if (!suppress_precompile) {
-        size_t i, n = jl_array_nrows(worklist);
-        for (i = 0; i < n; i++) {
-            jl_module_t *mod = (jl_module_t*)jl_array_ptr_ref(worklist, i);
+        size_t i, n = jl_array_nrows(mod_array);
+        for (i = 0; i < n; i ++) {
+            jl_module_t *mod = (jl_module_t*)jl_array_ptr_ref(mod_array, i);
             assert(jl_is_module(mod));
             foreach_mtable_in_module(mod, precompile_enq_all_specializations_, m);
         }

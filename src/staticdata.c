@@ -3406,7 +3406,7 @@ JL_DLLEXPORT void jl_create_system_image(void **_native_data, jl_array_t *workli
         if (_native_data != NULL) {
             jl_prepare_serialization_data(mod_array, &extext_methods, NULL, &query_cache);
             jl_precompile_toplevel_module = (jl_module_t*)jl_array_ptr_ref(worklist, jl_array_len(worklist)-1);
-            *_native_data = jl_precompile_worklist(worklist, extext_methods);
+            *_native_data = jl_precompile_worklist(worklist, extext_methods, mod_array);
             jl_precompile_toplevel_module = NULL;
             extext_methods = NULL;
         }
