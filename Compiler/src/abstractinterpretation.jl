@@ -2222,6 +2222,12 @@ function get_ci_mi(ci::CodeInstance)
     return def::MethodInstance
 end
 
+function get_ci_abi(ci::CodeInstance)
+    def = ci.def
+    isa(def, ABIOverride) && return def.abi
+    return (def::MethodInstance).specTypes
+end
+
 function abstract_invoke(interp::AbstractInterpreter, arginfo::ArgInfo, si::StmtInfo, sv::AbsIntState)
     argtypes = arginfo.argtypes
     ft′ = argtype_by_index(argtypes, 2)
