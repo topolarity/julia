@@ -3599,9 +3599,10 @@ static Value *compute_tindex_unboxed(jl_codectx_t &ctx, const jl_cgval_t &val, j
 
 
 static void union_alloca_type(jl_uniontype_t *ut,
-        bool &allunbox, size_t &nbytes, size_t &align, size_t &min_align)
+        bool &allunbox, size_t &nbytes, size_t &npointers, size_t &align, size_t &min_align)
 {
     nbytes = 0;
+    npointers = 0;
     align = 0;
     min_align = MAX_ALIGN;
     // compute the size of the union alloca that could hold this type
@@ -3609,10 +3610,13 @@ static void union_alloca_type(jl_uniontype_t *ut,
     allunbox = for_each_uniontype_small(
             [&](unsigned idx, jl_datatype_t *jt) {
                 if (!jl_is_datatype_singleton(jt)) {
-                    size_t nb1 = jl_datatype_size(jt);
+                    size_t nbytes1, npointers1;
+                    std::tie(nbytes1, npointers1) = split_value_size(jt);
                     size_t align1 = julia_alignment((jl_value_t*)jt);
-                    if (nb1 > nbytes)
-                        nbytes = nb1;
+                    if (nbytes1 > nbytes)
+                        nbytes = nbytes1;
+                    if (npointers1 > npointers)
+                        npointers = npointers1;
                     if (align1 > align)
                         align = align1;
                     if (align1 < min_align)
@@ -3627,8 +3631,8 @@ static void union_alloca_type(jl_uniontype_t *ut,
 
 static AllocaInst *try_emit_union_alloca(jl_codectx_t &ctx, jl_uniontype_t *ut, bool &allunbox, size_t &min_align, size_t &nbytes)
 {
-    size_t align;
-    union_alloca_type(ut, allunbox, nbytes, align, min_align);
+    size_t align, npointers;
+    union_alloca_type(ut, allunbox, nbytes, npointers, align, min_align);
     if (nbytes > 0) {
         // at least some of the values can live on the stack
         assert(align % min_align == 0);

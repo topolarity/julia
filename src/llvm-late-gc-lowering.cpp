@@ -1262,7 +1262,7 @@ State LateLowerGCFrame::LocalScan(Function &F) {
                 if (CI->hasStructRetAttr()) {
                     Type *ElT = getAttributeAtIndex(CI->getAttributes(), 1, Attribute::StructRet).getValueAsType();
                     auto tracked = CountTrackedPointers(ElT, true);
-                    if (tracked.count) {
+                    if (tracked.all) {
                         auto allocas_opt = FindSretAllocas((CI->arg_begin()[0])->stripInBoundsOffsets());
                         // We know that with the right optimizations we can forward a sret directly from an argument
                         // This hasn't been seen without adding IPO effects to julia functions but it's possible we need to handle that too
@@ -1273,35 +1273,46 @@ State LateLowerGCFrame::LocalScan(Function &F) {
                         }
                         auto allocas = allocas_opt.value();
                         for (AllocaInst *SRet : allocas) {
-                            if (!(SRet->isStaticAlloca() && isa<PointerType>(ElT) && ElT->getPointerAddressSpace() == AddressSpace::Tracked)) {
-                                assert(!tracked.derived);
-                                if (tracked.all) {
-                                    S.ArrayAllocas[SRet] = tracked.count * cast<ConstantInt>(SRet->getArraySize())->getZExtValue();
-                                }
-                                else {
-                                    Value *arg1 = (CI->arg_begin()[1])->stripInBoundsOffsets();
-                                    auto gc_allocas_opt = FindSretAllocas(arg1);
-                                    if (!gc_allocas_opt.has_value()) {
-                                        llvm_dump(&F);
-                                        abort();
-                                    }
-                                    auto gc_allocas = gc_allocas_opt.value();
-                                    if (gc_allocas.size() == 0) {
-                                        llvm_dump(CI);
-                                        errs() << "Expected one Alloca at least\n";
-                                        abort();
-                                    }
-                                    else {
-                                        for (AllocaInst* SRet_gc : gc_allocas) {
-                                            Type *ElT = SRet_gc->getAllocatedType();
-                                            if (!(SRet_gc->isStaticAlloca() && isa<PointerType>(ElT) && ElT->getPointerAddressSpace() == AddressSpace::Tracked)) {
-                                                S.ArrayAllocas[SRet_gc] = tracked.count * cast<ConstantInt>(SRet_gc->getArraySize())->getZExtValue();
-                                            }
-                                        }
-                                    }
-                                }
-                            }
+                            if (SRet->isStaticAlloca() && isa<PointerType>(ElT) && ElT->getPointerAddressSpace() == AddressSpace::Tracked)
+                                continue;
+                            assert(!tracked.derived);
+                            S.ArrayAllocas[SRet] = tracked.count * cast<ConstantInt>(SRet->getArraySize())->getZExtValue();
+                            // fprintf(stderr, "tracked.count: %u\narray_size: %zu\n", tracked.count, cast<ConstantInt>(SRet->getArraySize())->getZExtValue());
                         }
+                    }
+                }
+                Value *sret_roots;
+                if (CI->getParamAttributes(0).hasAttribute("julia.sret_roots"))
+                    sret_roots = CI->arg_begin()[0]->stripInBoundsOffsets();
+                else if (CI->getParamAttributes(1).hasAttribute("julia.sret_roots"))
+                    sret_roots = CI->arg_begin()[1]->stripInBoundsOffsets();
+                else
+                    sret_roots = nullptr;
+                if (sret_roots) {
+                    auto gc_allocas_opt = FindSretAllocas(sret_roots);
+                    if (!gc_allocas_opt.has_value()) {
+                        llvm_dump(&F);
+                        abort();
+                    }
+                    auto gc_allocas = gc_allocas_opt.value();
+                    if (gc_allocas.size() == 0) {
+                        llvm_dump(CI);
+                        errs() << "Expected one Alloca at least\n";
+                        abort();
+                    }
+                    for (AllocaInst* SRet_gc : gc_allocas) {
+                        // errs() << *SRet_gc << "\n";
+                        Type *ElT = SRet_gc->getAllocatedType();
+                        // unless this is a static alloca of tracked pointers
+                        if (SRet_gc->isStaticAlloca() && isa<PointerType>(ElT) && ElT->getPointerAddressSpace() == AddressSpace::Tracked) {
+                            // fprintf(stderr, "skipping...\n");
+                            continue;
+                        }
+                        size_t nroots = 1;
+                        if (isa<ArrayType>(ElT))
+                            nroots = cast<ArrayType>(ElT)->getNumElements();
+                        // fprintf(stderr, "nroots: %zu\nalloca: %zu\n", nroots, cast<ConstantInt>(SRet_gc->getArraySize())->getZExtValue());
+                        S.ArrayAllocas[SRet_gc] = nroots * cast<ConstantInt>(SRet_gc->getArraySize())->getZExtValue();
                     }
                 }
                 NoteOperandUses(S, BBS, I);

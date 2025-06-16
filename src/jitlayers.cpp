@@ -489,7 +489,7 @@ static int jl_analyze_workqueue(jl_code_instance_t *callee, jl_codegen_params_t 
                         jl_method_instance_t *mi = jl_get_ci_mi(codeinst);
                         size_t nrealargs = jl_nparams(mi->specTypes); // number of actual arguments being passed
                         bool is_opaque_closure = jl_is_method(mi->def.value) && mi->def.method->is_for_opaque_closure;
-                        emit_specsig_to_fptr1(proto.decl, proto.cc, proto.return_roots, mi->specTypes, codeinst->rettype, is_opaque_closure, nrealargs, params, pinvoke);
+                        emit_specsig_to_fptr1(proto.decl, proto.cc, proto.union_bytes, proto.return_roots, mi->specTypes, codeinst->rettype, is_opaque_closure, nrealargs, params, pinvoke);
                         jl_gc_unsafe_leave(ct->ptls, gc_state);
                         preal_decl = ""; // no need to fixup the name
                     }

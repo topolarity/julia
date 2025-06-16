@@ -2779,9 +2779,9 @@ static bool uses_specsig(jl_value_t *sig, bool needsparams, jl_value_t *rettype,
         return true;
     if (jl_is_uniontype(rettype)) {
         bool allunbox;
-        size_t nbytes, align, min_align;
-        union_alloca_type((jl_uniontype_t*)rettype, allunbox, nbytes, align, min_align);
-        if (nbytes > 0)
+        size_t nbytes, npointers, align, min_align;
+        union_alloca_type((jl_uniontype_t*)rettype, allunbox, nbytes, npointers, align, min_align);
+        if (nbytes > 0 || npointers > 0)
             return true; // some elements of the union could be returned unboxed avoiding allocation
     }
     if (jl_nparams(sig) <= 3) // few parameters == more efficient to pass directly
@@ -4950,7 +4950,8 @@ static jl_cgval_t emit_call_specfun_other(jl_codectx_t &ctx, bool is_opaque_clos
     unsigned idx = 0;
     AllocaInst *result = nullptr;
 
-    if (returninfo.cc == jl_returninfo_t::SRet || returninfo.cc == jl_returninfo_t::Union) {
+    if (returninfo.union_bytes) {
+        assert(returninfo.cc == jl_returninfo_t::SRet || returninfo.cc == jl_returninfo_t::Union);
         result = emit_static_alloca(ctx, returninfo.union_bytes, Align(returninfo.union_align));
         setName(ctx.emission_context, result, "sret_box");
         argvals[idx] = result;
@@ -5053,7 +5054,7 @@ static jl_cgval_t emit_call_specfun_other(jl_codectx_t &ctx, bool is_opaque_clos
             retval = mark_julia_type(ctx, call, false, jlretty);
             break;
         case jl_returninfo_t::SRet:
-            assert(result);
+            assert(result || returninfo.return_roots);
             retval = mark_julia_slot(result, jlretty, NULL, ctx.tbaa().tbaa_gcframe, load_gc_roots(ctx, return_roots, returninfo.return_roots));
             break;
         case jl_returninfo_t::Union: {
@@ -5081,13 +5082,14 @@ static jl_cgval_t emit_call_specfun_other(jl_codectx_t &ctx, bool is_opaque_clos
 }
 
 static jl_cgval_t emit_call_specfun_other(jl_codectx_t &ctx, bool is_opaque_closure, jl_value_t *specTypes, jl_value_t *jlretty, llvm::Value *callee, StringRef specFunctionObject, jl_code_instance_t *fromexternal,
-                                          ArrayRef<jl_cgval_t> argv, size_t nargs, jl_returninfo_t::CallingConv *cc, unsigned *nreturn_roots, jl_value_t *inferred_retty)
+                                          ArrayRef<jl_cgval_t> argv, size_t nargs, jl_returninfo_t::CallingConv *cc, unsigned *union_bytes, unsigned *nreturn_roots, jl_value_t *inferred_retty)
 {
     ++EmittedSpecfunCalls;
     // emit specialized call site
     jl_returninfo_t returninfo = get_specsig_function(ctx.emission_context, jl_Module, callee, specFunctionObject, specTypes, jlretty, is_opaque_closure);
     *cc = returninfo.cc;
     *nreturn_roots = returninfo.return_roots;
+    *union_bytes = returninfo.union_bytes;
     if (fromexternal) {
         std::string namep("p");
         Value *TheCallee = returninfo.decl.getCallee();
@@ -5108,11 +5110,11 @@ static jl_cgval_t emit_call_specfun_other(jl_codectx_t &ctx, bool is_opaque_clos
 }
 
 static jl_cgval_t emit_call_specfun_other(jl_codectx_t &ctx, jl_method_instance_t *mi, jl_value_t *jlretty, StringRef specFunctionObject, jl_code_instance_t *fromexternal,
-                                          ArrayRef<jl_cgval_t> argv, size_t nargs, jl_returninfo_t::CallingConv *cc, unsigned *return_roots, jl_value_t *inferred_retty)
+                                          ArrayRef<jl_cgval_t> argv, size_t nargs, jl_returninfo_t::CallingConv *cc, unsigned *union_bytes, unsigned *return_roots, jl_value_t *inferred_retty)
 {
     bool is_opaque_closure = jl_is_method(mi->def.value) && mi->def.method->is_for_opaque_closure;
     return emit_call_specfun_other(ctx, is_opaque_closure, mi->specTypes, jlretty, NULL,
-        specFunctionObject, fromexternal, argv, nargs, cc, return_roots, inferred_retty);
+        specFunctionObject, fromexternal, argv, nargs, cc, union_bytes, return_roots, inferred_retty);
 }
 
 static jl_value_t *get_ci_abi(jl_code_instance_t *ci)
@@ -5123,12 +5125,12 @@ static jl_value_t *get_ci_abi(jl_code_instance_t *ci)
 }
 
 static jl_cgval_t emit_call_specfun_other(jl_codectx_t &ctx, jl_code_instance_t *ci, StringRef specFunctionObject, jl_code_instance_t *fromexternal,
-    ArrayRef<jl_cgval_t> argv, size_t nargs, jl_returninfo_t::CallingConv *cc, unsigned *return_roots, jl_value_t *inferred_retty)
+    ArrayRef<jl_cgval_t> argv, size_t nargs, jl_returninfo_t::CallingConv *cc, unsigned *union_bytes, unsigned *return_roots, jl_value_t *inferred_retty)
 {
     jl_method_instance_t *mi = jl_get_ci_mi(ci);
     bool is_opaque_closure = jl_is_method(mi->def.value) && mi->def.method->is_for_opaque_closure;
     return emit_call_specfun_other(ctx, is_opaque_closure, get_ci_abi(ci), ci->rettype, NULL,
-        specFunctionObject, fromexternal, argv, nargs, cc, return_roots, inferred_retty);
+        specFunctionObject, fromexternal, argv, nargs, cc, union_bytes, return_roots, inferred_retty);
 }
 
 static jl_cgval_t emit_call_specfun_boxed(jl_codectx_t &ctx, jl_value_t *jlretty, StringRef specFunctionObject, jl_code_instance_t *fromexternal,
@@ -5205,10 +5207,10 @@ static jl_cgval_t emit_invoke(jl_codectx_t &ctx, const jl_cgval_t &lival, ArrayR
                 result = update_julia_type(ctx, mark_julia_type(ctx, ret, true, ctx.rettype), rt);
             }
             else {
-                unsigned return_roots = 0;
+                unsigned return_roots = 0, union_bytes = 0;
                 jl_returninfo_t::CallingConv cc = jl_returninfo_t::CallingConv::Boxed;
                 StringRef protoname = f->getName();
-                result = emit_call_specfun_other(ctx, mi, ctx.rettype, protoname, nullptr, argv, nargs, &cc, &return_roots, rt);
+                result = emit_call_specfun_other(ctx, mi, ctx.rettype, protoname, nullptr, argv, nargs, &cc, &union_bytes, &return_roots, rt);
             }
             handled = true;
         }
@@ -5278,14 +5280,14 @@ static jl_cgval_t emit_invoke(jl_codectx_t &ctx, const jl_cgval_t &lival, ArrayR
                         }
 
                         jl_returninfo_t::CallingConv cc = jl_returninfo_t::CallingConv::Boxed;
-                        unsigned return_roots = 0;
+                        unsigned return_roots = 0, union_bytes = 0;
                         if (specsig)
-                            result = emit_call_specfun_other(ctx, codeinst, protoname, external ? codeinst : nullptr, argv, nargs, &cc, &return_roots, rt);
+                            result = emit_call_specfun_other(ctx, codeinst, protoname, external ? codeinst : nullptr, argv, nargs, &cc, &union_bytes, &return_roots, rt);
                         else
                             result = emit_call_specfun_boxed(ctx, codeinst->rettype, protoname, external ? codeinst : nullptr, argv, nargs, rt);
                         if (need_to_emit) {
                             Function *trampoline_decl = cast<Function>(jl_Module->getNamedValue(protoname));
-                            ctx.call_targets[codeinst] = {cc, return_roots, trampoline_decl, nullptr, specsig, !always_inline, always_inline};
+                            ctx.call_targets[codeinst] = {cc, union_bytes, return_roots, trampoline_decl, nullptr, specsig, !always_inline, always_inline};
                         }
                     }
                 }
@@ -5374,7 +5376,7 @@ static jl_cgval_t emit_specsig_oc_call(jl_codectx_t &ctx, jl_value_t *oc_type, j
             return jl_cgval_t();
     }
     jl_returninfo_t::CallingConv cc = jl_returninfo_t::CallingConv::Boxed;
-    unsigned return_roots = 0;
+    unsigned return_roots = 0, union_bytes = 0;
 
     // Load specptr
     jl_cgval_t &theArg = argv[0];
@@ -5383,7 +5385,7 @@ static jl_cgval_t emit_specsig_oc_call(jl_codectx_t &ctx, jl_value_t *oc_type, j
     specptr = emit_inttoptr(ctx, specptr, ctx.types().T_ptr);
     JL_GC_PUSH1(&sigtype);
     jl_cgval_t r = emit_call_specfun_other(ctx, true, sigtype, oc_rett, specptr, "", NULL, argv, nargs,
-        &cc, &return_roots, oc_rett);
+        &cc, &union_bytes, &return_roots, oc_rett);
     JL_GC_POP();
     return r;
 }
@@ -6210,18 +6212,19 @@ static std::pair<Function*, Function*> get_oc_function(jl_codectx_t &ctx, jl_met
     // Get the specsig (if applicable)
     Function *specF = nullptr;
     jl_returninfo_t::CallingConv cc = jl_returninfo_t::CallingConv::Boxed;
-    unsigned return_roots = 0;
+    unsigned return_roots = 0, union_bytes = 0;
     bool is_opaque_closure = jl_is_method(mi->def.value) && mi->def.method->is_for_opaque_closure;
     assert(is_opaque_closure);
     if (specsig) {
         jl_returninfo_t returninfo = get_specsig_function(ctx.emission_context, jl_Module, nullptr, protoname, mi->specTypes, rettype, is_opaque_closure);
         cc = returninfo.cc;
         return_roots = returninfo.return_roots;
+        union_bytes = returninfo.union_bytes;
         specF = cast<Function>(returninfo.decl.getCallee());
     }
 
     if (need_to_emit) {
-        ctx.call_targets[ci] = {cc, return_roots, specsig ? specF : F, specsig ? F : nullptr, specsig, true, false};
+        ctx.call_targets[ci] = {cc, union_bytes, return_roots, specsig ? specF : F, specsig ? F : nullptr, specsig, true, false};
     }
 
     JL_GC_POP();
@@ -6862,7 +6865,7 @@ static jl_value_t *get_oc_type(jl_value_t *calltype, jl_value_t *rettype) JL_ALW
 }
 
 static void emit_specsig_to_specsig(
-        Function *gf_thunk, jl_returninfo_t::CallingConv cc, unsigned return_roots,
+        Function *gf_thunk, jl_returninfo_t::CallingConv cc, unsigned sret_bytes, unsigned return_roots,
         jl_value_t *calltype, jl_value_t *rettype, bool is_for_opaque_closure,
         size_t nargs,
         jl_codegen_params_t &params,
@@ -6882,8 +6885,10 @@ static void emit_specsig_to_specsig(
     ctx.builder.SetCurrentDebugLocation(noDbg);
     Function::arg_iterator AI = gf_thunk->arg_begin();
     SmallVector<jl_cgval_t, 0> myargs(nargs);
-    if (cc == jl_returninfo_t::SRet || cc == jl_returninfo_t::Union)
+    if (sret_bytes) {
+        assert(cc == jl_returninfo_t::SRet || cc == jl_returninfo_t::Union);
         ++AI;
+    }
     if (return_roots)
         ++AI;
     if (JL_FEAT_TEST(ctx,gcstack_arg)) {
@@ -6971,7 +6976,13 @@ static void emit_specsig_to_specsig(
         Value *sret = &*gf_thunk->arg_begin();
         Align align(julia_alignment(rettype));
         if (return_roots) {
-            Value *roots = gf_thunk->arg_begin() + 1; // root1 has type [n x {}*]*
+            // root1 has type [n x {}*]*
+            Value *roots = &gf_thunk->arg_begin()[0];
+            if (sret_bytes) {
+                roots = &gf_thunk->arg_begin()[1];
+            } else {
+                sret = nullptr;
+            }
             split_value_into(ctx, gf_retval, align, sret, align, jl_aliasinfo_t::fromTBAA(ctx, ctx.tbaa().tbaa_stack), roots, jl_aliasinfo_t::fromTBAA(ctx, ctx.tbaa().tbaa_gcframe));
         }
         else {
@@ -7004,13 +7015,13 @@ static void emit_specsig_to_specsig(
 }
 
 void emit_specsig_to_fptr1(
-        Function *gf_thunk, jl_returninfo_t::CallingConv cc, unsigned return_roots,
+        Function *gf_thunk, jl_returninfo_t::CallingConv cc, unsigned sret_bytes, unsigned return_roots,
         jl_value_t *calltype, jl_value_t *rettype, bool is_for_opaque_closure,
         size_t nargs,
         jl_codegen_params_t &params,
         Function *target)
 {
-    emit_specsig_to_specsig(gf_thunk, cc, return_roots, calltype, rettype, is_for_opaque_closure, nargs, params, target, calltype, rettype, nullptr, nullptr);
+    emit_specsig_to_specsig(gf_thunk, cc, sret_bytes, return_roots, calltype, rettype, is_for_opaque_closure, nargs, params, target, calltype, rettype, nullptr, nullptr);
 }
 
 static void emit_fptr1_wrapper(Module *M, StringRef gf_thunk_name, Value *target, jl_value_t *rettype_const, jl_value_t *declrt, jl_value_t *jlrettype, jl_codegen_params_t &params)
@@ -7062,7 +7073,7 @@ static void emit_specsig_to_specsig(
     Function *gf_thunk = cast<Function>(returninfo.decl.getCallee());
     jl_init_function(gf_thunk, params.TargetTriple);
     gf_thunk->setAttributes(AttributeList::get(gf_thunk->getContext(), {returninfo.attrs, gf_thunk->getAttributes()}));
-    emit_specsig_to_specsig(gf_thunk, returninfo.cc, returninfo.return_roots, calltype, rettype, is_for_opaque_closure, nargs, params, target, targetsig, targetrt, targetspec, rettype_const);
+    emit_specsig_to_specsig(gf_thunk, returninfo.cc, returninfo.union_bytes, returninfo.return_roots, calltype, rettype, is_for_opaque_closure, nargs, params, target, targetsig, targetrt, targetspec, rettype_const);
 }
 
 std::string emit_abi_converter(Module *M, jl_codegen_params_t &params, jl_abi_t from_abi, jl_code_instance_t *codeinst, Value *target, bool target_specsig)
@@ -7863,8 +7874,6 @@ static jl_returninfo_t get_specsig_function(jl_codegen_params_t &params, Module 
 {
     bool gcstack_arg = params.params->gcstack_arg;
     jl_returninfo_t props = {};
-    SmallVector<Type*,8> fsig;
-    SmallVector<std::string,4> argnames;
     Type *rt = NULL;
     Type *srt = NULL;
     Type *T_prjlvalue = PointerType::get(M->getContext(), AddressSpace::Tracked);
@@ -7878,11 +7887,9 @@ static jl_returninfo_t get_specsig_function(jl_codegen_params_t &params, Module 
     }
     else if (jl_is_uniontype(jlrettype)) {
         bool allunbox;
-        union_alloca_type((jl_uniontype_t*)jlrettype, allunbox, props.union_bytes, props.union_align, props.union_minalign);
-        if (props.union_bytes) {
+        union_alloca_type((jl_uniontype_t*)jlrettype, allunbox, props.union_bytes, props.return_roots, props.union_align, props.union_minalign);
+        if (props.union_bytes > 0 || props.return_roots > 0) {
             props.cc = jl_returninfo_t::Union;
-            fsig.push_back(PointerType::getUnqual(M->getContext()));
-            argnames.push_back("union_bytes_return");
             Type *pair[] = { T_prjlvalue, getInt8Ty(M->getContext()) };
             rt = StructType::get(M->getContext(), ArrayRef<Type*>(pair));
         }
@@ -7899,19 +7906,19 @@ static jl_returninfo_t get_specsig_function(jl_codegen_params_t &params, Module 
         rt = _julia_type_to_llvm(&params, M->getContext(), jlrettype, &retboxed);
         assert(!retboxed);
         if (rt != getVoidTy(M->getContext()) && deserves_sret(jlrettype, rt)) {
+            /*
             auto tracked = CountTrackedPointers(rt, true);
             assert(!tracked.derived);
             if (tracked.count && !tracked.all) {
                 props.return_roots = tracked.count;
                 assert(props.return_roots == ((jl_datatype_t*)jlrettype)->layout->npointers);
             }
-            props.cc = jl_returninfo_t::SRet;
             props.union_bytes = jl_datatype_size(jlrettype);
+            */
+            props.cc = jl_returninfo_t::SRet;
+            assert(jl_is_datatype(jlrettype));
+            std::tie(props.union_bytes, props.return_roots) = split_value_size((jl_datatype_t *)jlrettype);
             props.union_align = props.union_minalign = julia_alignment(jlrettype);
-            // sret is always passed from alloca
-            assert(M);
-            fsig.push_back(PointerType::get(M->getContext(), M->getDataLayout().getAllocaAddrSpace()));
-            argnames.push_back("sret_return");
             srt = rt;
             rt = getVoidTy(M->getContext());
         }
@@ -7923,28 +7930,36 @@ static jl_returninfo_t get_specsig_function(jl_codegen_params_t &params, Module 
         rt = T_prjlvalue;
     }
 
+    SmallVector<Type*,8> fsig;
+    SmallVector<std::string,4> argnames;
     SmallVector<AttributeSet, 8> attrs; // function declaration attributes
-    if (props.cc == jl_returninfo_t::SRet) {
-        assert(srt);
+    if (props.union_bytes) {
+        assert(props.cc == jl_returninfo_t::SRet || props.cc == jl_returninfo_t::Union);
         AttrBuilder param(M->getContext());
-        param.addStructRetAttr(srt);
+        if (props.cc == jl_returninfo_t::SRet) {
+            assert(srt);
+            param.addStructRetAttr(srt);
+        }
         param.addAttribute(Attribute::NoAlias);
         param.addAttribute(Attribute::NoCapture);
         param.addAttribute(Attribute::NoUndef);
         attrs.push_back(AttributeSet::get(M->getContext(), param));
-        assert(fsig.size() == 1);
-    }
-    if (props.cc == jl_returninfo_t::Union) {
-        AttrBuilder param(M->getContext());
-        param.addAttribute(Attribute::NoAlias);
-        param.addAttribute(Attribute::NoCapture);
-        param.addAttribute(Attribute::NoUndef);
-        attrs.push_back(AttributeSet::get(M->getContext(), param));
-        assert(fsig.size() == 1);
+
+        if (props.cc == jl_returninfo_t::Union) {
+            fsig.push_back(PointerType::getUnqual(M->getContext()));
+            argnames.push_back("union_bytes_return");
+        }
+        if (props.cc == jl_returninfo_t::SRet) {
+            // sret is always passed from alloca
+            assert(M);
+            fsig.push_back(PointerType::get(M->getContext(), M->getDataLayout().getAllocaAddrSpace()));
+            argnames.push_back("sret_return");
+        }
     }
 
     if (props.return_roots) {
         AttrBuilder param(M->getContext());
+        param.addAttribute("julia.sret_roots");
         param.addAttribute(Attribute::NoAlias);
         param.addAttribute(Attribute::NoCapture);
         param.addAttribute(Attribute::NoUndef);
@@ -8314,7 +8329,9 @@ static jl_llvm_functions_t
                                           jlrettype, ctx.is_opaque_closure,
                                           ArgNames, nreq);
         f = cast<Function>(returninfo.decl.getCallee());
-        has_sret = (returninfo.cc == jl_returninfo_t::SRet || returninfo.cc == jl_returninfo_t::Union);
+        has_sret = (returninfo.union_bytes > 0);
+        // has_sret is expected only for Union or SRet ABIs
+        assert(!has_sret || (returninfo.cc == jl_returninfo_t::SRet || returninfo.cc == jl_returninfo_t::Union));
         jl_init_function(f, ctx.emission_context.TargetTriple);
 
         // common pattern: see if all return statements are an argument in that
@@ -9249,7 +9266,7 @@ static jl_llvm_functions_t
                 retval = compute_tindex_unboxed(ctx, retvalinfo, jlrettype);
                 break;
             }
-            if (sret) {
+            if (sret || returninfo.return_roots) {
                 Align align(returninfo.union_align);
                 if (!returninfo.return_roots && !retvalinfo.inline_roots.empty()) {
                     assert(retvalinfo.V == nullptr);
@@ -9259,7 +9276,7 @@ static jl_llvm_functions_t
                 }
                 else if (returninfo.return_roots) {
                     assert(returninfo.cc == jl_returninfo_t::SRet);
-                    Value *return_roots = f->arg_begin() + 1;
+                    Value *return_roots = sret ? (f->arg_begin() + 1) : f->arg_begin();
                     split_value_into(ctx, retvalinfo, align, sret, align,
                             jl_aliasinfo_t::fromTBAA(ctx, ctx.tbaa().tbaa_stack), return_roots, jl_aliasinfo_t::fromTBAA(ctx, ctx.tbaa().tbaa_gcframe));
                 }
@@ -9819,7 +9836,7 @@ static jl_llvm_functions_t jl_emit_oc_wrapper(orc::ThreadSafeModule &m, jl_codeg
         Function *gf_thunk = cast<Function>(returninfo.decl.getCallee());
         jl_init_function(gf_thunk, ctx.emission_context.TargetTriple);
         size_t nrealargs = jl_nparams(mi->specTypes);
-        emit_specsig_to_fptr1(gf_thunk, returninfo.cc, returninfo.return_roots,
+        emit_specsig_to_fptr1(gf_thunk, returninfo.cc, returninfo.union_bytes, returninfo.return_roots,
                 mi->specTypes, rettype, true, nrealargs, ctx.emission_context,
                 prepare_call_in(gf_thunk->getParent(), jlopaque_closure_call_func)); // TODO: this could call emit_oc_call directly
         declarations.specFunctionObject = funcName;

@@ -201,11 +201,12 @@ struct jl_returninfo_t {
     size_t union_bytes;
     size_t union_align;
     size_t union_minalign;
-    unsigned return_roots;
+    size_t return_roots;
 };
 
 struct jl_codegen_call_target_t {
     jl_returninfo_t::CallingConv cc;
+    unsigned union_bytes;
     unsigned return_roots;
     llvm::Function *decl;
     llvm::Function *oc;
@@ -329,7 +330,7 @@ std::string emit_abi_constreturn(Module *M, jl_codegen_params_t &params, bool sp
 
 Function *emit_tojlinvoke(jl_code_instance_t *codeinst, StringRef theFptrName, Module *M, jl_codegen_params_t &params) JL_NOTSAFEPOINT;
 void emit_specsig_to_fptr1(
-        Function *gf_thunk, jl_returninfo_t::CallingConv cc, unsigned return_roots,
+        Function *gf_thunk, jl_returninfo_t::CallingConv cc, unsigned sret_bytes, unsigned return_roots,
         jl_value_t *calltype, jl_value_t *rettype, bool is_for_opaque_closure,
         size_t nargs,
         jl_codegen_params_t &params,
