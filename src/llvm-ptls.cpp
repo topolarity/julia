@@ -154,18 +154,19 @@ void LowerPTLS::fix_pgcstack_use(CallInst *pgcstack, Function *pgcstack_getter, 
         // if (!retboxed)
         //     foreach(retinst)
         //         emit_gc_unsafe_leave(ctx, last_gc_state);
-        IRBuilder<> builder(pgcstack->getNextNode());
-        auto phi = builder.CreatePHI(pgcstack->getType(), 2, "pgcstack");
-        pgcstack->replaceAllUsesWith(phi);
+        Instruction *After = pgcstack->getNextNode();
+        IRBuilder<> builder(After);
         MDBuilder MDB(pgcstack->getContext());
         SmallVector<uint32_t, 2> Weights{9, 1};
         TerminatorInst *fastTerm;
         TerminatorInst *slowTerm;
         assert(pgcstack->getType()); // Static analyzer
-        builder.SetInsertPoint(phi);
         auto cmp = builder.CreateICmpNE(pgcstack, Constant::getNullValue(pgcstack->getType()));
-        SplitBlockAndInsertIfThenElse(cmp, phi, &fastTerm, &slowTerm,
+        SplitBlockAndInsertIfThenElse(cmp, After, &fastTerm, &slowTerm,
                                       MDB.createBranchWeights(Weights));
+        builder.SetInsertPoint(After);
+        auto phi = builder.CreatePHI(pgcstack->getType(), 2, "pgcstack");
+        pgcstack->replaceUsesOutsideBlock(phi, pgcstack->getParent());
         if (CFGModified)
             *CFGModified = true;
         // emit slow branch code
