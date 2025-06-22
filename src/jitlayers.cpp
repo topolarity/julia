@@ -299,7 +299,7 @@ void *jl_jit_abi_converter_impl(jl_task_t *ct, jl_abi_t from_abi,
     std::string gf_thunk_name;
     {
         jl_codegen_params_t params(std::make_unique<LLVMContext>(), jl_ExecutionEngine->getDataLayout(), jl_ExecutionEngine->getTargetTriple()); // Locks the context
-        params.getContext().setDiscardValueNames(true);
+        params.getContext().setDiscardValueNames(false);
         params.cache = true;
         params.imaging_mode = 0;
         result_m = jl_create_ts_module("gfthunk", params.tsctx, params.DL, params.TargetTriple);
@@ -808,7 +808,7 @@ void jl_emit_codeinst_to_jit_impl(
     JL_TIMING(CODEINST_COMPILE, CODEINST_COMPILE);
     // emit the code in LLVM IR form to the new context
     jl_codegen_params_t params(std::make_unique<LLVMContext>(), jl_ExecutionEngine->getDataLayout(), jl_ExecutionEngine->getTargetTriple()); // Locks the context
-    params.getContext().setDiscardValueNames(true);
+    params.getContext().setDiscardValueNames(false);
     params.cache = true;
     params.imaging_mode = 0;
     orc::ThreadSafeModule result_m =
@@ -1538,12 +1538,28 @@ namespace {
 
                 {
                     JL_TIMING(LLVM_JIT, JIT_Opt);
-                    //Run the optimization
-                    (****PMs[PoolIdx]).run(M);
 
                     bool debug_ir = jl_ExecutionEngine->get_debuginfo_mode() == jl_debuginfo_emission_mode_t::llvm_ir;
                     bool dump_ir = !jl_ExecutionEngine->get_dump_debugir_directory().empty();
                     if (!M.functions().empty() && (debug_ir || dump_ir)) {
+                        // InstructionNamer pass
+                        for (auto &F : M.functions()) {
+                          for (auto &Arg : F.args()) {
+                            if (!Arg.hasName())
+                              Arg.setName("arg");
+                          }
+                         
+                          for (BasicBlock &BB : F) {
+                            if (!BB.hasName())
+                              BB.setName("bb");
+                         
+                            for (Instruction &I : BB) {
+                              if (!I.hasName() && !I.getType()->isVoidTy()) {
+                                I.setName("i");
+                              }
+                            }
+                          }
+                        }
 
                         // Generate a debug filename for the emitted IR
                         std::string debug_name = createDebugIRName(M);
@@ -1577,6 +1593,9 @@ namespace {
                             }
                         }
                     }
+
+                    //Run the optimization
+                    (****PMs[PoolIdx]).run(M);
 
                     assert(!verifyLLVMIR(M));
                 }

@@ -128,7 +128,7 @@ public:
   DIUpdater(Module &M, StringRef Filename = StringRef(),
             StringRef Directory = StringRef(), const Module *DisplayM = nullptr,
             const ValueToValueMapTy *VMap = nullptr)
-      : Builder(M), Layout(&M), LineTable(DisplayM ? DisplayM : &M), VMap(VMap),
+      : Builder(M), Layout(M.getDataLayout()), LineTable(DisplayM ? DisplayM : &M), VMap(VMap),
         Finder(), Filename(Filename), Directory(Directory), FileNode(nullptr),
         LexicalBlockFileNode(nullptr), M(M), tempNameCounter(0) {
 
@@ -150,8 +150,37 @@ public:
   }
 
   void visitFunction(Function &F) {
-    if (F.isDeclaration() || findDISubprogram(&F))
+    if (F.isDeclaration())
       return;
+
+    if (findDISubprogram(&F)) {
+      DISubprogram *Sub = findDISubprogram(&F);
+      for (size_t I = 0; I < F.arg_size(); I++) {
+        auto *Arg = F.getArg(I);
+        if (Arg->getName().empty())
+          continue;
+
+        unsigned Line = 0;
+        if (!findLine(&F, Line)) {
+          LLVM_DEBUG(dbgs() << "WARNING: No line for Function " << F.getName().str()
+                            << "\n");
+          return;
+        }
+        // TODO: The parameter variables clash with the existing ones (?)
+        //       Just delete the subprograms already...
+        /*
+        auto DILV = Builder.createParameterVariable(
+            Sub, Arg->getName(), I + 1, FileNode, Line,
+            getOrCreateType(Arg->getType()), true);
+            */
+        auto DILV = Builder.createAutoVariable(Sub, Arg->getName(), FileNode, Line,
+                                               getOrCreateType(Arg->getType()));
+        auto Loc = DebugLoc(DILocation::get(M.getContext(), Line, 0, Sub));
+        Builder.insertDbgValueIntrinsic(Arg, DILV, Builder.createExpression(),
+                                        Loc.get(), F.getEntryBlock().getFirstNonPHI());
+      }
+      return;
+    }
 
     StringRef MangledName = F.getName();
     DISubroutineType *Sig = createFunctionSignature(&F);
@@ -192,24 +221,20 @@ public:
 
     // Clang and the Kaleidoscope tutorial both copy function arguments to
     // allocas and then insert debug locations on these allocas.
-    IRBuilder<> ArgIrBuilder(&F.getEntryBlock(),
-                             F.getEntryBlock().getFirstInsertionPt());
+    //
+    // but instead, we just insert dbg.value intrinsics to avoid modifying
+    // the IR
     for (size_t I = 0; I < F.arg_size(); I++) {
       auto *Arg = F.getArg(I);
       if (Arg->getName().empty())
         continue;
-      auto *Alloca =
-          ArgIrBuilder.CreateAlloca(Arg->getType(), nullptr, Arg->getName());
-      ArgIrBuilder.CreateStore(Arg, Alloca);
 
-      // Scope must be the function for gdb to recognize this as a function
-      // argument
       auto DILV = Builder.createParameterVariable(
           Sub, Arg->getName(), I + 1, FileNode, Line,
-          getOrCreateType(Arg->getType()), true);
+          getOrCreateType(Arg->getType()), /*AlwaysPreserve=*/true);
       auto Loc = DebugLoc(DILocation::get(M.getContext(), Line, 0, Sub));
-      Builder.insertDeclare(Alloca, DILV, Builder.createExpression(), Loc.get(),
-                            &F.getEntryBlock());
+      Builder.insertDbgValueIntrinsic(Arg, DILV, Builder.createExpression(),
+                                      Loc.get(), F.getEntryBlock().getFirstNonPHI());
     }
   }
 
@@ -241,7 +266,7 @@ public:
     if (Loc) {
       Scope = llvm::cast<DILocalScope>(Loc.getScope());
       InlinedAt = Loc.getInlinedAt();
-    } else if ((Scope = dyn_cast<DILocalScope>(findScope(&I)))) {
+    } else if ((Scope = dyn_cast_if_present<DILocalScope>(findScope(&I)))) {
       InlinedAt = nullptr;
     } else {
       LLVM_DEBUG(dbgs() << "WARNING: no valid scope for instruction " << &I
@@ -250,8 +275,9 @@ public:
       return;
     }
 
-    if (isa<PHINode>(I))
-      Scope = Scope->getSubprogram(); // See https://github.com/llvm/llvm-project/issues/118883
+    // if (isa<PHINode>(I)) // TODO: Proper SSA scopes
+    Scope = I.getParent()->getParent()->getSubprogram(); // See https://github.com/llvm/llvm-project/issues/118883
+    InlinedAt = nullptr;
 
     DebugLoc NewLoc =
         DebugLoc(DILocation::get(M.getContext(), Line, Col, Scope, InlinedAt));
@@ -289,7 +315,7 @@ private:
       SplitName = CUToReplace->getSplitDebugFilename();
     } else {
       Producer =
-          "LLVM Version " XSTR(LLVM_VERSION_MAJOR) "." XSTR(LLVM_VERSION_MINOR);
+          "LLVM Version ";
     }
 
     FileNode = Builder.createFile(Filename, Directory);
@@ -425,26 +451,28 @@ private:
       if (ST->isOpaque())
         N = Builder.createUnspecifiedType(ST->getName());
       else {
-        DICompositeType *S = Builder.createStructType(
-            LexicalBlockFileNode,
-            ST->hasName() ? T->getStructName() : "literal", FileNode,
-            /*LineNumber=*/0, Layout.getTypeSizeInBits(T),
-            Layout.getPrefTypeAlign(T).value() * CHAR_BIT, /*DIFlags=*/llvm::DINode::FlagZero,
-            /*DerivedFrom=*/nullptr, llvm::DINodeArray()); // filled in later
-        N = S; // the Node _is_ the struct type.
+        DICompositeType *S = Builder.createReplaceableCompositeType(
+            dwarf::DW_TAG_structure_type,
+            ST->hasName() ? T->getStructName() : "literal", LexicalBlockFileNode, FileNode,
+            /*LineNumber=*/0);
 
         // N is added to the map (early) so that element search below can find
         // it, so as to avoid infinite recursion for structs that contain
         // pointers to their own type.
-        TypeDescriptors[T] = N;
+        TypeDescriptors[T] = S;
 
         SmallVector<Metadata *, 4>
             Elements; // unfortunately, SmallVector<Type *> does not decay to
                       // SmallVector<Metadata *>
 
+        //errs() << "type:\n";
+        //errs() << *T << "\n";
+
+        //errs() << "fields:\n";
         auto *TLayout = Layout.getStructLayout(llvm::cast<StructType>(T));
         for (unsigned I = 0; I < T->getStructNumElements(); ++I) {
           Type *ElType = T->getStructElementType(I);
+          //errs() << *ElType << "\n";
           DIType *ElDIType = getOrCreateType(ElType);
           DIType *MemType = Builder.createMemberType(
               LexicalBlockFileNode,
@@ -456,7 +484,15 @@ private:
           Elements.push_back(MemType);
         }
 
-        Builder.replaceArrays(S, Builder.getOrCreateArray(Elements));
+        N = Builder.createStructType(
+            LexicalBlockFileNode,
+            ST->hasName() ? T->getStructName() : "literal", FileNode,
+            /*LineNumber=*/0, Layout.getTypeSizeInBits(T),
+            Layout.getPrefTypeAlign(T).value() * CHAR_BIT, /*DIFlags=*/llvm::DINode::FlagZero,
+            /*DerivedFrom=*/nullptr, Builder.getOrCreateArray(Elements));
+
+        S->replaceAllUsesWith(N);
+        MDNode::deleteTemporary(S);
       }
     } else if (T->isPointerTy()) {
       N = Builder.createPointerType(
