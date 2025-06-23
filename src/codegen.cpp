@@ -1577,6 +1577,7 @@ static const auto &builtin_func_map() {
 }
 
 static _Atomic(uint64_t) globalUniqueGeneratedNames{1};
+static _Atomic(uint64_t) globalUniqueGeneratedGlobalNames{1000000};
 
 // --- code generation ---
 
@@ -6346,6 +6347,8 @@ static std::pair<Function*, Function*> get_oc_function(jl_codectx_t &ctx, jl_met
         if (specsig) {
             raw_string_ostream(name) << "j_" << name_from_method_instance(mi) << "_" << jl_atomic_fetch_add_relaxed(&globalUniqueGeneratedNames, 1);
             protoname = StringRef(name);
+        } else {
+            jl_atomic_fetch_add_relaxed(&globalUniqueGeneratedNames, 1); // Synchronize counter update w/ above
         }
         raw_string_ostream(oc) << "j1_" << name_from_method_instance(mi) << "_" << jl_atomic_fetch_add_relaxed(&globalUniqueGeneratedNames, 1);
         proto_oc = StringRef(oc);
@@ -8537,6 +8540,7 @@ static jl_llvm_functions_t
         // TODO: (if needsparams) add attributes: dereferenceable<sizeof(void*) * length(sp)>, readonly, nocapture
     }
     else {
+        jl_atomic_fetch_add_relaxed(&globalUniqueGeneratedNames, 1); // Synchronize counter update w/ above
         f = Function::Create(needsparams ? ctx.types().T_jlfuncparams : ctx.types().T_jlfunc,
                              GlobalVariable::ExternalLinkage,
                              declarations.specFunctionObject, M);
@@ -9975,12 +9979,15 @@ jl_llvm_functions_t jl_emit_codedecls(
     bool specsig, needsparams;
     std::tie(specsig, needsparams) = uses_specsig(get_ci_abi(codeinst), mi, codeinst->rettype, params.params->prefer_specsig);
     const char *name = name_from_method_instance(mi);
-    if (specsig)
+    if (specsig) {
         raw_string_ostream(decls.functionObject) << "jfptr_" << name << "_" << jl_atomic_fetch_add_relaxed(&globalUniqueGeneratedNames, 1);
-    else if (needsparams)
+    } else if (needsparams) {
+        jl_atomic_fetch_add_relaxed(&globalUniqueGeneratedNames, 1); // bump counter to synchronize numbering
         decls.functionObject = "jl_fptr_sparam";
-    else
+    } else {
+        jl_atomic_fetch_add_relaxed(&globalUniqueGeneratedNames, 1); // bump counter to synchronize numbering
         decls.functionObject = "jl_fptr_args";
+    }
     raw_string_ostream(decls.specFunctionObject) << (specsig ? "j_" : "j1_") << name << "_" << jl_atomic_fetch_add_relaxed(&globalUniqueGeneratedNames, 1);
     M.withModuleDo([&](Module &M) {
             bool is_opaque_closure = jl_is_method(mi->def.value) && mi->def.method->is_for_opaque_closure;
@@ -10060,6 +10067,12 @@ static jl_llvm_functions_t jl_emit_oc_wrapper(orc::ThreadSafeModule &m, jl_codeg
                 mi->specTypes, rettype, true, nrealargs, ctx.emission_context,
                 prepare_call_in(gf_thunk->getParent(), jlopaque_closure_call_func)); // TODO: this could call emit_oc_call directly
         declarations.specFunctionObject = funcName;
+    } else {
+        // just to allocate the function name / counter ID, even though we don't use it
+        Module *M = m.getModuleUnlocked();
+        jl_codectx_t ctx(M->getContext(), params, 0, 0);
+        ctx.name = M->getModuleIdentifier().data();
+        std::string funcName = get_function_name(true, false, ctx.name, ctx.emission_context.TargetTriple);
     }
     return declarations;
 }
