@@ -484,6 +484,10 @@ static Value *emit_unbox(jl_codectx_t &ctx, Type *to, const jl_cgval_t &x, jl_va
         assert(x.typ == jt);
         AllocaInst *combined = emit_static_alloca(ctx, to, Align(alignment));
         auto combined_ai = jl_aliasinfo_t::fromTBAA(ctx, ctx.tbaa().tbaa_stack);
+        // TODO: This is also flawed...
+        //       It should be an emit_guarded_test
+        //
+        //       which then has a ϕ-node for what comes out
         recombine_value(ctx, x, combined, combined_ai, Align(alignment), false);
         p = combined;
         ai = combined_ai;
@@ -506,23 +510,64 @@ static void emit_unbox_store(jl_codectx_t &ctx, const jl_cgval_t &x, Value *dest
 
     auto dest_ai = jl_aliasinfo_t::fromTBAA(ctx, tbaa_dest);
 
-    if (!x.inline_roots.empty()) {
-        recombine_value(ctx, x, dest, dest_ai, align_dst, isVolatile);
-        return;
-    }
+    // OK, the problem here is clear - just because I have a split representation
+    // doesn't mean that I might not *also* be boxed... That part is determined
+    // dynamically.
+    //
+    // This currently blindly assumes that the roots are *filled*
+    // (which is incorrect - unless I force you to unbox, which is silly)
+    //
+    // The 'correct' thing to do here is to branch on whether the value is boxed
+    //
+    BasicBlock *afterBB = nullptr;
 
-    if (!x.ispointer()) { // already unboxed, but sometimes need conversion (e.g. f32 -> i32)
+    // if split representation, combine and store
+    if (!x.inline_roots.empty()) {
+        // TODO: verify this change / guard more broadly...
+        if (x.Vboxed == nullptr) {
+            recombine_value(ctx, x, dest, dest_ai, align_dst, isVolatile);
+            return;
+        } else {
+            Value *null_ptr = Constant::getNullValue(ctx.types().T_prjlvalue);
+            Value *isboxed = ctx.builder.CreateICmpNE(x.Vboxed, null_ptr);
+            BasicBlock *boxedBB = BasicBlock::Create(ctx.builder.getContext(), "isboxed", ctx.f);
+            BasicBlock *unboxedBB = BasicBlock::Create(ctx.builder.getContext(), "unboxed", ctx.f);
+            afterBB = BasicBlock::Create(ctx.builder.getContext(), "after", ctx.f);
+            ctx.builder.CreateCondBr(isboxed, boxedBB, unboxedBB);
+
+            ctx.builder.SetInsertPoint(unboxedBB);
+            recombine_value(ctx, x, dest, dest_ai, align_dst, isVolatile);
+            ctx.builder.CreateBr(afterBB);
+
+            ctx.builder.SetInsertPoint(boxedBB);
+        }
+    } else if (!x.ispointer()) { // already unboxed, but sometimes need conversion (e.g. f32 -> i32)
         assert(x.V);
         Value *unboxed = zext_struct(ctx, x.V);
         StoreInst *store = ctx.builder.CreateAlignedStore(unboxed, dest, align_dst);
         store->setVolatile(isVolatile);
         dest_ai.decorateInst(store);
+        if (afterBB) {
+            ctx.builder.CreateBr(afterBB);
+            ctx.builder.SetInsertPoint(afterBB);
+        }
         return;
     }
 
-    Value *src = data_pointer(ctx, x);
+    // here we *don't* have inline_roots (actually very surprising)
+    // and then we assume that dest is non-NULL because we are not
+    // a ghost...
+    Value *src = afterBB ? x.Vboxed : data_pointer(ctx, x);
     auto src_ai = jl_aliasinfo_t::fromTBAA(ctx, x.tbaa);
+    // TODO: it's this one...
+    size_t assume_id = 51;
+    FunctionCallee absint = Intrinsic::getOrInsertDeclaration(jl_Module, Intrinsic::abs, ArrayRef<Type*>(ctx.types().T_size));
+    ctx.builder.CreateAssumption(ctx.builder.CreateTrunc(ctx.builder.CreateCall(absint, {ConstantInt::get(ctx.types().T_size, assume_id), ConstantInt::get(getInt1Ty(ctx.builder.getContext()), 1)}), getInt1Ty(ctx.builder.getContext())));
     emit_memcpy(ctx, dest, dest_ai, src, src_ai, jl_datatype_size(x.typ), Align(align_dst), align_src ? *align_src : Align(julia_alignment(x.typ)), isVolatile);
+    if (afterBB) {
+        ctx.builder.CreateBr(afterBB);
+        ctx.builder.SetInsertPoint(afterBB);
+    }
 }
 
 static jl_datatype_t *staticeval_bitstype(const jl_cgval_t &targ)
@@ -788,6 +833,9 @@ static jl_cgval_t emit_pointerref(jl_codectx_t &ctx, ArrayRef<jl_cgval_t> argv)
         thePtr = emit_ptrgep(ctx, thePtr, im1);
         setName(ctx.emission_context, thePtr, "pointerref_src");
         MDNode *tbaa = best_tbaa(ctx.tbaa(), ety);
+        size_t assume_id = 53;
+        FunctionCallee absint = Intrinsic::getOrInsertDeclaration(jl_Module, Intrinsic::abs, ArrayRef<Type*>(ctx.types().T_size));
+        ctx.builder.CreateAssumption(ctx.builder.CreateTrunc(ctx.builder.CreateCall(absint, {ConstantInt::get(ctx.types().T_size, assume_id), ConstantInt::get(getInt1Ty(ctx.builder.getContext()), 1)}), getInt1Ty(ctx.builder.getContext())));
         emit_memcpy(ctx, strct, jl_aliasinfo_t::fromTBAA(ctx, tbaa), thePtr, jl_aliasinfo_t::fromTBAA(ctx, nullptr), size, Align(sizeof(jl_value_t*)), Align(align_nb));
         return mark_julia_type(ctx, strct, true, ety);
     }
@@ -860,6 +908,7 @@ static jl_cgval_t emit_pointerset(jl_codectx_t &ctx, ArrayRef<jl_cgval_t> argv)
         ai.decorateInst(store);
     }
     else if (!x.inline_roots.empty()) {
+        // TODO: here?
         recombine_value(ctx, e, thePtr, jl_aliasinfo_t(), Align(align_nb), false);
     }
     else if (x.ispointer()) {
@@ -869,6 +918,9 @@ static jl_cgval_t emit_pointerset(jl_codectx_t &ctx, ArrayRef<jl_cgval_t> argv)
         setName(ctx.emission_context, im1, "pointerset_offset");
         auto gep = emit_ptrgep(ctx, thePtr, im1);
         setName(ctx.emission_context, gep, "pointerset_ptr");
+        size_t assume_id = 55;
+        FunctionCallee absint = Intrinsic::getOrInsertDeclaration(jl_Module, Intrinsic::abs, ArrayRef<Type*>(ctx.types().T_size));
+        ctx.builder.CreateAssumption(ctx.builder.CreateTrunc(ctx.builder.CreateCall(absint, {ConstantInt::get(ctx.types().T_size, assume_id), ConstantInt::get(getInt1Ty(ctx.builder.getContext()), 1)}), getInt1Ty(ctx.builder.getContext())));
         emit_memcpy(ctx, gep, jl_aliasinfo_t::fromTBAA(ctx, nullptr), x, size, Align(align_nb), Align(julia_alignment(ety)));
     }
     else {

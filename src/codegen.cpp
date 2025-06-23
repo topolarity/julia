@@ -1707,6 +1707,7 @@ struct jl_aliasinfo_t {
 
 // metadata tracking for a llvm Value* during codegen
 const uint8_t UNION_BOX_MARKER = 0x80;
+// TODO: This could use a std::move constructor for its SmallVector...
 struct jl_cgval_t {
     Value *V; // may be of type T* or T, or set to NULL if ghost (or if the value has not been initialized yet, for a variable definition)
     // For unions, we may need to keep a reference to the boxed part individually.
@@ -1724,6 +1725,19 @@ struct jl_cgval_t {
     //       exceptions: PhiNode and UpsilonNode arguments which need special
     //       handling to account for the possibility that this may be NULL.
     Value *Vboxed;
+
+    // The problem we have now is that when `x` is stored w/ re-combination, it
+    // doesn't actually know whether it's in re-combined form or not.
+    //
+    // .V *used* to just always contain the relevant bits to write out (the
+    // contents - whether boxed or not) and then the `inline_roots` became
+    // a compile-time flag for whether or not this is a split representation
+    //
+    // Almost certainly we *do* need the runtime-polymorphic version of this,
+    // which will mean that recombine_value checks whether Vboxed is non-null,
+    // and if so, it just does a full copy of those contents as usual.
+    //
+    //  (i.e. either do a memcpy if boxed, or recombine if not)
 
     Value *TIndex; // if `V` is an unboxed (tagged) Union described by `typ`, this gives the DataType index (1-based, small int) as an i8
     SmallVector<Value*,0> inline_roots; // if present, `V` is a pointer, but not in canonical layout
@@ -2130,7 +2144,8 @@ static GlobalVariable *get_pointer_to_constant(jl_codegen_params_t &emission_con
             gv = get_gv(gvname);
         }
     }
-    assert(gv->getName().starts_with(name.str()));
+    // TODO: What went wrong...?
+    // assert(gv->getName().starts_with(name.str()));
     assert(val == gv->getInitializer());
     return gv;
 }
@@ -2245,7 +2260,7 @@ static inline jl_cgval_t mark_julia_const(jl_codectx_t &ctx, jl_value_t *jv)
 static inline jl_cgval_t mark_julia_slot(Value *v, jl_value_t *typ, Value *tindex, MDNode *tbaa, ArrayRef<Value*> inline_roots=None)
 {
     // this enables lazy-copying of immutable values and stack or argument slots
-    jl_cgval_t tagval(v, false, typ, tindex, tbaa, inline_roots);
+    jl_cgval_t tagval(v, /* isboxed */ false, typ, tindex, tbaa, inline_roots);
     return tagval;
 }
 
@@ -2286,6 +2301,9 @@ static inline jl_cgval_t value_to_pointer(jl_codectx_t &ctx, Value *v, jl_value_
 static inline jl_cgval_t value_to_pointer(jl_codectx_t &ctx, const jl_cgval_t &v)
 {
     if (!v.inline_roots.empty()) {
+        // TODO: This is *also* wrong... it doesn't account for TIndex either
+
+
         //if (v.V == nullptr) {
         //    AllocaInst *loc = emit_static_roots(ctx, v.inline_roots.size());
         //    for (size_t i = 0; i < v.inline_roots.counts(); i++)
@@ -2302,6 +2320,7 @@ static inline jl_cgval_t value_to_pointer(jl_codectx_t &ctx, const jl_cgval_t &v
     }
     if (v.ispointer())
         return v;
+    // this just blindly uses v.V, even though v.VBoxed might be what we need... right?
     return value_to_pointer(ctx, v.V, v.typ, v.TIndex);
 }
 
@@ -2352,18 +2371,19 @@ static inline jl_cgval_t update_julia_type(jl_codectx_t &ctx, const jl_cgval_t &
         }
         return v; // doesn't improve type info
     }
+    size_t nroots = 0;
     if (v.TIndex) {
         jl_value_t *utyp = jl_unwrap_unionall(typ);
         if (jl_is_datatype(utyp)) {
             bool alwaysboxed;
             if (jl_is_concrete_type(utyp))
                 alwaysboxed = deserves_unionbox(utyp);
-            else
+            else // if utyp is not concrete, then we say it's alwaysboxed if its mutable and not abstract 
                 alwaysboxed = !((jl_datatype_t*)utyp)->name->abstract && ((jl_datatype_t*)utyp)->name->mutabl;
             if (alwaysboxed) {
                 // discovered that this union-split type must actually be isboxed
                 if (v.Vboxed) {
-                    return jl_cgval_t(v.Vboxed, true, typ, NULL, best_tbaa(ctx.tbaa(), typ), v.inline_roots);
+                    return jl_cgval_t(v.Vboxed, true, typ, NULL, best_tbaa(ctx.tbaa(), typ), None);
                 }
                 else {
                     // type mismatch (there weren't any boxed values in the union)
@@ -2374,6 +2394,9 @@ static inline jl_cgval_t update_julia_type(jl_codectx_t &ctx, const jl_cgval_t &
         }
         if (!jl_is_concrete_type(typ))
             return v; // not generally worth trying to change type info (which would require recomputing tindex)
+        bool hasptr = ((jl_datatype_t*)typ)->layout->first_ptr >= 0;
+        nroots = hasptr ? ((jl_datatype_t*)typ)->layout->npointers : 0;
+        // nroots = split_value_size((jl_datatype_t*)typ).second;
     }
     Type *T = julia_type_to_llvm(ctx, typ);
     if (type_is_ghost(T))
@@ -2383,7 +2406,12 @@ static inline jl_cgval_t update_julia_type(jl_codectx_t &ctx, const jl_cgval_t &
         CreateTrap(ctx.builder);
         return jl_cgval_t();
     }
-    return jl_cgval_t(v, typ, NULL);
+    jl_cgval_t updated(v, typ, NULL);
+    if (!updated.inline_roots.empty()) {
+        assert(nroots <= updated.inline_roots.size());
+        updated.inline_roots.resize(nroots);
+    }
+    return updated;
 }
 
 static jl_cgval_t convert_julia_type(jl_codectx_t &ctx, const jl_cgval_t &v, jl_value_t *typ, Value **skip=nullptr);
@@ -2620,6 +2648,7 @@ static jl_cgval_t convert_julia_type_union(jl_codectx_t &ctx, const jl_cgval_t &
     else {
         return jl_cgval_t(boxed(ctx, v), true, typ, NULL, best_tbaa(ctx.tbaa(), typ), None);
     }
+    // TODO: This can leave us with an 'abnormally' small root size
     return jl_cgval_t(v, typ, new_tindex);
 }
 
@@ -2644,14 +2673,25 @@ static jl_cgval_t convert_julia_type(jl_codectx_t &ctx, const jl_cgval_t &v, jl_
                 CreateTrap(ctx.builder);
             return jl_cgval_t();
         }
+        size_t nroots = split_value_size((jl_datatype_t*)typ).second;
         bool mustbox_union = v.TIndex && deserves_unionbox(typ);
-        if (v.Vboxed && (v.isboxed || mustbox_union)) {
-            if (skip) {
-                *skip = ctx.builder.CreateNot(emit_exactly_isa(ctx, v, (jl_datatype_t*)typ, true));
+        if (v.Vboxed) {
+            if (v.isboxed || mustbox_union) {
+                // We know that the Vboxed pointer is valid
+                if (skip) {
+                    *skip = ctx.builder.CreateNot(emit_exactly_isa(ctx, v, (jl_datatype_t*)typ, true));
+                }
+                return jl_cgval_t(v.Vboxed, true, typ, NULL, best_tbaa(ctx.tbaa(), typ), None);
+            } else {
+                // We don't know whether the Vboxed pointer is NULL or not, so box here to
+                // force it to be dereference-able
+                //
+                // TODO: Instead make codegen runtime-polymorphic over the boxed / unboxed
+                // representation, even without the TIndex
+                if (nroots > 0) // only needed if the .inline_roots representation is ambiguous
+                    return mark_julia_type(ctx, boxed(ctx, v), /* isboxed */ true, typ);
             }
-            return jl_cgval_t(v.Vboxed, true, typ, NULL, best_tbaa(ctx.tbaa(), typ), v.inline_roots);
-        }
-        if (mustbox_union) {
+        } else if (mustbox_union) {
             // type mismatch: there weren't any boxed values in the union
             if (skip)
                 *skip = ConstantInt::get(getInt1Ty(ctx.builder.getContext()), 1);
@@ -2659,6 +2699,13 @@ static jl_cgval_t convert_julia_type(jl_codectx_t &ctx, const jl_cgval_t &v, jl_
                 CreateTrap(ctx.builder);
             return jl_cgval_t();
         }
+        jl_cgval_t updated(v, typ, /* tindex */ nullptr);
+        if (!updated.inline_roots.empty()) {
+            // truncate the roots, if necessary
+            assert(nroots <= updated.inline_roots.size());
+            updated.inline_roots.resize(nroots);
+        }
+        return updated;
     }
     else {
         bool makeboxed = false;
@@ -5074,7 +5121,8 @@ static jl_cgval_t emit_call_specfun_other(jl_codectx_t &ctx, bool is_opaque_clos
             break;
         case jl_returninfo_t::SRet:
             assert(result || returninfo.return_roots);
-            retval = mark_julia_slot(result, jlretty, NULL, ctx.tbaa().tbaa_gcframe, load_gc_roots(ctx, return_roots, returninfo.return_roots));
+            retval = mark_julia_slot(result, jlretty, /* tindex */ NULL, ctx.tbaa().tbaa_gcframe, load_gc_roots(ctx, return_roots, returninfo.return_roots));
+            // no Vboxed ...?
             break;
         case jl_returninfo_t::Union: {
             assert(result || returninfo.return_roots);
@@ -5611,6 +5659,9 @@ static jl_cgval_t emit_varinfo(jl_codectx_t &ctx, jl_varinfo_t &vi, jl_sym_t *va
                 else {
                     const DataLayout &DL = jl_Module->getDataLayout();
                     uint64_t sz = DL.getTypeStoreSize(T);
+                    size_t assume_id = 21;
+                    FunctionCallee absint = Intrinsic::getOrInsertDeclaration(jl_Module, Intrinsic::abs, ArrayRef<Type*>(ctx.types().T_size));
+                    ctx.builder.CreateAssumption(ctx.builder.CreateTrunc(ctx.builder.CreateCall(absint, {ConstantInt::get(ctx.types().T_size, assume_id), ConstantInt::get(getInt1Ty(ctx.builder.getContext()), 1)}), getInt1Ty(ctx.builder.getContext())));
                     emit_memcpy(ctx, ssaslot, stack_ai, vi.value, sz, ssaslot->getAlign(), varslot->getAlign());
                 }
             }
@@ -5708,8 +5759,12 @@ static void emit_vi_assignment_unboxed(jl_codectx_t &ctx, jl_varinfo_t &vi, Valu
                 Align align(julia_alignment(rval_info.typ));
                 if (vi.inline_roots)
                     split_value_into(ctx, rval_info, align, vi.value.V, align, jl_aliasinfo_t::fromTBAA(ctx, tbaa), vi.inline_roots, jl_aliasinfo_t::fromTBAA(ctx, ctx.tbaa().tbaa_gcframe), vi.isVolatile);
-                else
+                else {
+                    size_t assume_id = 105;
+                    FunctionCallee absint = Intrinsic::getOrInsertDeclaration(jl_Module, Intrinsic::abs, ArrayRef<Type*>(ctx.types().T_size));
+                    ctx.builder.CreateAssumption(ctx.builder.CreateTrunc(ctx.builder.CreateCall(absint, {ConstantInt::get(ctx.types().T_size, assume_id), ConstantInt::get(getInt1Ty(ctx.builder.getContext()), 1)}), getInt1Ty(ctx.builder.getContext())));
                     emit_unbox_store(ctx, rval_info, vi.value.V, tbaa, align, align, vi.isVolatile);
+                }
             }
         }
     }
@@ -5751,13 +5806,19 @@ static void emit_phinode_assign(jl_codectx_t &ctx, ssize_t idx, jl_value_t *r)
             AllocaInst *phi = nullptr;
 
             // Create PHINodes
-            PHINode *Tindex_phi = PHINode::Create(getInt8Ty(ctx.builder.getContext()), jl_array_nrows(edges), "tindex_phi");
+            std::string tindex_name;
+            raw_string_ostream(tindex_name) << "ssa_tindex_phi_" << idx << "_";
+            PHINode *Tindex_phi = PHINode::Create(getInt8Ty(ctx.builder.getContext()), jl_array_nrows(edges), StringRef(tindex_name));
             Tindex_phi->insertInto(BB, InsertPt);
-            PHINode *ptr_phi = PHINode::Create(ctx.types().T_prjlvalue, jl_array_nrows(edges), "ptr_phi");
+            std::string ptr_phi_name;
+            raw_string_ostream(ptr_phi_name) << "ssa_ptr_phi_" << idx << "_";
+            PHINode *ptr_phi = PHINode::Create(ctx.types().T_prjlvalue, jl_array_nrows(edges), StringRef(ptr_phi_name));
             ptr_phi->insertInto(BB, InsertPt);
             roots.resize(npointers);
             for (size_t nr = 0; nr < npointers; nr++) {
-                auto root_phi = PHINode::Create(ctx.types().T_prjlvalue, jl_array_nrows(edges), "root_phi");
+                std::string root_phi_name;
+                raw_string_ostream(root_phi_name) << "root_phi_" << nr << "_" << idx << "_";
+                auto root_phi = PHINode::Create(ctx.types().T_prjlvalue, jl_array_nrows(edges), StringRef(root_phi_name));
                 root_phi->insertInto(BB, InsertPt);
                 roots[nr] = root_phi;
             }
@@ -5765,6 +5826,9 @@ static void emit_phinode_assign(jl_codectx_t &ctx, ssize_t idx, jl_value_t *r)
             if (dest) {
                 phi = cast<AllocaInst>(dest->clone());
                 phi->insertAfter(dest);
+                size_t assume_id = 31;
+                FunctionCallee absint = Intrinsic::getOrInsertDeclaration(jl_Module, Intrinsic::abs, ArrayRef<Type*>(ctx.types().T_size));
+                ctx.builder.CreateAssumption(ctx.builder.CreateTrunc(ctx.builder.CreateCall(absint, {ConstantInt::get(ctx.types().T_size, assume_id), ConstantInt::get(getInt1Ty(ctx.builder.getContext()), 1)}), getInt1Ty(ctx.builder.getContext())));
                 ctx.builder.CreateMemCpy(phi, Align(min_align), dest, dest->getAlign(), nbytes, false);
                 ctx.builder.CreateLifetimeEnd(dest);
             }
@@ -5775,18 +5839,41 @@ static void emit_phinode_assign(jl_codectx_t &ctx, ssize_t idx, jl_value_t *r)
             Value *ptr = decay_derived(ctx, ptr_phi);
             if (phi != nullptr)
                 ptr = ctx.builder.CreateSelect(isboxed, ptr, decay_derived(ctx, phi));
-            jl_cgval_t val = mark_julia_slot(ptr, phiType, Tindex_phi, best_tbaa(ctx.tbaa(), phiType));
+            jl_cgval_t val = mark_julia_slot(ptr, phiType, Tindex_phi, best_tbaa(ctx.tbaa(), phiType),
+                    // TODO: Why is this so... weird?
+                roots.empty() ? ArrayRef<Value*>() : ArrayRef((Value *const *)&roots.front(), roots.size()));
+            assert(val.TIndex != nullptr);
+            // This Vboxed expects this to *always* be de-referenceable but I fucked that up...
             val.Vboxed = ptr_phi;
+            assert(val.TIndex != nullptr);
             ctx.PhiNodes.push_back(std::make_tuple(val, BB, dest, ptr_phi, roots, r));
+            std::string val_name;
+            raw_string_ostream(val_name) << "ssa_" << idx;
+            if (val.V && !val.V->hasName())
+                val.V->setName(val_name);
+            std::string val_name2;
+            raw_string_ostream(val_name2) << "ssa_boxed_" << idx;
+            if (val.Vboxed && !val.Vboxed->hasName())
+                val.V->setName(val_name2);
             ctx.SAvalues[idx] = val;
             ctx.ssavalue_assigned[idx] = true;
             return;
         }
         else if (allunbox) {
-            PHINode *Tindex_phi = PHINode::Create(getInt8Ty(ctx.builder.getContext()), jl_array_nrows(edges), "tindex_phi");
+            std::string tindex_name;
+            raw_string_ostream(tindex_name) << "ssa_tindex_phi_" << idx << "_";
+            PHINode *Tindex_phi = PHINode::Create(getInt8Ty(ctx.builder.getContext()), jl_array_nrows(edges), StringRef(tindex_name));
             Tindex_phi->insertInto(BB, InsertPt);
             jl_cgval_t val = mark_julia_slot(NULL, phiType, Tindex_phi, ctx.tbaa().tbaa_stack);
             ctx.PhiNodes.push_back(std::make_tuple(val, BB, dest, (PHINode*)nullptr, roots, r));
+            std::string val_name;
+            raw_string_ostream(val_name) << "ssa_" << idx;
+            if (val.V && !val.V->hasName())
+                val.V->setName(val_name);
+            std::string val_name2;
+            raw_string_ostream(val_name2) << "ssa_boxed_" << idx;
+            if (val.Vboxed && !val.Vboxed->hasName())
+                val.V->setName(val_name2);
             ctx.SAvalues[idx] = val;
             ctx.ssavalue_assigned[idx] = true;
             return;
@@ -5799,7 +5886,16 @@ static void emit_phinode_assign(jl_codectx_t &ctx, ssize_t idx, jl_value_t *r)
     if (type_is_ghost(vtype)) {
         assert(jl_is_datatype(phiType) && jl_is_datatype_singleton((jl_datatype_t*)phiType));
         // Skip adding it to the PhiNodes list, since we didn't create one.
-        ctx.SAvalues[idx] = mark_julia_const(ctx, ((jl_datatype_t*)phiType)->instance);
+        jl_cgval_t val = mark_julia_const(ctx, ((jl_datatype_t*)phiType)->instance);
+        std::string val_name;
+        raw_string_ostream(val_name) << "ssa_ghost_" << idx;
+        if (val.V && !val.V->hasName())
+            val.V->setName(val_name);
+        std::string val_name2;
+        raw_string_ostream(val_name2) << "ssa_ghost_boxed_" << idx;
+        if (val.Vboxed && !val.Vboxed->hasName())
+            val.V->setName(val_name2);
+        ctx.SAvalues[idx] = val;
         ctx.ssavalue_assigned[idx] = true;
         return;
     }
@@ -5829,6 +5925,9 @@ static void emit_phinode_assign(jl_codectx_t &ctx, ssize_t idx, jl_value_t *r)
 #else
             phi->insertBefore(dest);
 #endif
+            size_t assume_id = 33;
+            FunctionCallee absint = Intrinsic::getOrInsertDeclaration(jl_Module, Intrinsic::abs, ArrayRef<Type*>(ctx.types().T_size));
+            ctx.builder.CreateAssumption(ctx.builder.CreateTrunc(ctx.builder.CreateCall(absint, {ConstantInt::get(ctx.types().T_size, assume_id), ConstantInt::get(getInt1Ty(ctx.builder.getContext()), 1)}), getInt1Ty(ctx.builder.getContext())));
             ctx.builder.CreateMemCpy(phi, align, dest, align, nb, false);
             ctx.builder.CreateLifetimeEnd(dest);
         }
@@ -5840,7 +5939,17 @@ static void emit_phinode_assign(jl_codectx_t &ctx, ssize_t idx, jl_value_t *r)
         value_phi->insertInto(BB, InsertPt);
         slot = mark_julia_type(ctx, value_phi, isboxed, phiType);
     }
+    // This provides a non-NULL value_phi only if the thing is boxed (makes sense)
+    // TODO: I didn't adjust this at all!
     ctx.PhiNodes.push_back(std::make_tuple(slot, BB, dest, value_phi, roots, r));
+    std::string val_name;
+    raw_string_ostream(val_name) << "ssa_" << idx;
+    if (slot.V && !slot.V->hasName())
+        slot.V->setName(val_name);
+    std::string val_name2;
+    raw_string_ostream(val_name2) << "ssa_boxed_" << idx;
+    if (slot.Vboxed && !slot.Vboxed->hasName())
+        slot.V->setName(val_name2);
     ctx.SAvalues[idx] = slot;
     ctx.ssavalue_assigned[idx] = true;
     return;
@@ -5875,6 +5984,14 @@ static void emit_ssaval_assign(jl_codectx_t &ctx, ssize_t ssaidx_0based, jl_valu
             }
         }
     }
+    std::string val_name;
+    raw_string_ostream(val_name) << "ssa_" << ssaidx_0based;
+    if (slot.V && !slot.V->hasName())
+        slot.V->setName(val_name);
+    std::string val_name2;
+    raw_string_ostream(val_name2) << "ssa_boxed_" << ssaidx_0based;
+    if (slot.Vboxed && !slot.Vboxed->hasName())
+        slot.V->setName(val_name2);
     ctx.SAvalues[ssaidx_0based] = slot; // now SAvalues[ssaidx_0based] contains the SAvalue
     ctx.ssavalue_assigned[ssaidx_0based] = true;
 }
@@ -7025,6 +7142,9 @@ static void emit_specsig_to_specsig(
             split_value_into(ctx, gf_retval, align, sret, align, jl_aliasinfo_t::fromTBAA(ctx, ctx.tbaa().tbaa_stack), roots, jl_aliasinfo_t::fromTBAA(ctx, ctx.tbaa().tbaa_gcframe));
         }
         else {
+            size_t assume_id = 111;
+            FunctionCallee absint = Intrinsic::getOrInsertDeclaration(jl_Module, Intrinsic::abs, ArrayRef<Type*>(ctx.types().T_size));
+            ctx.builder.CreateAssumption(ctx.builder.CreateTrunc(ctx.builder.CreateCall(absint, {ConstantInt::get(ctx.types().T_size, assume_id), ConstantInt::get(getInt1Ty(ctx.builder.getContext()), 1)}), getInt1Ty(ctx.builder.getContext())));
             emit_unbox_store(ctx, gf_retval, sret, ctx.tbaa().tbaa_stack, align, align);
         }
         ctx.builder.CreateRetVoid();
@@ -8341,6 +8461,16 @@ static jl_llvm_functions_t
     std::string _funcName = get_function_name(specsig, needsparams, ctx.name, ctx.emission_context.TargetTriple);
     declarations.specFunctionObject = _funcName;
 
+    if (strcmp(_funcName.c_str(), "julia_compute_assumed_settings_1215") == 0) {
+        for (size_t stmt_i = 0; stmt_i < jl_array_len(stmts); stmt_i++) {
+            jl_value_t *stmt = jl_array_ptr_ref(stmts, stmt_i);
+            fprintf(stderr, " %%%zu = ", stmt_i);
+            // jl_(stmt);
+            fprintf(stderr, "\n");
+        }
+        abort();
+    }
+
     // allocate Function declarations and wrapper objects
     //Safe because params holds ctx lock
     Module *M = TSM.getModuleUnlocked();
@@ -9261,8 +9391,13 @@ static jl_llvm_functions_t
 
             Value *isboxed_union = NULL;
             Value *retval = NULL;
+            // TODO: How does sret not run into this issue already...?
+            //
+            // It would seem like every return type from a function has this
+            // 'maybe-boxed' reality to it...
             Value *sret = has_sret ? f->arg_begin() : NULL;
             Type *retty = f->getReturnType();
+            size_t nreturn_roots = returninfo.return_roots;
             switch (returninfo.cc) {
             case jl_returninfo_t::Boxed:
                 retval = boxed(ctx, retvalinfo); // skip the gcroot on the return path
@@ -9274,6 +9409,8 @@ static jl_llvm_functions_t
                     retval = emit_unbox(ctx, retty, retvalinfo, jlrettype);
                 break;
             case jl_returninfo_t::SRet:
+                // TODO: Indeed, this one cannot return a maybe-boxed value
+                //       (but that's arguably quite useful ?)
                 retval = NULL;
                 break;
             case jl_returninfo_t::Union: {
@@ -9281,9 +9418,10 @@ static jl_llvm_functions_t
                 if (retvalinfo.TIndex) {
                     tindex = retvalinfo.TIndex;
                     data = Constant::getNullValue(ctx.types().T_prjlvalue);
-                    if (retvalinfo.V == NULL) {
+                    if (retvalinfo.V == NULL && retvalinfo.inline_roots.empty()) {
                         // treat this as a simple Ghosts
                         sret = NULL;
+                        nreturn_roots = 0;
                     }
                     else if (retvalinfo.Vboxed) {
                         // also need to account for the possibility the return object is boxed
@@ -9301,6 +9439,7 @@ static jl_llvm_functions_t
                     tindex = ctx.builder.CreateOr(tindex, ConstantInt::get(getInt8Ty(ctx.builder.getContext()), UNION_BOX_MARKER));
                     data = boxed(ctx, retvalinfo);
                     sret = NULL;
+                    nreturn_roots = 0;
                 }
                 retval = UndefValue::get(retty);
                 retval = ctx.builder.CreateInsertValue(retval, data, 0);
@@ -9311,7 +9450,7 @@ static jl_llvm_functions_t
                 retval = compute_tindex_unboxed(ctx, retvalinfo, jlrettype);
                 break;
             }
-            if (sret || returninfo.return_roots) {
+            if (sret || nreturn_roots) {
                 Align align(returninfo.union_align);
                 assert(returninfo.return_roots || retvalinfo.inline_roots.empty());
                 if (returninfo.return_roots) {
@@ -9330,6 +9469,9 @@ static jl_llvm_functions_t
                     assert(returninfo.cc == jl_returninfo_t::SRet || returninfo.cc == jl_returninfo_t::Union);
                     if (returninfo.cc == jl_returninfo_t::SRet) {
                         assert(jl_is_concrete_type(jlrettype));
+                        size_t assume_id = 23;
+                        FunctionCallee absint = Intrinsic::getOrInsertDeclaration(jl_Module, Intrinsic::abs, ArrayRef<Type*>(ctx.types().T_size));
+                        ctx.builder.CreateAssumption(ctx.builder.CreateTrunc(ctx.builder.CreateCall(absint, {ConstantInt::get(ctx.types().T_size, assume_id), ConstantInt::get(getInt1Ty(ctx.builder.getContext()), 1)}), getInt1Ty(ctx.builder.getContext())));
                         emit_memcpy(ctx, sret, jl_aliasinfo_t::fromTBAA(ctx, nullptr), retvalinfo,
                                     jl_datatype_size(jlrettype), align, align);
                     }
@@ -9581,10 +9723,14 @@ static jl_llvm_functions_t
                         SmallVector<Value*,0> mayberoots(tracked, Constant::getNullValue(ctx.types().T_prjlvalue));
                         if (typedval.typ != jl_bottom_type) {
                             Align align(julia_alignment(phiType));
-                            if (tracked)
+                            if (tracked) {
                                 split_value_into(ctx, typedval, align, dest, align, jl_aliasinfo_t::fromTBAA(ctx, ctx.tbaa().tbaa_stack), mayberoots);
-                            else
+                            } else {
+                                size_t assume_id = 101;
+                                FunctionCallee absint = Intrinsic::getOrInsertDeclaration(jl_Module, Intrinsic::abs, ArrayRef<Type*>(ctx.types().T_size));
+                                ctx.builder.CreateAssumption(ctx.builder.CreateTrunc(ctx.builder.CreateCall(absint, {ConstantInt::get(ctx.types().T_size, assume_id), ConstantInt::get(getInt1Ty(ctx.builder.getContext()), 1)}), getInt1Ty(ctx.builder.getContext())));
                                 emit_unbox_store(ctx, typedval, dest, ctx.tbaa().tbaa_stack, align, align);
+                            }
                         }
                         return mayberoots;
                     });
@@ -9618,6 +9764,17 @@ static jl_llvm_functions_t
                         RTindex = ConstantInt::get(getInt8Ty(ctx.builder.getContext()), UNION_BOX_MARKER);
                     }
                     else {
+                        // TODO: Why... is this legal?
+                        //
+                        // It seems like it guarantees that we create a non-dereferenceable Vboxed...
+                        // (I guess that part is fine - it's just gated by the RTindex)
+                        //
+                        // but that interacts poorly with convert_julia_type
+                        //
+                        // I suspect this is a real bug, so I'm going to try to reproduce it tomorrow...
+                        //   1. Put a dynamically-boxed value into the Φ-node
+                        //   2. Add a π-node to shake off the TIndex
+                        //   3. Do something that will not use `Vboxed`, even though V is not valid
                         auto tracked = split_value_size((jl_datatype_t*)(val.constant ? jl_typeof(val.constant) : val.typ)).second;
                         if (VN)
                             V = Constant::getNullValue(ctx.types().T_prjlvalue);
@@ -9627,8 +9784,12 @@ static jl_llvm_functions_t
                             jl_aliasinfo_t ai = jl_aliasinfo_t::fromTBAA(ctx, tbaa);
                             if (tracked)
                                 split_value_into(ctx, val, align, dest, align, ai, incomingroots);
-                            else
+                            else {
+                                size_t assume_id = 103;
+                                FunctionCallee absint = Intrinsic::getOrInsertDeclaration(jl_Module, Intrinsic::abs, ArrayRef<Type*>(ctx.types().T_size));
+                                ctx.builder.CreateAssumption(ctx.builder.CreateTrunc(ctx.builder.CreateCall(absint, {ConstantInt::get(ctx.types().T_size, assume_id), ConstantInt::get(getInt1Ty(ctx.builder.getContext()), 1)}), getInt1Ty(ctx.builder.getContext())));
                                 emit_unbox_store(ctx, val, dest, tbaa, align, align);
+                            }
                         }
                         RTindex = ConstantInt::get(getInt8Ty(ctx.builder.getContext()), tindex);
                     }

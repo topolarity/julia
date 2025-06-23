@@ -1079,11 +1079,26 @@ static void split_value_into(jl_codectx_t &ctx, const jl_cgval_t &x, Align align
     assert(jl_is_concrete_type(x.typ));
     auto src_ai = jl_aliasinfo_t::fromTBAA(ctx, x.tbaa);
     Type *T_prjlvalue = ctx.types().T_prjlvalue;
+    // TODO: we actually need to guard this based on Vboxed now...
+    //
+    // Basically, *every* inline_roots.empty() check now needs to
+    // be audited, because whether we're using the roots is a
+    // dynamic issue now
+    // 
+    // (that we check by looking at Vboxed, which is unusual but
+    //  I *think* it's OK - for now, the easy solution is just to
+    //  delete the roots on the thing and force it to be boxed?
+    //
+    //   - yeah that tends to be how we usually solve it)
     if (!x.inline_roots.empty()) {
         // `x` is already split - just copy the values over
         auto sizes = split_value_size(typ);
-        if (sizes.first > 0)
+        if (sizes.first > 0) {
+            size_t assume_id = 1;
+            FunctionCallee absint = Intrinsic::getOrInsertDeclaration(jl_Module, Intrinsic::abs, ArrayRef<Type*>(ctx.types().T_size));
+            ctx.builder.CreateAssumption(ctx.builder.CreateTrunc(ctx.builder.CreateCall(absint, {ConstantInt::get(ctx.types().T_size, assume_id), ConstantInt::get(getInt1Ty(ctx.builder.getContext()), 1)}), getInt1Ty(ctx.builder.getContext())));
             emit_memcpy(ctx, dst, dst_ai, x.V, src_ai, sizes.first, align_dst, align_src, isVolatileStore);
+        }
         for (size_t i = 0; i < sizes.second; i++) {
             Value *src_root = x.inline_roots[i];
             Value *dst_root_ptr = emit_ptrgep(ctx, inline_roots_ptr, i * sizeof(void*));
@@ -1092,6 +1107,9 @@ static void split_value_into(jl_codectx_t &ctx, const jl_cgval_t &x, Align align
         return;
     }
     if (inline_roots_ptr == nullptr) {
+        size_t assume_id = 201;
+        FunctionCallee absint = Intrinsic::getOrInsertDeclaration(jl_Module, Intrinsic::abs, ArrayRef<Type*>(ctx.types().T_size));
+        ctx.builder.CreateAssumption(ctx.builder.CreateTrunc(ctx.builder.CreateCall(absint, {ConstantInt::get(ctx.types().T_size, assume_id), ConstantInt::get(getInt1Ty(ctx.builder.getContext()), 1)}), getInt1Ty(ctx.builder.getContext())));
         emit_unbox_store(ctx, x, dst, ctx.tbaa().tbaa_stack, align_src, align_dst, isVolatileStore);
         return;
     }
@@ -1106,6 +1124,9 @@ static void split_value_into(jl_codectx_t &ctx, const jl_cgval_t &x, Align align
         bool last = i == npointers;
         size_t ptr = last ? jl_datatype_size(typ) : (jl_ptr_offset(typ, i) * sizeof(void*));
         if (ptr > src_off) {
+            size_t assume_id = 3;
+            FunctionCallee absint = Intrinsic::getOrInsertDeclaration(jl_Module, Intrinsic::abs, ArrayRef<Type*>(ctx.types().T_size));
+            ctx.builder.CreateAssumption(ctx.builder.CreateTrunc(ctx.builder.CreateCall(absint, {ConstantInt::get(ctx.types().T_size, assume_id), ConstantInt::get(getInt1Ty(ctx.builder.getContext()), 1)}), getInt1Ty(ctx.builder.getContext())));
             emit_memcpy(ctx,
                 emit_ptrgep(ctx, dst, dst_off),
                 dst_ai,
@@ -1150,13 +1171,20 @@ static void split_value_into(jl_codectx_t &ctx, const jl_cgval_t &x, Align align
     if (!x.inline_roots.empty()) {
         // `x` is already split - just copy the values over
         auto sizes = split_value_size(typ);
-        if (sizes.first > 0)
+        if (sizes.first > 0) {
+            size_t assume_id = 5;
+            FunctionCallee absint = Intrinsic::getOrInsertDeclaration(jl_Module, Intrinsic::abs, ArrayRef<Type*>(ctx.types().T_size));
+            ctx.builder.CreateAssumption(ctx.builder.CreateTrunc(ctx.builder.CreateCall(absint, {ConstantInt::get(ctx.types().T_size, assume_id), ConstantInt::get(getInt1Ty(ctx.builder.getContext()), 1)}), getInt1Ty(ctx.builder.getContext())));
             emit_memcpy(ctx, dst, dst_ai, x.V, src_ai, sizes.first, align_dst, align_src);
+        }
         for (size_t i = 0; i < sizes.second; i++)
             inline_roots[i] = x.inline_roots[i];
         return;
     }
     if (inline_roots.empty()) {
+        size_t assume_id = 203;
+        FunctionCallee absint = Intrinsic::getOrInsertDeclaration(jl_Module, Intrinsic::abs, ArrayRef<Type*>(ctx.types().T_size));
+        ctx.builder.CreateAssumption(ctx.builder.CreateTrunc(ctx.builder.CreateCall(absint, {ConstantInt::get(ctx.types().T_size, assume_id), ConstantInt::get(getInt1Ty(ctx.builder.getContext()), 1)}), getInt1Ty(ctx.builder.getContext())));
         emit_unbox_store(ctx, x, dst, ctx.tbaa().tbaa_stack, align_src, align_dst, false);
         return;
     }
@@ -1171,6 +1199,9 @@ static void split_value_into(jl_codectx_t &ctx, const jl_cgval_t &x, Align align
         bool last = i == npointers;
         size_t ptr = last ? jl_datatype_size(typ) : (jl_ptr_offset(typ, i) * sizeof(void*));
         if (ptr > src_off) {
+            size_t assume_id = 7;
+            FunctionCallee absint = Intrinsic::getOrInsertDeclaration(jl_Module, Intrinsic::abs, ArrayRef<Type*>(ctx.types().T_size));
+            ctx.builder.CreateAssumption(ctx.builder.CreateTrunc(ctx.builder.CreateCall(absint, {ConstantInt::get(ctx.types().T_size, assume_id), ConstantInt::get(getInt1Ty(ctx.builder.getContext()), 1)}), getInt1Ty(ctx.builder.getContext())));
             emit_memcpy(ctx,
                 emit_ptrgep(ctx, dst, dst_off),
                 dst_ai,
@@ -1263,6 +1294,9 @@ static void recombine_value(jl_codectx_t &ctx, const jl_cgval_t &x, Value *dst, 
         bool last = i == npointers;
         size_t ptr = last ? jl_datatype_size(typ) : (jl_ptr_offset(typ, i) * sizeof(void*));
         if (ptr > dst_off) {
+            size_t assume_id = 9;
+            FunctionCallee absint = Intrinsic::getOrInsertDeclaration(jl_Module, Intrinsic::abs, ArrayRef<Type*>(ctx.types().T_size));
+            ctx.builder.CreateAssumption(ctx.builder.CreateTrunc(ctx.builder.CreateCall(absint, {ConstantInt::get(ctx.types().T_size, assume_id), ConstantInt::get(getInt1Ty(ctx.builder.getContext()), 1)}), getInt1Ty(ctx.builder.getContext())));
             emit_memcpy(ctx,
                 emit_ptrgep(ctx, dst, dst_off),
                 dst_ai,
@@ -2950,6 +2984,9 @@ static jl_cgval_t emit_unionload(jl_codectx_t &ctx, Value *addr, Value *ptindex,
         AllocaInst *lv = emit_static_alloca(ctx, fsz, Align(al));
         setName(ctx.emission_context, lv, "immutable_union");
         jl_aliasinfo_t ai = jl_aliasinfo_t::fromTBAA(ctx, tbaa);
+        size_t assume_id = 11;
+        FunctionCallee absint = Intrinsic::getOrInsertDeclaration(jl_Module, Intrinsic::abs, ArrayRef<Type*>(ctx.types().T_size));
+        ctx.builder.CreateAssumption(ctx.builder.CreateTrunc(ctx.builder.CreateCall(absint, {ConstantInt::get(ctx.types().T_size, assume_id), ConstantInt::get(getInt1Ty(ctx.builder.getContext()), 1)}), getInt1Ty(ctx.builder.getContext())));
         emit_memcpy(ctx, lv, ai, addr, ai, fsz, Align(al), Align(al));
         addr = lv;
     }
@@ -3404,6 +3441,9 @@ static void init_bits_cgval(jl_codectx_t &ctx, Value *newv, const jl_cgval_t &v)
     unsigned alignment = julia_alignment(v.typ);
     unsigned newv_align = std::max(alignment, (unsigned)sizeof(void*));
     newv = maybe_decay_tracked(ctx, newv);
+    size_t assume_id = 205;
+    FunctionCallee absint = Intrinsic::getOrInsertDeclaration(jl_Module, Intrinsic::abs, ArrayRef<Type*>(ctx.types().T_size));
+    ctx.builder.CreateAssumption(ctx.builder.CreateTrunc(ctx.builder.CreateCall(absint, {ConstantInt::get(ctx.types().T_size, assume_id), ConstantInt::get(getInt1Ty(ctx.builder.getContext()), 1)}), getInt1Ty(ctx.builder.getContext())));
     emit_unbox_store(ctx, v, newv, tbaa, Align(alignment), Align(newv_align));
 }
 
@@ -3696,10 +3736,20 @@ static Value *box_union(jl_codectx_t &ctx, const jl_cgval_t &vinfo, const SmallB
                 }
                 else {
                     jl_cgval_t vinfo_r = jl_cgval_t(vinfo, (jl_value_t*)jt, NULL);
+                    // shrink the roots to match the narrowed type
+                    if (!vinfo_r.inline_roots.empty()) {
+                        // truncate the roots, if necessary
+                        size_t nroots = split_value_size((jl_datatype_t*)jt).second;
+                        assert(nroots <= vinfo_r.inline_roots.size());
+                        vinfo_r.inline_roots.resize(nroots);
+                    }
                     box = _boxed_special(ctx, vinfo_r, t);
                     if (!box) {
                         box = emit_allocobj(ctx, jt, true);
                         setName(ctx.emission_context, box, "unionbox");
+                        size_t assume_id = 403;
+                        FunctionCallee absint = Intrinsic::getOrInsertDeclaration(jl_Module, Intrinsic::abs, ArrayRef<Type*>(ctx.types().T_size));
+                        ctx.builder.CreateAssumption(ctx.builder.CreateTrunc(ctx.builder.CreateCall(absint, {ConstantInt::get(ctx.types().T_size, assume_id), ConstantInt::get(getInt1Ty(ctx.builder.getContext()), 1)}), getInt1Ty(ctx.builder.getContext())));
                         init_bits_cgval(ctx, box, vinfo_r);
                     }
                 }
@@ -3851,6 +3901,21 @@ static Value *boxed(jl_codectx_t &ctx, const jl_cgval_t &vinfo, bool is_promotab
                 };
                 box = emit_allocobj(ctx, (jl_datatype_t*)jt, true);
                 setName(ctx.emission_context, box, arg_typename);
+                size_t assume_id = 401;
+                // It... is here...
+                //
+                // This is very interesting because we blindly deleted our TIndex, but
+                // we didn't actually guarantee that we are boxed so now we suffer
+                // because lost that bit of runtime info.
+                FunctionCallee absint = Intrinsic::getOrInsertDeclaration(jl_Module, Intrinsic::abs, ArrayRef<Type*>(ctx.types().T_size));
+                ctx.builder.CreateAssumption(ctx.builder.CreateTrunc(ctx.builder.CreateCall(absint, {ConstantInt::get(ctx.types().T_size, assume_id), ConstantInt::get(getInt1Ty(ctx.builder.getContext()), 1)}), getInt1Ty(ctx.builder.getContext())));
+                std::string fname = ctx.f->getName().str();
+
+                // This is supposed to copy `vinfo` (in either split or non-split format)
+                // into the canonical (non-split) format in the freshly-allocated `box`
+
+                //if (fname.find("51499") != std::string::npos)
+                //    abort();
                 init_bits_cgval(ctx, box, vinfo);
             }
         }
@@ -3873,10 +3938,14 @@ static void emit_unionmove(jl_codectx_t &ctx, Value *dest, MDNode *tbaa_dst, Val
             // TODO: refine and document this guard, under careful consideration of the roots that the src / dst have
             emit_guarded_test(ctx, skip, nullptr, [&] {
                 unsigned alignment = julia_alignment(typ);
-                if (inline_roots_ptr != nullptr && !src.inline_roots.empty())
+                if (inline_roots_ptr != nullptr)
                     split_value_into(ctx, mark_julia_const(ctx, src.constant), Align(alignment), dest, Align(alignment), jl_aliasinfo_t::fromTBAA(ctx, tbaa_dst), inline_roots_ptr, jl_aliasinfo_t::fromTBAA(ctx, tbaa_roots));
-                else
+                else {
+                    size_t assume_id = 211;
+                    FunctionCallee absint = Intrinsic::getOrInsertDeclaration(jl_Module, Intrinsic::abs, ArrayRef<Type*>(ctx.types().T_size));
+                    ctx.builder.CreateAssumption(ctx.builder.CreateTrunc(ctx.builder.CreateCall(absint, {ConstantInt::get(ctx.types().T_size, assume_id), ConstantInt::get(getInt1Ty(ctx.builder.getContext()), 1)}), getInt1Ty(ctx.builder.getContext())));
                     emit_unbox_store(ctx, mark_julia_const(ctx, src.constant), dest, tbaa_dst, Align(alignment), Align(alignment), isVolatile);
+                }
                 return nullptr;
             });
         }
@@ -3886,15 +3955,24 @@ static void emit_unionmove(jl_codectx_t &ctx, Value *dest, MDNode *tbaa_dst, Val
         if (!deserves_unionbox(src.typ)) {
             emit_guarded_test(ctx, skip, nullptr, [&] {
                 unsigned alignment = julia_alignment(src.typ);
-                if (inline_roots_ptr != nullptr && !src.inline_roots.empty())
+                if (inline_roots_ptr != nullptr)
                     split_value_into(ctx, src, Align(alignment), dest, Align(alignment), jl_aliasinfo_t::fromTBAA(ctx, tbaa_dst), inline_roots_ptr, jl_aliasinfo_t::fromTBAA(ctx, tbaa_roots));
-                else
+                else {
+                    size_t assume_id = 213;
+                    FunctionCallee absint = Intrinsic::getOrInsertDeclaration(jl_Module, Intrinsic::abs, ArrayRef<Type*>(ctx.types().T_size));
+                    ctx.builder.CreateAssumption(ctx.builder.CreateTrunc(ctx.builder.CreateCall(absint, {ConstantInt::get(ctx.types().T_size, assume_id), ConstantInt::get(getInt1Ty(ctx.builder.getContext()), 1)}), getInt1Ty(ctx.builder.getContext())));
                     emit_unbox_store(ctx, src, dest, tbaa_dst, Align(alignment), Align(alignment), isVolatile);
+                }
                 return nullptr;
             });
         }
     }
     else if (src.TIndex) {
+        // OK, this basically requires you to provide a skip if the RHS
+        // might actually be boxed - and in that case, nothing gets copied
+        // to the LHS
+        //
+        // (it should actually verify this by not masking with the AND)
         Value *tindex = ctx.builder.CreateAnd(src.TIndex, ConstantInt::get(getInt8Ty(ctx.builder.getContext()), 0x7f));
         if (skip)
             tindex = ctx.builder.CreateSelect(skip, ConstantInt::get(getInt8Ty(ctx.builder.getContext()), 0), tindex);
@@ -3912,7 +3990,17 @@ static void emit_unionmove(jl_codectx_t &ctx, Value *dest, MDNode *tbaa_dst, Val
                     BasicBlock *tempBB = BasicBlock::Create(ctx.builder.getContext(), "union_move", ctx.f);
                     ctx.builder.SetInsertPoint(tempBB);
                     switchInst->addCase(ConstantInt::get(getInt8Ty(ctx.builder.getContext()), idx), tempBB);
-                    if (npointers > nroots_dst) {
+                    if (inline_roots_ptr != nullptr && src.inline_roots.empty()) {
+                        jl_cgval_t concrete_src(src, (jl_value_t *)jt, /* TIndex */ nullptr);
+                        split_value_into(ctx, concrete_src, Align(alignment), dest, Align(alignment), jl_aliasinfo_t::fromTBAA(ctx, tbaa_dst), inline_roots_ptr, jl_aliasinfo_t::fromTBAA(ctx, tbaa_roots));
+                        ctx.builder.CreateBr(postBB);
+                        return;
+                    }
+                    // src.inline_roots can be smaller than expected, if convert_julia_type widened us
+                    // to a larger Union{...} type
+                    //
+                    // TODO: track the normal alloca size too
+                    if (npointers > nroots_dst || (!src.inline_roots.empty() && npointers > src.inline_roots.size())) {
                         // This should be boxed and / or trapped, depending on whether the
                         // target location can support boxed Union{...} types or not
                         Function *trap_func =
@@ -3927,6 +4015,7 @@ static void emit_unionmove(jl_codectx_t &ctx, Value *dest, MDNode *tbaa_dst, Val
                     }
                     for (size_t i = 0; i < npointers; i++) {
                         assert(i < src.inline_roots.size());
+                        assert(i < nroots_dst);
                         Value *src_root = src.inline_roots[i];
                         Value *dst_root_ptr = emit_ptrgep(ctx, inline_roots_ptr, i * sizeof(void*));
                         jl_aliasinfo_t roots_ai = jl_aliasinfo_t::fromTBAA(ctx, tbaa_roots);
@@ -3945,6 +4034,9 @@ static void emit_unionmove(jl_codectx_t &ctx, Value *dest, MDNode *tbaa_dst, Val
                             ctx.builder.CreateUnreachable();
                             return;
                         } else {
+                            size_t assume_id = 13;
+                            FunctionCallee absint = Intrinsic::getOrInsertDeclaration(jl_Module, Intrinsic::abs, ArrayRef<Type*>(ctx.types().T_size));
+                            ctx.builder.CreateAssumption(ctx.builder.CreateTrunc(ctx.builder.CreateCall(absint, {ConstantInt::get(ctx.types().T_size, assume_id), ConstantInt::get(getInt1Ty(ctx.builder.getContext()), 1)}), getInt1Ty(ctx.builder.getContext())));
                             emit_memcpy(ctx, dest, jl_aliasinfo_t::fromTBAA(ctx, tbaa_dst), src_ptr,
                                         jl_aliasinfo_t::fromTBAA(ctx, src.tbaa), nbytes, Align(alignment), Align(alignment), isVolatile);
                         }
@@ -3975,9 +4067,13 @@ static void emit_unionmove(jl_codectx_t &ctx, Value *dest, MDNode *tbaa_dst, Val
         emit_guarded_test(ctx, skip, nullptr, [&] {
             Value *datatype = emit_typeof(ctx, src, false, false);
             Value *copy_bytes = emit_datatype_size(ctx, datatype);
-            if (dest)
+            if (dest) {
+                size_t assume_id = 15;
+                FunctionCallee absint = Intrinsic::getOrInsertDeclaration(jl_Module, Intrinsic::abs, ArrayRef<Type*>(ctx.types().T_size));
+                ctx.builder.CreateAssumption(ctx.builder.CreateTrunc(ctx.builder.CreateCall(absint, {ConstantInt::get(ctx.types().T_size, assume_id), ConstantInt::get(getInt1Ty(ctx.builder.getContext()), 1)}), getInt1Ty(ctx.builder.getContext())));
                 emit_memcpy(ctx, dest, jl_aliasinfo_t::fromTBAA(ctx, tbaa_dst), data_pointer(ctx, src),
                             jl_aliasinfo_t::fromTBAA(ctx, src.tbaa), copy_bytes, Align(1), Align(1), isVolatile);
+            }
             assert(inline_roots_ptr != nullptr || nroots_dst == 0);
             for (size_t i = 0; i < nroots_dst; i++) {
                 Value *src_root;
@@ -4010,10 +4106,15 @@ static void emit_unionmove(jl_codectx_t &ctx, Value *dest, MDNode *tbaa_dst, Mut
             //       the type has roots or not!
             emit_guarded_test(ctx, skip, nullptr, [&] {
                 unsigned alignment = julia_alignment(typ);
-                if (!inline_roots.empty() && !src.inline_roots.empty())
+                // TODO: Why do we only split_value_into if both are non-empty
+                if (!inline_roots.empty())
                     split_value_into(ctx, mark_julia_const(ctx, src.constant), Align(alignment), dest, Align(alignment), jl_aliasinfo_t::fromTBAA(ctx, tbaa_dst), inline_roots);
-                else
+                else {
+                    size_t assume_id = 123;
+                    FunctionCallee absint = Intrinsic::getOrInsertDeclaration(jl_Module, Intrinsic::abs, ArrayRef<Type*>(ctx.types().T_size));
+                    ctx.builder.CreateAssumption(ctx.builder.CreateTrunc(ctx.builder.CreateCall(absint, {ConstantInt::get(ctx.types().T_size, assume_id), ConstantInt::get(getInt1Ty(ctx.builder.getContext()), 1)}), getInt1Ty(ctx.builder.getContext())));
                     emit_unbox_store(ctx, mark_julia_const(ctx, src.constant), dest, tbaa_dst, Align(alignment), Align(alignment), isVolatile);
+                }
                 return nullptr;
             });
         }
@@ -4023,10 +4124,14 @@ static void emit_unionmove(jl_codectx_t &ctx, Value *dest, MDNode *tbaa_dst, Mut
         if (!deserves_unionbox(src.typ)) {
             emit_guarded_test(ctx, skip, nullptr, [&] {
                 unsigned alignment = julia_alignment(src.typ);
-                if (!inline_roots.empty() && !src.inline_roots.empty())
+                if (!inline_roots.empty())
                     split_value_into(ctx, src, Align(alignment), dest, Align(alignment), jl_aliasinfo_t::fromTBAA(ctx, tbaa_dst), inline_roots);
-                else
+                else {
+                    size_t assume_id = 121;
+                    FunctionCallee absint = Intrinsic::getOrInsertDeclaration(jl_Module, Intrinsic::abs, ArrayRef<Type*>(ctx.types().T_size));
+                    ctx.builder.CreateAssumption(ctx.builder.CreateTrunc(ctx.builder.CreateCall(absint, {ConstantInt::get(ctx.types().T_size, assume_id), ConstantInt::get(getInt1Ty(ctx.builder.getContext()), 1)}), getInt1Ty(ctx.builder.getContext())));
                     emit_unbox_store(ctx, src, dest, tbaa_dst, Align(alignment), Align(alignment), isVolatile);
+                }
                 return nullptr;
             });
         }
@@ -4052,7 +4157,17 @@ static void emit_unionmove(jl_codectx_t &ctx, Value *dest, MDNode *tbaa_dst, Mut
                     BasicBlock *tempBB = BasicBlock::Create(ctx.builder.getContext(), "union_move", ctx.f);
                     ctx.builder.SetInsertPoint(tempBB);
                     switchInst->addCase(ConstantInt::get(getInt8Ty(ctx.builder.getContext()), idx), tempBB);
-                    if (npointers > inline_roots.size()) {
+                    if (!inline_roots.empty() && src.inline_roots.empty()) {
+                        // TODO: It's... really this simple?
+                        SmallVector<Value*,0> new_inline_roots(inline_roots.size(), Constant::getNullValue(ctx.types().T_prjlvalue));
+                        jl_cgval_t concrete_src(src, (jl_value_t *)jt, /* TIndex */ nullptr);
+                        split_value_into(ctx, concrete_src, Align(alignment), dest, Align(alignment), jl_aliasinfo_t::fromTBAA(ctx, tbaa_dst), new_inline_roots);
+                        for (size_t i = 0; i < inline_roots.size(); i++)
+                            cast<PHINode>(inline_roots[i])->addIncoming(new_inline_roots[i], tempBB);
+                        ctx.builder.CreateBr(postBB);
+                        return;
+                    }
+                    if (npointers > inline_roots.size() || (!src.inline_roots.empty() && npointers > src.inline_roots.size())) {
                         Function *trap_func =
 #if JL_LLVM_VERSION >= 200000
                             Intrinsic::getOrInsertDeclaration(ctx.f->getParent(), Intrinsic::trap);
@@ -4082,6 +4197,9 @@ static void emit_unionmove(jl_codectx_t &ctx, Value *dest, MDNode *tbaa_dst, Mut
                             ctx.builder.CreateUnreachable();
                             return;
                         } else {
+                            size_t assume_id = 17;
+                            FunctionCallee absint = Intrinsic::getOrInsertDeclaration(jl_Module, Intrinsic::abs, ArrayRef<Type*>(ctx.types().T_size));
+                            ctx.builder.CreateAssumption(ctx.builder.CreateTrunc(ctx.builder.CreateCall(absint, {ConstantInt::get(ctx.types().T_size, assume_id), ConstantInt::get(getInt1Ty(ctx.builder.getContext()), 1)}), getInt1Ty(ctx.builder.getContext())));
                             emit_memcpy(ctx, dest, jl_aliasinfo_t::fromTBAA(ctx, tbaa_dst), src_ptr,
                                         jl_aliasinfo_t::fromTBAA(ctx, src.tbaa), nbytes, Align(alignment), Align(alignment), isVolatile);
                         }
@@ -4116,9 +4234,13 @@ static void emit_unionmove(jl_codectx_t &ctx, Value *dest, MDNode *tbaa_dst, Mut
         emit_guarded_test(ctx, skip, nullptr, [&] {
             Value *datatype = emit_typeof(ctx, src, false, false);
             Value *copy_bytes = emit_datatype_size(ctx, datatype);
-            if (dest)
+            if (dest) {
+                size_t assume_id = 19;
+                FunctionCallee absint = Intrinsic::getOrInsertDeclaration(jl_Module, Intrinsic::abs, ArrayRef<Type*>(ctx.types().T_size));
+                ctx.builder.CreateAssumption(ctx.builder.CreateTrunc(ctx.builder.CreateCall(absint, {ConstantInt::get(ctx.types().T_size, assume_id), ConstantInt::get(getInt1Ty(ctx.builder.getContext()), 1)}), getInt1Ty(ctx.builder.getContext())));
                 emit_memcpy(ctx, dest, jl_aliasinfo_t::fromTBAA(ctx, tbaa_dst), data_pointer(ctx, src),
                             jl_aliasinfo_t::fromTBAA(ctx, src.tbaa), copy_bytes, Align(1), Align(1), isVolatile);
+            }
             for (size_t i = 0; i < inline_roots.size(); i++) {
                 if (i < src.inline_roots.size())
                     inline_roots[i] = src.inline_roots[i];
@@ -4460,6 +4582,7 @@ static jl_cgval_t emit_new_struct(jl_codectx_t &ctx, jl_value_t *ty, size_t narg
                 }
                 Value *fval = NULL;
                 if (jl_field_isptr(sty, i)) {
+                    // Right, this is where we are storing...
                     fval = boxed(ctx, fval_info, field_promotable);
                     if (!init_as_value) {
                         if (dest) {
@@ -4550,6 +4673,9 @@ static jl_cgval_t emit_new_struct(jl_codectx_t &ctx, jl_value_t *ty, size_t narg
                         split_value_into(ctx, fval_info, align_src, dest, align_dst, jl_aliasinfo_t::fromTBAA(ctx, ctx.tbaa().tbaa_stack), roots);
                     }
                     else {
+                        size_t assume_id = 301;
+                        FunctionCallee absint = Intrinsic::getOrInsertDeclaration(jl_Module, Intrinsic::abs, ArrayRef<Type*>(ctx.types().T_size));
+                        ctx.builder.CreateAssumption(ctx.builder.CreateTrunc(ctx.builder.CreateCall(absint, {ConstantInt::get(ctx.types().T_size, assume_id), ConstantInt::get(getInt1Ty(ctx.builder.getContext()), 1)}), getInt1Ty(ctx.builder.getContext())));
                         emit_unbox_store(ctx, fval_info, dest, ctx.tbaa().tbaa_stack, align_src, align_dst);
                     }
                 }
@@ -4880,6 +5006,7 @@ static jl_cgval_t _emit_memoryref(jl_codectx_t &ctx, const jl_cgval_t &mem, cons
 static Value *emit_memoryref_FCA(jl_codectx_t &ctx, const jl_cgval_t &ref, const jl_datatype_layout_t *layout)
 {
     if (!ref.inline_roots.empty()) {
+        // TOOD: This is wrong now too...
         LLVMContext &C = ctx.builder.getContext();
         StructType *type = get_memoryref_type(C, ctx.types().T_size, layout, 0);
         LoadInst *load0 = ctx.builder.CreateLoad(type->getElementType(0), ref.V);

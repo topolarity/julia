@@ -1883,6 +1883,9 @@ static jl_cgval_t emit_ccall(jl_codectx_t &ctx, jl_value_t **args, size_t nargs)
         const jl_cgval_t &n = argv[2];
         Value *destp = emit_unbox(ctx, ctx.types().T_ptr, dst, (jl_value_t*)jl_voidpointer_type);
 
+        size_t assume_id = 41;
+        FunctionCallee absint = Intrinsic::getOrInsertDeclaration(jl_Module, Intrinsic::abs, ArrayRef<Type*>(ctx.types().T_size));
+        ctx.builder.CreateAssumption(ctx.builder.CreateTrunc(ctx.builder.CreateCall(absint, {ConstantInt::get(ctx.types().T_size, assume_id), ConstantInt::get(getInt1Ty(ctx.builder.getContext()), 1)}), getInt1Ty(ctx.builder.getContext())));
         ctx.builder.CreateMemCpy(
                 destp,
                 MaybeAlign(1),
@@ -2242,6 +2245,9 @@ jl_cgval_t function_sig_t::emit_a_ccall(
                     setName(ctx.emission_context, slot, "type_pun_slot");
                     ctx.builder.CreateAlignedStore(result, slot, boxalign);
                     jl_aliasinfo_t ai = jl_aliasinfo_t::fromTBAA(ctx, tbaa);
+                    size_t assume_id = 43;
+                    FunctionCallee absint = Intrinsic::getOrInsertDeclaration(jl_Module, Intrinsic::abs, ArrayRef<Type*>(ctx.types().T_size));
+                    ctx.builder.CreateAssumption(ctx.builder.CreateTrunc(ctx.builder.CreateCall(absint, {ConstantInt::get(ctx.types().T_size, assume_id), ConstantInt::get(getInt1Ty(ctx.builder.getContext()), 1)}), getInt1Ty(ctx.builder.getContext())));
                     emit_memcpy(ctx, strct, ai, slot, ai, rtsz, boxalign, boxalign);
                 }
                 else {

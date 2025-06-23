@@ -231,7 +231,7 @@ public:
 
       auto DILV = Builder.createParameterVariable(
           Sub, Arg->getName(), I + 1, FileNode, Line,
-          getOrCreateType(Arg->getType()), /*AlwaysPreserve=*/true);
+          getOrCreateType(Arg->getType()), true);
       auto Loc = DebugLoc(DILocation::get(M.getContext(), Line, 0, Sub));
       Builder.insertDbgValueIntrinsic(Arg, DILV, Builder.createExpression(),
                                       Loc.get(), F.getEntryBlock().getFirstNonPHI());
