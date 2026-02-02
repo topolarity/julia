@@ -226,7 +226,7 @@ function _find_scope_decls!(ctx, scope, ex)
     elseif k === K"break" && numchildren(ex) >= 2
         # For break with value, only recurse into the value expression (second child), not the label
         _find_scope_decls!(ctx, scope, ex[2])
-    elseif needs_resolution(ex) && !(k === K"scope_block" || k === K"lambda")
+    elseif needs_resolution(ex) && !(k === K"scope_block" || k === K"method_defs" || k === K"lambda")
         for e in children(ex)
             _find_scope_decls!(ctx, scope, e)
         end
@@ -237,7 +237,7 @@ end
 # means finding all variables declared and used in the scope `ex` and generating
 # the (identifier,layer)=>binding_id mapping `scope.vars`
 function enter_scope!(ctx, ex)
-    @assert kind(ex) in KSet"lambda scope_block"
+    @assert kind(ex) in KSet"lambda scope_block method_defs"
     # Note that generated functions produce lambdas with this false
     is_toplevel_thunk = kind(ex) === K"lambda" && ex.is_toplevel_thunk
     parent_id = (is_toplevel_thunk || isempty(ctx.scope_stack)) ?
@@ -419,6 +419,19 @@ function _resolve_scopes(ctx, ex::SyntaxTree,
         end
         pop!(ctx.scope_stack)
         @ast ctx ex [K"block" stmts...]
+    elseif k == K"method_defs"
+        newscope = enter_scope!(ctx, ex) # implicit K"scope_block"(:hard)
+        ex1 = _resolve_scopes(ctx, ex[1], newscope)
+        stmts = SyntaxList(ctx)
+        add_local_decls!(ctx, stmts, ex, newscope)
+        let blk = ex[2]
+            @assert kind(blk) == K"block"
+            for e in children(blk)
+                push!(stmts, _resolve_scopes(ctx, e, newscope))
+            end
+        end
+        pop!(ctx.scope_stack)
+        result = @ast ctx ex [K"method_defs" ex1 [K"block" stmts...]]
     elseif k == K"islocal"
         e1 = ex[1]
         islocal = kind(e1) == K"Identifier" &&
