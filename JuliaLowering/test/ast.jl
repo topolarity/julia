@@ -1,6 +1,6 @@
 let node = JS.newleaf(SyntaxGraph(), LineNumberNode(1), K"Value", nothing)
-    @test JS.hasattr(node, :value)
-    @test node.value === nothing
+    @test JS.hasattr(Any, node, :value)
+    @test JS.getattr(Any, node, :value) === nothing
 end
 
 @testset "assert_syntaxtree" begin

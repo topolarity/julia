@@ -19,7 +19,7 @@ end
     st = jl_lower(test_mod, JuliaSyntax.parsestmt(SyntaxTree, "1 + 2 - \n 3"))
     JuliaSyntax.ensure_attributes!(st._graph; debuginfo=Any)
     add_debuginfo!(st)
-    csbt = st.debuginfo
+    csbt = JuliaSyntax.getattr(Core.DebugInfo, st, :debuginfo)
     usbt = uncompress_sbt(csbt)
     cusbt = compress_sbt(usbt)
     @test csbt isa Core.DebugInfo

@@ -59,7 +59,7 @@ function expand_quote(ctx, ex)
     if is_expr_value(ex)
         @jl_assert isempty(unquoted) ex
         ex
-    elseif kind(ex) === K"Identifier" && !hasattr(ex, :mod)
+    elseif kind(ex) === K"Identifier" && !hasattr(Module, ex, :mod)
         @jl_assert isempty(unquoted) ex
         # not just an optimization; expected e.g. in (. mod (quote field))
         @ast ctx ex [(ctx.expr_compat_mode ? K"inert" : K"inert_syntaxtree") ex]
@@ -158,7 +158,7 @@ function _eval_dot(world::UInt, mod, ex::SyntaxTree)
         ex = ex[1]
     end
     kind(ex) in KSet"Identifier Symbol" && mod isa Module ?
-        Base.invoke_in_world(world, getproperty, mod, Symbol(ex.name_val)) :
+        Base.invoke_in_world(world, getproperty, mod, Symbol(getattr(String, ex, :name_val))) :
         nothing
 end
 
@@ -171,16 +171,16 @@ function eval_macro_name(ctx, mctx::MacroContext, ex0::SyntaxTree, sl)
     ex = expand_forms_1(ctx, ex0, sl)
     try
         if kind(ex) === K"Value"
-            ex.value
+            getattr(Any, ex, :value)
         elseif kind(ex) === K"Identifier"
             # module from globalref, or some expansion, or default
-            if hasattr(ex, :mod)
-                mod = ex.mod::Module
-            elseif hasattr(ex, :scope_layer)
-                mod = ctx.scope_layers[ex.scope_layer::LayerId].mod
+            if hasattr(Module, ex, :mod)
+                mod = getattr(Module, ex, :mod)
+            elseif hasattr(LayerId, ex, :scope_layer)
+                mod = ctx.scope_layers[getattr(LayerId, ex, :scope_layer)].mod
             end
             Base.invoke_in_world(ctx.macro_world, getproperty,
-                                 mod, Symbol(ex.name_val))
+                                 mod, Symbol(getattr(String, ex, :name_val)))
         elseif kind(ex) === K"." &&
                 (ed = _eval_dot(ctx.macro_world, mod, ex); !isnothing(ed))
             ed
@@ -207,18 +207,18 @@ end
 # See also set_scope_layer()
 function set_macro_arg_hygiene(ctx, ex, sl)
     k = kind(ex)
-    sl = ctx.scope_layers[get(ex, :scope_layer, sl.id)]
+    sl = ctx.scope_layers[getattr(LayerId, ex, :scope_layer, sl.id)]
     if is_leaf(ex)
-        setattr!(mkleaf(ex), :scope_layer, sl.id)
+        setattr!(LayerId, mkleaf(ex), :scope_layer, sl.id)
     elseif k === K"hygienic-scope"
         set_macro_arg_hygiene(
             ctx, ex[1], new_macro_scope_layer(
-                ctx, sl, ex[2].value::Module, sl.hygiene_compat))
+                ctx, sl, getattr(Any, ex[2], :value)::Module, sl.hygiene_compat))
     elseif k === K"escape"
         set_macro_arg_hygiene(ctx, ex[1], parent_layer(ctx, sl, ex))
     else
         node = mapchildren(e->set_macro_arg_hygiene(ctx, e, sl), ctx, ex)
-        setattr!(node, :scope_layer, sl.id)
+        setattr!(LayerId, node, :scope_layer, sl.id)
     end
 end
 
@@ -274,7 +274,7 @@ function expand_macro(ctx, ex, outer_sl)
     macfunc = eval_macro_name(ctx, mctx, macname, outer_sl)
     raw_args = ex[3:end]
     macro_loc = if kind(ex[2]) === K"Value"
-        loc = ex[2].value
+        loc = getattr(Any, ex[2], :value)
         if loc isa MacroSource
             loc
         elseif loc isa LineNumberNode
@@ -285,7 +285,7 @@ function expand_macro(ctx, ex, outer_sl)
         end
     elseif kind(ex[2]) === K"VERSION"
         loc = source_location(LineNumberNode, ex)
-        isdefined(Core, :MacroSource) ? Core.MacroSource(loc, ex[2].value) : loc
+        isdefined(Core, :MacroSource) ? Core.MacroSource(loc, getattr(Any, ex[2], :value)) : loc
     else
         LineNumberNode(0, :none)
     end
@@ -376,7 +376,7 @@ end
 
 function append_sourceref!(ctx, ex, id::NodeId)
     @jl_assert ex._id != id ex
-    setattr!(ex, :macro_source, id)
+    setattr!(NodeId, ex, :macro_source, id)
     for c in children(ex)
         append_sourceref!(ctx, c, id)
     end
@@ -389,7 +389,7 @@ function remove_scope_layer!(ex)
             remove_scope_layer!(c)
         end
     end
-    JuliaSyntax.deleteattr!(ex, :scope_layer)
+    JuliaSyntax.deleteattr!(LayerId, ex, :scope_layer)
     ex
 end
 
@@ -405,23 +405,23 @@ identifier with the expansion it came from.
 """
 function expand_forms_1(ctx::MacroExpansionContext, ex::SyntaxTree, sl::ScopeLayer)
     k = kind(ex)
-    expr_sl = ctx.scope_layers[get(ex, :scope_layer, sl.id)]
+    expr_sl = ctx.scope_layers[getattr(LayerId, ex, :scope_layer, sl.id)]
     if k == K"Identifier"
-        hasattr(ex, :scope_layer) ?
-            ex : setattr!(mkleaf(ex), :scope_layer, sl.id)
+        hasattr(LayerId, ex, :scope_layer) ?
+            ex : setattr!(LayerId, mkleaf(ex), :scope_layer, sl.id)
     elseif k == K"escape"
         if numchildren(ex) !== 1
             throw(LoweringError(ex, "`escape` requires one argument"))
         end
         expand_forms_1(ctx, ex[1], parent_layer(ctx, expr_sl, ex))
     elseif k == K"hygienic-scope"
-        if !(2 <= numchildren(ex) <= 3 && ex[2].value isa Module)
+        if !(2 <= numchildren(ex) <= 3 && getattr(Any, ex[2], :value) isa Module)
             throw(LoweringError(ex,"`hygienic-scope` requires an AST and a module"))
         end
         expand_forms_1(
             ctx, ex[1],
             new_macro_scope_layer(
-                ctx, expr_sl, ex[2].value::Module, expr_sl.hygiene_compat))
+                ctx, expr_sl, getattr(Any, ex[2], :value)::Module, expr_sl.hygiene_compat))
     elseif k == K"quote"
         if numchildren(ex) !== 1
             throw(LoweringError(ex,"`quote` expects one argument"))
@@ -443,7 +443,7 @@ function expand_forms_1(ctx::MacroExpansionContext, ex::SyntaxTree, sl::ScopeLay
         # if this is a form that requires resolving some identifier, add the
         # scope layer.  if this is an unknown form to be cleaned up by AST
         # conversion, save the scope layer just in case.
-        setattr(mapchildren(e->expand_forms_1(ctx,e,sl), ctx, ex),
+        setattr(LayerId, mapchildren(e->expand_forms_1(ctx,e,sl), ctx, ex),
                 :scope_layer, expr_sl.id)
     elseif is_leaf(ex)
         ex

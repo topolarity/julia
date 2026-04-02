@@ -98,13 +98,13 @@ function JuliaSyntax.newleaf(ctx, prov, k, @nospecialize(value))
     leaf = newleaf(ctx, prov, k)
     if k == K"Identifier" || k == K"core" || k == K"top" || k == K"Symbol" ||
             k == K"globalref" || k == K"Placeholder"
-        setattr!(leaf._graph, leaf._id, :name_val, value)
+        setattr!(String, leaf._graph, leaf._id, :name_val, value)
     elseif k == K"BindingId"
-        setattr!(leaf._graph, leaf._id, :var_id, value)
+        setattr!(IdTag, leaf._graph, leaf._id, :var_id, value)
     elseif k == K"label"
-        setattr!(leaf._graph, leaf._id, :id, value)
+        setattr!(Int, leaf._graph, leaf._id, :id, value)
     elseif k == K"symboliclabel" || k == K"symbolicgoto"
-        setattr!(leaf._graph, leaf._id, :name_val, value)
+        setattr!(String, leaf._graph, leaf._id, :name_val, value)
     elseif k in KSet"TOMBSTONE SourceLocation latestworld latestworld_if_toplevel
                      softscope nothing"
         # no attributes
@@ -117,7 +117,7 @@ function JuliaSyntax.newleaf(ctx, prov, k, @nospecialize(value))
               k == K"Bool"    ? value                   :
               k == K"VERSION" ? value                   :
               error("Unexpected leaf kind `$k`")
-        setattr!(leaf._graph, leaf._id, :value, val)
+        setattr!(Any, leaf._graph, leaf._id, :value, val)
     end
     leaf
 end
@@ -242,16 +242,16 @@ function _expand_ast_tree(ctx, srcref, tree, jl_line::QuoteNode)
             n = isnothing(val) ? :(newleaf($ctx, $srcref, $kind)) :
                 :(newleaf($ctx, $srcref, $kind, $val))
             for (attr, val) in kws
-                n = :(setattr!($n, $attr, $val))
+                n = :(setattr!(Any, $n, $attr, $val))
             end
-            DEBUG ? :(setattr!($n, :jl_source, $jl_line)) : n
+            DEBUG ? :(setattr!(LineNumberNode, $n, :jl_source, $jl_line)) : n
         end
     elseif Meta.isexpr(tree, :call) && tree.args[1] === :(=>)
         # Leaf node with copied attributes
         kind = esc(tree.args[3])
         srcref2 = esc(tree.args[2])
-        n = :(setattr!(mkleaf($srcref2), :kind, $kind))
-        DEBUG ? :(setattr!($n, :jl_source, $jl_line)) : n
+        n = :(setattr!(Kind, mkleaf($srcref2), :kind, $kind))
+        DEBUG ? :(setattr!(LineNumberNode, $n, :jl_source, $jl_line)) : n
     elseif Meta.isexpr(tree, (:vcat, :hcat, :vect))
         # Interior node
         flatargs = []
@@ -277,9 +277,9 @@ function _expand_ast_tree(ctx, srcref, tree, jl_line::QuoteNode)
         let (kind, srcref, kws) = _match_kind(srcref, flatargs[1])
             n = :(newnode($ctx, $srcref, $kind, $children_ex))
             for (attr, val) in kws
-                n = :(setattr!($n, $attr, $val))
+                n = :(setattr!(Any, $n, $attr, $val))
             end
-            DEBUG ? :(setattr!($n, :jl_source, $jl_line)) : n
+            DEBUG ? :(setattr!(LineNumberNode, $n, :jl_source, $jl_line)) : n
         end
     elseif Meta.isexpr(tree, :(:=))
         lhs = tree.args[1]
@@ -361,7 +361,7 @@ end
 #-------------------------------------------------------------------------------
 function set_scope_layer(ctx, ex, layer_id, force)
     k = kind(ex)
-    new_layer = force ? layer_id : get(ex, :scope_layer, layer_id)
+    new_layer = force ? layer_id : getattr(LayerId, ex, :scope_layer, layer_id)
 
     ex2 = if k == K"module" || k == K"toplevel" || k == K"inert" || k == K"inert_syntaxtree"
         mknode(ex, children(ex))
@@ -373,7 +373,7 @@ function set_scope_layer(ctx, ex, layer_id, force)
     else
         mkleaf(ex)
     end
-    setattr!(ex2, :scope_layer, new_layer)
+    setattr!(LayerId, ex2, :scope_layer, new_layer)
 end
 
 """
@@ -390,7 +390,7 @@ function adopt_scope(ex::SyntaxTree, layer::ScopeLayer)
 end
 
 function adopt_scope(ex::SyntaxTree, ref::SyntaxTree)
-    adopt_scope(ex, ref.scope_layer)
+    adopt_scope(ex, getattr(LayerId, ref, :scope_layer))
 end
 
 function adopt_scope(exs::SyntaxList, ref)
@@ -410,10 +410,10 @@ const CompileHints = Base.ImmutableDict{Symbol,Any}
 
 function setmeta!(ex::SyntaxTree, key::Symbol, @nospecialize(val))
     meta = begin
-        m = get(ex, :meta, nothing)
+        m = getattr(CompileHints, ex, :meta, nothing)
         isnothing(m) ? CompileHints(key, val) : CompileHints(m, key, val)
     end
-    setattr!(ex, :meta, meta)
+    setattr!(CompileHints, ex, :meta, meta)
     ex
 end
 
@@ -421,7 +421,7 @@ setmeta(ex::SyntaxTree, k::Symbol, @nospecialize(v)) =
     setmeta!(is_leaf(ex) ? mkleaf(ex) : mknode(ex, children(ex)), k, v)
 
 function getmeta(ex::SyntaxTree, name::Symbol, default)
-    meta = get(ex, :meta, nothing)
+    meta = getattr(CompileHints, ex, :meta, nothing)
     isnothing(meta) ? default : get(meta, name, default)
 end
 
@@ -439,7 +439,7 @@ function extension_type(ex)
     @jl_assert kind(ex) == K"assert" ex
     @jl_assert numchildren(ex) >= 1 ex
     @jl_assert kind(ex[1]) == K"Symbol" ex
-    ex[1].name_val
+    getattr(String, ex[1], :name_val)
 end
 
 function is_eventually_call(ex::SyntaxTree)
@@ -479,7 +479,7 @@ function is_valid_modref(ex)
 end
 
 function is_core_Any(ex)
-    kind(ex) === K"core" && ex.name_val::String === "Any"
+    kind(ex) === K"core" && getattr(String, ex, :name_val) === "Any"
 end
 
 function is_simple_atom(ctx, ex)
@@ -547,7 +547,7 @@ end
 # hygiene_compat rules as if it were on its original layer.
 function new_internal_escapable_scope_layer(ctx, ident::SyntaxTree)
     @jl_assert kind(ident) == K"Identifier" ident
-    old_sl = ctx.scope_layers[ident.scope_layer::LayerId]
+    old_sl = ctx.scope_layers[getattr(LayerId, ident, :scope_layer)]
     sl = ScopeLayer(
         length(ctx.scope_layers)+1, old_sl.mod, old_sl.id,
         old_sl.hygiene_compat, true)

@@ -133,40 +133,21 @@ function child(graph::SyntaxGraph, id::NodeId, i::Integer)
     graph.edges[graph.edge_ranges[id][i]]
 end
 
-# XXX: the @noinline (and the one on setattr!) work around an issue where
-# codegen produces a trampoline for `getindex`
-@noinline function getattr(graph::SyntaxGraph{Dict{Symbol,Dict{NodeId,Any}}}, name::Symbol)
-    getfield(graph, :attributes)[name]
+function getattr(::Type{T}, graph::SyntaxGraph, name::Symbol) where T
+    graph.attributes[name]
 end
 
-function getattr(graph::SyntaxGraph{<:NamedTuple}, name::Symbol)
-    getfield(getfield(graph, :attributes), name)
+function hasattr(::Type{T}, graph::SyntaxGraph, name::Symbol) where T
+    haskey(graph.attributes, name)
 end
 
-function hasattr(graph::SyntaxGraph{Dict{Symbol,Dict{NodeId,Any}}}, name::Symbol)
-    haskey(getfield(graph, :attributes), name)
-end
-
-function hasattr(graph::SyntaxGraph{<:NamedTuple}, name::Symbol)
-    haskey(getfield(graph, :attributes), name)
-end
-
-# TODO: Probably terribly non-inferable?
-@noinline function setattr!(graph::SyntaxGraph, id::NodeId, k::Symbol, @nospecialize(v))
-    getattr(graph, k)[id] = v
+function setattr!(::Type{T}, graph::SyntaxGraph, id::NodeId, k::Symbol, v::T) where T
+    getattr(T, graph, k)[id] = v
     id
 end
 
-function deleteattr!(graph::SyntaxGraph, id::NodeId, name::Symbol)
-    delete!(getattr(graph, name), id)
-end
-
-function Base.getproperty(graph::SyntaxGraph, name::Symbol)
-    # TODO: Remove access to internals?
-    name === :edge_ranges && return getfield(graph, :edge_ranges)
-    name === :edges       && return getfield(graph, :edges)
-    name === :attributes  && return getfield(graph, :attributes)
-    return getattr(graph, name)
+function deleteattr!(::Type{T}, graph::SyntaxGraph, id::NodeId, name::Symbol) where T
+    delete!(getattr(T, graph, name), id)
 end
 
 """
@@ -207,7 +188,7 @@ end
 function node_string(ex::SyntaxTree, depth=2)
     out = "(_id="*string(ex._id)
     for n in sort!(collect(attrnames(ex)))
-        out *= ", "*string(n)*"="*repr(getproperty(ex, n))
+        out *= ", "*string(n)*"="*repr(getattr(Any, ex, n))
     end
     if is_leaf(ex)
         out *= ", leaf"
@@ -222,29 +203,18 @@ function node_string(ex::SyntaxTree, depth=2)
     return out
 end
 
-function Base.getproperty(ex::SyntaxTree, name::Symbol)
-    name === :_graph && return getfield(ex, :_graph)
-    name === :_id  && return getfield(ex, :_id)
+function getattr(::Type{T}, ex::SyntaxTree, name::Symbol) where T
     graph = getfield(ex, :_graph)
-    val = get(getattr(graph, name), getfield(ex, :_id)) do
-        error("Property `$name` not defined on node: $(node_string(ex))")
+    val = get(getattr(T, graph, name), getfield(ex, :_id)) do
+        error("Attribute `$name` not defined on node: $(node_string(ex))")
     end
-    return val
+    return val::T
 end
 
-function Base.setproperty!(ex::SyntaxTree, name::Symbol, @nospecialize(val))
-    setattr!(ex._graph, ex._id, name, val)
-    val
-end
-
-function Base.propertynames(ex::SyntaxTree)
-    attrnames(ex)
-end
-
-function Base.get(ex::SyntaxTree, name::Symbol, default)
+function getattr(::Type{T}, ex::SyntaxTree, name::Symbol, default::D) where {T, D}
     graph = getfield(ex, :_graph)
-    !hasattr(graph, name) && return default
-    get(getattr(graph, name), getfield(ex, :_id), default)
+    !hasattr(T, graph, name) && return default
+    return get(getattr(T, graph, name), getfield(ex, :_id), default)::Union{T, D}
 end
 
 function Base.getindex(ex::SyntaxTree, i::Integer)
@@ -263,9 +233,9 @@ function Base.:≈(ex1::SyntaxTree, ex2::SyntaxTree)
         return false
     end
     if is_leaf(ex1)
-        return hasattr(ex1, :value) == hasattr(ex2, :value) &&
-               get(ex1, :value,    nothing) == get(ex2, :value,    nothing) &&
-               get(ex1, :name_val, nothing) == get(ex2, :name_val, nothing)
+        return hasattr(Any, ex1, :value) == hasattr(Any, ex2, :value) &&
+               getattr(Any, ex1, :value, nothing) == getattr(Any, ex2, :value, nothing) &&
+               getattr(String, ex1, :name_val, nothing) == getattr(String, ex2, :name_val, nothing)
     else
         if numchildren(ex1) != numchildren(ex2)
             return false
@@ -274,10 +244,10 @@ function Base.:≈(ex1::SyntaxTree, ex2::SyntaxTree)
     end
 end
 
-function hasattr(ex::SyntaxTree, name::Symbol)
+function hasattr(::Type{T}, ex::SyntaxTree, name::Symbol) where T
     graph = ex._graph
-    !hasattr(graph, name) && return false
-    return haskey(getattr(graph, name), ex._id)
+    !hasattr(T, graph, name) && return false
+    return haskey(getattr(T, graph, name), ex._id)
 end
 
 function attrnames(ex::SyntaxTree)
@@ -285,15 +255,15 @@ function attrnames(ex::SyntaxTree)
     (name::Symbol for (name, value) in pairs(attrs) if haskey(value, ex._id))
 end
 
-function setattr!(ex::SyntaxTree, name::Symbol, @nospecialize(val))
-    setattr!(ex._graph, ex._id, name, val)
+function setattr!(::Type{T}, ex::SyntaxTree, name::Symbol, val::T) where T
+    setattr!(T, ex._graph, ex._id, name, val)
     ex
 end
-setattr(ex::SyntaxTree, name::Symbol, @nospecialize(val)) =
-    setattr!(is_leaf(ex) ? mkleaf(ex) : mknode(ex, children(ex)), name, val)
+setattr(::Type{T}, ex::SyntaxTree, name::Symbol, val::T) where T =
+    setattr!(T, is_leaf(ex) ? mkleaf(ex) : mknode(ex, children(ex)), name, val)
 
-function deleteattr!(ex::SyntaxTree, name::Symbol)
-    deleteattr!(ex._graph, ex._id, name)
+function deleteattr!(::Type{T}, ex::SyntaxTree, name::Symbol) where T
+    deleteattr!(T, ex._graph, ex._id, name)
 end
 
 # JuliaSyntax tree API
@@ -315,11 +285,11 @@ function head(ex::SyntaxTree)
 end
 
 function kind(ex::SyntaxTree)
-    ex.kind::Kind
+    getattr(Kind, ex, :kind)
 end
 
 function flags(ex::SyntaxTree)
-    get(ex, :syntax_flags, 0x0000)::UInt16
+    getattr(UInt16, ex, :syntax_flags, 0x0000)
 end
 
 
@@ -382,24 +352,25 @@ SyntaxList of [st.source, st.source.source, ..., textref]
 """
 function provenance(st::SyntaxTree)
     prov = SyntaxList(st._graph)
-    s = st.source
+    s = getattr(SourceAttrType, st, :source)
     while s isa NodeId
         s_tree = SyntaxTree(st._graph, s)
         push!(prov, s_tree)
-        s = s_tree.source
+        s = getattr(SourceAttrType, s_tree, :source)
     end
     return prov
 end
 
 "`provenance(st)[1]`, or `st` if that's empty"
 function prov(st::SyntaxTree)
-    st.source isa NodeId ? SyntaxTree(st._graph, st.source) : st
+    getattr(SourceAttrType, st, :source) isa NodeId ?
+        SyntaxTree(st._graph, getattr(SourceAttrType, st, :source)) : st
 end
 
 "textref of st (possibly == st)"
 function prov_end(st::SyntaxTree)
     out = st
-    while out.source isa NodeId
+    while getattr(SourceAttrType, out, :source) isa NodeId
         out = prov(out)
     end
     return out
@@ -407,15 +378,15 @@ end
 
 "`st`'s textref's `.source`, ignoring all `.macro_source`"
 function sourceref(st::SyntaxTree)
-    prov_end(st).source::Union{LineNumberNode, SourceRef}
+    getattr(SourceAttrType, prov_end(st), :source)::Union{LineNumberNode, SourceRef}
 end
 
 "The last macro expansion `st` was involved in, or nothing"
 function macro_prov(st::SyntaxTree)
-    while !hasattr(st, :macro_source) && st.source isa NodeId
+    while !hasattr(NodeId, st, :macro_source) && getattr(SourceAttrType, st, :source) isa NodeId
         st = prov(st)
     end
-    hasattr(st, :macro_source) && return SyntaxTree(st._graph, st.macro_source)
+    hasattr(NodeId, st, :macro_source) && return SyntaxTree(st._graph, getattr(NodeId, st, :macro_source))
     return nothing
 end
 
@@ -457,7 +428,7 @@ end
 function _flattened_provenance(st::SyntaxTree, out)
     msrc = macro_prov(st)
     # macro_source === source means `st` is from the `msrc` macro body
-    !isnothing(msrc) && msrc._id !== st.source &&
+    !isnothing(msrc) && msrc._id !== getattr(SourceAttrType, st, :source) &&
         _flattened_provenance(msrc, out)
     push!(out, prov_end(st))
     out
@@ -467,7 +438,7 @@ function is_ancestor(ex, ancestor)
     if !is_compatible_graph(ex, ancestor)
         return false
     end
-    sources = ex._graph.source
+    sources = getattr(SourceAttrType, ex._graph, :source)
     id::NodeId = ex._id
     while true
         s = get(sources, id, nothing)
@@ -664,8 +635,8 @@ function newnode(graph::SyntaxGraph, prov::SourceAttrType, k::Kind, children)
 end
 function newleaf(graph::SyntaxGraph, prov::SourceAttrType, k::Kind)
     st = SyntaxTree(graph, new_id!(graph))
-    setattr!(st, :kind, k)
-    setattr!(st, :source, prov)
+    setattr!(Kind, st, :kind, k)
+    setattr!(SourceAttrType, st, :source, prov)
 end
 
 newnode(graph::SyntaxGraph, prov::SyntaxTree, k::Kind, children) =
@@ -690,7 +661,7 @@ function mkleaf(old::SyntaxTree)
     graph = syntax_graph(old)
     st = SyntaxTree(graph, new_id!(graph))
     copy_attrs!(st, old)
-    setattr!(st, :source, old._id)
+    setattr!(SourceAttrType, st, :source, old._id)
 end
 function mktree(old::SyntaxTree)
     if is_leaf(old)
@@ -707,7 +678,7 @@ function copy_attrs!(dest, src)
     # TODO: Make this faster?
     for (name, attr) in pairs(src._graph.attributes)
         if (name !== :source && name !== :macro_source) && haskey(attr, src._id)
-            setattr!(dest, name, attr[src._id])
+            setattr!(Any, dest, name, attr[src._id])
         end
     end
 end
@@ -766,12 +737,12 @@ function _copy_ast(graph2::SyntaxGraph, graph1::SyntaxGraph, id1::NodeId, seen)
         setchildren!(graph2, id2, cs)
     end
     for src_attr in (:source, :macro_source)
-        src1 = get(SyntaxTree(graph1, id1), src_attr, nothing)
+        src1 = getattr(Any, SyntaxTree(graph1, id1), src_attr, nothing)
         if src1 isa NodeId
             src2 =  _copy_ast(graph2, graph1, src1, seen)
-            setattr!(graph2, id2, src_attr, src2)
+            setattr!(NodeId, graph2, id2, src_attr, src2)
         elseif src_attr == :source
-            setattr!(graph2, id2, src_attr, src1)
+            setattr!(SourceAttrType, graph2, id2, src_attr, src1)
         end
     end
     copy_attrs!(SyntaxTree(graph2, id2), SyntaxTree(graph1, id1))
@@ -811,8 +782,8 @@ function _unalias_copy_tree(old::SyntaxTree)
         mknode(old, cs)
     end
     # difference from mktree: don't add to provenance chain
-    hasattr(old, :macro_source) && setattr!(out, :macro_source, old.macro_source)
-    setattr!(out, :source, old.source)
+    hasattr(NodeId, old, :macro_source) && setattr!(NodeId, out, :macro_source, getattr(NodeId, old, :macro_source))
+    setattr!(SourceAttrType, out, :source, getattr(SourceAttrType, old, :source))
 end
 
 # Note that `seen_edges` is only needed for when edge ranges overlap, which is a
@@ -897,12 +868,12 @@ function prune(graph1_a::SyntaxGraph, entrypoints_a::Vector{NodeId})
     resolved_sources = Dict{NodeId, SourceAttrType}() # graph1 id => graph2 src
 
     for (n2, n1) in enumerate(nodes1)
-        graph2.source[n2] =
+        getattr(SourceAttrType, graph2, :source)[n2] =
             _prune_get_resolved!(n1, graph1, map12, resolved_sources, :source)
-        if hasattr(graph1, :macro_source) && haskey(graph1.macro_source, n1)
-            msrc1 = graph1.macro_source[n1]
+        if hasattr(NodeId, graph1, :macro_source) && haskey(getattr(NodeId, graph1, :macro_source), n1)
+            msrc1 = getattr(NodeId, graph1, :macro_source)[n1]
             if haskey(map12, msrc1)
-                graph2.macro_source[n2] = map12[msrc1]
+                getattr(NodeId, graph2, :macro_source)[n2] = map12[msrc1]
             end
         end
     end
@@ -917,7 +888,7 @@ function _prune_get_resolved!(id1::NodeId, graph1::SyntaxGraph,
                               attr::Symbol)
     out = get(resolved_sources, id1, nothing)
     if isnothing(out)
-        src1 = getattr(graph1, attr)[id1]
+        src1 = getattr(SourceAttrType, graph1, attr)[id1]
         out = if haskey(map12, src1)
             map12[src1]
         elseif src1 isa NodeId
@@ -941,7 +912,7 @@ function annotate_parent!(st::SyntaxTree)
 end
 
 function _annotate_parent!(st::SyntaxTree, pid::NodeId)
-    setattr!(st, :parent, pid)
+    setattr!(NodeId, st, :parent, pid)
     mapchildren(t->_annotate_parent!(t, st._id), syntax_graph(st), st)
 end
 
@@ -1227,8 +1198,8 @@ function build_tree(::Type{SyntaxTree}, stream::ParseStream;
     length(cs) === 1 && return only(cs)
     id = new_id!(graph)
     setchildren!(graph, id, reverse(cs).ids)
-    setattr!(graph, id, :source, source)
-    setattr!(graph, id, :kind, K"wrapper")
+    setattr!(SourceAttrType, graph, id, :source, source)
+    setattr!(Kind, graph, id, :kind, K"wrapper")
     return SyntaxTree(graph, id)
 end
 
@@ -1250,11 +1221,11 @@ function _insert_green(graph::SyntaxGraph, sf::Base.RefValue{SourceFile},
                        txtbuf::Vector{UInt8}, offset::Int,
                        cursor::RedTreeCursor)
     id = new_id!(graph)
-    setattr!(graph, id, :kind, kind(cursor))
+    setattr!(Kind, graph, id, :kind, kind(cursor))
     let f = remove_flags(flags(cursor), NON_TERMINAL_FLAG)
-        f != 0 && setattr!(graph, id, :syntax_flags, f)
+        f != 0 && setattr!(UInt16, graph, id, :syntax_flags, f)
     end
-    setattr!(graph, id, :source, SourceRef(sf, first_byte(cursor), last_byte(cursor)))
+    setattr!(SourceAttrType, graph, id, :source, SourceRef(sf, first_byte(cursor), last_byte(cursor)))
     if !is_leaf(cursor)
         cs = NodeId[]
         for c in reverse(cursor)
@@ -1265,9 +1236,9 @@ function _insert_green(graph::SyntaxGraph, sf::Base.RefValue{SourceFile},
         v = parse_julia_literal(txtbuf, head(cursor), byte_range(cursor) .+ offset)
         if v isa Symbol
             # TODO: Fixes in JuliaSyntax to avoid ever converting to Symbol
-            setattr!(graph, id, :name_val, string(v))
+            setattr!(String, graph, id, :name_val, string(v))
         elseif !isnothing(v)
-            setattr!(graph, id, :value, v)
+            setattr!(Any, graph, id, :value, v)
         end
     end
     return id
@@ -1305,9 +1276,9 @@ function _green_to_est(parent::SyntaxTree, parent_i::Int,
 
     graph = syntax_graph(st)
     k = kind(st)
-    symleaf(s::String) = setattr!(newleaf(graph, st, K"Identifier"), :name_val, s)
-    core_globalref(s::String) = setattr!(symleaf(s), :mod, Core)
-    valleaf(@nospecialize(v)) = setattr!(newleaf(graph, st, K"Value"), :value, v)
+    symleaf(s::String) = setattr!(String, newleaf(graph, st, K"Identifier"), :name_val, s)
+    core_globalref(s::String) = setattr!(Module, symleaf(s), :mod, Core)
+    valleaf(@nospecialize(v)) = setattr!(Any, newleaf(graph, st, K"Value"), :value, v)
 
     if k === K"DotsIdentifier"
         # `..`/`...` used as an ordinary identifier (eg the `..` operator, or
@@ -1319,11 +1290,11 @@ function _green_to_est(parent::SyntaxTree, parent_i::Int,
 
     if is_leaf(st)
         return if k === K"CmdMacroName" || k === K"StrMacroName"
-            name = lower_identifier_name(st.name_val, k)
+            name = lower_identifier_name(getattr(String, st, :name_val), k)
             symleaf(name)
         elseif k === K"VERSION"
             valleaf(version_to_expr(st))
-        elseif (v = get(st, :value, nothing); v isa Union{Int128,UInt128,BigInt})
+        elseif (v = getattr(Any, st, :value, nothing); v isa Union{Int128,UInt128,BigInt})
             # syntax TODO: likely unnecessary; this is just to match RGN->Expr,
             # which added this to match flisp parsing text->Expr.
             macname = v isa Int128 ? "@int128_str" :
@@ -1332,9 +1303,9 @@ function _green_to_est(parent::SyntaxTree, parent_i::Int,
             arg = valleaf(replace(sourcetext(st), '_'=>""))
             ret_cids = tree_ids(mac, valleaf(nothing), arg)
             newnode(graph, st, K"macrocall", ret_cids)
-        elseif hasattr(st, :name_val) && !(kind(st) in KSet"Identifier")
+        elseif hasattr(String, st, :name_val) && !(kind(st) in KSet"Identifier")
             # certain kinds should really be identifiers.  known: &, |, :
-            symleaf(st.name_val)
+            symleaf(getattr(String, st, :name_val))
         else
             st
         end
@@ -1359,15 +1330,15 @@ function _green_to_est(parent::SyntaxTree, parent_i::Int,
         # "@M.x" => (macro_name (. M x)) => (. M @x)
         #           (macro_name else) => else
         if kind(cs[1]) === K"Identifier"
-            return symleaf(lower_identifier_name(cs[1].name_val, K"macro_name"))
+            return symleaf(lower_identifier_name(getattr(String, cs[1], :name_val), K"macro_name"))
         else
             inner_st = cs[1]
             inner_cs = preprocessed_green_children(inner_st)
             if (length(inner_cs) === 2 && kind(inner_st) === K"." &&
                 kind(inner_cs[2]) === K"Identifier")
                 (lhs, raw_m) = _green_to_est(cs[1], 1, inner_cs[1]), inner_cs[2]
-                mname_s = lower_identifier_name(raw_m.name_val, K"macro_name")
-                mname = setattr!(mkleaf(raw_m), :name_val, mname_s)
+                mname_s = lower_identifier_name(getattr(String, raw_m, :name_val), K"macro_name")
+                mname = setattr!(String, mkleaf(raw_m), :name_val, mname_s)
                 mname_inert = newnode(graph, raw_m, K"inert", tree_ids(mname))
                 return mknode(inner_st, tree_ids(lhs, mname_inert))
             else
@@ -1383,13 +1354,13 @@ function _green_to_est(parent::SyntaxTree, parent_i::Int,
         lhs = _green_to_est(st, 0, cs[1])
         rhs = _green_to_est(st, 0, cs[3])
         out = newnode(graph, st, K"unknown_head", tree_ids(lhs, rhs))
-        return setattr!(out, :name_val, op_s)
+        return setattr!(String, out, :name_val, op_s)
     elseif k === K".op=" && n_cs === 3
         op_s = '.' * string(cs[2]) * '='
         lhs = _green_to_est(st, 0, cs[1])
         rhs = _green_to_est(st, 0, cs[3])
         out = newnode(graph, st, K"unknown_head", tree_ids(lhs, rhs))
-        return setattr!(out, :name_val, op_s)
+        return setattr!(String, out, :name_val, op_s)
     elseif k === K"op=" && n_cs === 1
         # (op= +) => +=   (the operator name itself, eg when quoted as `:(+=)`)
         return symleaf(string(cs[1]) * '=')
@@ -1427,7 +1398,7 @@ function _green_to_est(parent::SyntaxTree, parent_i::Int,
             cs[2], cs[1] = cs[1], cs[2]
         end
         if is_postfix_op_call(st) && kind(cs[1]) == K"Identifier" &&
-            cs[1].name_val === "'"
+            getattr(String, cs[1], :name_val) === "'"
             popfirst!(cs)
             ret_k = K"'"
         end
@@ -1443,7 +1414,7 @@ function _green_to_est(parent::SyntaxTree, parent_i::Int,
                 # (dotcall + args...) => (call .+ args...)
                 ret_k = K"call"
                 if kind(cs[1]) === K"Identifier"
-                    cs[1] = symleaf('.' * cs[1].name_val)
+                    cs[1] = symleaf('.' * getattr(String, cs[1], :name_val))
                 end
             end
         end
@@ -1467,7 +1438,7 @@ function _green_to_est(parent::SyntaxTree, parent_i::Int,
 
             if (coalesce_dot || is_syntactic_operator(kind(cs[1])) ||
                 kind(parent) === K"comparison" && iseven(parent_i))
-                return symleaf('.' * cs[1].name_val)
+                return symleaf('.' * getattr(String, cs[1], :name_val))
             end
         end
     elseif k === K"ref" || k === K"curly"
@@ -1563,7 +1534,7 @@ function _green_to_est(parent::SyntaxTree, parent_i::Int,
                 g_out = newnode(graph, c, K"flatten", tree_ids(g_out))
             end
         end
-        return setattr!(g_out, :source, st._id) # outermost provenance
+        return setattr!(SourceAttrType, g_out, :source, st._id) # outermost provenance
     elseif k === K"filter"
         @assert n_cs === 2
         # (filter (iteration is...) cond) => (filter cond is...)
@@ -1671,7 +1642,7 @@ function _green_to_est(parent::SyntaxTree, parent_i::Int,
     # Recurse on `cs`.  If no children change, just return `st`.
     ret_cs = _map_green_to_est(st, cs; kw_in_params)
     return ret_cs.ids == children(st).ids && ret_k == kind(st) ?
-        st : setattr!(mknode(st, ret_cs), :kind, ret_k)
+        st : setattr!(Kind, mknode(st, ret_cs), :kind, ret_k)
 end
 
 function _map_green_to_est(parent::SyntaxTree, cs::SyntaxList;
@@ -1753,10 +1724,10 @@ function _string_to_est(st::SyntaxTree, cs::SyntaxList; unwrap_literal)
         if !prev_str && cur_str && !next_str
             push!(ret_cs, c)
         elseif cur_str
-            write(buf, c.value)
+            write(buf, getattr(Any, c, :value))
             if !next_str
                 ret_c = newleaf(st._graph, st, literal_k)
-                setattr!(ret_c, :value, String(take!(buf)))
+                setattr!(Any, ret_c, :value, String(take!(buf)))
                 push!(ret_cs, ret_c)
             end
         else

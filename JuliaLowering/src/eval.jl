@@ -73,14 +73,14 @@ function lower_step(iter::LoweringIterator, mod::Module, world::UInt;
     elseif k == K"module"
         (version, notbare, name, body) = @stm ex begin
             [K"module" version nb_st name body] ->
-                (version.value, nb_st.value, name, body)
+                (getattr(Any, version, :value), getattr(Any, nb_st, :value), name, body)
             [K"module" nb_st name body] ->
-                (nothing, nb_st.value, name, body)
+                (nothing, getattr(Any, nb_st, :value), name, body)
         end
         if kind(name) != K"Identifier"
             throw(LoweringError(name, "Expected module name"))
         end
-        newmod_name = Symbol(name.name_val)
+        newmod_name = Symbol(getattr(String, name, :name_val))
         loc = source_location(LineNumberNode, ex)
         push!(iter.todo, (body, true, 1))
         return Core.svec(:begin_module, version, newmod_name, notbare, loc)
@@ -363,7 +363,7 @@ function add_ci_debuginfo!(st::SyntaxTree, file::Symbol,
         a
     end
 
-    setattr!(st, :debuginfo, Core.DebugInfo(
+    setattr!(Core.DebugInfo, st, :debuginfo, Core.DebugInfo(
         file, top_sbt, Core.svec(),
         @ccall(jl_compress_codelocs((-1)::Int32, locs::Any,
                                     numchildren(st[1])::Csize_t)::String)))
@@ -418,14 +418,14 @@ function compute_ssaflags(st::SyntaxTree)
     for (i, stmt) in enumerate(stmts)
         is_flag_stmt = true
         @stm stmt begin
-            [K"inbounds" [K"Value"]] -> stmt[1].value::Bool ?
+            [K"inbounds" [K"Value"]] -> getattr(Any, stmt[1], :value)::Bool ?
                 (inbounds_depth += 1) : # push
                 (inbounds_depth = 0)    # clear
             [K"inbounds_pop"] -> (inbounds_depth = max(0, inbounds_depth-1))
             [K"boundscheck" _...] -> nothing
-            [K"inline" [K"Value"]] -> stmt[1].value::Bool ?
+            [K"inline" [K"Value"]] -> getattr(Any, stmt[1], :value)::Bool ?
                 push!(inline_flags, true) : checked_pop!(inline_flags)
-            [K"noinline" [K"Value"]] -> stmt[1].value::Bool ?
+            [K"noinline" [K"Value"]] -> getattr(Any, stmt[1], :value)::Bool ?
                 push!(inline_flags, false) : checked_pop!(inline_flags)
             [K"purity"] -> checked_pop!(purity_flags)
             [K"purity" _ _...] -> push!(
@@ -519,7 +519,7 @@ function to_code_info(ex::SyntaxTree, slots::Vector{Slot}, meta::CompileHints)
 
     _CodeInfo(
         stmts,
-        ex.debuginfo,
+        getattr(Core.DebugInfo, ex, :debuginfo),
         ssavaluetypes,
         ssaflags,
         slotnames,
@@ -553,30 +553,30 @@ end
 function _to_lowered_expr(ex::SyntaxTree)
     k = kind(ex)
     if is_literal(k)
-        ex.value
+        getattr(Any, ex, :value)
     elseif k == K"nothing"
         nothing
     elseif k == K"core"
-        GlobalRef(Core, Symbol(ex.name_val::String))
+        GlobalRef(Core, Symbol(getattr(String, ex, :name_val)))
     elseif k == K"top"
-        GlobalRef(Base, Symbol(ex.name_val::String))
+        GlobalRef(Base, Symbol(getattr(String, ex, :name_val)))
     elseif k == K"globalref"
-        GlobalRef(ex.mod::Module, Symbol(ex.name_val::String))
+        GlobalRef(getattr(Module, ex, :mod), Symbol(getattr(String, ex, :name_val)))
     elseif k == K"Identifier"
         # Implicitly refers to name in parent module
         # TODO: Should we even have plain identifiers at this point or should
         # they all effectively be resolved into GlobalRef earlier?
-        Symbol(ex.name_val::String)
+        Symbol(getattr(String, ex, :name_val))
     elseif k == K"SourceLocation"
         QuoteNode(source_location(LineNumberNode, ex))
     elseif k == K"Symbol"
-        QuoteNode(Symbol(ex.name_val::String))
+        QuoteNode(Symbol(getattr(String, ex, :name_val)))
     elseif k == K"slot"
-        Core.SlotNumber(ex.var_id::IdTag)
+        Core.SlotNumber(getattr(IdTag, ex, :var_id))
     elseif k == K"static_parameter"
-        Expr(:static_parameter, ex.var_id::IdTag)
+        Expr(:static_parameter, getattr(IdTag, ex, :var_id))
     elseif k == K"SSAValue"
-        Core.SSAValue(ex.var_id::IdTag)
+        Core.SSAValue(getattr(IdTag, ex, :var_id))
     elseif k == K"return"
         Core.ReturnNode(_to_lowered_expr(ex[1]))
     elseif k == K"inert"
@@ -584,24 +584,24 @@ function _to_lowered_expr(ex::SyntaxTree)
     elseif k == K"inert_syntaxtree"
         ex[1]
     elseif k == K"code_info"
-        ir = to_code_info(ex, ex.slots, ex.meta)
-        if ex.is_toplevel_thunk
+        ir = to_code_info(ex, getattr(Vector{Slot}, ex, :slots), getattr(CompileHints, ex, :meta))
+        if getattr(Bool, ex, :is_toplevel_thunk)
             Expr(:thunk, ir) # TODO: Maybe nice to just return a CodeInfo here?
         else
             ir
         end
     elseif k == K"Value"
         # TODO: we still do this in some interpolation, genfunc situations
-        # @jl_assert !isa_lowering_ast_node(ex.value) (
+        # @jl_assert !isa_lowering_ast_node(getattr(Any, ex, :value)) (
         #     ex, string("smuggling AST through Value is asking for trouble; ",
         #                "find a SyntaxTree representation"))
-        ex.value isa LineNumberNode ? QuoteNode(ex.value) : ex.value
+        let v = getattr(Any, ex, :value); v isa LineNumberNode ? QuoteNode(v) : v; end
     elseif k == K"goto"
-        Core.GotoNode(ex[1].id)
+        Core.GotoNode(getattr(Int, ex[1], :id))
     elseif k == K"gotoifnot"
-        Core.GotoIfNot(_to_lowered_expr(ex[1]), ex[2].id)
+        Core.GotoIfNot(_to_lowered_expr(ex[1]), getattr(Int, ex[2], :id))
     elseif k == K"enter"
-        catch_idx = ex[1].id
+        catch_idx = getattr(Int, ex[1], :id)
         numchildren(ex) == 1 ?
             Core.EnterNode(catch_idx) :
             Core.EnterNode(catch_idx, _to_lowered_expr(ex[2]))
@@ -641,7 +641,7 @@ function _to_lowered_expr(ex::SyntaxTree)
         ret = Expr(:cfunction)
         for (i, e) in enumerate(children(ex))
             if i == 2 && kind(e) == K"static_eval" && kind(e[1]) == K"globalref"
-                push!(ret.args, QuoteNode(Symbol(e[1].name_val::String)))
+                push!(ret.args, QuoteNode(Symbol(getattr(String, e[1], :name_val))))
             else
                 push!(ret.args, _to_lowered_expr(e))
             end
@@ -693,7 +693,7 @@ function _foreigncall_arg1_expr(ex)
         _to_lowered_expr(ex)
     else
         k = kind(ex)
-        Expr(Symbol((k === K"unknown_head" ? ex.name_val : untokenize(k))::String),
+        Expr(Symbol((k === K"unknown_head" ? getattr(String, ex, :name_val) : untokenize(k))::String),
              map(_foreigncall_arg1_expr, children(ex))...)
     end
 end

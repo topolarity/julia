@@ -59,21 +59,21 @@ end
 
 function _expr_to_est(graph::SyntaxGraph, @nospecialize(e), src::LineNumberNode)
     st = if e isa Symbol
-        setattr!(newleaf(graph, src, K"Identifier"), :name_val, String(e))
+        setattr!(String, newleaf(graph, src, K"Identifier"), :name_val, String(e))
     elseif e isa QuoteNode
         cid, _ = _expr_to_est(graph, e.value, src)
         newnode(graph, src, K"inert", NodeId[cid])
     elseif e isa Expr && e.head === :scope_layer
         @assert length(e.args) === 2 && e.args[1] isa Symbol
         ident = newleaf(graph, src, K"Identifier")
-        setattr!(ident, :name_val, String(e.args[1]::Symbol))
-        setattr!(ident, :scope_layer, e.args[2])
+        setattr!(String, ident, :name_val, String(e.args[1]::Symbol))
+        setattr!(LayerId, ident, :scope_layer, e.args[2])
     elseif e isa Expr && e.head === :lambda && length(e.args) == 2
         argnames = e.args[1]::Vector{Any}
         arg_cs = NodeId[]
         for name in argnames
             id = newleaf(graph, src, K"Identifier")
-            setattr!(id, :name_val, String(name::Symbol))
+            setattr!(String, id, :name_val, String(name::Symbol))
             push!(arg_cs, id._id)
         end
         body_id, src = _expr_to_est(graph, e.args[2], src)
@@ -81,8 +81,8 @@ function _expr_to_est(graph::SyntaxGraph, @nospecialize(e), src::LineNumberNode)
         tvars_block = newnode(graph, src, K"block", NodeId[])
         st = newnode(graph, src, K"lambda",
                      NodeId[args_block._id, tvars_block._id, body_id])
-        setattr!(st, :is_toplevel_thunk, false)
-        setattr!(st, :toplevel_pure, false)
+        setattr!(Bool, st, :is_toplevel_thunk, false)
+        setattr!(Bool, st, :toplevel_pure, false)
     elseif e isa Expr
         head_s = string(e.head)
         st_k = find_kind(head_s)
@@ -98,13 +98,13 @@ function _expr_to_est(graph::SyntaxGraph, @nospecialize(e), src::LineNumberNode)
             end
         end
         if isnothing(st_k)
-            setattr!(newnode(graph, old_src, K"unknown_head", cs), :name_val, head_s)
+            setattr!(String, newnode(graph, old_src, K"unknown_head", cs), :name_val, head_s)
         else
             newnode(graph, old_src, st_k, cs)
         end
     elseif e isa GlobalRef
         # Represent globalref as K"Identifier" with :mod attribute
-        setattr!(newleaf(graph, src, K"Identifier", string(e.name)), :mod, e.mod)
+        setattr!(Module, newleaf(graph, src, K"Identifier", string(e.name)), :mod, e.mod)
     else
         # We may want additional special cases for other types where
         # `Base.isa_ast_node(e)`, but `K"Value"` should be fine for most, since
@@ -113,7 +113,7 @@ function _expr_to_est(graph::SyntaxGraph, @nospecialize(e), src::LineNumberNode)
             # linenode outside of block or toplevel
             src = e
         end
-        setattr!(newleaf(graph, src, K"Value"), :value, e)
+        setattr!(Any, newleaf(graph, src, K"Value"), :value, e)
     end
     @jl_assert isa_lowering_ast_node(e) || is_expr_value(st) st
 
@@ -126,13 +126,13 @@ end
 function est_to_expr(st::SyntaxTree, suppress_linenodes=false)
     k = kind(st)
     if kind(st) === K"Identifier"
-        n = Symbol(st.name_val::String)
-        mod = get(st, :mod, nothing)
+        n = Symbol(getattr(String, st, :name_val))
+        mod = getattr(Module, st, :mod, nothing)
         !isnothing(mod) ? GlobalRef(mod, n) :
-            hasattr(st, :scope_layer) ? Expr(:scope_layer, n, st.scope_layer) :
+            hasattr(LayerId, st, :scope_layer) ? Expr(:scope_layer, n, getattr(LayerId, st, :scope_layer)) :
             n
     elseif is_leaf(st) && is_expr_value(st)
-        v = st.value
+        v = getattr(Any, st, :value)
         # Let `st.value isa Symbol` (or other AST node).  Since we enforce that
         # this is never produced by the reverse Expr->SyntaxTree transformation,
         # there is no lonely Expr for which `st` is the only SyntaxTree
@@ -147,7 +147,7 @@ function est_to_expr(st::SyntaxTree, suppress_linenodes=false)
         @jl_assert !is_leaf(st) (st, "est_to_expr should only be used pre-desugaring")
         # In a partially-expanded or quoted AST, there may be heads with no
         # corresponding kind
-        head = Symbol((k === K"unknown_head" ? st.name_val : untokenize(k))::String)
+        head = Symbol((k === K"unknown_head" ? getattr(String, st, :name_val) : untokenize(k))::String)
         out = Expr(head)
 
         # (Move the following assumptions to the docs if they turn out accurate)
@@ -191,13 +191,13 @@ end
 function _dst_separate_dotop(st::SyntaxTree)
     k = kind(st)
     if k === K"Identifier"
-        dotop_s = st.name_val::String
+        dotop_s = getattr(String, st, :name_val)::String
         !is_dotted_operator(dotop_s) && return est_to_dst(st)
         op_s = dotop_s[nextind(dotop_s,1):end]
-        op_leaf = setattr(mkleaf(st), :name_val, op_s)
+        op_leaf = setattr(String, mkleaf(st), :name_val, op_s)
         return @ast st._graph st [K"." op_leaf]
-    elseif k === K"Value" && st.value isa GlobalRef &&
-        is_dotted_operator(string(st.value.name))
+    elseif k === K"Value" && getattr(Any, st, :value) isa GlobalRef &&
+        is_dotted_operator(string(getattr(Any, st, :value).name))
         @jl_assert false (st, "TODO: handle dotted globalref")
     else
         return est_to_dst(st)
@@ -279,14 +279,14 @@ function _dst_fix_arglist(st::SyntaxTree)
     end
 end
 
-_is_false(st::SyntaxTree) = kind(st) === K"Value" && st.value === false
+_is_false(st::SyntaxTree) = kind(st) === K"Value" && getattr(Any, st, :value) === false
 
 function _expand_literal_pow(st::SyntaxTree)
     k = kind(st)
     (k in KSet"call dotcall" &&
         numchildren(st) === 3 &&
-        get(st[1], :name_val, "") === "^" &&
-        get(st[3], :value, nothing) isa Integer) || return st
+        getattr(String, st[1], :name_val, "") === "^" &&
+        getattr(Any, st[3], :value, nothing) isa Integer) || return st
     @ast st._graph st [k
         "literal_pow"::K"top"
         st[1] st[2]
@@ -295,9 +295,9 @@ function _expand_literal_pow(st::SyntaxTree)
 end
 
 function _est_to_dst_ident(st::SyntaxTree)
-    s = st.name_val::String
+    s = getattr(String, st, :name_val)
     if is_writeonly_est_name(s)
-        setattr!(mkleaf(st), :kind, K"Placeholder")
+        setattr!(Kind, mkleaf(st), :kind, K"Placeholder")
     else
         st
     end
@@ -340,7 +340,7 @@ function apply_arg_meta(st, meta::Union{Nothing, Symbol, Dict{String, Symbol}})
         elseif isnothing(meta)
             st
         else
-            sym = get(meta, st.name_val::String, nothing)
+            sym = get(meta, getattr(String, st, :name_val), nothing)
             !isnothing(sym) ? setmeta(st, sym, true) : st
         end
     elseif k == K"Placeholder" || k == K"tuple" || k == K"::" && numchildren(st) == 1
@@ -352,7 +352,7 @@ function apply_arg_meta(st, meta::Union{Nothing, Symbol, Dict{String, Symbol}})
     elseif k == K"meta"
         # not specified what to do here if we get conflicting
         # specialize/nospecialize
-        meta2 = Symbol(st[1].name_val::String)
+        meta2 = Symbol(getattr(String, st[1], :name_val))
         @jl_assert meta2 in (:specialize, :nospecialize) st
         apply_arg_meta(st[2], meta2)
     elseif k == K"parameters"
@@ -384,12 +384,12 @@ function collect_body_arg_meta(st)
         k = kind(c)
         @stm c begin
             [K"meta" [K"Identifier"] idents...] -> begin
-                meta = Symbol(c[1].name_val::String)
+                meta = Symbol(getattr(String, c[1], :name_val))
                 meta in (:specialize, :nospecialize) || continue
                 length(idents) == 0 && return meta
                 isnothing(out) && (out = Dict{String, Symbol}())
                 for id in idents
-                    kind(id) === K"Identifier" && (out[id.name_val] = meta)
+                    kind(id) === K"Identifier" && (out[getattr(String, id, :name_val)] = meta)
                 end
             end
             # Only leading meta statements are recognized in lowering.  Ideally
@@ -422,17 +422,17 @@ function est_to_dst(st::SyntaxTree)
 
     return @stm st begin
         [K"Identifier"] -> _est_to_dst_ident(st)
-        [K"Value"] -> st.value === nothing ? newleaf(g, st, K"nothing") : st
+        [K"Value"] -> getattr(Any, st, :value) === nothing ? newleaf(g, st, K"nothing") : st
         (_, when=is_leaf(st)) -> st
         ([K"unknown_head" l r],
-         when=(s=st.name_val; Base.isoperator(s))) -> let
+         when=(s=getattr(String, st, :name_val); Base.isoperator(s))) -> let
              (op_s, out_k) = s[1] === '.' ?
                  (s[nextind(s,1):prevind(s,end)], K".op=") :
                  (s[1:prevind(s,end)], K"op=")
 
              op_leaf = newleaf(g, st, K"Identifier")
-             setattr!(op_leaf, :name_val, op_s)
-             setattr!(op_leaf, :scope_layer, st.scope_layer)
+             setattr!(String, op_leaf, :name_val, op_s)
+             setattr!(LayerId, op_leaf, :scope_layer, getattr(LayerId, st, :scope_layer))
              @ast g st [out_k rec(l) op_leaf rec(r)]
          end
         [K"comparison" cs0...] -> let cs = copy(cs0)
@@ -442,12 +442,12 @@ function est_to_dst(st::SyntaxTree)
             mknode(st, cs)
         end
         [K"'" x] ->
-            @ast g st [K"call" "'"::K"Identifier"(scope_layer=st.scope_layer) rec(x)]
+            @ast g st [K"call" "'"::K"Identifier"(scope_layer=getattr(LayerId, st, :scope_layer)) rec(x)]
         [K"." f [K"tuple" args...]] -> _expand_literal_pow(
             @ast g st [K"dotcall" rec(f) _dst_sink_parameters(args)...])
-        ([K"inert" [K"Identifier"]], when=!hasattr(st[1], :mod)) ->
+        ([K"inert" [K"Identifier"]], when=!hasattr(Module, st[1], :mod)) ->
             @ast g st st[1]=>K"Symbol"
-        ([K"inert_syntaxtree" [K"Identifier"]], when=!hasattr(st[1], :mod)) ->
+        ([K"inert_syntaxtree" [K"Identifier"]], when=!hasattr(Module, st[1], :mod)) ->
             @ast g st st[1]=>K"Symbol"
         [K"inert" _] -> st
         [K"inert_syntaxtree" _] -> st
@@ -469,7 +469,7 @@ function est_to_dst(st::SyntaxTree)
         [K"foreigncall" [K"tuple" _...] args...] ->
             @ast g st [K"foreigncall" [K"foreigncall_arg1" st[1]] args...]
         ([K"call" [K"Identifier"] sym args...],
-         when=st[1].name_val::String === "ccall") -> if kind(sym) === K"tuple"
+         when=getattr(String, st[1], :name_val) === "ccall") -> if kind(sym) === K"tuple"
              @ast g st [K"call" st[1] [K"foreigncall_arg1" st[2]] mapsyntax(rec, args)...]
          else
              @ast g st [K"call" st[1] rec(sym) mapsyntax(rec, args)...]
@@ -570,35 +570,35 @@ function est_to_dst(st::SyntaxTree)
         #-----------------------------------------------------------------------
         # Heads not emitted from parsing
         ([K"meta" s vs...],
-         when=(meta=get(s, :name_val, "")::String; meta in ("nospecialize", "specialize"))) ->
+         when=(meta=getattr(String, s, :name_val, ""); meta in ("nospecialize", "specialize"))) ->
              # Should be handled in the function case
              newleaf(g, st, K"nothing")
         [K"meta" syms...] ->
             @ast g st [K"meta" mapsyntax(
-                s->(kind(s) === K"Identifier" ? setattr(s, :kind, K"Symbol") : s),
+                s->(kind(s) === K"Identifier" ? setattr(Kind, s, :kind, K"Symbol") : s),
                 syms)...
            ]
         [K"boundscheck" x] -> mknode(st, SyntaxList(g))
         [K"inbounds" [K"Identifier"]] -> newnode(g, st, K"inbounds_pop", SyntaxList(g))
-        [K"core" x] -> setattr!(mkleaf(st), :name_val, x.name_val)
-        [K"top" x] -> setattr!(mkleaf(st), :name_val, x.name_val)
-        [K"static_parameter" x] -> setattr!(mkleaf(st), :var_id, x.value::IdTag)
+        [K"core" x] -> setattr!(String, mkleaf(st), :name_val, getattr(String, x, :name_val))
+        [K"top" x] -> setattr!(String, mkleaf(st), :name_val, getattr(String, x, :name_val))
+        [K"static_parameter" x] -> setattr!(IdTag, mkleaf(st), :var_id, getattr(Any, x, :value)::IdTag)
         [K"copyast" [K"inert" ex]] -> @ast g st [K"call"
             interpolate_ast::K"Value"
             Expr::K"Value"
             [K"inert"(st[1]) ex]
         ]
-        [K"symbolicgoto" lab] -> setattr!(mkleaf(st), :name_val, lab.name_val)
-        [K"oldsymbolicgoto" lab] -> setattr!(mkleaf(st), :name_val, lab.name_val)
-        [K"symboliclabel" lab] -> setattr!(mkleaf(st), :name_val, lab.name_val)
-        [K"symbolicblock" id body] -> let s = id.name_val::String
+        [K"symbolicgoto" lab] -> setattr!(String, mkleaf(st), :name_val, getattr(String, lab, :name_val))
+        [K"oldsymbolicgoto" lab] -> setattr!(String, mkleaf(st), :name_val, getattr(String, lab, :name_val))
+        [K"symboliclabel" lab] -> setattr!(String, mkleaf(st), :name_val, getattr(String, lab, :name_val))
+        [K"symbolicblock" id body] -> let s = getattr(String, id, :name_val)
             if is_writeonly_est_name(s)
                 @ast g st [K"symbolicblock" id=>K"Placeholder" rec(body)]
             else
                 @ast g st [K"symbolicblock" id=>K"symboliclabel" rec(body)]
             end
         end
-        [K"unknown_head" cs...] -> let head = st.name_val
+        [K"unknown_head" cs...] -> let head = getattr(String, st, :name_val)
             if head === "latestworld-if-toplevel"
                 newleaf(g, st, K"latestworld_if_toplevel")
             else
@@ -616,7 +616,7 @@ function est_to_dst(st::SyntaxTree)
             # forms (e.g. function definitions) stay inert.
             out_fptr = if kind(fptr) == K"inert" && numchildren(fptr) == 1 &&
                           kind(fptr[1]) == K"Identifier"
-                ident = setattr!(mkleaf(fptr[1]), :scope_layer, 1)
+                ident = setattr!(LayerId, mkleaf(fptr[1]), :scope_layer, 1)
                 @ast g fptr [K"static_eval"(fptr) ident]
             else
                 rec(fptr)
@@ -641,6 +641,6 @@ end
 
 function purity_expr_to_flags(st::SyntaxTree)
     @jl_assert kind(st) === K"purity" st
-    args = Bool[x.value for x in children(st)]
+    args = Bool[getattr(Any, x, :value) for x in children(st)]
     Base.encode_effects_override(Base.EffectsOverride(args...))
 end
