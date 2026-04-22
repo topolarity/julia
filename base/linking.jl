@@ -149,6 +149,17 @@ else
     shlibdir() = libdir()
 end
 
+# Bundled linker inputs on macOS (libclang_rt.osx.a, libSystem.tbd) live next to the
+# compiler-rt JLL archive in the build tree, and in private_libdir in the install tree.
+function _macos_toolchain_lib(name)
+    for dir in (private_libdir(), joinpath(libdir(), "darwin"))
+        path = joinpath(dir, name)
+        isfile(path) && return path
+    end
+    # Last resort — let lld produce the not-found error against the install location
+    return joinpath(private_libdir(), name)
+end
+
 verbose_linking() = something(Base.get_bool_env("JULIA_VERBOSE_LINKING", false), false)
 
 function link_image_cmd(path, out; is_sysimage::Bool = false)
@@ -168,7 +179,10 @@ function link_image_cmd(path, out; is_sysimage::Bool = false)
             end
         end
     elseif Sys.isapple()
-        LIBS = (LIBS..., "-lSystem")
+        # required runtime libraries on macOS / LLVM. Passing libSystem.tbd by full path
+        # sidesteps the need for `-syslibroot` / an installed macOS SDK.
+        LIBS = (LIBS..., _macos_toolchain_lib("libclang_rt.osx.a"),
+                         _macos_toolchain_lib("libSystem.tbd"))
     end
 
     V = verbose_linking() ? "--verbose" : ""

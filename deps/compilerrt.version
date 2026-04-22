@@ -1,0 +1,8 @@
+# -*- makefile -*-
+
+## jll artifact
+# Bundled compiler-rt builtins archive (libclang_rt.osx.a on macOS) used by Base.Linking
+# when the target build doesn't link the system C/C++ driver. The builtins ABI is stable
+# across LLVM versions, so this can lag Julia's libLLVM version without issue.
+COMPILERRT_JLL_NAME := LLVMCompilerRT
+COMPILERRT_JLL_VER := 17.0.6+0
