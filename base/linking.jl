@@ -88,17 +88,23 @@ function dsymutil(; adjust_PATH::Bool = true, adjust_LIBPATH::Bool = true)
     return Cmd(Cmd([dsymutil_path()]); env)
 end
 
-function ld()
+function ld(; strict_definitions::Bool = false)
     default_args = ``
     @static if Sys.iswindows()
         # LLD supports mingw style linking
         flavor = "gnu"
         m = Sys.ARCH == :x86_64 ? "i386pep" : "i386pe"
-        default_args = `-m $m -Bdynamic --enable-auto-image-base --allow-multiple-definition --disable-auto-import --disable-runtime-pseudo-reloc`
+        default_args = `-m $m -Bdynamic --enable-auto-image-base --disable-auto-import --disable-runtime-pseudo-reloc`
+        if !strict_definitions
+            default_args = `$default_args --allow-multiple-definition`
+        end
     elseif Sys.isapple()
         flavor = "darwin"
         arch = Sys.ARCH == :aarch64 ? :arm64 : Sys.ARCH
-        default_args = `-arch $arch -undefined dynamic_lookup -platform_version macos $(Base.MACOS_PRODUCT_VERSION) $(Base.MACOS_PLATFORM_VERSION)`
+        default_args = `-arch $arch -platform_version macos $(Base.MACOS_PRODUCT_VERSION) $(Base.MACOS_PLATFORM_VERSION)`
+        if !strict_definitions
+            default_args = `$default_args -undefined dynamic_lookup`
+        end
     else
         flavor = "gnu"
     end
@@ -145,13 +151,14 @@ end
 
 verbose_linking() = something(Base.get_bool_env("JULIA_VERBOSE_LINKING", false), false)
 
-function link_image_cmd(path, out)
+function link_image_cmd(path, out; is_sysimage::Bool = false)
     PRIVATE_LIBDIR = "-L$(private_libdir())"
     SHLIBDIR = "-L$(shlibdir())"
     LIBS = isdebugbuild() ? ("-ljulia-debug", "-ljulia-internal-debug") :
                         ("-ljulia", "-ljulia-internal")
     @static if Sys.iswindows()
-        LIBS = (LIBS..., "-lopenlibm", "-lgcc_s", "-lgcc", "-lmsvcrt")
+        libm_link = "-l" * replace(Base.libm_name, r"^lib" => "")
+        LIBS = (LIBS..., libm_link, "-lgcc_s", "-lgcc", "-lmsvcrt")
         if isdebugbuild()
             LIBS = (LIBS..., "-lssp")
             if isfile(joinpath(private_libdir(), "libmingwex.a"))
@@ -160,14 +167,17 @@ function link_image_cmd(path, out)
                 LIBS = (LIBS..., "-lmingwex", "-lkernel32")
             end
         end
+    elseif Sys.isapple()
+        LIBS = (LIBS..., "-lSystem")
     end
 
     V = verbose_linking() ? "--verbose" : ""
-    `$(ld()) $V $SHARED -o $out $(whole_archive(path)) $PRIVATE_LIBDIR $SHLIBDIR $LIBS`
+    `$(ld(; strict_definitions = is_sysimage)) $V $SHARED -o $out $(whole_archive(path)) $PRIVATE_LIBDIR $SHLIBDIR $LIBS`
 end
 
-function link_image(path, out, internal_stderr::IO=stderr, internal_stdout::IO=stdout)
-    run(link_image_cmd(path, out), Base.DevNull(), internal_stderr, internal_stdout)
+function link_image(path, out, internal_stderr::IO=stderr, internal_stdout::IO=stdout;
+                    is_sysimage::Bool = false)
+    run(link_image_cmd(path, out; is_sysimage), Base.DevNull(), internal_stderr, internal_stdout)
 end
 
 end # module Linking
