@@ -9,6 +9,9 @@
     small_arraylist_*;
     jl_*;
     ijl_*;
+    ccall_reentry_trampoline;
+    ccall_resolve_and_patch;
+    csymbol_lookup;
     _jl_mutex_*;
     rec_backtrace*;
     julia_*;

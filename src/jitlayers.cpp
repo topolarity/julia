@@ -63,6 +63,7 @@
 using namespace llvm;
 
 #include "jitlayers.h"
+#include "csymbol_stubs.h"
 #include "julia_assert.h"
 #include "processor.h"
 #include "julia-task-dispatcher.h"
@@ -285,6 +286,33 @@ StringRef jl_codegen_output_t::get_call_target(jl_code_instance_t *ci, bool spec
     return target.decl->getName();
 }
 
+Function *jl_codegen_output_t::get_ccall_target(const char *f_name, void *f_lib,
+                                                jl_value_t *target)
+{
+    // Either `f_name` (statically known C string) or `target` (a Julia tuple
+    // value carrying the runtime name expression) must be set. Both NULL is
+    // unreachable post-#59165.
+    assert(f_name || target);
+    // Note on rooting: we store raw pointers for the spec's three key fields
+    // and rely on transient rooting through the owning method's IR for the
+    // duration of codegen + linking. The interned f_name and the f_lib
+    // sentinel/string are GC-stable on their own. The `target` tuple lives
+    // in the method's :foreigncall Expr until link time; if the linker takes
+    // the lazy path and creates a stub that outlives the current compile,
+    // it promotes `target` to a permanent global root via jl_as_global_root
+    // — see linkCCall.
+    auto &f = ccall_targets[{f_name, f_lib, target}];
+    if (f)
+        return f;
+    // Use the static name when available; otherwise synthesize a per-spec
+    // unique tag from the counter (the dynamic-name spec doesn't have a
+    // human-readable name to embed).
+    std::string name = f_name ? names(f_name, "_") : names("ccall_dyn", "_");
+    auto fty = FunctionType::get(Type::getVoidTy(get_context()), false);
+    f = Function::Create(fty, Function::ExternalLinkage, name, get_module());
+    return f;
+}
+
 jl_emitted_output_t jl_codegen_output_t::finish(std::unique_ptr<LLVMContext> ctx,
                                                 std::unique_ptr<Module> mod,
                                                 orc::SymbolStringPool &SSP)
@@ -305,9 +333,10 @@ jl_emitted_output_t jl_codegen_output_t::finish(std::unique_ptr<LLVMContext> ctx
     }
     for (auto &[call, target] : call_targets)
         info->call_targets[call] = intern(target.decl->getName());
-    for (auto [val, gv] : global_targets) {
+    for (auto [val, gv] : global_targets)
         info->global_targets[val] = intern(gv->getName());
-    }
+    for (auto [func, target] : ccall_targets)
+        info->ccall_targets[func] = intern(target->getName());
 
     return {std::move(ctx), std::move(mod), std::move(info)};
 }
@@ -1699,6 +1728,8 @@ llvm::DataLayout jl_create_datalayout(TargetMachine &TM) {
     return jl_data_layout;
 }
 
+extern "C" void ccall_reentry_trampoline(void);
+
 JuliaOJIT::JuliaOJIT()
   : TM(createTargetMachine()),
     DL(jl_create_datalayout(*TM)),
@@ -1862,6 +1893,16 @@ JuliaOJIT::JuliaOJIT()
     asan_crt[mangle("___asan_globals_registered")] = {ExecutorAddr::fromPtr(&jl___asan_globals_registered), JITSymbolFlags::Common | JITSymbolFlags::Exported};
     cantFail(JD.define(orc::absoluteSymbols(asan_crt)));
 #endif
+    cantFail(JD.define(
+        absoluteSymbols({{ES.intern("__ccall_reentry_trampoline"),
+                          {ExecutorAddr::fromPtr(&ccall_reentry_trampoline),
+                           JITSymbolFlags::Exported | JITSymbolFlags::Callable}}})));
+
+    {
+        auto Mgr = julia::csymbol::CSymbolStubManager::Create(ObjectLayer, JD);
+        cantFail(Mgr.takeError());
+        CSymbolStubs = std::move(*Mgr);
+    }
 
     if (jl_is_timing_trace) {
         PrintLLVMTimers.push_back([]() JL_NOTSAFEPOINT {
@@ -2221,6 +2262,17 @@ bool JuliaOJIT::linkOutput(orc::MaterializationResponsibility &MR, MemoryBufferR
         Syms.at(T)->setName(Dest);
     }
 
+    // For every CCall, link it to an existing symbol in the JIT or create a
+    // lazy PLT stub.
+    // TODO: rewrite to use G.makeAbsolute / G.makeDefined with inline JITLink
+    // stubs instead of defining separate ORC symbols.
+    for (auto &[CCall, T] : Info->ccall_targets) {
+        auto It = Syms.find(T);
+        if (It == Syms.end())
+            continue;
+        linkCCall(MR, G, *It->second, CCall);
+    }
+
     // Rename globals and add mappings
     // TODO: don't leak when we have a way to GC code
 #ifdef __clang_analyzer__
@@ -2286,6 +2338,50 @@ orc::SymbolStringPtr JuliaOJIT::linkCallTarget(orc::MaterializationResponsibilit
 
     assert(Sym->invoke_api == API);
     return Sym->specptr;
+}
+
+static bool ccall_lookup(jl_ccall_spec_t spec, void *&addr, bool throw_err)
+{
+    // Eager resolution only applies to fully-static specs (both lib and
+    // func known at codegen time). Any spec carrying a non-NULL `target`
+    // tuple needs runtime evaluation and must take the lazy path.
+    if (spec.func == nullptr || spec.target != nullptr)
+        return false;
+    void *l = jl_get_library_((const char *)spec.lib, throw_err);
+    // `l` may be NULL in the special case that we looked up RTLD_DEFAULT (spec.lib == NULL)
+    if (spec.lib != nullptr && l == nullptr)
+        return false;
+    if (!jl_dlsym(l, spec.func, &addr, throw_err, 1))
+        return false;
+    return true;
+}
+
+void JuliaOJIT::linkCCall(orc::MaterializationResponsibility &MR,
+                          jitlink::LinkGraph &G,
+                          jitlink::Symbol &Sym,
+                          jl_ccall_spec_t CCall)
+{
+    // Eager path: if the symbol is already loaded into the host process,
+    // resolve it to an absolute address inline.
+    void *Addr;
+    if (ccall_lookup(CCall, Addr, false)) {
+        //fprintf(stderr, "resolving ccall eagerly...\n");
+        G.makeAbsolute(Sym, ExecutorAddr::fromPtr(Addr));
+        return;
+    }
+    //fprintf(stderr, "resolving ccall lazily...\n");
+
+    // Lazy path: hand off to CSymbolStubManager. It hands back a canonical
+    // JD-level symbol name for the stub and registers the per-spec (stub,
+    // ptr-slot, tramp, data) MaterializationUnit on first encounter.
+    // JITLink resolves Sym through the JD when the caller graph
+    // materializes; the stub graph is built lazily on first lookup.
+    //
+    // The target svec is permanently rooted by build_target_svec at the
+    // point of construction (interpret_ccall_symbol_arg /
+    // interpret_cglobal_symbol_arg). Nothing to do here.
+    SymbolStringPtr Canonical = CSymbolStubs->getOrCreateStub(CCall);
+    Sym.setName(Canonical);
 }
 
 jl_code_instance_t *JuliaOJIT::findCompatibleCI(jl_code_instance_t *CI)

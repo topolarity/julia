@@ -732,6 +732,225 @@ static jl_compiled_functions_t::iterator get_ci_equiv_compiled(jl_code_instance_
     return compiled_functions.end();
 }
 
+// ---------------------------------------------------------------------------
+// AOT-side emission of lazy ccall stubs.
+//
+// Mirrors the JIT-side CSymbolStubManager (src/csymbol_stubs.{h,cpp}). For every
+// entry in out.ccall_targets, we replace the placeholder Function declaration
+// with a defined naked function backed by inline asm `jmp *(ptr)(%rip)`, and
+// emit accompanying ptr-slot, trampoline, and csymbol_data_t struct globals.
+//
+// The shared resolver `ccall_reentry_trampoline` is statically linked into
+// libjulia; the system linker resolves it during final link.
+//
+// For dynamic ccalls (Spec.lib_expr != NULL), the lib_expr field of the data
+// struct is a literal_pointer_val_slot — the same pgv mechanism cfuncdata_t
+// uses for declrt/sigt — so the pkgimage serializer relocates the slot at
+// image load.
+// ---------------------------------------------------------------------------
+
+// Per-arch asm for the stub: load the pointer slot's value and branch to it.
+// Identical shape to the existing `plt_asm_*` machinery used by
+// emit_pkg_plt_thunk — single deref, then branch.
+static const char *ccall_stub_asm_x86_64 =
+    "jmpq  *${0:a}\n";
+static const char *ccall_stub_asm_aarch64 =
+    "adrp  x16, ${0}\n"
+    "ldr   x16, [x16, :lo12:${0}]\n"
+    "br    x16\n";
+static const char *ccall_stub_asm_aarch64_macho =
+    "adrp  x16, ${0}@page\n"
+    "ldr   x16, [x16, ${0}@pageoff]\n"
+    "br    x16\n";
+static const char *ccall_stub_asm_riscv64 =
+    "1: auipc t0, %pcrel_hi(${0})\n"
+    "   ld    t0, %pcrel_lo(1b)(t0)\n"
+    "   jr    t0\n";
+
+// Per-arch asm for the trampoline: load &data into a scratch register then
+// PUSH it onto the stack and branch to the shared resolver. Pushing first
+// is essential — the system PLT's lazy-resolve path clobbers scratch regs
+// (%r11 on x86-64, x16/x17 on AArch64), so we can't just leave &data in a
+// register across the branch. The asm resolver reads &data from the stack.
+//
+// On x86-64 we push 16 bytes (an alignment pad + &data) so the resolver is
+// entered at %rsp = 8 mod 16, i.e. the standard SysV alignment after `call`.
+// _dl_runtime_resolve assumes that alignment when binding the resolver
+// itself on the first call.
+//
+// Operand 0 = &data; operand 1 = resolver.
+//
+// `$$0` is the LLVM inline-asm escape for a literal `$0` (the immediate
+// constant zero). Bare `$0` would be parsed as a reference to operand 0
+// and would emit a R_X86_64_32S relocation against the data symbol —
+// invalid in -fPIC / shared libraries.
+static const char *ccall_tramp_asm_x86_64 =
+    "pushq $$0\n"
+    "leaq  ${0:c}(%rip), %r11\n"
+    "pushq %r11\n"
+    "jmp   ${1:c}\n";
+static const char *ccall_tramp_asm_aarch64 =
+    "adrp  x16, ${0}\n"
+    "add   x16, x16, :lo12:${0}\n"
+    "str   x16, [sp, #-16]!\n"
+    "b     ${1}\n";
+static const char *ccall_tramp_asm_aarch64_macho =
+    "adrp  x16, ${0}@page\n"
+    "add   x16, x16, ${0}@pageoff\n"
+    "str   x16, [sp, #-16]!\n"
+    "b     ${1}\n";
+static const char *ccall_tramp_asm_riscv64 =
+    "1: auipc t0, %pcrel_hi(${0})\n"
+    "   addi  t0, t0, %pcrel_lo(1b)\n"
+    "   addi  sp, sp, -16\n"
+    "   sd    t0, 0(sp)\n"
+    "2: auipc t1, %pcrel_hi(${1})\n"
+    "   jalr  zero, t1, %pcrel_lo(2b)\n";
+
+static void aot_emit_ccall_stubs(jl_codegen_output_t &out)
+{
+    if (out.ccall_targets.empty())
+        return;
+
+    auto &M = out.get_module();
+    auto &Ctx = out.get_context();
+    auto Triple = out.TargetTriple;
+    auto OF = Triple.getObjectFormat();
+
+    const char *StubAsm = nullptr;
+    const char *TrampAsm = nullptr;
+    if (Triple.getArch() == llvm::Triple::x86_64) {
+        StubAsm = ccall_stub_asm_x86_64;
+        TrampAsm = ccall_tramp_asm_x86_64;
+    } else if (Triple.isAArch64()) {
+        StubAsm = OF == llvm::Triple::MachO ? ccall_stub_asm_aarch64_macho
+                                            : ccall_stub_asm_aarch64;
+        TrampAsm = OF == llvm::Triple::MachO ? ccall_tramp_asm_aarch64_macho
+                                             : ccall_tramp_asm_aarch64;
+    } else if (Triple.isRISCV64()) {
+        StubAsm = ccall_stub_asm_riscv64;
+        TrampAsm = ccall_tramp_asm_riscv64;
+    } else {
+        // For unsupported archs, leave ccall_targets alone — the placeholder
+        // declarations will be unresolved externals at link time. Caller
+        // should ensure those archs use the legacy PLT path in codegen.
+        return;
+    }
+
+    PointerType *PtrTy = PointerType::getUnqual(Ctx);
+    Type *VoidTy = Type::getVoidTy(Ctx);
+    FunctionType *VoidFnTy = FunctionType::get(VoidTy, false);
+
+    // csymbol_data_t = { ptr, ptr, ptr, ptr }
+    StructType *DataTy = StructType::get(Ctx, {PtrTy, PtrTy, PtrTy, PtrTy});
+
+    // External declaration for the shared resolver in libjulia.
+    auto ResolverDecl = M.getOrInsertFunction("ccall_reentry_trampoline",
+                                              VoidFnTy);
+    auto ResolverFn = cast<Function>(ResolverDecl.getCallee());
+
+    size_t id = 0;
+    for (auto &[Spec, StubFn] : out.ccall_targets) {
+        std::string base = "$ccall$" + std::to_string(id++);
+
+        // String for func name (NULL for dynamic-name specs; the resolver
+        // pulls it from `target` instead).
+        Constant *FuncConst = ConstantPointerNull::get(PtrTy);
+        if (Spec.func) {
+            auto FuncStrInit = ConstantDataArray::getString(Ctx, Spec.func, true);
+            auto FuncStrGV = new GlobalVariable(M, FuncStrInit->getType(), true,
+                                                GlobalVariable::PrivateLinkage,
+                                                FuncStrInit, base + "$funcstr");
+            FuncConst = FuncStrGV;
+        }
+
+        // String for lib name (NULL for dynamic-lib specs; otherwise either
+        // an interned string OR a small sentinel cast from int — cast back
+        // to const char* and pass through).
+        Constant *LibConst = ConstantPointerNull::get(PtrTy);
+        if (Spec.lib) {
+            uintptr_t libVal = reinterpret_cast<uintptr_t>(Spec.lib);
+            if (libVal <= 3) {
+                // Sentinel — represent as integer cast to ptr.
+                LibConst = ConstantExpr::getIntToPtr(
+                    ConstantInt::get(Type::getInt64Ty(Ctx), libVal), PtrTy);
+            } else {
+                auto LibStrInit = ConstantDataArray::getString(
+                    Ctx, static_cast<const char*>(Spec.lib), true);
+                auto LibStrGV = new GlobalVariable(M, LibStrInit->getType(), true,
+                                                   GlobalVariable::PrivateLinkage,
+                                                   LibStrInit, base + "$libstr");
+                LibConst = LibStrGV;
+            }
+        }
+
+        // target: NULL when the spec is fully static; otherwise a
+        // pgv-relocated jl_value_t* pointing at the source-level (fn,) or
+        // (fn, lib) tuple. literal_pointer_val_slot is the same pgv
+        // mechanism cfuncdata_t and dynamic-lib specs already use.
+        Constant *TargetConst = ConstantPointerNull::get(PtrTy);
+        if (Spec.target) {
+            TargetConst = literal_pointer_val_slot(out, Spec.target);
+        }
+
+        // Placeholder for the data struct's ptr_slot field (filled in once
+        // we've created the ptr GV below).
+        auto PtrGV = new GlobalVariable(M, PtrTy, /*isConstant=*/false,
+                                        GlobalVariable::PrivateLinkage,
+                                        ConstantPointerNull::get(PtrTy),
+                                        base + "$ptr");
+
+        // Data struct: { ptr_slot, lib, func, target }
+        auto DataInit = ConstantStruct::get(DataTy, {
+            PtrGV, LibConst, FuncConst, TargetConst
+        });
+        auto DataGV = new GlobalVariable(M, DataTy, /*isConstant=*/true,
+                                         GlobalVariable::PrivateLinkage,
+                                         DataInit, base + "$data");
+
+        // Trampoline: naked function whose inline asm pushes &data and
+        // tail-branches to ccall_reentry_trampoline (see ccall_tramp_asm_*).
+        auto TrampFn = Function::Create(VoidFnTy, GlobalValue::PrivateLinkage,
+                                        base + "$tramp", &M);
+        TrampFn->addFnAttr(Attribute::Naked);
+        TrampFn->addFnAttr(Attribute::NoUnwind);
+        TrampFn->addFnAttr("frame-pointer", "none");
+        {
+            IRBuilder<> B(BasicBlock::Create(Ctx, "", TrampFn));
+            auto AsmTy = FunctionType::get(VoidTy, {PtrTy, PtrTy}, false);
+            auto IA = InlineAsm::get(AsmTy, TrampAsm, "s,s",
+                                     /*hasSideEffects=*/true,
+                                     /*isAlignStack=*/false);
+            auto Call = B.CreateCall(IA, {DataGV, ResolverFn});
+            Call->addFnAttr(Attribute::NoReturn);
+            B.CreateUnreachable();
+        }
+
+        // Initialize ptr to point at the trampoline.
+        PtrGV->setInitializer(TrampFn);
+
+        // Convert the placeholder Function declaration (created earlier by
+        // get_ccall_target with type `void()`) into a defined naked function
+        // whose body is `jmp *(ptr)(%rip)`. Call sites that invoke it with
+        // various typed signatures still work — under opaque pointers,
+        // function types live at the call site, not at the declaration.
+        StubFn->setLinkage(GlobalValue::PrivateLinkage);
+        StubFn->addFnAttr(Attribute::Naked);
+        StubFn->addFnAttr(Attribute::NoUnwind);
+        StubFn->addFnAttr("frame-pointer", "none");
+        {
+            IRBuilder<> B(BasicBlock::Create(Ctx, "", StubFn));
+            auto AsmTy = FunctionType::get(VoidTy, {PtrTy}, false);
+            auto IA = InlineAsm::get(AsmTy, StubAsm, "s",
+                                     /*hasSideEffects=*/true,
+                                     /*isAlignStack=*/false);
+            auto Call = B.CreateCall(IA, {PtrGV});
+            Call->addFnAttr(Attribute::NoReturn);
+            B.CreateUnreachable();
+        }
+    }
+}
+
 // Static version of JuliaOJIT::linkOutput
 static void aot_link_output(jl_codegen_output_t &out)
 {
@@ -834,6 +1053,11 @@ static void jl_emit_native_to_output(jl_native_code_desc_t *data, jl_array_t *co
     emit_llvmcall_modules(out);
     // finally, make sure all referenced methods get fixed up, particularly if the user declined to compile them
     aot_link_output(out);
+    // emit lazy-ccall stubs (stub/ptr/tramp/data per ccall_targets entry).
+    // Mirrors the JIT-side CSymbolStubManager but produces IR + inline asm so
+    // the AOT-compiled artifact is self-contained except for the
+    // `ccall_reentry_trampoline` external (resolved against libjulia).
+    aot_emit_ccall_stubs(out);
     // including generating cfunction thunks
     generate_cfunc_thunks(out);
     aot_optimize_roots(out, method_roots);

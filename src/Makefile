@@ -66,6 +66,7 @@ SRCS := \
 	threading scheduler stackwalk null_sysimage \
 	method jlapi signal-handling safepoint timing subtype rtutils \
 	crc32c APInt processor ircode opaque_closure codegen-stubs coverage runtime_ccall engine \
+	ccall_reenter ccall_runtime \
 	$(GC_SRCS)
 
 RT_LLVMLINK :=
@@ -84,7 +85,7 @@ CODEGEN_SRCS := codegen jitlayers aotcompile debuginfo disasm llvm-simdloop \
 	llvm-pass-helpers llvm-ptls llvm-propagate-addrspaces \
 	llvm-multiversioning llvm-alloc-opt llvm-alloc-helpers cgmemmgr llvm-remove-addrspaces \
 	llvm-remove-ni llvm-julia-licm llvm-demote-float16 llvm-cpufeatures llvm-expand-atomic-modify \
-	pipeline llvm_api \
+	pipeline llvm_api csymbol_stubs \
 	$(GC_CODEGEN_SRCS)
 FLAGS_COMMON += -I$(shell $(LLVM_CONFIG_HOST) --includedir)
 CG_LLVM_LIBS := all
@@ -317,6 +318,10 @@ $(BUILDDIR)/%.o : $(SRCDIR)/%.d
 	@$(call PRINT_DTRACE, $(DTRACE) -G -s $< -o $@)
 $(BUILDDIR)/%.dbg.obj : $(SRCDIR)/%.d
 	@$(call PRINT_DTRACE, $(DTRACE) -G -s $< -o $@)
+$(BUILDDIR)/%.o: $(SRCDIR)/%.S | $(BUILDDIR)
+	@$(call PRINT_CC, $(CC) $(SHIPFLAGS) $(JCPPFLAGS) -c $< -o $@)
+$(BUILDDIR)/%.dbg.obj: $(SRCDIR)/%.S | $(BUILDDIR)
+	@$(call PRINT_CC, $(CC) $(DEBUGFLAGS) $(JCPPFLAGS) -c $< -o $@)
 
 # public header rules
 $(eval $(call dir_target,$(build_includedir)/julia))

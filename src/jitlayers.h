@@ -1,5 +1,8 @@
 // This file is a part of Julia. License is MIT: https://julialang.org/license
 
+#ifndef JL_JITLAYERS_H
+#define JL_JITLAYERS_H
+
 #include "llvm/ADT/SmallSet.h"
 #include <llvm/ADT/MapVector.h>
 #include <llvm/ADT/StringSet.h>
@@ -63,6 +66,8 @@
 # include <llvm/ExecutionEngine/Orc/RTDyldObjectLinkingLayer.h>
 
 using namespace llvm;
+
+namespace julia { namespace csymbol { class CSymbolStubManager; } }
 
 inline int jl_is_timing_passes = 0;
 inline int jl_is_timing_trace = 0;
@@ -383,11 +388,59 @@ private:
     StringMap<unsigned> counter;
 };
 
+struct jl_ccall_spec_t {
+    // Static cache for the function name (interned C string). NULL for
+    // dynamic-name ccalls, where the resolver pulls the name from `target`
+    // at first-call time.
+    const char *func;
+    // Static cache for the library: one of the special library sentinels
+    // (JL_EXE_LIBNAME, JL_LIBJULIA_DL_LIBNAME, JL_LIBJULIA_INTERNAL_DL_LIBNAME)
+    // or an interned C string. NULL for dynamic ccalls.
+    void *lib;
+    // Target spec as a Core.svec of 1 or 2 elements (fn,) / (fn, lib).
+    // Populated whenever `func` or `lib` is NULL (i.e. anything dynamic);
+    // NULL for fully-static specs.
+    //
+    // This pointer is session-local and must be kept GC-rooted for as long
+    // as the owning dylib lives. It is never serialized into LLVM IR
+    // (keeping IR cacheable); the linker reads it out of the side-table at
+    // link time.
+    jl_value_t *target;
+};
+
+template<>
+struct llvm::DenseMapInfo<jl_ccall_spec_t> {
+    // Key all three fields: specs that differ in any of (func, lib, target)
+    // must not collide. `target` is keyed by pointer identity, matching the
+    // existing per-site convention (each ccall syntactic occurrence gets its
+    // own tuple value).
+    using T = std::tuple<const char *, void *, jl_value_t *>;
+    using I = DenseMapInfo<T>;
+    static inline jl_ccall_spec_t from(T t) {
+        return {std::get<0>(t), std::get<1>(t), std::get<2>(t)};
+    }
+    static inline T to(jl_ccall_spec_t t) {
+        return {t.func, t.lib, t.target};
+    }
+
+    static inline jl_ccall_spec_t getEmptyKey() { return from(I::getEmptyKey()); }
+    static inline jl_ccall_spec_t getTombstoneKey() { return from(I::getTombstoneKey()); }
+    static unsigned getHashValue(const jl_ccall_spec_t &Val) { return I::getHashValue(to(Val)); }
+    static bool isEqual(const jl_ccall_spec_t &LHS, const jl_ccall_spec_t &RHS) { return I::isEqual(to(LHS), to(RHS)); }
+};
+
+// TODO: resolver table entry for the C resolver (ccall_resolve_and_patch)
+// struct ccall_resolve_info {
+//     jl_ccall_spec_t spec;
+//     void *stub_ptr_slot;  // writable pointer that the jump stub loads from
+// };
+
 struct jl_linker_info_t {
     DenseMap<jl_code_instance_t *, jl_codeinst_funcs_t<orc::SymbolStringPtr>> ci_funcs;
     DenseMap<std::pair<jl_code_instance_t *, jl_invoke_api_t>, orc::SymbolStringPtr>
         call_targets;
     DenseMap<void *, orc::SymbolStringPtr> global_targets;
+    DenseMap<jl_ccall_spec_t, orc::SymbolStringPtr> ccall_targets;
 };
 
 struct jl_emitted_output_t {
@@ -422,6 +475,8 @@ public:
     std::string make_name(StringRef orig_name);
 
     StringRef get_call_target(jl_code_instance_t *ci, bool specsig, bool always_inline);
+    Function *get_ccall_target(const char *f_name, void *f_lib,
+                               jl_value_t *target);
 
     // Discard all the context that will be invalidated when we compile the
     // module.  The context and module will be moved to the jl_emitted_output_t.
@@ -435,6 +490,8 @@ public:
         call_targets;
     DenseMap<jl_code_instance_t *, jl_llvm_functions_t> ci_funcs;
     SmallVector<std::pair<jl_code_instance_t *, GlobalVariable *>, 0> external_fns;
+    // ccall symbol + library -> LLVM function declaration
+    DenseMap<jl_ccall_spec_t, Function *> ccall_targets;
 
     SmallVector<cfunc_decl_t,0> cfuncs;
     std::map<void*, GlobalVariable*> global_targets;
@@ -882,6 +939,13 @@ protected:
                                         jl_code_instance_t *CI,
                                         jl_invoke_api_t API) JL_NOTSAFEPOINT;
 
+    // Resolve or create a lazy PLT stub for a ccall target.
+    // TODO: rewrite to use G.makeAbsolute / G.makeDefined with inline JITLink stubs
+    void linkCCall(orc::MaterializationResponsibility &MR,
+                                   jitlink::LinkGraph &G,
+                                   jitlink::Symbol &Sym,
+                                   jl_ccall_spec_t CCall);
+
     // If the provided CodeInstance is neither compiled nor has an ORC symbol in
     // CISymbols, look for a compatible CodeInstance in the MethodInstance's
     // cache that does.  Returns the original CodeInstance if none exists.
@@ -906,12 +970,15 @@ private:
     std::mutex SharedBytesMutex{};
     SharedBytesT SharedBytes;
 
-    // LinkerMutex protects CISymbols, Names
+    // LinkerMutex protects CISymbols, CCallSymbols, Names
     std::mutex LinkerMutex;
     // CISymbols maps CodeInstance pointers to their ORC symbols.  If a
     // CodeInstance is eligible for garbage collection, it must be removed from
     // this map first, with unregisterCI.
     CISymbolMap CISymbols;
+    // DenseMap<jl_ccall_spec_t, jitlink::Symbol&> CCallSymbols;
+    // TODO: resolver table for the C trampoline (ccall_resolve_and_patch)
+    // DenseMap<void *, ccall_resolve_info> ResolverTable;
     jl_name_counter_t Names;
 
     std::unique_ptr<DLSymOptimizer> DLSymOpt;
@@ -934,6 +1001,12 @@ private:
     std::unique_ptr<OptimizerT> Optimizers;
     OptimizeLayerT OptimizeLayer;
     std::shared_ptr<JLDebuginfoPlugin> DebuginfoPlugin;
+
+    // C-symbol lazy-stub manager: hands out canonical JD-level symbol names
+    // for both ccall stubs (callable) and cglobal slots (data). Constructed
+    // during JuliaOJIT initialization once ObjectLayer / JD are ready.
+    // See src/csymbol_stubs.{h,cpp}.
+    std::unique_ptr<julia::csymbol::CSymbolStubManager> CSymbolStubs;
 };
 extern JuliaOJIT *jl_ExecutionEngine;
 
@@ -988,3 +1061,5 @@ CodeGenOptLevel CodeGenOptLevelFor(int optlevel) JL_NOTSAFEPOINT;
 #else
 CodeGenOpt::Level CodeGenOptLevelFor(int optlevel) JL_NOTSAFEPOINT;
 #endif
+
+#endif // JL_JITLAYERS_H
