@@ -1047,6 +1047,10 @@ int equiv_type(jl_value_t *ta, jl_value_t *tb) JL_CANSAFEPOINT;
 int references_name(jl_value_t *p, jl_typename_t *name, int affects_layout, int freevars) JL_NOTSAFEPOINT;
 jl_datatype_t *jl_lookup_cache_type_(jl_datatype_t *type) JL_CANSAFEPOINT;
 jl_value_t *jl_lookup_foreignsymbol(jl_value_t *v) JL_CANSAFEPOINT;
+// Re-arm every lazily-resolved ccall/cglobal cache slot, sending the next
+// access back through the resolver. Called from jl_dlclose, since cached
+// pointers into a library that is being unloaded would otherwise dangle.
+JL_DLLEXPORT void jl_csymbol_invalidate_cache(void) JL_NOTSAFEPOINT;
 void jl_cache_type_(jl_datatype_t *type) JL_CANSAFEPOINT;
 void jl_cache_type_if_absent(jl_datatype_t *type) JL_CANSAFEPOINT;
 jl_svec_t *cache_rehash_set(jl_svec_t *a, size_t newsz) JL_CANSAFEPOINT;
@@ -1783,6 +1787,7 @@ void win32_formatmessage(DWORD code, char *reason, int len) JL_NOTSAFEPOINT;
 #endif
 
 JL_DLLEXPORT void *jl_get_library_(const char *f_lib, int throw_err) JL_CANSAFEPOINT;
+JL_DLLEXPORT void *jl_get_library_if_loaded(const char *f_lib) JL_NOTSAFEPOINT;
 JL_DLLEXPORT void *jl_find_dynamic_library_by_addr(void *symbol, int throw_err, int close) JL_NOTSAFEPOINT;
 #define jl_get_library(f_lib) jl_get_library_(f_lib, 1)
 JL_DLLEXPORT void *jl_load_and_lookup(const char *f_lib, const char *f_name, _Atomic(void*) *hnd) JL_CANSAFEPOINT;

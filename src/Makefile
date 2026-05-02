@@ -71,6 +71,7 @@ SRCS := \
 	threading scheduler stackwalk static_exports \
 	method jlapi signal-handling safepoint timing subtype rtutils \
 	crc32c APInt processor ircode opaque_closure codegen-stubs coverage runtime_ccall engine \
+	ccall_reenter ccall_runtime \
 	$(GC_SRCS)
 
 RT_LLVMLINK :=
@@ -89,7 +90,7 @@ CODEGEN_SRCS := codegen jitlayers aotcompile debuginfo disasm llvm-simdloop \
 	llvm-multiversioning llvm-alloc-opt llvm-alloc-helpers cgmemmgr llvm-remove-addrspaces \
 	llvm-remove-ni llvm-julia-licm llvm-demote-float16 llvm-cpufeatures llvm-expand-atomic-modify \
 	llvm-cancellation-lowering \
-	pipeline llvm_api objcache \
+	pipeline llvm_api objcache csymbol_stubs \
 	$(GC_CODEGEN_SRCS)
 # translation units of $(CODEGEN_SRCS), except objcache, which includes the hash
 CODEGEN_SRCS_HASH := $(patsubst %,$(SRCDIR)/%.cpp,$(filter-out objcache llvm-final-gc-lowering-mmtk,$(CODEGEN_SRCS)))
@@ -407,6 +408,14 @@ $(BUILDDIR)/%.o : $(SRCDIR)/%.d
 	@$(call PRINT_DTRACE, $(DTRACE) -G -s $< -o $@)
 $(BUILDDIR)/%.dbg.obj : $(SRCDIR)/%.d
 	@$(call PRINT_DTRACE, $(DTRACE) -G -s $< -o $@)
+$(BUILDDIR)/%.o: $(SRCDIR)/%.S | $(BUILDDIR)
+	@$(call PRINT_CC, $(CC) $(SHIPFLAGS) $(JCPPFLAGS) -c $< -o $@)
+$(BUILDDIR)/%.dbg.obj: $(SRCDIR)/%.S | $(BUILDDIR)
+	@$(call PRINT_CC, $(CC) $(DEBUGFLAGS) $(JCPPFLAGS) -c $< -o $@)
+$(BUILDDIR)/%.static.o: $(SRCDIR)/%.S | $(BUILDDIR)
+	@$(call PRINT_CC, $(CC) $(SHIPFLAGS) $(JCPPFLAGS) -c $< -o $@)
+$(BUILDDIR)/%.static.dbg.obj: $(SRCDIR)/%.S | $(BUILDDIR)
+	@$(call PRINT_CC, $(CC) $(DEBUGFLAGS) $(JCPPFLAGS) -c $< -o $@)
 
 # public header rules
 $(eval $(call dir_target,$(build_includedir)/julia))

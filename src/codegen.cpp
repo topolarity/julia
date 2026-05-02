@@ -147,6 +147,7 @@ typedef Instruction TerminatorInst;
 #endif
 
 #include "jitlayers.h"
+#include "ccall_data.h"
 #include "processor.h"
 #include "julia_assert.h"
 
@@ -1402,17 +1403,32 @@ static const auto memcmp_func = new JuliaFunction<TypeFnContextAndSizeT>{
             {}); },
     // TODO: inferLibFuncAttributes(*memcmp_func, TLI);
 };
-static const auto jldlsym_func = new JuliaFunction<>{
-    XSTR(jl_load_and_lookup),
+// Pure dlsym lookup — does dlopen+dlsym and returns the resolved address,
+// but DOES NOT touch the cache slot. The cache store is emitted as a
+// visible IR instruction at the inline cglobal lookup site.
+//
+// Memory effects: kept at LLVM's default ("may read/write any memory")
+// because the dynamic-lib path inside csymbol_lookup transitively calls
+// jl_lazy_load_and_lookup → jl_apply_generic, which can allocate / hit a
+// safepoint and therefore touches arbitrary heap state. Telling LLVM
+// "argmem: read + inaccessiblemem: readwrite" was tighter than reality
+// and allowed LLVM to elide stack stores that the GC needs to see when
+// walking the stack on a dispatch-induced safepoint. Slightly weaker
+// LICM as a result, but a tiny regression on cglobal hot-loops is the
+// honest price of dispatch potentially happening behind the call.
+//
+// The result is not marked nonnull: a weak symbol can resolve to NULL.
+static const auto jl_csymbol_lookup_func = new JuliaFunction<>{
+    XSTR(csymbol_lookup),
     [](LLVMContext &C) { return FunctionType::get(getPointerTy(C),
-            {getPointerTy(C), getPointerTy(C), getPointerTy(C)}, false); },
-    nullptr,
-};
-static const auto jllazydlsym_func = new JuliaFunction<>{
-    XSTR(jl_lazy_load_and_lookup),
-    [](LLVMContext &C) { return FunctionType::get(getPointerTy(C),
-            {JuliaType::get_prjlvalue_ty(C), JuliaType::get_prjlvalue_ty(C)}, false); },
-    nullptr,
+            {getPointerTy(C)}, false); },
+    [](LLVMContext &C) {
+        AttrBuilder FnAttrs(C);
+        FnAttrs.addAttribute(Attribute::Cold);
+        return AttributeList::get(C,
+                AttributeSet::get(C, FnAttrs),
+                AttributeSet(),
+                {}); },
 };
 static const auto jltypeassert_func = new JuliaFunction<>{
     XSTR(jl_typeassert),
@@ -11400,7 +11416,7 @@ static void init_jit_functions(void)
     add_named_global(jl_typeof_func, (void*)NULL);
     add_named_global(jl_field_write_barrier_p11_func, (void*)NULL);
     add_named_global(jl_field_write_barrier_p13_func, (void*)NULL);
-    add_named_global(jldlsym_func, &jl_load_and_lookup);
+    add_named_global(jl_csymbol_lookup_func, &csymbol_lookup);
     add_named_global("jl_adopt_thread", &jl_adopt_thread);
     add_named_global(jlgetcfunctiontrampoline_func, &jl_get_cfunction_trampoline);
     add_named_global(jlgetnthfieldchecked_func, &jl_get_nth_field_checked);

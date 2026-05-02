@@ -2389,6 +2389,144 @@ end
     end
 end
 
+@testset "lazy-stub ccall path covers RTLD_DEFAULT and vararg" begin
+    # These paths used to go through emit_plt (creating jlplt_*_got GVs) or
+    # runtime_sym_lookup with libptrgv set (calling jl_load_and_lookup) — the
+    # two patterns DLSymOptimizer matched. All of the cases below take the
+    # unified lazy-stub path (get_ccall_target → CSymbolStubManager /
+    # aot_emit_ccall_stubs) and emit none of those patterns.
+
+    # A. RTLD_DEFAULT static-name ccall (no library spec).
+    rtld_strlen(s::String) = ccall(:strlen, Csize_t, (Cstring,), s)
+    # B. Static-lib + static-name vararg ccall (used to trip the "vararg
+    #    incompatible with musttail" fallback).
+    staticlib_vararg(x::Int64) =
+        ccall((:test_reg_32_va, libccalltest), Int64, (Cint, Int64...), 1, x)
+    # C. RTLD_DEFAULT vararg ccall.
+    function rtld_snprintf(buf::Vector{UInt8}, x::Int32)
+        ccall(:snprintf, Cint,
+              (Ptr{UInt8}, Csize_t, Cstring, Cint...),
+              buf, sizeof(buf), "%d", x)
+    end
+    # D. Static-lib + static-name non-vararg.
+    staticlib_uchar(x) = ccall((:testUcharX, libccalltest), Int32, (UInt8,), x % UInt8)
+
+    # Functional checks.
+    @test rtld_strlen("abc") == 3
+    @test rtld_strlen("") == 0
+    @test staticlib_vararg(Int64(17)) == 17
+    let buf = zeros(UInt8, 64)
+        n = rtld_snprintf(buf, Int32(99))
+        @test n == 2 && unsafe_string(pointer(buf), n) == "99"
+    end
+    @test staticlib_uchar(3) == 1
+    @test staticlib_uchar(2) == 0
+
+    # IR-shape checks: confirm none of the DLSymOptimizer-relevant patterns
+    # appear in the codegen output for any of the migrated paths.
+    # (`dynccall_*` slot GVs are intentionally still used as cache slots by
+    # `emit_csymbol_lazy_lookup` via `runtime_sym_gvs`; not a legacy marker.)
+    function assert_no_legacy_patterns(f, sig)
+        ir = sprint(io -> code_llvm(io, f, sig; raw=true,
+                                    dump_module=false, optimize=true,
+                                    debuginfo=:none))
+        @test !occursin("jl_load_and_lookup", ir)
+        @test !occursin("jl_lazy_load_and_lookup", ir)
+        @test !occursin("jl_get_binding_value_seqcst", ir)
+        @test !occursin("jlplt_", ir)
+        return ir
+    end
+    assert_no_legacy_patterns(rtld_strlen,      Tuple{String})
+    assert_no_legacy_patterns(staticlib_vararg, Tuple{Int64})
+    assert_no_legacy_patterns(rtld_snprintf,    Tuple{Vector{UInt8}, Int32})
+    assert_no_legacy_patterns(staticlib_uchar,  Tuple{Int})
+
+    # E. Dynamic-name ccall: non-const Symbol global referenced via GlobalRef.
+    #    The function name is captured in the target svec and resolved by
+    #    `csymbol_lookup` at first-call time, so the dynamic-name case shares
+    #    the same unified lazy-stub path as everything else.
+    global dyn_fn = :testUcharX
+    dynamic_uchar(x) = ccall((dyn_fn, libccalltest), Int32, (UInt8,), x % UInt8)
+    @test dynamic_uchar(3) == 1
+    @test dynamic_uchar(2) == 0
+    assert_no_legacy_patterns(dynamic_uchar, Tuple{Int})
+
+    # F. Single-symbol ccall that resolves to libjulia-internal via the
+    #    `i`-prefix special case in interpret_foreignsymbol. f_lib is set
+    #    to the JL_LIBJULIA_INTERNAL_DL_LIBNAME sentinel, exercising the
+    #    sentinel-cast path in build_csymbol_data_global / aot_emit_ccall_stubs.
+    #    IR-only check — calling internal symbols with the wrong context is
+    #    not meaningful; we just want to confirm the path lowers cleanly.
+    julia_internal_get_safepoint() = ccall(:jl_get_safepoint_handle, Ptr{Cvoid}, ())
+    let ir = sprint(io -> code_llvm(io, julia_internal_get_safepoint, Tuple{};
+                                    raw=true, dump_module=false, optimize=true,
+                                    debuginfo=:none))
+        @test !occursin("jl_load_and_lookup", ir)
+        @test !occursin("jl_lazy_load_and_lookup", ir)
+        @test !occursin("jlplt_", ir)
+    end
+
+    # G. Static name + dynamic-lib expression (the lib slot is a non-const
+    #    or LazyLibrary value referenced by GlobalRef). Exercises the
+    #    `data->lib == NULL && lib_dyn != NULL` branch of csymbol_lookup,
+    #    which dispatches through jl_lazy_load_and_lookup.
+    global dyn_lib = libccalltest
+    dynamic_lib_uchar(x) = ccall((:testUcharX, dyn_lib), Int32, (UInt8,), x % UInt8)
+    @test dynamic_lib_uchar(3) == 1
+    assert_no_legacy_patterns(dynamic_lib_uchar, Tuple{Int})
+
+    # H. Literal-pointer ccall (`symarg.jl_ptr` path). The first arg is a
+    #    Ptr value, not a tuple — bypasses the lazy-stub path entirely and
+    #    calls through the pointer directly.
+    let uchar_ptr = Libdl.dlsym(Libdl.dlopen(libccalltest), :testUcharX)
+        ccall_via_ptr(p::Ptr{Cvoid}, x) = ccall(p, Int32, (UInt8,), x % UInt8)
+        @test ccall_via_ptr(uchar_ptr, 3) == 1
+    end
+
+    # cglobal coverage: the cglobal name lookup goes through
+    # interpret_foreignsymbol + emit_csymbol_lazy_lookup. Exercise the
+    # same shape variants as for ccall.
+
+    # I. cglobal with static name + static lib.
+    cglob_static() = cglobal((:abi_probe, libccalltest))
+    @test cglob_static() isa Ptr{Nothing}
+    @test cglob_static() != C_NULL
+    @test cglob_static() == Libdl.dlsym(Libdl.dlopen(libccalltest), :abi_probe)
+    assert_no_legacy_patterns(cglob_static, Tuple{})
+
+    # J. cglobal with static name + dynamic lib (dyn_lib above).
+    cglob_dyn_lib() = cglobal((:abi_probe, dyn_lib))
+    @test cglob_dyn_lib() == cglob_static()
+    assert_no_legacy_patterns(cglob_dyn_lib, Tuple{})
+
+    # K. cglobal with dynamic name.
+    global dyn_cglobal_sym = :abi_probe
+    cglob_dyn_name() = cglobal((dyn_cglobal_sym, libccalltest))
+    @test cglob_dyn_name() == cglob_static()
+    assert_no_legacy_patterns(cglob_dyn_name, Tuple{})
+
+    # L. cglobal with a Ptr expression form (no tuple) — bypasses the
+    #    lazy-lookup path; emit_cglobal reinterprets the value as Ptr{Cvoid}.
+    let p = cglob_static()
+        cglob_via_ptr(p::Ptr{Nothing}) = cglobal(p)
+        @test cglob_via_ptr(p) == p
+    end
+
+    # M. A symbol that fails to resolve throws from inside the shared
+    #    resolver; the backtrace must still unwind through it to the caller.
+    @noinline missing_symbol_caller() =
+        ccall((:definitely_not_a_ccalltest_symbol, libccalltest), Cint, ())
+    let bt = try
+            missing_symbol_caller()
+            nothing
+        catch
+            stacktrace(catch_backtrace())
+        end
+        @test bt !== nothing
+        @test any(frame -> frame.func === :missing_symbol_caller, bt)
+    end
+end
+
 module Test57749
 using Test, Zstd_jll
 const prefix = "Zstd version: "

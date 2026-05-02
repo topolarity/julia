@@ -303,12 +303,18 @@ int jl_dlclose(void *handle)
     if (!handle) {
         return -1;
     }
+    jl_csymbol_invalidate_cache();
     return !FreeLibrary((HMODULE) handle);
 #else
     if (!handle) {
         dlerror(); /* Reset error status. */
         return -1;
     }
+    // Drop cached ccall/cglobal target pointers before the mapping goes
+    // away: a slot is shared by every site with the same (lib, sym) spec,
+    // so a stale entry would send an unrelated call site into an unmapped
+    // page. Re-resolution happens lazily on next use.
+    jl_csymbol_invalidate_cache();
     return dlclose(handle);
 #endif
 }

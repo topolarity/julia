@@ -49,6 +49,26 @@ void *jl_get_library_(const char *f_lib, int throw_err) JL_CANSAFEPOINT
     return hnd;
 }
 
+// Like jl_get_library_, but never loads a library: returns NULL unless `f_lib`
+// names one of the special libraries or has already been loaded by
+// jl_get_library_ (and therefore resolves to the same handle a later
+// jl_get_library_ would return).
+JL_DLLEXPORT void *jl_get_library_if_loaded(const char *f_lib) JL_NOTSAFEPOINT
+{
+    if (f_lib == NULL)
+        return jl_RTLD_DEFAULT_handle;
+    if (f_lib == JL_EXE_LIBNAME)
+        return jl_exe_handle;
+    if (f_lib == JL_LIBJULIA_INTERNAL_DL_LIBNAME)
+        return jl_libjulia_internal_handle;
+    if (f_lib == JL_LIBJULIA_DL_LIBNAME)
+        return jl_libjulia_handle;
+    JL_LOCK_NOGC(&libmap_lock);
+    void *hnd = strhash_get(&libMap, (void*)f_lib);
+    JL_UNLOCK_NOGC(&libmap_lock);
+    return hnd == HT_NOTFOUND ? NULL : hnd;
+}
+
 JL_DLLEXPORT
 void *jl_load_and_lookup(const char *f_lib, const char *f_name, _Atomic(void*) *hnd)
 {
