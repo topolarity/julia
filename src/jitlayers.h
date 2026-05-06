@@ -492,6 +492,19 @@ public:
     SmallVector<std::pair<jl_code_instance_t *, GlobalVariable *>, 0> external_fns;
     // ccall symbol + library -> LLVM function declaration
     DenseMap<jl_ccall_spec_t, Function *> ccall_targets;
+    // cglobal sites: same spec key as ccall, but no placeholder Function —
+    // the diamond (emit_csymbol_lazy_lookup) is inline at every site. All
+    // sites for the same spec share one per-(lib, sym) cache slot from
+    // runtime_sym_gvs and one csymbol_data_t global (deduplicated by spec
+    // in emit_csymbol_lazy_lookup), so we just track those two GVs per
+    // spec. The link-time native-link pass walks data_gv's uses (works
+    // across optimizer transforms — instruction pointers don't, GVs do)
+    // to find every csymbol_lookup call site at rewrite time.
+    struct cglobal_target_t {
+        GlobalVariable *slot = nullptr;
+        GlobalVariable *data_gv = nullptr;
+    };
+    DenseMap<jl_ccall_spec_t, cglobal_target_t> cglobal_targets;
 
     SmallVector<cfunc_decl_t,0> cfuncs;
     std::map<void*, GlobalVariable*> global_targets;

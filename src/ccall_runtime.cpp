@@ -65,9 +65,14 @@ void *csymbol_lookup(const struct csymbol_data_t *data)
     // (potentially a LazyLibrary or other heap value), and the path that
     // consumes it (jl_lazy_load_and_lookup → jl_apply_generic) can
     // allocate / safepoint inside dispatch. Push it onto the GC frame
-    // before any of those callsites can run.
+    // before any of those callsites can run. The actual_id / actual_name
+    // slots are used only on the AbstractSystemLibrary verification path
+    // (n == 4); they hold the results of dlid()/dlname() across the second
+    // jl_apply_generic call.
     jl_value_t *lib_dyn = nullptr;
-    JL_GC_PUSH1(&lib_dyn);
+    jl_value_t *actual_id = nullptr;
+    jl_value_t *actual_name = nullptr;
+    JL_GC_PUSH3(&lib_dyn, &actual_id, &actual_name);
 
     if ((func == nullptr || lib == nullptr) && data->target != nullptr) {
         // The `target` field is a *slot* pointer — one level of indirection
@@ -82,6 +87,24 @@ void *csymbol_lookup(const struct csymbol_data_t *data)
             func = resolve_func_value(jl_svecref(target, 0));
         if (lib == nullptr && n >= 2) {
             lib_dyn = eval_if_globalref(jl_svecref(target, 1));
+        }
+        if (n == 4) {
+            // AbstractSystemLibrary form: `target` is (fn, lib_ref, lib_id, lib_name).
+            // Subtypes of AbstractSystemLibrary opt into a stable-identity
+            // contract — dlid() and dlname() must be invariant for the life
+            // of the handle. Enforce that here, before we dlopen, by comparing
+            // the values frozen at definition time against what the lib_obj
+            // returns now. Mismatch indicates a buggy subtype implementation
+            // (or a LazyLibrary whose path was mutated).
+            if (jl_libdl_dlid_func == nullptr || jl_libdl_dlname_func == nullptr)
+                jl_error("AbstractSystemLibrary identity check requires Libdl to be loaded");
+            jl_value_t *expected_id = jl_svecref(target, 2);
+            jl_value_t *expected_name = jl_svecref(target, 3);
+            actual_id = jl_apply_generic(jl_libdl_dlid_func, &lib_dyn, 1);
+            actual_name = jl_apply_generic(jl_libdl_dlname_func, &lib_dyn, 1);
+            if (!jl_egal(actual_id, expected_id) || !jl_egal(actual_name, expected_name))
+                jl_errorf("ccall: AbstractSystemLibrary identity changed since definition "
+                          "(dlid()/dlname() must be stable for AbstractSystemLibrary subtypes)");
         }
     }
 

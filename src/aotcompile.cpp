@@ -807,6 +807,276 @@ static const char *ccall_tramp_asm_riscv64 =
     "2: auipc t1, %pcrel_hi(${1})\n"
     "   jalr  zero, t1, %pcrel_lo(2b)\n";
 
+// Forward decl: defined below alongside the native-link rewrite passes.
+static bool is_native_linked_spec(const jl_ccall_spec_t &Spec);
+
+// JSON-escape a NUL-terminated string into `os`, including the surrounding
+// quotes.
+static void emit_json_string(llvm::raw_ostream &os, const char *s, size_t n)
+{
+    os << '"';
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        switch (c) {
+            case '"':  os << "\\\""; break;
+            case '\\': os << "\\\\"; break;
+            case '\n': os << "\\n"; break;
+            case '\r': os << "\\r"; break;
+            case '\t': os << "\\t"; break;
+            default:
+                if (c < 0x20) {
+                    char buf[8];
+                    snprintf(buf, sizeof(buf), "\\u%04x", c);
+                    os << buf;
+                }
+                else {
+                    os << (char)c;
+                }
+        }
+    }
+    os << '"';
+}
+
+static void emit_json_string(llvm::raw_ostream &os, const char *s)
+{
+    emit_json_string(os, s, strlen(s));
+}
+
+// Map a Spec.lib pointer to a sentinel name, or NULL if it's a real string.
+static const char *lib_sentinel_name(const void *lib)
+{
+    if (lib == JL_EXE_LIBNAME) return "<exe>";
+    if (lib == JL_LIBJULIA_DL_LIBNAME) return "<libjulia>";
+    if (lib == JL_LIBJULIA_INTERNAL_DL_LIBNAME) return "<libjulia-internal>";
+    return NULL;
+}
+
+// Format a target svec element as a string, matching the JSON sentinels.
+static std::string format_svec_element(jl_value_t *elem)
+{
+    if (elem == NULL || elem == jl_nothing)
+        return "<unknown>";
+    if (jl_is_string(elem))
+        return std::string(jl_string_data(elem), jl_string_len(elem));
+    if (jl_is_symbol(elem))
+        return std::string(jl_symbol_name((jl_sym_t*)elem));
+    if (jl_is_globalref(elem)) {
+        std::string s = "<dynamic:";
+        s += jl_symbol_name(jl_globalref_mod((jl_globalref_t*)elem)->name);
+        s += '.';
+        s += jl_symbol_name(jl_globalref_name((jl_globalref_t*)elem));
+        s += '>';
+        return s;
+    }
+    return "<unknown>";
+}
+
+// Group key (library name) for a spec — what `library` would be in the
+// flat-entry JSON shape.
+static std::string format_lib_key(const jl_ccall_spec_t &Spec)
+{
+    if (Spec.lib) {
+        const char *sentinel = lib_sentinel_name(Spec.lib);
+        if (sentinel) return sentinel;
+        return std::string((const char*)Spec.lib);
+    }
+    if (Spec.target && jl_is_svec(Spec.target)) {
+        jl_svec_t *svec = (jl_svec_t*)Spec.target;
+        size_t n = jl_svec_len(svec);
+        if (n == 4)
+            return format_svec_element(jl_svecref(svec, 3));
+        if (n >= 2)
+            return format_svec_element(jl_svecref(svec, 1));
+    }
+    return "<rtld-default>";
+}
+
+// Symbol name for a spec, with sentinel fallbacks for dynamic/unknown.
+static std::string format_symbol(const jl_ccall_spec_t &Spec)
+{
+    if (Spec.func)
+        return std::string(Spec.func);
+    if (Spec.target && jl_is_svec(Spec.target) &&
+            jl_svec_len((jl_svec_t*)Spec.target) >= 1)
+        return format_svec_element(jl_svecref((jl_svec_t*)Spec.target, 0));
+    return "<unknown>";
+}
+
+// Library UUID (4-tuple AbstractSystemLibrary form) as a hex string, or
+// empty for forms that don't carry one.
+static std::string format_lib_id(const jl_ccall_spec_t &Spec)
+{
+    if (!(Spec.target && jl_is_svec(Spec.target) &&
+            jl_svec_len((jl_svec_t*)Spec.target) == 4))
+        return "";
+    jl_svec_t *svec = (jl_svec_t*)Spec.target;
+    jl_value_t *lib_id = jl_svecref(svec, 2);
+    if (!lib_id || lib_id == jl_nothing)
+        return "";
+    jl_value_t *str_val = NULL;
+    JL_TRY {
+        str_val = jl_apply_generic(
+            (jl_value_t*)jl_get_function(jl_base_module, "string"), &lib_id, 1);
+    }
+    JL_CATCH {
+        str_val = NULL;
+    }
+    if (str_val && jl_is_string(str_val))
+        return std::string(jl_string_data(str_val), jl_string_len(str_val));
+    return "";
+}
+
+// Write a JSON manifest of every ccall/cglobal usage site to `path`,
+// grouped by library. Each group lists its `symbols` (deduped + sorted,
+// merging ccall and cglobal references), `linkage` ("native" if any spec
+// under that library is bound via the native-link policy, otherwise
+// "lazy"), and a `library_id` UUID when the AbstractSystemLibrary
+// 4-tuple form provided one. Libraries we can't statically resolve land
+// under sentinel keys (`<rtld-default>`, `<dynamic:Module.binding>`,
+// `<unknown>`) so the consumer still sees the full set of foreign
+// dependencies — including the unknown ones.
+static void aot_export_foreign_deps(jl_codegen_output_t &out, const char *path)
+{
+    struct lib_group_t {
+        std::string id;            // empty if not 4-tuple
+        bool native_linked = false;
+        std::set<std::string> symbols;
+    };
+    // std::map gives us sorted-by-key order in the output.
+    std::map<std::string, lib_group_t> groups;
+
+    auto record = [&](const jl_ccall_spec_t &Spec) {
+        std::string lib = format_lib_key(Spec);
+        auto &group = groups[lib];
+        std::string id = format_lib_id(Spec);
+        if (!id.empty())
+            group.id = id;
+        if (is_native_linked_spec(Spec))
+            group.native_linked = true;
+        group.symbols.insert(format_symbol(Spec));
+    };
+
+    for (auto &[Spec, StubFn] : out.ccall_targets) {
+        (void)StubFn;
+        record(Spec);
+    }
+    for (auto &[Spec, Entry] : out.cglobal_targets) {
+        (void)Entry;
+        record(Spec);
+    }
+
+    std::error_code EC;
+    llvm::raw_fd_ostream os(path, EC, llvm::sys::fs::OF_Text);
+    if (EC) {
+        jl_safe_printf("juliac: failed to open foreign deps export file '%s': %s\n",
+                       path, EC.message().c_str());
+        return;
+    }
+
+    os << "{\n";
+    os << "  \"version\": 1,\n";
+    os << "  \"libraries\": [";
+    bool first = true;
+    for (auto &[lib_name, group] : groups) {
+        os << (first ? "\n    " : ",\n    ");
+        first = false;
+        os << "{\n";
+        os << "      \"library\": ";
+        emit_json_string(os, lib_name.c_str(), lib_name.size());
+        if (!group.id.empty()) {
+            os << ",\n      \"library_id\": ";
+            emit_json_string(os, group.id.c_str(), group.id.size());
+        }
+        os << ",\n      \"linkage\": ";
+        emit_json_string(os, group.native_linked ? "native" : "lazy");
+        os << ",\n      \"symbols\": [";
+        bool sfirst = true;
+        for (auto &s : group.symbols) {
+            if (!sfirst) os << ", ";
+            emit_json_string(os, s.c_str(), s.size());
+            sfirst = false;
+        }
+        os << "]\n    }";
+    }
+    os << (first ? "" : "\n  ");
+    os << "]\n";
+    os << "}\n";
+}
+
+// Phase 1 native-link decision: `Spec` is eligible if its target svec has the
+// 4-element AbstractSystemLibrary shape (fn, lib_ref, lib_id, lib_name) AND
+// the lib_name string is in the runtime's native-link table (populated via
+// jl_add_native_link_lib). Eligibility implies the stub for this Spec should
+// be replaced with a direct external reference at link time so the system
+// linker resolves it via DT_NEEDED rather than the lazy-resolve trampoline.
+static bool is_native_linked_spec(const jl_ccall_spec_t &Spec)
+{
+    if (Spec.func == nullptr || Spec.target == nullptr)
+        return false;
+    if (!jl_is_svec(Spec.target))
+        return false;
+    jl_svec_t *svec = (jl_svec_t*)Spec.target;
+    if (jl_svec_len(svec) != 4)
+        return false;
+    jl_value_t *friendly_name_val = jl_svecref(svec, 3);
+    if (!jl_is_string(friendly_name_val))
+        return false;
+    return jl_is_native_link_lib(jl_string_data(friendly_name_val)) != 0;
+}
+
+// For each cglobal spec that matches the native-link policy:
+//   (1) change the per-(lib,sym) cache slot's initializer to point at a
+//       direct external symbol so the diamond's first atomic load returns
+//       non-null and the cold csymbol_lookup branch is unreachable at
+//       runtime;
+//   (2) replace each cold-path csymbol_lookup call's `data_gv` argument
+//       with `null` and erase `data_gv` from the module, so the per-site
+//       `_jl_csymbol_data_*` global doesn't appear in the final binary.
+// The diamond IR is left untouched (the cold call stays in the binary with
+// a NULL argument — unreachable at runtime by virtue of the initializer
+// change). This shape works regardless of whether the LLVM optimizer runs
+// after this pass or before it: setting the initializer is a runtime fact,
+// and erasing data_gv is a structural change we make ourselves.
+static void aot_rewrite_cglobals_for_native_link(jl_codegen_output_t &out)
+{
+    if (out.cglobal_targets.empty())
+        return;
+    auto &M = out.get_module();
+    PointerType *PtrTy = PointerType::getUnqual(M.getContext());
+    for (auto &[Spec, Entry] : out.cglobal_targets) {
+        if (!is_native_linked_spec(Spec))
+            continue;
+        // Emit / reuse an external opaque global declaration for the symbol.
+        auto Decl = M.getOrInsertGlobal(Spec.func, PtrTy, [&]() {
+            return new GlobalVariable(M, PtrTy, /*isConstant=*/false,
+                                      GlobalValue::ExternalLinkage,
+                                      /*Initializer=*/nullptr, Spec.func);
+        });
+        Constant *ExtAddr = cast<Constant>(Decl);
+        // (1) Slot initializer: makes the runtime fast path always hit.
+        Entry.slot->setInitializer(ExtAddr);
+        // (2) Walk data_gv's current uses (resilient across optimizer
+        // transforms — instruction pointers don't survive, GVs do), null
+        // out any operand that points at it, then erase the GV from the
+        // module. After this the (per-spec, deduplicated)
+        // `_jl_csymbol_data_*` is gone from the binary; the cold calls
+        // remain as unreachable IR (their arguments are now null).
+        GlobalVariable *DataGV = Entry.data_gv;
+        if (DataGV == nullptr)
+            continue;
+        Constant *Null = ConstantPointerNull::get(PtrTy);
+        SmallVector<User*, 4> Users(DataGV->users());
+        for (User *U : Users) {
+            for (Use &Op : U->operands()) {
+                if (Op.get() == DataGV)
+                    Op.set(Null);
+            }
+        }
+        if (DataGV->use_empty())
+            DataGV->eraseFromParent();
+    }
+}
+
 static void aot_emit_ccall_stubs(jl_codegen_output_t &out)
 {
     if (out.ccall_targets.empty())
@@ -851,6 +1121,24 @@ static void aot_emit_ccall_stubs(jl_codegen_output_t &out)
 
     size_t id = 0;
     for (auto &[Spec, StubFn] : out.ccall_targets) {
+        // Native-link bypass: when the spec's friendly_name is in the
+        // user-supplied native-link set, replace all uses of the placeholder
+        // StubFn with a direct external symbol declaration named after
+        // Spec.func. The system linker (via -l<lib> at final link) binds it.
+        // Skip the lazy stub / trampoline / data emission entirely for this
+        // entry; the IR was identical to the JIT case up to this point.
+        if (is_native_linked_spec(Spec)) {
+            FunctionType *FT = StubFn->getFunctionType();
+            auto Decl = M.getOrInsertFunction(Spec.func, FT);
+            Function *ExtFn = cast<Function>(Decl.getCallee());
+            ExtFn->setLinkage(GlobalValue::ExternalLinkage);
+            if (StubFn != ExtFn) {
+                StubFn->replaceAllUsesWith(ExtFn);
+                StubFn->eraseFromParent();
+            }
+            continue;
+        }
+
         std::string base = "$ccall$" + std::to_string(id++);
 
         // String for func name (NULL for dynamic-name specs; the resolver
@@ -1057,7 +1345,19 @@ static void jl_emit_native_to_output(jl_native_code_desc_t *data, jl_array_t *co
     // Mirrors the JIT-side CSymbolStubManager but produces IR + inline asm so
     // the AOT-compiled artifact is self-contained except for the
     // `ccall_reentry_trampoline` external (resolved against libjulia).
+    // Optional foreign-deps JSON manifest dump. Runs before stub emission so
+    // the maps still describe the full unrewritten set. The native_linked
+    // flag in the JSON reflects the policy decision that aot_emit_ccall_stubs
+    // and aot_rewrite_cglobals_for_native_link are about to act on.
+    if (const char *foreign_deps_path = jl_get_foreign_deps_export_path()) {
+        aot_export_foreign_deps(out, foreign_deps_path);
+    }
     aot_emit_ccall_stubs(out);
+    // Same native-link policy as ccall stubs: rewrite cglobal lookup sites
+    // whose `friendly_name` is in the runtime's native-link table to point
+    // at a directly linked external symbol. Must run after stubs (the policy
+    // check uses the same `is_native_linked_spec`) but is independent.
+    aot_rewrite_cglobals_for_native_link(out);
     // including generating cfunction thunks
     generate_cfunc_thunks(out);
     aot_optimize_roots(out, method_roots);

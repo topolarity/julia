@@ -19,7 +19,66 @@
 #include "support/strhash.h"
 
 // --- library symbol lookup ---
+jl_value_t *jl_libdl_dlid_func JL_GLOBALLY_ROOTED;
+jl_value_t *jl_libdl_dlname_func JL_GLOBALLY_ROOTED;
 jl_value_t *jl_libdl_dlopen_func JL_GLOBALLY_ROOTED;
+jl_value_t *jl_abstractsystemlibrary_type JL_GLOBALLY_ROOTED; // TODO: move to be handled like other types
+                                                              //       (maybe just move to Core)
+
+// Native-link policy table — process-local set of friendly_names that
+// aot_emit_ccall_stubs should bind via external symbols rather than lazy
+// stubs. Populated by `jl_add_native_link_lib`; queried by
+// `jl_is_native_link_lib`. Not serialized into the sysimage.
+static htable_t link_native_libs;
+static jl_mutex_t link_native_libs_lock;
+static int link_native_libs_initialized = 0;
+
+static void link_native_libs_ensure_init(void) JL_NOTSAFEPOINT
+{
+    if (!link_native_libs_initialized) {
+        strhash_new(&link_native_libs, 8);
+        link_native_libs_initialized = 1;
+    }
+}
+
+JL_DLLEXPORT void jl_add_native_link_lib(const char *name) JL_NOTSAFEPOINT
+{
+    if (name == NULL)
+        return;
+    JL_LOCK_NOGC(&link_native_libs_lock);
+    link_native_libs_ensure_init();
+    // strhash_put internalizes the key; duplicate inserts are harmless.
+    // Value must be != HT_NOTFOUND (which is (void*)1); use the key itself.
+    strhash_put(&link_native_libs, (void *)name, (void *)name);
+    JL_UNLOCK_NOGC(&link_native_libs_lock);
+}
+
+JL_DLLEXPORT int jl_is_native_link_lib(const char *name) JL_NOTSAFEPOINT
+{
+    if (name == NULL)
+        return 0;
+    JL_LOCK_NOGC(&link_native_libs_lock);
+    int hit = link_native_libs_initialized &&
+              strhash_has(&link_native_libs, (void *)name);
+    JL_UNLOCK_NOGC(&link_native_libs_lock);
+    return hit;
+}
+
+// Foreign-deps JSON export — process-local sticky path. Read by the AOT
+// codegen pipeline (aot_export_foreign_deps in aotcompile.cpp).
+static char *foreign_deps_export_path = NULL;
+
+JL_DLLEXPORT void jl_set_foreign_deps_export_path(const char *path) JL_NOTSAFEPOINT
+{
+    if (foreign_deps_export_path)
+        free(foreign_deps_export_path);
+    foreign_deps_export_path = (path && path[0]) ? strdup(path) : NULL;
+}
+
+JL_DLLEXPORT const char *jl_get_foreign_deps_export_path(void) JL_NOTSAFEPOINT
+{
+    return foreign_deps_export_path;
+}
 
 // map from user-specified lib names to handles
 static htable_t libMap;

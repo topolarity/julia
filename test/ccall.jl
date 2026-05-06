@@ -2174,3 +2174,78 @@ const sym = :ZSTD_versionString
 get_zstd_version() = prefix * unsafe_string(ccall((sym, libzstd), Cstring, ()))
 @test startswith(get_zstd_version(), "Zstd")
 end
+
+# Test AbstractSystemLibrary and dlid resolution effects
+module TestAbstractSystemLibrary
+using Test, Libdl
+
+# AbstractSystemLibrary type hierarchy
+@test LazyLibrary <: AbstractSystemLibrary
+@test isabstracttype(AbstractSystemLibrary)
+
+# Custom AbstractSystemLibrary subtype with dlid
+struct MyLib <: AbstractSystemLibrary
+    id::String
+end
+Libdl.dlid(lib::MyLib) = Base.UUID(UInt128(hash(lib.id)))
+Libdl.dlname(lib::MyLib) = lib.id
+
+const mylib = MyLib("libtest")
+
+# dlid resolution effect attaches library ID as 3rd tuple element
+function uses_mylib()
+    ccall((:my_symbol, mylib), Cint, ())
+end
+let ci = only(code_lowered(uses_mylib))
+    fptr = ci.code[1].args[1]
+    @test fptr.head === :tuple
+    @test length(fptr.args) == 4
+    @test fptr.args[1] == QuoteNode(:my_symbol)
+    @test fptr.args[2] == GlobalRef(@__MODULE__, :mylib)
+    @test fptr.args[3] == Base.UUID(UInt128(hash("libtest")))
+    @test fptr.args[4] == "libtest"
+end
+
+# dlid returning nothing does not expand the tuple
+struct NoIdLib <: AbstractSystemLibrary end
+Libdl.dlid(::NoIdLib) = nothing
+Libdl.dlname(::NoIdLib) = nothing
+
+const noidlib = NoIdLib()
+function uses_noidlib()
+    ccall((:my_symbol, noidlib), Cint, ())
+end
+let ci = only(code_lowered(uses_noidlib))
+    fptr = ci.code[1].args[1]
+    @test fptr.head === :tuple
+    @test length(fptr.args) == 2
+end
+
+# Old-style string library produces 2-element tuple (backward compat)
+function uses_string_lib()
+    ccall((:foo, "libbar"), Cint, ())
+end
+let ci = only(code_lowered(uses_string_lib))
+    fptr = ci.code[1].args[1]
+    @test fptr.head === :tuple
+    @test length(fptr.args) == 2
+end
+
+# LazyLibrary with plain string path has dlid returning nothing
+@test dlname(LazyLibrary("libfoo")) === nothing
+
+# Identity-drift detection: subtypes of AbstractSystemLibrary promise stable
+# dlid()/dlname(); the resolver enforces this at first-call time via jl_egal.
+mutable struct DriftLib <: AbstractSystemLibrary
+    n::Ref{Int}
+end
+Libdl.dlid(lib::DriftLib) = Base.UUID(UInt128(lib.n[]))
+Libdl.dlname(lib::DriftLib) = string("libdrift_", lib.n[])
+
+const driftlib = DriftLib(Ref(1))
+drift_call() = ccall((:not_used, driftlib), Cint, ())
+# Mutate id/name AFTER method definition; first call must throw.
+driftlib.n[] = 2
+@test_throws ErrorException drift_call()
+
+end # module TestAbstractSystemLibrary

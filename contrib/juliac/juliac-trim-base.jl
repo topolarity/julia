@@ -9,6 +9,7 @@ end
 (f::Base.RedirectStdStream)(io::Core.CoreSTDOUT) = Base._redirect_io_global(io, f.unix_fd)
 
 @eval Base begin
+    show(io::IO, ::Colon) = print(io, "Colon()")
     depwarn(msg, funcsym; force::Bool=false) = nothing
     _assert_tostring(msg) = ""
     reinit_stdio() = nothing
@@ -78,14 +79,48 @@ end
             print(io, T.var.name)
         end
     end
-    # these functions are not `--trim`-compatible if it resolves to a Varargs{...} specialization
+    show_type_name(io::IO, tn::Core.TypeName) = print(io, tn.name)
+    # this function is not `--trim`-compatible if it resolves to a Varargs{...} specialization
     # and since it only has 1-argument methods this happens too often by default (just 2-3 args)
-    setfield!(typeof(throw_boundserror).name, :max_args, Int32(5), :monotonic)
-    setfield!(typeof(throw_eachindex_mismatch_indices).name, :max_args, Int32(5), :monotonic)
-    setfield!(typeof(_throw_boundserror_indices).name, :max_args, Int32(5), :monotonic)
-    setfield!(typeof(print).name, :max_args, Int32(10), :monotonic)
-    setfield!(typeof(println).name, :max_args, Int32(10), :monotonic)
-    setfield!(typeof(print_to_string).name, :max_args, Int32(10), :monotonic)
+    mapreduce(f::F, op::F2, A::AbstractArrayOrBroadcasted; dims=:, init=_InitialValue()) where {F, F2} =
+    _mapreduce_dim(f, op, init, A, dims)
+    mapreduce(f::F, op::F2, A::AbstractArrayOrBroadcasted...; kw...) where {F, F2} =
+        reduce(op, map(f, A...); kw...)
+
+    _mapreduce_dim(f::F, op::F2, nt, A::AbstractArrayOrBroadcasted, ::Colon) where {F, F2} =
+        mapfoldl_impl(f, op, nt, A)
+
+    _mapreduce_dim(f::F, op::F2, ::_InitialValue, A::AbstractArrayOrBroadcasted, ::Colon) where {F, F2} =
+        _mapreduce(f, op, IndexStyle(A), A)
+
+    _mapreduce_dim(f::F, op::F2, nt, A::AbstractArrayOrBroadcasted, dims) where {F, F2} =
+        mapreducedim!(f, op, reducedim_initarray(A, dims, nt), A)
+
+    _mapreduce_dim(f::F, op::F2, ::_InitialValue, A::AbstractArrayOrBroadcasted, dims) where {F,F2} =
+        mapreducedim!(f, op, reducedim_init(f, op, A, dims), A)
+
+    mapreduce_empty_iter(f::F, op::F2, itr, ItrEltype) where {F, F2} =
+        reduce_empty_iter(MappingRF(f, op), itr, ItrEltype)
+        mapreduce_first(f::F, op::F2, x) where {F,F2} = reduce_first(op, f(x))
+
+    _mapreduce(f::F, op::F2, A::AbstractArrayOrBroadcasted) where {F,F2} = _mapreduce(f, op, IndexStyle(A), A)
+    mapreduce_empty(::typeof(identity), op::F, T) where {F} = reduce_empty(op, T)
+    mapreduce_empty(::typeof(abs), op::F, T) where {F}     = abs(reduce_empty(op, T))
+    mapreduce_empty(::typeof(abs2), op::F, T) where {F}    = abs2(reduce_empty(op, T))
+
+    # @noinline in front of function makes the setfield! not work properly
+    function throw_eachindex_mismatch_indices(::IndexLinear, inds...)
+        @noinline 
+        throw(DimensionMismatch("all inputs to eachindex must have the same indices"))
+    end
+    function throw_eachindex_mismatch_indices(::IndexCartesian, inds...)
+        @noinline
+        throw(DimensionMismatch("all inputs to eachindex must have the same axes"))
+    end
+    setfield!(typeof(Base.throw_eachindex_mismatch_indices).name, :max_args, Int32(5), :monotonic)
+    setfield!(typeof(Base.print).name, :max_args, Int32(10), :monotonic)
+    setfield!(typeof(Base.println).name, :max_args, Int32(10), :monotonic)
+    setfield!(typeof(Base.print_to_string).name, :max_args, Int32(10), :monotonic)
 
     # not `--trim`-compatible if these resolve to a Varargs{...} specialization, primarily
     # due to `Core._apply_iterate` having no dispatch-resolved form (#57830)
@@ -148,6 +183,30 @@ end
                 rethrow()
             end
         end
+    end
+end
+@eval Base.Sort begin
+    issorted(itr;
+        lt::T=isless, by::F=identity, rev::Union{Bool,Nothing}=nothing, order::Ordering=Forward) where {T,F} =
+        issorted(itr, ord(lt,by,rev,order))
+end
+@eval Base.TOML begin
+    function try_return_datetime(p, year, month, day, h, m, s, ms)
+        return DateTime(year, month, day, h, m, s, ms)
+    end
+    function try_return_date(p, year, month, day)
+        return Date(year, month, day)
+    end
+    function parse_local_time(l::Parser)
+        h = @try parse_int(l, false)
+        h in 0:23 || return ParserError(ErrParsingDateTime)
+        _, m, s, ms = @try _parse_local_time(l, true)
+        # TODO: Could potentially parse greater accuracy for the
+        # fractional seconds here.
+        return try_return_time(l, h, m, s, ms)
+    end
+    function try_return_time(p, h, m, s, ms)
+        return Time(h, m, s, ms)
     end
 end
 

@@ -19,6 +19,8 @@ file = nothing
 add_ccallables = false
 relative_rpath = false
 verbose = false
+link_native_libs = String[]  # --link-native=libzstd,libssl,...
+foreign_deps_export = nothing  # --export-foreign-deps=path.json
 
 help = findfirst(x->x == "--help", ARGS)
 if help !== nothing
@@ -29,6 +31,8 @@ if help !== nothing
         --export-abi <file>  Emit type / function information for the ABI (in JSON format)
         --compile-ccallable  Include all methods marked `@ccallable` in output
         --relative-rpath     Configure the library / executable to lookup all required libraries in an adjacent "julia/" folder
+        --link-native=<comma-separated friendly_names>  Bind ccalls to these libraries via direct external symbols at link time instead of the lazy stub. Names are AbstractSystemLibrary `dlname()` values (e.g. `libzstd` for Zstd_jll).
+        --export-foreign-deps=<path>  Write a JSON manifest of every ccall/cglobal usage site to <path>. Includes both native-linked and lazy-stub sites; unknown libs/symbols are flagged with sentinel values.
         --verbose            Request verbose output
         """)
     exit(0)
@@ -114,6 +118,12 @@ let i = 1
             push!(julia_args, arg) # forwarded arg
         elseif arg == "--experimental"
             push!(julia_args, arg) # forwarded arg
+        elseif startswith(arg, "--link-native=")
+            for name in split(arg[length("--link-native=")+1:end], ',', keepempty=false)
+                push!(link_native_libs, String(name))
+            end
+        elseif startswith(arg, "--export-foreign-deps=")
+            global foreign_deps_export = arg[length("--export-foreign-deps=")+1:end]
         elseif startswith(arg, "--proj")
             global project = arg
         else
@@ -181,7 +191,18 @@ function compile_products(enable_trim::Bool)
     if abi_export_file !== nothing
         push!(args, abi_export_file)
     end
-    cmd = addenv(`$julia_cmd_target $project --output-o $img_path --output-incremental=no $strip_args $julia_args $(joinpath(@__DIR__,"juliac-buildscript.jl")) $(args)`, "OPENBLAS_NUM_THREADS" => 1, "JULIA_NUM_THREADS" => 1)
+    env = Pair{String,String}["OPENBLAS_NUM_THREADS" => "1", "JULIA_NUM_THREADS" => "1"]
+    if !isempty(link_native_libs)
+        # Buildscript reads this and registers each name with the runtime
+        # native-link table before AOT codegen runs.
+        push!(env, "JULIAC_LINK_NATIVE_LIBS" => join(link_native_libs, ','))
+    end
+    if foreign_deps_export !== nothing
+        # Buildscript reads this and forwards to the runtime; the AOT
+        # pipeline writes the JSON manifest to this path.
+        push!(env, "JULIAC_FOREIGN_DEPS_EXPORT" => abspath(foreign_deps_export))
+    end
+    cmd = addenv(`$julia_cmd_target $project --output-o $img_path --output-incremental=no $strip_args $julia_args $(joinpath(@__DIR__,"juliac-buildscript.jl")) $(args)`, env...)
     verbose && println("Running: $cmd")
     if !success(pipeline(cmd; stdout, stderr))
         println(stderr, "\nFailed to compile $file")
@@ -200,13 +221,28 @@ function link_products()
     end
 
     julia_libs = Base.shell_split(Base.isdebugbuild() ? "-ljulia-debug -ljulia-internal-debug" : "-ljulia -ljulia-internal")
+    # Map each `--link-native=<friendly_name>` to a linker arg. Two shapes:
+    #   - SONAME-style names containing `.so` or `.a` (e.g. `libopenblas64_.so`,
+    #     produced by `Libdl.LazyLibrary`'s default `dlname`) → `-l:<name>`,
+    #     which tells GNU ld to match the filename exactly.
+    #   - Bare product names (e.g. `libbzip2`, produced by `JLLWrappers.JLLLibrary`)
+    #     → `-l<name without leading "lib">`, the standard ld convention.
+    # -L paths are the user's responsibility (handled later in the build system).
+    native_link_args = String[]
+    for name in link_native_libs
+        if occursin(".so", name) || endswith(name, ".a")
+            push!(native_link_args, "-l:" * name)
+        else
+            push!(native_link_args, startswith(name, "lib") ? "-l" * name[4:end] : "-l" * name)
+        end
+    end
     try
         if output_type == "--output-lib"
-            cmd2 = `$(cc) $(allflags) $(rpath) -o $outname -shared $(Base.Linking.whole_archive(img_path; is_cc=true)) $(julia_libs)`
+            cmd2 = `$(cc) $(allflags) $(rpath) -o $outname -shared $(Base.Linking.whole_archive(img_path; is_cc=true)) $(julia_libs) $(native_link_args)`
         elseif output_type == "--output-sysimage"
-            cmd2 = `$(cc) $(allflags) $(rpath) -o $outname -shared $(Base.Linking.whole_archive(img_path; is_cc=true)) $(julia_libs)`
+            cmd2 = `$(cc) $(allflags) $(rpath) -o $outname -shared $(Base.Linking.whole_archive(img_path; is_cc=true)) $(julia_libs) $(native_link_args)`
         else
-            cmd2 = `$(cc) $(allflags) $(rpath) -o $outname $(Base.Linking.whole_archive(img_path; is_cc=true)) $(julia_libs)`
+            cmd2 = `$(cc) $(allflags) $(rpath) -o $outname $(Base.Linking.whole_archive(img_path; is_cc=true)) $(julia_libs) $(native_link_args)`
         end
         verbose && println("Running: $cmd2")
         run(cmd2)

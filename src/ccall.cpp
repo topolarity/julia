@@ -54,12 +54,15 @@ GlobalVariable *jl_emit_RTLD_DEFAULT_var(Module *M)
     return prepare_global_in(M, jlRTLD_DEFAULT_var);
 }
 
+// TODO: review & rewrite
+
 typedef struct {
     jl_value_t *gcroot[3];     // GC roots: [f_name_val, f_lib_val, target_svec]
 
     // Static name resolution (compile-time known)
     const char *f_name;        // static function name
     const char *f_lib;         // static library name
+    const char *f_lib_id;      // library identifier from dlid() (for AOT linking)
 
     // Dynamic name resolution (simple runtime expressions)
     jl_value_t *f_name_expr;   // expression for function name
@@ -99,10 +102,14 @@ static jl_value_t *unwrap_quoted(jl_value_t *v)
 // generated native code (and across pkgimage relocation, where the slot's
 // contents are fixed up to the resolved address again).
 //
-// Assumes `arg` is the post-#59165 normalized form: a 1- or 2-element
+// Assumes `arg` is the post-#59165 normalized form: a 1-, 2-, or 4-element
 // `Expr(:tuple, ...)` whose elements are GlobalRef / QuoteNode / Symbol /
-// String. This is the canonical shape both ccall (#59165) and cglobal
-// (#59165's cglobal extension) deliver to codegen.
+// String / Base.UUID. The 1- and 2-element forms are the canonical shape
+// both ccall (#59165) and cglobal (#59165's cglobal extension) deliver to
+// codegen. The 4-element form `(fn, lib_ref, lib_id, lib_name)` is produced
+// by definition-time AbstractSystemLibrary expansion in resolve_definition_effects;
+// the resolver uses lib_id/lib_name to verify the lib_ref's identity hasn't
+// drifted at first-call time.
 static jl_value_t *build_target_svec(const native_sym_arg_t &symarg, jl_value_t *arg)
 {
     bool dynamic_func = (symarg.f_name == nullptr);
@@ -121,6 +128,13 @@ static jl_value_t *build_target_svec(const native_sym_arg_t &symarg, jl_value_t 
     else if (nargs == 2) {
         svec = (jl_value_t*)jl_svec2(unwrap_quoted(jl_exprarg(e, 0)),
                                      unwrap_quoted(jl_exprarg(e, 1)));
+    }
+    else if (nargs == 4) {
+        svec = (jl_value_t*)jl_svec(4,
+            unwrap_quoted(jl_exprarg(e, 0)),
+            unwrap_quoted(jl_exprarg(e, 1)),
+            unwrap_quoted(jl_exprarg(e, 2)),
+            unwrap_quoted(jl_exprarg(e, 3)));
     }
     if (svec == nullptr)
         return nullptr;
@@ -323,6 +337,10 @@ static Value *runtime_sym_lookup(
 // `ptr_slot` points at the existing per-(lib, sym) cache `llvmgv` from
 // `runtime_sym_gvs`, so multiple use sites for the same symbol share the
 // resolved-pointer cache without any additional plumbing.
+//
+// Per-spec deduplication of the data_gv itself happens in the caller
+// (emit_csymbol_lazy_lookup) via `cglobal_targets`, so this routine just
+// builds a fresh data_gv every time it's invoked.
 static Constant *build_csymbol_data_global(jl_codegen_output_t &emission_context,
                                            const native_sym_arg_t &symarg,
                                            GlobalVariable *llvmgv)
@@ -437,8 +455,25 @@ static Value *emit_csymbol_lazy_lookup(jl_codectx_t &ctx,
 
     f->insert(f->end(), resolve_bb);
     ctx.builder.SetInsertPoint(resolve_bb);
-    Constant *data_gv = build_csymbol_data_global(ctx.emission_context, symarg,
-                                                   llvmgv);
+    // Look up (or create + record) the per-spec csymbol_data_t global.
+    // Multiple cglobal sites with the same spec share one data_gv (along
+    // with the per-(lib, sym) cache slot from runtime_sym_gvs), so the
+    // map ends up with a single entry per spec and the AOT link pass has
+    // exactly one GV to walk uses on.
+    jl_ccall_spec_t spec = {symarg.f_name, (void*)symarg.f_lib, symarg.target};
+    auto &entry = ctx.emission_context.cglobal_targets[spec];
+    entry.slot = llvmgv;
+    Constant *data_gv;
+    if (entry.data_gv) {
+        data_gv = entry.data_gv;
+    }
+    else {
+        Constant *built = build_csymbol_data_global(ctx.emission_context, symarg,
+                                                    llvmgv);
+        if (auto *DataGV = dyn_cast<GlobalVariable>(built))
+            entry.data_gv = DataGV;
+        data_gv = built;
+    }
     auto resolverFn = prepare_call(jl_csymbol_lookup_func);
     CallInst *resolved = ctx.builder.CreateCall(resolverFn, {data_gv});
     resolved->addFnAttr(Attribute::Cold);
@@ -506,6 +541,8 @@ static GlobalVariable *emit_plt_thunk(
         else
             got->addAttribute("julia.libidx", std::to_string((uintptr_t) symarg.f_lib));
         got->addAttribute("julia.fname", symarg.f_name);
+        if (symarg.f_lib_id)
+            got->addAttribute("julia.libid", symarg.f_lib_id);
     }
     BasicBlock *b0 = BasicBlock::Create(M->getContext(), "top", plt);
     IRBuilder<> irbuilder(b0);
@@ -827,6 +864,7 @@ static void interpret_foreignsymbol(jl_codectx_t &ctx, native_sym_arg_t &out, jl
     // Initialize all fields to safe defaults
     out.f_name = nullptr;
     out.f_lib = nullptr;
+    out.f_lib_id = nullptr;
     out.f_name_expr = nullptr;
     out.f_lib_expr = nullptr;
     out.target = nullptr;
@@ -885,6 +923,30 @@ static void interpret_foreignsymbol(jl_codectx_t &ctx, native_sym_arg_t &out, jl
                 }
                 else if (jl_is_string(lib_val)) {
                     out.f_lib = jl_string_data(lib_val);
+                }
+            }
+        }
+        else if (nargs == 4) {
+            // AbstractSystemLibrary form: (func_name, lib_ref, lib_id, lib_name).
+            // The fname/lib_ref pair is set up identically to the nargs==2 case
+            // (the lib is inherently dynamic — a LazyLibrary instance — so f_lib
+            // stays NULL and we go through the lib_dyn path at runtime). The
+            // lib_id and lib_name elements are propagated only via the target
+            // svec so the resolver can verify the lib_obj's identity at first-call
+            // time; they don't participate in the static codegen caches.
+            jl_value_t *fname_arg = jl_array_ptr_ref(tuple_args, 0);
+            jl_value_t *lib_arg = jl_array_ptr_ref(tuple_args, 1);
+            out.f_name_expr = fname_arg;
+            out.f_lib_expr = lib_arg;
+
+            jl_value_t *fname_val = static_eval(ctx, fname_arg);
+            if (fname_val != nullptr) {
+                out.gcroot[0] = fname_val;
+                if (jl_is_symbol(fname_val)) {
+                    out.f_name = jl_symbol_name((jl_sym_t*)fname_val);
+                }
+                else if (jl_is_string(fname_val)) {
+                    out.f_name = jl_string_data(fname_val);
                 }
             }
         }

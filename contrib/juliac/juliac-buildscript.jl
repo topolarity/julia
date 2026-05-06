@@ -20,6 +20,26 @@ if Base.get_bool_env("JULIA_USE_FLISP_PARSER", false) === false
     Base.JuliaSyntax.enable_in_core!()
 end
 
+# Native-link policy: register each comma-separated name with the runtime
+# before any user code (and therefore any ccall lowering) runs. The AOT
+# stub-emission pass (aot_emit_ccall_stubs) consults this table to decide
+# which 4-tuple ccalls to bind via direct external symbols at link time.
+let raw = get(ENV, "JULIAC_LINK_NATIVE_LIBS", "")
+    if !isempty(raw)
+        for name in split(raw, ',', keepempty=false)
+            ccall(:jl_add_native_link_lib, Cvoid, (Cstring,), String(name))
+        end
+    end
+end
+
+# Foreign-deps export path. The AOT pipeline writes a JSON manifest of every
+# ccall/cglobal usage site to this path before stub emission rewrites things.
+let path = get(ENV, "JULIAC_FOREIGN_DEPS_EXPORT", "")
+    if !isempty(path)
+        ccall(:jl_set_foreign_deps_export_path, Cvoid, (Cstring,), path)
+    end
+end
+
 include(joinpath(@__DIR__, "abi_export.jl"))
 
 # Load user code
