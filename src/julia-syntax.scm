@@ -409,13 +409,21 @@
             ;; might be moved to a different scope by closure-convert.
             (temps (map (lambda (x) (make-ssavalue)) names))
             (renames (map cons names temps))
+            ;; For normal method defs we don't know in general whether the
+             ;; user's rett expression is evaluable at method-def time (it
+             ;; may reference an argument value, or call functions that
+             ;; don't accept TypeVars). The lambda body already enforces
+             ;; the user-written rett at call time, so we just store `Any`
+             ;; in the argdata slot here. Interface methods use a real
+             ;; substituted rett — see interface-def-expr-.
             (mdef
              (if (null? sparams)
                  `(method ,ename
                           (call (core svec)
                                 (call (core svec) ,@(dots->vararg types))
                                 (call (core svec))
-                                (inert ,loc))
+                                (inert ,loc)
+                                (core Any))
                           ,body)
                  `(method ,ename
                           (block
@@ -437,7 +445,8 @@
                                                              (replace-vars ty renames))
                                                            types)))
                                  (call (core svec) ,@temps)
-                                 (inert ,loc)))
+                                 (inert ,loc)
+                                 (core Any)))
                           ,body))))
        (if (or (symbol? name) (globalref? name))
            `(block ,@generator (method ,name) (latestworld-if-toplevel) ,mdef (unnecessary ,name))  ;; return the function
@@ -1235,6 +1244,101 @@
               (method-def-expr name sparams argl body rett))))
           (else
            (error (string "invalid assignment location \"" (deparse name) "\""))))))
+
+;; Build an (interface argdata) form. This lowers to a call to jl_method_def
+;; with f == NULL, the runtime sentinel for "interface".
+;; The lowered form re-uses the `interface` head, but is distinguished from
+;; the surface form (which has 2 trailing args: a signature and a line node)
+;; by arity (lowered form has only the argdata as a single trailing arg).
+(define (interface-def-expr- name sparams argl rett loc)
+  (let* ((names  (map car sparams))
+         (anames (llist-vars argl))
+         (unused_anames (filter (lambda (x) (not (eq? x UNUSED))) anames)))
+    (if (has-dups unused_anames)
+        (error (string "interface argument name not unique: \"" (car (has-dups unused_anames)) "\"")))
+    (if (has-dups names)
+        (error (string "interface static parameter name not unique: \"" (car (has-dups names)) "\"")))
+    (if (any (lambda (x) (and (not (eq? x UNUSED)) (memq x names))) anames)
+        (error (string "interface argument and static parameter name not distinct: \""
+                       (car (intersect names unused_anames)) "\"")))
+    (let* ((types   (llist-types argl))
+           (temps   (map (lambda (x) (make-ssavalue)) names))
+           (renames (map cons names temps))
+           (argdata
+            (if (null? sparams)
+                `(call (core svec)
+                       (call (core svec) ,@(dots->vararg types))
+                       (call (core svec))
+                       (inert ,loc)
+                       ,rett)
+                `(block
+                  ,@(let loop ((n       names)
+                               (t       temps)
+                               (sp      (map bounds-to-TypeVar sparams))
+                               (ren     '())
+                               (assigns '()))
+                      (if (null? n)
+                          (reverse! assigns)
+                          (loop (cdr n) (cdr t) (cdr sp)
+                                (cons (cons (car n) (car t)) ren)
+                                (cons (make-assignment (car t) (replace-vars (car sp) ren))
+                                      assigns))))
+                  (call (core svec)
+                        (call (core svec)
+                              ,@(dots->vararg
+                                 (map (lambda (ty) (replace-vars ty renames)) types)))
+                        (call (core svec) ,@temps)
+                        (inert ,loc)
+                        ,(replace-vars rett renames)))))
+           (mdef `(interface ,argdata)))
+      ;; Forward-declare the gf binding so the signature's #self#::Typeof(name) resolves.
+      (if (or (symbol? name) (globalref? name))
+          `(block (method ,name) (latestworld-if-toplevel) ,mdef (unnecessary ,name))
+          `(block ,mdef (null))))))
+
+(define (expand-interface-def e)
+  ;; Two shapes share the head 'interface':
+  ;;   - surface (from the parser): (interface <sig> <loc>) — length 3
+  ;;   - lowered: (interface <argdata>) — length 2 (already produced by us;
+  ;;     pass through after expanding sub-expressions to avoid re-entry).
+  (if (length= e 2)
+      `(interface ,(expand-forms (cadr e)))
+  (let* ((sig0 (cadr e))
+         (loc  (if (length> e 2) (caddr e) '(line 0 none)))
+         (where #f))
+    (if (and (pair? sig0) (eq? (car sig0) 'where))
+        (let ((w (flatten-where-expr sig0)))
+          (set! where (cddr w))
+          (set! sig0 (cadr w))))
+    (let* ((dcl  (and (pair? sig0) (eq? (car sig0) '|::|)))
+           (rett (if dcl (caddr sig0) '(core Any)))
+           (sig  (if dcl (cadr sig0) sig0)))
+      (cond
+       ;; bare `interface foo` => `interface foo(::Any...)::Any`
+       ((symbol-or-interpolate? sig)
+        (let ((name sig))
+          (if (not (valid-name? name))
+              (error (string "invalid interface name \"" name "\"")))
+          (let* ((argl (list `(... (|::| (core Any)))))
+                 (farg `(|::| |#self#| (call (core Typeof) ,name)))
+                 (argl (fix-arglist (cons farg argl))))
+            (expand-forms
+             (interface-def-expr- name '() argl rett loc)))))
+       ;; (call name args...)
+       ((and (pair? sig) (eq? (car sig) 'call))
+        (let* ((raw-typevars (or where '()))
+               (sparams (map analyze-typevar raw-typevars))
+               (callargs (cdr sig))
+               (name    (car callargs))
+               (argl    (cdr callargs))
+               (farg    `(|::| |#self#| (call (core Typeof) ,name)))
+               (argl    (fix-arglist (cons farg argl))))
+          (if (not (or (symbol? name) (globalref? name)))
+              (error (string "invalid interface name \"" (deparse name) "\"")))
+          (expand-forms
+           (interface-def-expr- name sparams argl rett loc))))
+       (else
+        (error "invalid interface declaration")))))))
 
 ;; handle ( )->( ) function expressions. blocks `(a;b=1)` on the left need to be
 ;; converted to argument lists with kwargs.
@@ -2689,6 +2793,7 @@
 (define expand-table
   (table
    'function       expand-function-def
+   'interface      expand-interface-def
    '->             expand-arrow
    'let            expand-let
    'soft-let       (lambda (e) (expand-let e #f))
@@ -5332,6 +5437,20 @@ f(x) = yt(x)
             ((isdefined throw_undef_if_not) (if tail (emit-return tail e) e))
             ((boundscheck) (if tail (emit-return tail e) e))
 
+            ((interface)
+             (if (not (null? (cadr lam)))
+                 (error (string "Global interface declaration" (linenode-string current-loc)
+                                " needs to be placed at the top level, or use \"eval\".")))
+             (let* ((sig (compile (cadr e) break-labels #t #f))
+                    (sig (if (valid-ir-argument? sig)
+                             sig
+                             (let ((l (make-ssavalue)))
+                               (emit `(= ,l ,sig))
+                               l))))
+               (let ((val (make-ssavalue)))
+                 (emit `(= ,val (interface ,sig)))
+                 (if tail (emit-return tail val))
+                 val)))
             ((method)
              (if (not (null? (cadr lam)))
                  (error (string "Global method definition" (linenode-string current-loc)

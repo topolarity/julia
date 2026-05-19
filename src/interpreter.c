@@ -697,6 +697,14 @@ static jl_value_t *eval_body(jl_array_t *stmts, interpreter_state *s, size_t ip,
                     jl_value_t *res = eval_methoddef((jl_expr_t*)stmt, s);
                     s->locals[jl_source_nslots(s->src) + s->ip] = res;
                 }
+                else if (head == jl_interface_sym) {
+                    jl_value_t *atypes = NULL;
+                    JL_GC_PUSH1(&atypes);
+                    atypes = eval_value(jl_exprarg(stmt, 0), s);
+                    jl_method_t *res = jl_method_def((jl_svec_t*)atypes, NULL, NULL, s->module);
+                    s->locals[jl_source_nslots(s->src) + s->ip] = (jl_value_t*)res;
+                    JL_GC_POP();
+                }
                 else if (head == jl_toplevel_sym) {
                     jl_value_t *res = jl_toplevel_eval(s->module, stmt);
                     s->locals[jl_source_nslots(s->src) + s->ip] = res;
