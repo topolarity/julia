@@ -367,6 +367,7 @@ typedef struct _jl_method_t {
 
     jl_value_t *slot_syms; // compacted list of slot names (String)
     jl_value_t *external_mt; // reference to the method table this method is part of, null if part of the internal table
+    jl_value_t *rt; // declared return type for interface methods; NULL for ordinary methods (used as the interface/method discriminator)
     jl_value_t *source;  // original code template (jl_code_info_t, but may be compressed), null for builtins
     jl_debuginfo_t *debuginfo;  // fixed linetable from the source argument, null if not available
     _Atomic(jl_method_instance_t*) unspecialized;  // unspecialized executable method instance, or null
