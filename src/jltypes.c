@@ -3976,7 +3976,7 @@ void jl_init_types(void) JL_GC_DISABLED
     jl_method_type =
         jl_new_datatype(jl_symbol("Method"), core,
                         jl_any_type, jl_emptysvec,
-                        jl_perm_symsvec(33,
+                        jl_perm_symsvec(34,
                             "name",
                             "module",
                             "file",
@@ -3989,6 +3989,7 @@ void jl_init_types(void) JL_GC_DISABLED
                             "speckeyset", // !const
                             "slot_syms",
                             "external_mt",
+                            "rt",
                             "source", // !const
                             "debuginfo", // !const
                             "unspecialized", // !const
@@ -4010,7 +4011,7 @@ void jl_init_types(void) JL_GC_DISABLED
                             "constprop",
                             "max_varargs",
                             "purity"),
-                        jl_svec(33,
+                        jl_svec(34,
                             jl_symbol_type,
                             jl_module_type,
                             jl_symbol_type,
@@ -4020,9 +4021,10 @@ void jl_init_types(void) JL_GC_DISABLED
                             jl_ulong_type,
                             jl_type_type,
                             jl_any_type, // union(jl_simplevector_type, jl_method_instance_type),
-                            jl_genericmemory_type, // union(jl_memory_uint8_type, jl_memory_uint16_type, jl_memory_uint32_type, jl_memory_uint64_type, jl_memory_any_type)
+                            jl_genericmemory_type, // union(jl_memory_uint8_type, jl_memory_uint32_type, jl_memory_uint64_type, jl_memory_any_type)
                             jl_string_type,
                             jl_any_type,
+                            jl_any_type, // rt: declared return type for interface methods (or NULL for ordinary methods)
                             jl_any_type,
                             jl_debuginfo_type,
                             jl_any_type, // jl_method_instance_type
@@ -4048,7 +4050,7 @@ void jl_init_types(void) JL_GC_DISABLED
                         0, 1, 10);
     //const static uint32_t method_constfields[] = { 0b0, 0b0 }; // (1<<0)|(1<<1)|(1<<2)|(1<<3)|(1<<6)|(1<<9)|(1<<10)|(1<<17)|(1<<21)|(1<<22)|(1<<23)|(1<<24)|(1<<25)|(1<<26)|(1<<27)|(1<<28)|(1<<29)|(1<<30);
     //jl_method_type->name->constfields = method_constfields;
-    const static uint32_t method_atomicfields[] = { 0x20000070, 0x0 }; // (1<<4)|(1<<5)|(1<<6)|(1<<29)
+    const static uint32_t method_atomicfields[] = { 0x40000070, 0x0 }; // (1<<4)|(1<<5)|(1<<6)|(1<<30)
     jl_method_type->name->atomicfields = method_atomicfields;
 
     jl_method_instance_type =
@@ -4277,7 +4279,7 @@ void jl_init_types(void) JL_GC_DISABLED
     jl_svecset(jl_methcache_type->types, 2, jl_long_type); // voidpointer
     jl_svecset(jl_methcache_type->types, 3, jl_long_type); // uint32_t plus alignment
     jl_svecset(jl_methtable_type->types, 3, jl_module_type);
-    jl_svecset(jl_method_type->types, 14, jl_method_instance_type);
+    jl_svecset(jl_method_type->types, 15, jl_method_instance_type);
     //jl_svecset(jl_debuginfo_type->types, 0, jl_method_instance_type); // union(jl_method_instance_type, jl_method_type, jl_symbol_type)
     jl_svecset(jl_method_instance_type->types, 4, jl_code_instance_type);
     jl_svecset(jl_code_instance_type->types, 18, jl_voidpointer_type);
