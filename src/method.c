@@ -1067,6 +1067,7 @@ JL_DLLEXPORT jl_method_t *jl_new_method_uninit(jl_module_t *module)
     m->ccallable = NULL;
     m->module = module;
     m->external_mt = NULL;
+    m->rt = NULL;
     m->source = NULL;
     m->debuginfo = NULL;
     jl_atomic_store_relaxed(&m->unspecialized, NULL);
@@ -1270,17 +1271,14 @@ JL_DLLEXPORT jl_method_t* jl_method_def(jl_svec_t *argdata,
                                         jl_module_t *module)
 {
     // argdata is svec(svec(types...), svec(typevars...), functionloc, rett)
+    //   f == NULL signals an interface method declaration: build a Method
+    //   with `rt` populated from `rett` and skip the source/table-insert
+    //   steps (TODO: insert into a parallel interface MethodTable).
+    const int is_interface = (f == NULL);
     jl_svec_t *atypes = (jl_svec_t*)jl_svecref(argdata, 0);
     jl_svec_t *tvars = (jl_svec_t*)jl_svecref(argdata, 1);
     jl_value_t *functionloc = jl_svecref(argdata, 2);
     jl_value_t *rett = jl_svec_len(argdata) >= 4 ? jl_svecref(argdata, 3) : (jl_value_t*)jl_any_type;
-    (void)rett; // currently unused in the normal path
-    if (f == NULL) {
-        // interface method: stub for now.
-        // TODO: register into a parallel interface MethodTable instead.
-        jl_safe_printf("interface method: stub (no parallel table wired yet)\n");
-        return (jl_method_t*)jl_nothing;
-    }
     assert(jl_is_svec(atypes));
     assert(jl_is_svec(tvars));
     size_t nargs = jl_svec_len(atypes);
@@ -1314,7 +1312,7 @@ JL_DLLEXPORT jl_method_t* jl_method_def(jl_svec_t *argdata,
     jl_value_t *dtname = jl_argument_datatypename(jl_kwcall_type && ft == (jl_value_t*)jl_kwcall_type && nargs >= 3 ? jl_svecref(atypes, 2) : ft);
     name = dtname != jl_nothing ? ((jl_typename_t*)dtname)->singletonname : jl_any_type->name->singletonname;
 
-    if (!jl_is_code_info(f)) {
+    if (!is_interface && !jl_is_code_info(f)) {
         // this occurs when there is a closure being added to an out-of-scope function
         // the user should only do this at the toplevel
         // the result is that the closure variables get interpolated directly into the IR
@@ -1334,7 +1332,8 @@ JL_DLLEXPORT jl_method_t* jl_method_def(jl_svec_t *argdata,
         }
         int isvalid = (jl_is_type(elt) || jl_is_typevar(elt) || jl_is_vararg(elt)) && elt != jl_bottom_type;
         if (!isvalid) {
-            jl_sym_t *argname = (jl_sym_t*)jl_array_ptr_ref(f->slotnames, i);
+            jl_sym_t *argname = is_interface ? jl_unused_sym
+                                             : (jl_sym_t*)jl_array_ptr_ref(f->slotnames, i);
             if (argname == jl_unused_sym)
                 jl_exceptionf(jl_argumenterror_type,
                               "invalid type for argument number %d in method definition for %s at %s:%d",
@@ -1385,9 +1384,18 @@ JL_DLLEXPORT jl_method_t* jl_method_def(jl_svec_t *argdata,
     m->nargs = nargs;
     m->file = file;
     m->line = line;
-    jl_method_set_source(m, f);
-
-    jl_method_table_insert(mt, m, NULL);
+    if (is_interface) {
+        // `m->rt != NULL` is the discriminator separating interface methods
+        // from ordinary methods. The TODO is to insert into a parallel
+        // interface MethodTable here so the method is queryable; until then
+        // we just build the Method and return it.
+        m->rt = rett;
+        jl_gc_wb(m, rett);
+    }
+    else {
+        jl_method_set_source(m, f);
+        jl_method_table_insert(mt, m, NULL);
+    }
     if (jl_newmeth_tracer)
         jl_call_tracer(jl_newmeth_tracer, (jl_value_t*)m);
     JL_GC_POP();
