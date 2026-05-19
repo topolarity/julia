@@ -256,6 +256,7 @@ void jl_init_common_symbols(void)
     jl_public_sym = jl_symbol("public");
     jl_assign_sym = jl_symbol("=");
     jl_method_sym = jl_symbol("method");
+    jl_interface_sym = jl_symbol("interface");
     jl_exc_sym = jl_symbol("the_exception");
     jl_enter_sym = jl_symbol("enter");
     jl_leave_sym = jl_symbol("leave");

@@ -2041,6 +2041,7 @@ JL_DLLEXPORT int jl_isabspath(const char *in) JL_NOTSAFEPOINT;
     XX(macrocall_sym) \
     XX(max_methods_sym) \
     XX(meta_sym) \
+    XX(interface_sym) \
     XX(method_sym) \
     XX(module_sym) \
     XX(monotonic_sym) \
