@@ -729,7 +729,7 @@
 ;; symbol tokens that do not simply parse to themselves when appearing alone as
 ;; an element of an argument list
 (define non-standalone-symbol-token?
-  (Set (append operators reserved-words '(.... mutable primitive abstract))))
+  (Set (append operators reserved-words '(.... mutable primitive abstract interface))))
 
 ; parse-eq* is used where commas are special, for example in an argument list
 (define (parse-eq* s)
@@ -1137,7 +1137,7 @@
     (parse-call-with-initial-ex s (parse-unary-prefix s) nxt)))
 
 (define (parse-call-with-initial-ex s ex tok)
-  (if (or (initial-reserved-word? tok) (memq tok '(mutable primitive abstract)))
+  (if (or (initial-reserved-word? tok) (memq tok '(mutable primitive abstract interface)))
       (parse-resword s ex)
       (parse-call-chain s ex #f)))
 
@@ -1522,6 +1522,19 @@
                           (nb   (with-space-sensitive (parse-cond s))))
                      (begin0 (list 'primitive spec nb)
                              (expect-end (take-lineendings s) "primitive type"))))))
+
+       ((interface)
+        ;; `interface` only acts as a keyword when followed by an identifier-like
+        ;; token that can begin a method signature (i.e. cannot be an operand
+        ;; continuation for the identifier `interface`).
+        (let ((loc (line-number-node s))
+              (nxt (peek-token s)))
+          (if (not (and (symbol? nxt)
+                        (not (reserved-word? nxt))
+                        (not (operator? nxt))))
+              (parse-call-chain s word #f)
+              ;; sig is one of: a bare symbol, (call f args...), (|::| sig rett), or (where sig vars...)
+              (list 'interface (parse-def s #t #f) loc))))
 
        ((typegroup)
         ;; Grouped type definitions (mutually recursive)

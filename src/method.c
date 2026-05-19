@@ -1269,10 +1269,18 @@ JL_DLLEXPORT jl_method_t* jl_method_def(jl_svec_t *argdata,
                                         jl_code_info_t *f,
                                         jl_module_t *module)
 {
-    // argdata is svec(svec(types...), svec(typevars...), functionloc)
+    // argdata is svec(svec(types...), svec(typevars...), functionloc, rett)
     jl_svec_t *atypes = (jl_svec_t*)jl_svecref(argdata, 0);
     jl_svec_t *tvars = (jl_svec_t*)jl_svecref(argdata, 1);
     jl_value_t *functionloc = jl_svecref(argdata, 2);
+    jl_value_t *rett = jl_svec_len(argdata) >= 4 ? jl_svecref(argdata, 3) : (jl_value_t*)jl_any_type;
+    (void)rett; // currently unused in the normal path
+    if (f == NULL) {
+        // interface method: stub for now.
+        // TODO: register into a parallel interface MethodTable instead.
+        jl_safe_printf("interface method: stub (no parallel table wired yet)\n");
+        return (jl_method_t*)jl_nothing;
+    }
     assert(jl_is_svec(atypes));
     assert(jl_is_svec(tvars));
     size_t nargs = jl_svec_len(atypes);

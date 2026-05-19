@@ -6928,6 +6928,24 @@ static jl_cgval_t emit_expr(jl_codectx_t &ctx, jl_value_t *expr, ssize_t ssaidx_
             jl_method_type);
         return meth;
     }
+    else if (head == jl_interface_sym) {
+        // (interface argdata) — register an interface method via jl_method_def
+        // with f = NULL (the sentinel for an interface declaration).
+        assert(nargs == 1);
+        Value *argdata = boxed(ctx, emit_expr(ctx, args[0]));
+        Value *mdargs[4] = {
+            /*argdata*/argdata,
+            /*mt*/ConstantPointerNull::get(cast<PointerType>(ctx.types().T_prjlvalue)),
+            /*code*/ConstantPointerNull::get(cast<PointerType>(ctx.types().T_prjlvalue)),
+            /*module*/literal_pointer_val(ctx, (jl_value_t*)ctx.module)
+        };
+        jl_cgval_t meth = mark_julia_type(
+            ctx,
+            ctx.builder.CreateCall(prepare_call(jlmethod_func), ArrayRef<Value*>(mdargs)),
+            true,
+            jl_method_type);
+        return meth;
+    }
     else if (head == jl_new_sym) {
         bool is_promotable = false;
         if (ssaidx_0based >= 0) {

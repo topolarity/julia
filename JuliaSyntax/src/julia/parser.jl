@@ -275,7 +275,8 @@ function peek_initial_reserved_words(ps::ParseState)
         k2 = peek(ps, 2, skip_newlines=false)
         return (k == K"mutable"   && k2 == K"struct") ||
                (k == K"primitive" && k2 == K"type")   ||
-               (k == K"abstract"  && k2 == K"type")
+               (k == K"abstract"  && k2 == K"type")   ||
+               (k == K"interface" && (k2 == K"Identifier" || k2 == K"$" || k2 == K"var"))
     elseif k == K"typegroup" && ps.stream.version < (1, 14)
         # On older versions, typegroup is an identifier. But if followed by
         # a type definition keyword (which would be a syntax error in old
@@ -2089,6 +2090,26 @@ function parse_resword(ps::ParseState)
         bump_closing_token(ps, K"end")
         emit(ps, mark, K"typegroup")
         min_supported_version(v"1.14", ps, mark, "typegroup")
+    elseif word == K"interface"
+        # Interface declarations (single-line, no `end`):
+        # interface foo                       ==> (interface foo)
+        # interface foo(::Any...)             ==> (interface (call foo (... (::-pre Any))))
+        # interface foo(::Any...)::Any        ==> (interface (::-i (call foo (... (::-pre Any))) Any))
+        # interface foo(::T)::Ref{T} where T  ==> (interface (where (::-i (call foo (::-pre T)) (curly Ref T)) T))
+        bump(ps, TRIVIA_FLAG)
+        bump_trivia(ps)
+        parse_unary_prefix(ps)
+        parse_call_chain(ps, mark)
+        if peek(ps) == K"::"
+            bump(ps, TRIVIA_FLAG)
+            parse_call(ps)
+            emit(ps, mark, K"::", INFIX_FLAG)
+        end
+        if peek(ps) == K"where"
+            parse_where_chain(ps, mark)
+        end
+        emit(ps, mark, K"interface")
+        min_supported_version(v"1.14", ps, mark, "interface")
     elseif word == K"try"
         parse_try(ps)
     elseif word == K"return"

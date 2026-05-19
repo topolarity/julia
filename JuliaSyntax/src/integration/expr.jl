@@ -578,6 +578,10 @@ end
             # Add location if not ErrorVal or unwrapped block
             @isexpr(arg2, :block) && pushfirst!(arg2.args, loc)
         end
+    elseif k == K"interface"
+        # interface declarations carry their source location as the last
+        # argument so the flisp lowering can recover it (see expand-interface-def).
+        push!(args, loc)
     elseif k == K"macro"
         if length(args) > 1
             pushfirst!((args[2]::Expr).args, loc)

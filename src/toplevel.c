@@ -397,7 +397,7 @@ static void expr_attributes(jl_value_t *v, jl_array_t *body, int *has_ccall, int
         *has_defs = 1;
         return;
     }
-    else if (jl_is_toplevel_only_expr(v)) {
+    else if (head == jl_interface_sym || jl_is_toplevel_only_expr(v)) {
         *has_defs = 1;
     }
     else if (head == jl_cfunction_sym) {
