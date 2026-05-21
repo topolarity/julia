@@ -3475,6 +3475,10 @@ JL_DLLEXPORT void jl_interface_table_insert(jl_method_t *method)
     jl_typemap_entry_t *newentry = NULL;
     JL_GC_PUSH1(&newentry);
     JL_LOCK(&mt->cache->writelock);
+    // jl_typemap_alloc requires min_world > 0 && max_world > 0; we create
+    // the entry in the "not yet active" state (min > max) and then mark it
+    // active under world_counter_lock by setting min_world to the new world
+    // and max_world to the unbounded sentinel.
     newentry = jl_typemap_alloc((jl_tupletype_t*)method->sig, NULL, jl_emptysvec,
                                 (jl_value_t*)method, ~(size_t)0, 1);
     jl_typemap_insert(&mt->defs, (jl_value_t*)mt, newentry, 0);
@@ -4590,14 +4594,99 @@ STATIC_INLINE jl_value_t *verify_type(jl_value_t *v) JL_NOTSAFEPOINT
     return v;
 }
 
-STATIC_INLINE jl_value_t *_jl_invoke(jl_value_t *F, jl_value_t **args, uint32_t nargs, jl_method_instance_t *mfunc, size_t world,
-   enum internal_compilation_triggers cause) JL_CANSAFEPOINT
+// Throw a ReturnTypeError naming the interface Method whose `rt` (after
+// sparam substitution -> `expected`) the runtime value `got` failed to
+// satisfy. Falls back to TypeError if Core.ReturnTypeError isn't defined
+// yet (early bootstrap).
+static void JL_NORETURN jl_throw_return_type_error(
+    jl_value_t *f, jl_value_t *args_tuple, jl_value_t *expected,
+    jl_value_t *got, jl_method_t *method, size_t world) JL_CANSAFEPOINT
+{
+    if (jl_returntypeerror_type) {
+        jl_value_t *e = jl_new_struct_uninit(jl_returntypeerror_type);
+        struct jl_return_type_error {
+            jl_value_t *f;
+            jl_value_t *args;
+            jl_value_t *expected;
+            jl_value_t *got;
+            jl_value_t *method;
+            size_t world;
+        } *pe = (struct jl_return_type_error*)e,
+           ee = {f, args_tuple, expected, got, (jl_value_t*)method, world};
+        *pe = ee;
+        jl_throw(e);
+    }
+    else {
+        jl_type_error("interface return type", expected, got);
+    }
+    // not reached
+}
+
+// After a dynamic dispatch returns, check the value against every interface
+// method whose signature overlaps the call. Each match contributes its own
+// `rt` (after sparam substitution) as an independent `isa` assertion --
+// interfaces apply cumulatively, with no specificity/interference sorting.
+// On the first failure we throw a ReturnTypeError naming the offending
+// interface method.
+//
+// `tt` may be passed in from the dispatch lookup to avoid rebuilding the
+// call's argtuple; if NULL we build it lazily here. The whole pass is gated
+// on `jl_interface_table->defs` so programs without any interface methods
+// declared so far pay only an atomic load.
+STATIC_INLINE jl_value_t *apply_interface_assertions(
+    jl_value_t *F, jl_value_t **args, uint32_t nargs,
+    jl_tupletype_t *tt, jl_value_t *res, size_t world) JL_CANSAFEPOINT
+{
+    if (jl_atomic_load_relaxed(&jl_interface_table->defs) == jl_nothing)
+        return res;
+
+    jl_value_t *matches = NULL;
+    jl_value_t *rt = NULL;
+    jl_value_t *args_tup = NULL;
+    JL_GC_PUSH5(&res, &tt, &matches, &rt, &args_tup);
+    if (tt == NULL)
+        tt = arg_type_tuple(F, args, nargs);
+
+    size_t min_valid = 0, max_valid = ~(size_t)0;
+    matches = jl_matching_methods(
+        tt, (jl_value_t*)jl_interface_table,
+        /*lim=*/-1, /*include_ambiguous=*/1,
+        world, &min_valid, &max_valid, NULL);
+
+    if (matches != jl_nothing && jl_is_array(matches)) {
+        size_t n = jl_array_nrows((jl_array_t*)matches);
+        for (size_t i = 0; i < n; i++) {
+            jl_method_match_t *mm =
+                (jl_method_match_t*)jl_array_ptr_ref((jl_array_t*)matches, i);
+            jl_method_t *m = mm->method;
+            if (m->rt == NULL)
+                continue;
+            rt = m->rt;
+            // Only walk the type to substitute sparams when the declared rt
+            // actually mentions one (e.g. `Ref{T}`). Concrete rt's like `Int`
+            // skip the instantiation entirely.
+            if (jl_has_free_typevars(rt))
+                rt = jl_instantiate_type_in_env(
+                    rt, (jl_unionall_t*)m->sig, jl_svec_data(mm->sparams));
+            if (!jl_isa(res, rt)) {
+                args_tup = jl_f_tuple(NULL, args, nargs);
+                jl_throw_return_type_error(F, args_tup, rt, res, m, world);
+            }
+        }
+    }
+    JL_GC_POP();
+    return res;
+}
+
+STATIC_INLINE jl_value_t *_jl_invoke(jl_value_t *F, jl_value_t **args, uint32_t nargs,
+                                     jl_method_instance_t *mfunc, jl_tupletype_t *tt, size_t world,
+                                     enum internal_compilation_triggers cause) JL_CANSAFEPOINT
 {
     jl_code_instance_t *codeinst = NULL;
     jl_callptr_t invoke = jl_method_compiled_callptr(mfunc, world, &codeinst);
     if (invoke) {
         jl_value_t *res = invoke(F, args, nargs, codeinst);
-        return verify_type(res);
+        return apply_interface_assertions(F, args, nargs, tt, verify_type(res), world);
     }
     int64_t last_alloc = jl_options.malloc_log ? jl_gc_diff_total_bytes() : 0;
     int last_errno = errno;
@@ -4613,19 +4702,19 @@ STATIC_INLINE jl_value_t *_jl_invoke(jl_value_t *F, jl_value_t **args, uint32_t 
         jl_gc_sync_total_bytes(last_alloc); // discard allocation count from compilation
     invoke = jl_atomic_load_acquire(&codeinst->invoke);
     jl_value_t *res = invoke(F, args, nargs, codeinst);
-    return verify_type(res);
+    return apply_interface_assertions(F, args, nargs, tt, verify_type(res), world);
 }
 
 JL_DLLEXPORT jl_value_t *jl_invoke(jl_value_t *F, jl_value_t **args, uint32_t nargs, jl_method_instance_t *mfunc)
 {
     size_t world = jl_current_task->world_age;
-    return _jl_invoke(F, args, nargs, mfunc, world, TRIGGER_FOREIGN);
+    return _jl_invoke(F, args, nargs, mfunc, NULL, world, TRIGGER_FOREIGN);
 }
 
 jl_value_t *jl_invoke_fromdispatch(jl_value_t *F, jl_value_t **args, uint32_t nargs, jl_method_instance_t *mfunc)
 {
     size_t world = jl_current_task->world_age;
-    return _jl_invoke(F, args, nargs, mfunc, world, TRIGGER_DISPATCH);
+    return _jl_invoke(F, args, nargs, mfunc, NULL, world, TRIGGER_DISPATCH);
 }
 
 // Used by jl_eval_thunk to invoke top-level thunks.  They will be
@@ -4664,7 +4753,7 @@ JL_DLLEXPORT jl_value_t *jl_invoke_oc(jl_value_t *F, jl_value_t **args, uint32_t
     size_t last_age = ct->world_age;
     size_t world = oc->world;
     ct->world_age = world;
-    jl_value_t *ret = _jl_invoke(F, args, nargs, mfunc, world, TRIGGER_NONE);
+    jl_value_t *ret = _jl_invoke(F, args, nargs, mfunc, NULL, world, TRIGGER_NONE);
     ct->world_age = last_age;
     return ret;
 }
@@ -4709,7 +4798,8 @@ void call_cache_stats()
 #endif
 
 STATIC_INLINE jl_method_instance_t *jl_lookup_generic_(jl_value_t *F, jl_value_t **args, uint32_t nargs,
-                                                       uint32_t callsite, size_t world, int for_call) JL_CANSAFEPOINT
+                                                       uint32_t callsite, size_t world, int for_call,
+                                                       jl_tupletype_t **tt_out) JL_CANSAFEPOINT
 {
 #ifdef JL_GF_PROFILE
     ncalls++;
@@ -4842,6 +4932,11 @@ have_entry:
         jl_printf(JL_STDOUT, " at %s:%d\n", jl_symbol_name(mfunc->def.method->file), mfunc->def.method->line);
 #endif
 
+    // Hand the constructed argtuple to the caller so it can be reused for the
+    // interface-assertion pass without rebuilding. On the call-cache fast
+    // path nothing was built, so tt remains NULL.
+    if (tt_out)
+        *tt_out = tt;
     return mfunc;
 }
 
@@ -4850,17 +4945,21 @@ jl_method_instance_t *jl_apply_lookup(jl_value_t **args, size_t nargs, size_t wo
 {
     assert(nargs);
     return jl_lookup_generic_(args[0], &args[1], nargs - 1,
-            jl_int32hash_fast(jl_return_address()), world, 0);
+            jl_int32hash_fast(jl_return_address()), world, 0, NULL);
 }
 
 JL_DLLEXPORT jl_value_t *jl_apply_generic(jl_value_t *F, jl_value_t **args, uint32_t nargs)
 {
     size_t world = jl_current_task->world_age;
+    jl_tupletype_t *tt = NULL;
+    JL_GC_PUSH1(&tt);
     jl_method_instance_t *mfunc = jl_lookup_generic_(F, args, nargs,
                                                      jl_int32hash_fast(jl_return_address()),
-                                                     world, 1);
+                                                     world, 1, &tt);
     JL_GC_PROMISE_ROOTED(mfunc);
-    return _jl_invoke(F, args, nargs, mfunc, world, TRIGGER_DISPATCH);
+    jl_value_t *res = _jl_invoke(F, args, nargs, mfunc, tt, world, TRIGGER_DISPATCH);
+    JL_GC_POP();
+    return res;
 }
 
 // buggy way to lookup a method given a list of arguments
@@ -4950,6 +5049,8 @@ jl_value_t *jl_gf_invoke(jl_value_t *types0, jl_value_t *gf, jl_value_t **args, 
 jl_value_t *jl_gf_invoke_by_method(jl_method_t *method, jl_value_t *gf, jl_value_t **args, size_t nargs)
 {
     jl_method_instance_t *mfunc = NULL;
+    jl_tupletype_t *tt = NULL; // hoisted so it can be reused by the interface-assertion pass
+    JL_GC_PUSH1(&tt);
     jl_typemap_entry_t *tm = NULL;
     jl_typemap_t *invokes = jl_atomic_load_relaxed(&method->invokes);
     if (invokes != jl_nothing)
@@ -4960,8 +5061,7 @@ jl_value_t *jl_gf_invoke_by_method(jl_method_t *method, jl_value_t *gf, jl_value
     else {
         int64_t last_alloc = jl_options.malloc_log ? jl_gc_diff_total_bytes() : 0;
         jl_svec_t *tpenv = jl_emptysvec;
-        jl_tupletype_t *tt = NULL;
-        JL_GC_PUSH2(&tpenv, &tt);
+        JL_GC_PUSH1(&tpenv);
         JL_LOCK(&method->writelock);
         invokes = jl_atomic_load_relaxed(&method->invokes);
         tm = jl_typemap_assoc_exact(invokes, gf, args, nargs, 1, 1);
@@ -4994,7 +5094,9 @@ jl_value_t *jl_gf_invoke_by_method(jl_method_t *method, jl_value_t *gf, jl_value
         }
     }
     size_t world = jl_current_task->world_age;
-    return _jl_invoke(gf, args, nargs - 1, mfunc, world, TRIGGER_INVOKE);
+    jl_value_t *res = _jl_invoke(gf, args, nargs - 1, mfunc, tt, world, TRIGGER_INVOKE);
+    JL_GC_POP();
+    return res;
 }
 
 static jl_sym_t *jl_gf_supertype_name(jl_sym_t *name)

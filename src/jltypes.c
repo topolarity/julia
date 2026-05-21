@@ -4558,6 +4558,7 @@ void post_boot_hooks(void)
     jl_typeerror_type        = (jl_datatype_t*)core("TypeError");
     jl_argumenterror_type    = (jl_datatype_t*)core("ArgumentError");
     jl_methoderror_type      = (jl_datatype_t*)core("MethodError");
+    jl_returntypeerror_type  = (jl_datatype_t*)core("ReturnTypeError");
     jl_loaderror_type        = (jl_datatype_t*)core("LoadError");
     jl_initerror_type        = (jl_datatype_t*)core("InitError");
     jl_missingcodeerror_type = (jl_datatype_t*)core("MissingCodeError");
