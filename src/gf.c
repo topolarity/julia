@@ -3419,6 +3419,40 @@ JL_DLLEXPORT void jl_method_table_insert(jl_methtable_t *mt, jl_method_t *method
     JL_GC_POP();
 }
 
+// Insert an interface Method into `jl_interface_table`. Interface methods are
+// cumulative: multiple definitions with overlapping signatures coexist without
+// ambiguity, do not replace each other, and do not participate in dispatch.
+// As a result this routine is much simpler than jl_method_table_insert: it
+// just adds the entry to the typemap and bumps the world counter, skipping
+// dispatch-cache updates, ambiguity/interference computation, method-overwrite
+// handling, and backedge invalidation.
+JL_DLLEXPORT void jl_interface_table_insert(jl_method_t *method)
+{
+    JL_TIMING(ADD_METHOD, ADD_METHOD);
+    assert(jl_is_method(method));
+    jl_methtable_t *mt = jl_interface_table;
+    assert(jl_is_mtable(mt));
+    jl_timing_show_method(method, JL_TIMING_DEFAULT_BLOCK);
+    jl_typemap_entry_t *newentry = NULL;
+    JL_GC_PUSH1(&newentry);
+    JL_LOCK(&mt->cache->writelock);
+    newentry = jl_typemap_alloc((jl_tupletype_t*)method->sig, NULL, jl_emptysvec,
+                                (jl_value_t*)method, ~(size_t)0, 1);
+    jl_typemap_insert(&mt->defs, (jl_value_t*)mt, newentry, 0);
+    JL_UNLOCK(&mt->cache->writelock);
+
+    JL_LOCK(&world_counter_lock);
+    if (!jl_atomic_load_relaxed(&allow_new_worlds))
+        jl_error("Method changes have been disabled via a call to disable_new_worlds.");
+    size_t world = jl_atomic_load_relaxed(&jl_world_counter) + 1;
+    jl_atomic_store_relaxed(&method->primary_world, world);
+    jl_atomic_store_relaxed(&newentry->min_world, world);
+    jl_atomic_store_relaxed(&newentry->max_world, ~(size_t)0);
+    jl_atomic_store_release(&jl_world_counter, world);
+    JL_UNLOCK(&world_counter_lock);
+    JL_GC_POP();
+}
+
 static void JL_NORETURN jl_method_error_bare(jl_value_t *f, jl_value_t *args, size_t world)
 {
     if (jl_methoderror_type) {
