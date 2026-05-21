@@ -87,6 +87,7 @@
     XX(genericmemoryref_typename, jl_typename_t*) \
     XX(memoryref_uint8_type, jl_value_t*) \
     XX(methoderror_type, jl_datatype_t*) \
+    XX(returntypeerror_type, jl_datatype_t*) \
     XX(method_instance_type, jl_datatype_t*) \
     XX(method_match_type, jl_datatype_t*) \
     XX(method_type, jl_datatype_t*) \
