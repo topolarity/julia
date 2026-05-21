@@ -589,6 +589,11 @@ static NOINLINE void _finish_jl_init_(jl_image_buf_t sysimage, jl_ptls_t ptls, j
     if (sysimage.kind != JL_IMAGE_KIND_NONE) {
         // Load the .ji or .so sysimage
         jl_restore_system_image(&parsed_image, sysimage);
+        // The interface MethodTable is intentionally not serialized via
+        // INSERT_TAG (which trips sysimage construction); re-create it from
+        // scratch every startup so the global is always non-NULL. There are
+        // no persistent interface methods today.
+        jl_interface_table = jl_new_method_table(jl_symbol("interfacetable"), jl_core_module);
     }
     else {
         // No sysimage provided, init a minimal environment

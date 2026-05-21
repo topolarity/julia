@@ -3492,6 +3492,7 @@ void jl_init_types(void) JL_GC_DISABLED
     jl_methcache_type = jl_new_uninitialized_datatype();
     jl_methtable_type = jl_new_uninitialized_datatype();
     jl_method_table = jl_new_method_table(jl_symbol("methodtable"), core);
+    jl_interface_table = jl_new_method_table(jl_symbol("interfacetable"), core);
 
     jl_emptysvec = (jl_svec_t*)jl_gc_permobj(ct->ptls, sizeof(void*), jl_simplevector_type, 0);
     jl_set_typetagof(jl_emptysvec, jl_simplevector_tag, GC_OLD_MARKED);
@@ -3950,6 +3951,9 @@ void jl_init_types(void) JL_GC_DISABLED
     jl_method_table->module = core;
     jl_atomic_store_relaxed(&jl_method_table->cache->leafcache, (jl_genericmemory_t*)jl_an_empty_memory_any);
     jl_method_table->backedges = (jl_genericmemory_t*)jl_an_empty_memory_any;
+    jl_interface_table->module = core;
+    jl_atomic_store_relaxed(&jl_interface_table->cache->leafcache, (jl_genericmemory_t*)jl_an_empty_memory_any);
+    jl_interface_table->backedges = (jl_genericmemory_t*)jl_an_empty_memory_any;
     jl_atomic_store_relaxed(&core->bindingkeyset, (jl_genericmemory_t*)jl_an_empty_memory_any);
     // export own name, so "using Foo" makes "Foo" itself visible
     jl_set_initial_const(core, core->name, (jl_value_t*)core, 1);

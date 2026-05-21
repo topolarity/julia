@@ -1243,6 +1243,12 @@ JL_DLLEXPORT jl_methtable_t *jl_method_table_for(jl_value_t *argtypes JL_PROPAGA
     return jl_method_table;
 }
 
+// accessor for the parallel MethodTable that holds `interface` declarations.
+JL_DLLEXPORT jl_methtable_t *jl_get_interface_table(void) JL_NOTSAFEPOINT
+{
+    return jl_interface_table;
+}
+
 // get a MethodCache for dispatch
 JL_DLLEXPORT jl_methcache_t *jl_method_cache_for(jl_value_t *argtypes JL_PROPAGATES_ROOT) JL_NOTSAFEPOINT
 {
@@ -1375,9 +1381,19 @@ JL_DLLEXPORT jl_method_t* jl_method_def(jl_svec_t *argdata,
         jl_errorf("cannot add methods to builtin function `%s`", jl_symbol_name(name));
 
     m = jl_new_method_uninit(module);
-    if (external_mt)
-        jl_gc_wb_fresh(m, external_mt);
-    m->external_mt = (jl_value_t*)external_mt;
+    if (is_interface) {
+        // Interface methods live in the parallel jl_interface_table. They
+        // carry `external_mt = jl_interface_table` and a non-NULL `rt`
+        // (the declared return type). Both fields distinguish them from
+        // ordinary methods at lookup/reflection time.
+        jl_gc_wb_fresh(m, jl_interface_table);
+        m->external_mt = (jl_value_t*)jl_interface_table;
+    }
+    else {
+        if (external_mt)
+            jl_gc_wb_fresh(m, external_mt);
+        m->external_mt = (jl_value_t*)external_mt;
+    }
     m->sig = argtype;
     m->name = name;
     m->isva = isva;
@@ -1385,12 +1401,9 @@ JL_DLLEXPORT jl_method_t* jl_method_def(jl_svec_t *argdata,
     m->file = file;
     m->line = line;
     if (is_interface) {
-        // `m->rt != NULL` is the discriminator separating interface methods
-        // from ordinary methods. The TODO is to insert into a parallel
-        // interface MethodTable here so the method is queryable; until then
-        // we just build the Method and return it.
         m->rt = rett;
         jl_gc_wb(m, rett);
+        jl_interface_table_insert(m);
     }
     else {
         jl_method_set_source(m, f);
