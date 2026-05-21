@@ -233,7 +233,7 @@ export
     ErrorException, BoundsError, DivideError, DomainError, Exception,
     InterruptException, InexactError, OutOfMemoryError, ReadOnlyMemoryError,
     OverflowError, StackOverflowError, SegmentationFault, UndefRefError, UndefVarError,
-    TypeError, ArgumentError, MethodError, AssertionError, LoadError, InitError,
+    TypeError, ArgumentError, MethodError, ReturnTypeError, AssertionError, LoadError, InitError,
     UndefKeywordError, ConcurrencyViolationError, FieldError,
     # AST representation
     Expr, QuoteNode, LineNumberNode, GlobalRef,
@@ -492,6 +492,22 @@ struct MethodError <: Exception
     MethodError(@nospecialize(f), @nospecialize(args), world::UInt) = new(f, args, world)
 end
 MethodError(@nospecialize(f), @nospecialize(args)) = MethodError(f, args, typemax_UInt)
+
+# Thrown by the dynamic dispatcher when a method's actual return value
+# violates a declared `interface` return-type contract. `method` is the
+# interface Method whose `rt` (after sparam substitution into `expected`)
+# the runtime value `got` failed to satisfy.
+struct ReturnTypeError <: Exception
+    f
+    args
+    expected
+    got
+    method
+    world::UInt
+    ReturnTypeError(@nospecialize(f), @nospecialize(args), @nospecialize(expected),
+                    @nospecialize(got), @nospecialize(method), world::UInt) =
+        new(f, args, expected, got, method, world)
+end
 
 struct AssertionError <: Exception
     msg::AbstractString

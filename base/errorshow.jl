@@ -257,6 +257,67 @@ function show_convert_error(io::IO, ex::MethodError, arg_types_param)
     end
 end
 
+function show_interface_signature(io::IO, m::Method)
+    @nospecialize io
+    sig = m.sig
+    tvars = TypeVar[]
+    while sig isa UnionAll
+        push!(tvars, sig.var)
+        io = IOContext(io, :unionall_env => sig.var)
+        sig = sig.body
+    end
+    sig = sig::DataType
+    params = sig.parameters
+    use_color = get(io, :color, false)::Bool
+    print(io, "interface ")
+    show_signature_function(io, params[1])
+    print(io, "(")
+    for i in 2:length(params)
+        i > 2 && show_separator(io, use_color)
+        p = params[i]
+        if isvarargtype(p)
+            sigstr = (unwrap_unionall(p).parameters[1], "...")
+        else
+            sigstr = (p,)
+        end
+        if use_color
+            print(io, text_colors[:light_black], "::", sigstr..., text_colors[:default])
+        else
+            print(io, "::", sigstr...)
+        end
+    end
+    print(io, ")")
+    if use_color
+        print(io, text_colors[:light_black], "::", m.rt, text_colors[:default])
+    else
+        print(io, "::", m.rt)
+    end
+    show_method_params(io, tvars)
+end
+
+function showerror(io::IO, ex::ReturnTypeError)
+    @nospecialize io
+    m = ex.method::Method
+    f = ex.f
+    arg_types = isa(ex.args, Tuple) ? typesof(ex.args...) : ex.args
+    # Header line, in MethodError style: "f(::T1, ::T2) returned ..."
+    print(io, "ReturnTypeError: ")
+    buf = IOBuffer()
+    iob = IOContext(buf, io)
+    show_signature_function(iob, Core.Typeof(f))
+    show_tuple_as_call(iob, :function, arg_types; hasfirst=false)
+    print(io, String(take!(buf)), " returned a value of type ", typeof(ex.got))
+    print(io, ", not matching its interface contract (expected ", ex.expected, "):\n\n")
+    print(io, "  ")
+    show_interface_signature(io, m)
+    let file = m.file === Symbol("") ? "none" : string(m.file)
+        println(io)
+        print_module_path_file(io, m.module, fixup_stdlib_path(file), Int(m.line);
+                               digit_align_width = 3)
+    end
+    print(io, "\n")
+end
+
 function showerror(io::IO, ex::MethodError)
     @nospecialize io
     # ex.args is a tuple type if it was thrown from `invoke` and is
