@@ -7559,8 +7559,14 @@ std::string emit_abi_converter(jl_codegen_output_t &out, jl_abi_t from_abi, jl_c
     // build a args1 -> args1 converter thunk (to add typeassert on result)
     Module *M = &out.get_module();
     bool needsparams = false;
-    bool target_is_opaque_closure = false;
     jl_method_instance_t *mi = jl_get_ci_mi(codeinst);
+    // The body of an OpaqueClosure-source method was compiled with the
+    // captures-as-OC-pointer ABI: its specsig LLVM signature reserves a single
+    // pointer slot for argv[0] regardless of the formal captures type. Match
+    // that when constructing the target's returninfo, otherwise the call site
+    // here will produce a different LLVM signature than the body actually has.
+    bool target_is_opaque_closure = jl_is_method(mi->def.method) &&
+                                    mi->def.method->is_for_opaque_closure;
     // Unique per emission (like emit_abi_dispatcher / emit_abi_constreturn): each ABIAdapter record
     // gets its own distinct adapter Function, so the fvar table has no duplicates and `fptr_record`
     // stays 1:1 (fvar id -> one record) -- mirroring how each CodeInstance gets its own Function.
