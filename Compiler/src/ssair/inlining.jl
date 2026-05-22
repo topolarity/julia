@@ -339,12 +339,9 @@ function ir_prepare_inlining!(insert_node!::Inserter, inline_target::Union{IRCod
             argexprs = fix_va_argexprs!(insert_node!, inline_target, argexprs, nargs_def, topline)
         end
     end
-    if def.is_for_opaque_closure
-        # Replace the first argument by a load of the capture environment
-        argexprs[1] = insert_node!(
-            NewInstruction(Expr(:call, GlobalRef(Core, :getfield), argexprs[1], QuoteNode(:captures)),
-            ir.argtypes[1], topline))
-    end
+    # OpaqueClosure invocations bind arg 1 to the captures Tuple at the call
+    # site (see `handle_opaque_closure_call!`), so an OC body inlines as a
+    # standard method here -- no OC-specific argument handling.
     return SSASubstitute(mi, argexprs, spvals_ssa, new_inlined_at)
 end
 
@@ -1485,6 +1482,23 @@ function handle_opaque_closure_call!(todo::Vector{Pair{Int,Any}},
         item = semiconcrete_result_item(result, info, flag, state)
     else
         item = analyze_method!(result, info.match, sig.argtypes, info, flag, state; allow_typevars=false)
+    end
+    if isa(item, Union{InliningTodo, InvokeCase})
+        # An OpaqueClosure invocation passes the OC object as arg 1, but the
+        # body expects its captures Tuple there.  Bind it here -- at the call,
+        # keyed on this being an OC *invocation* rather than on the callee being
+        # an unregistered OC method -- so the body is handled like any standard
+        # method, whether it is a synthetic unregistered method or (eventually)
+        # a native one.  The captures type comes from the OC's environment type
+        # at the call (`info.match`), not from the callee.  Both the inlined
+        # (`InliningTodo`) and `:invoke` (`InvokeCase`) cases consume arg 1, so
+        # both are rewritten here and `ir_prepare_inlining!` needs no OC case.
+        line = ir[SSAValue(idx)][:line]
+        captures_ty = info.match.spec_types.parameters[1]
+        captures = insert_node!(ir, idx,
+            NewInstruction(Expr(:call, GlobalRef(Core, :getfield), stmt.args[1], QuoteNode(:captures)),
+                           captures_ty, line))
+        stmt.args[1] = captures
     end
     handle_single_case!(todo, ir, idx, stmt, item)
     return nothing

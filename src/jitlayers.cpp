@@ -273,8 +273,13 @@ StringRef jl_codegen_output_t::get_call_target(jl_code_instance_t *ci, bool spec
     target.private_linkage = always_inline;
     if (specsig) {
         jl_method_instance_t *mi = jl_get_ci_mi(ci);
+        // The only ABI with OC-as-argv[0] today is `jl_opaque_closure_method`'s
+        // wrapper (used by the do-not-compile fallback in `opaque_closure.c`).
+        // OC-source body methods compile with a standard specsig (captures at
+        // argv[0]); the OC ABI is bridged on the call side by the adapter
+        // stored in `oc->invoke` / `oc->specptr`.
         bool is_opaque_closure =
-            jl_is_method(mi->def.value) && mi->def.method->is_for_opaque_closure;
+            jl_is_method(mi->def.value) && mi->def.method == jl_opaque_closure_method;
         jl_returninfo_t info =
             get_specsig_function(*this, &get_module(), nullptr, protoname, get_ci_abi(ci),
                                  ci->rettype, is_opaque_closure);

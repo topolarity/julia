@@ -225,5 +225,7 @@ JL_CALLABLE(jl_f_opaque_closure_call) JL_CANSAFEPOINT
             typ = jl_unwrap_vararg(typ);
         jl_typeassert(args[i], typ);
     }
+    // The adapter installed at `oc->invoke` performs the world-age switch
+    // to `oc->world` (uniform across all adapter flavors).
     return oc->invoke(F, args, nargs);
 }
