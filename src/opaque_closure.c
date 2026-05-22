@@ -70,82 +70,59 @@ static jl_opaque_closure_t *new_opaque_closure(jl_tupletype_t *argt, jl_value_t 
     void *specptr = NULL;
 
     if (ci) {
-        uint8_t specsigflags;
-        jl_callptr_t invoke;
-        jl_read_codeinst_invoke(ci, &specsigflags, &invoke, &specptr, 1);
-        callptr = (jl_fptr_args_t)invoke; // codegen puts the object (or a jl_fptr_interpret_call token )here for us, even though it was the wrong type to put here
-
+        // Compute the OC's declared rettype, tightening or widening from the body
+        // CI's natural rettype as needed to fit within [rt_lb, rt_ub].
         selected_rt = ci->rettype;
-        // If we're not allowed to generate a specsig with this, rt, fall
-        // back to the invoke wrapper. We could instead generate a specsig->specsig
-        // wrapper, but lets leave that for later.
         if (!jl_subtype(rt_lb, selected_rt)) {
-            // TODO: It would be better to try to get a specialization with the
-            // correct rt check here (or we could codegen a wrapper).
-            specptr = NULL; // this will force codegen of the unspecialized version
-            callptr = (jl_fptr_args_t)jl_interpret_opaque_closure;
             jl_value_t *ts[2] = {rt_lb, (jl_value_t*)ci->rettype};
             selected_rt = jl_type_union(ts, 2);
         }
         if (!jl_subtype(ci->rettype, rt_ub)) {
-            // TODO: It would be better to try to get a specialization with the
-            // correct rt check here (or we could codegen a wrapper).
-            specptr = NULL; // this will force codegen of the unspecialized version
-            callptr = (jl_fptr_args_t)jl_interpret_opaque_closure;
             selected_rt = jl_type_intersection(rt_ub, selected_rt);
-        }
-
-        if (callptr == (jl_fptr_args_t)jl_fptr_interpret_call) {
-            callptr = (jl_fptr_args_t)jl_interpret_opaque_closure;
-        }
-        else if (callptr == (jl_fptr_args_t)jl_fptr_args && specptr != NULL) {
-            callptr = (jl_fptr_args_t)specptr;
-        }
-        else if (callptr == (jl_fptr_args_t)jl_fptr_const_return) {
-            callptr = jl_isa(ci->rettype_const, selected_rt) ?
-                (jl_fptr_args_t)jl_fptr_const_opaque_closure :
-                (jl_fptr_args_t)jl_fptr_const_opaque_closure_typeerror;
-            captures = ci->rettype_const;
         }
     }
 
     jl_value_t *oc_type JL_ALWAYS_LEAFTYPE = jl_apply_type2((jl_value_t*)jl_opaque_closure_type, (jl_value_t*)argt, selected_rt);
     JL_GC_PROMISE_ROOTED(oc_type);
 
-    if (specptr == NULL) {
-        if (ci != NULL) {
-            // The body CI exists but doesn't expose a directly-usable specptr at
-            // the OC's declared sig/rt (typically because the declared rettype is
-            // tighter than the body's natural rettype, see lines 82-95 above).
-            // Route through `jl_jit_abi_converter` to get a cached adapter
-            // that bridges the OC's declared specsig to the body CI's specptr.
-            // `is_opaque_closure=1` tells the adapter codegen that argv[0] is the
-            // OC value (which the body's slippery ABI also accepts directly).
-            jl_value_t *adapter_sigt = jl_argtype_with_function_type(oc_type, (jl_value_t*)argt);
-            jl_abi_t from_abi = {
-                adapter_sigt,
-                selected_rt,
-                jl_nparams(adapter_sigt),
-                /* specsig */ 1,
-                /* is_opaque_closure */ 1,
-            };
-            specptr = jl_jit_abi_converter(ct, from_abi, ci, NULL);
-        }
-        else {
-            // do_compile==0: no body CI to adapt to. Fall back to the original
-            // `jl_emit_oc_wrapper` path so the OC can still dispatch via the
-            // interpreter through `jl_f_opaque_closure_call`.
-            jl_method_instance_t *mi_generic = jl_specializations_get_linfo(jl_opaque_closure_method, sigtype, jl_emptysvec);
+    if (ci != NULL) {
+        // The OC's two callable slots are both cache-backed adapters that bridge
+        // from "OC-as-first-arg" calling conventions to the body CI's specptr.
+        // - `oc->specptr`: specsig adapter, called from `emit_specsig_oc_call`.
+        // - `oc->invoke`:  jlcall adapter, called via generic dispatch and from
+        //   `jl_invoke_oc`.
+        // Both target the same body CI; the only difference is the source ABI.
+        // For const-return bodies (`ci->invoke == jl_fptr_const_return_addr`),
+        // `jl_jit_abi_converter` routes through `emit_abi_constreturn` which
+        // bakes the literal into the adapter (no need to stash in `captures`).
+        jl_value_t *adapter_sigt = jl_argtype_with_function_type(oc_type, (jl_value_t*)argt);
+        size_t adapter_nargs = jl_nparams(adapter_sigt);
+        jl_abi_t specsig_abi = {
+            adapter_sigt, selected_rt, adapter_nargs,
+            /* specsig */ 1, /* is_opaque_closure */ 1,
+        };
+        jl_abi_t jlcall_abi = {
+            adapter_sigt, selected_rt, adapter_nargs,
+            /* specsig */ 0, /* is_opaque_closure */ 1,
+        };
+        specptr = jl_jit_abi_converter(ct, specsig_abi, ci, NULL);
+        callptr = (jl_fptr_args_t)jl_jit_abi_converter(ct, jlcall_abi, ci, NULL);
+    }
+    else {
+        // do_compile==0: no body CI to adapt to. Fall back to the original
+        // `jl_emit_oc_wrapper` path so the OC can still dispatch via the
+        // interpreter through `jl_f_opaque_closure_call`.
+        jl_method_instance_t *mi_generic = jl_specializations_get_linfo(jl_opaque_closure_method, sigtype, jl_emptysvec);
 
-            // OC wrapper methods are not world dependent and have no edges or other info
-            ci = jl_get_method_uninferred(mi_generic, selected_rt, 1, ~(size_t)0, NULL, NULL);
-            if (!jl_atomic_load_acquire(&ci->invoke)) {
-                jl_code_info_t *src = NULL;
-                jl_emit_codeinsts_to_jit(&ci, &src, 1); // confusing this actually calls jl_emit_oc_wrapper and never actually compiles ci (which would be impossible since it cannot have source)
-                jl_compile_codeinst(ci);
-            }
-            specptr = jl_atomic_load_relaxed(&ci->specptr.fptr);
+        // OC wrapper methods are not world dependent and have no edges or other info
+        ci = jl_get_method_uninferred(mi_generic, selected_rt, 1, ~(size_t)0, NULL, NULL);
+        if (!jl_atomic_load_acquire(&ci->invoke)) {
+            jl_code_info_t *src = NULL;
+            jl_emit_codeinsts_to_jit(&ci, &src, 1); // confusing this actually calls jl_emit_oc_wrapper and never actually compiles ci (which would be impossible since it cannot have source)
+            jl_compile_codeinst(ci);
         }
+        specptr = jl_atomic_load_relaxed(&ci->specptr.fptr);
+        // callptr stays as jl_interpret_opaque_closure
     }
     jl_opaque_closure_t *oc = (jl_opaque_closure_t*)jl_gc_alloc(ct->ptls, sizeof(jl_opaque_closure_t), oc_type);
     oc->source = source;
