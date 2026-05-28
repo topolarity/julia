@@ -432,6 +432,14 @@ end
 # enable threads support
 @eval PCRE PCRE_COMPILE_LOCK = Threads.SpinLock()
 
+# Turn on the type-piracy verifier (checks every subsequent method definition).
+# It is enabled here, not during the Compiler bootstrap, because `check_method`
+# renders its diagnostics with `show` -- which is only available once base/show.jl
+# (and the rest of Base's IO stack) has loaded. The world captured here therefore
+# postdates `show`, so the verifier never falls back to the bootstrap print path.
+@Core.latestworld
+Compiler.TypePiracy.enable!()
+
 # Record dependency information for files belonging to the Compiler, so that
 # we know whether the .ji can just give the Base copy or not.
 # TODO: We may want to do this earlier to avoid TOCTOU issues.

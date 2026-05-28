@@ -2303,6 +2303,8 @@ JL_DLLEXPORT jl_module_t *jl_base_relative_to(jl_module_t *m JL_PROPAGATES_ROOT)
 
 // tracing
 JL_DLLEXPORT void jl_register_newmeth_tracer(void (*callback)(jl_method_t *tracee));
+// install the (single) method-definition verifier used for type-piracy detection
+JL_DLLEXPORT void jl_set_methoddef_verifier(jl_value_t *f);
 
 // AST access
 JL_DLLEXPORT jl_value_t *jl_copy_ast(jl_value_t *expr JL_MAYBE_UNROOTED);

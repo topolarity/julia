@@ -2163,7 +2163,7 @@ JL_DLLEXPORT jl_module_t *jl_module_parent(jl_module_t *m) { return m->parent; }
 jl_module_t *jl_module_root(jl_module_t *m)
 {
     while (1) {
-        if (m->parent == NULL || m->parent == m)
+        if (m->istopmod || m->parent == NULL || m->parent == m)
             return m;
         m = m->parent;
     }

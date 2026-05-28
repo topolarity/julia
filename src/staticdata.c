@@ -122,7 +122,7 @@ extern "C" {
 // TODO: put WeakRefs on the weak_refs list during deserialization
 // TODO: handle finalizers
 
-#define NUM_TAGS    6
+#define NUM_TAGS    7
 
 // An array of special references that need to be restored from the sysimg
 static void get_tags(jl_value_t **tags[NUM_TAGS])
@@ -133,6 +133,7 @@ static void get_tags(jl_value_t **tags[NUM_TAGS])
     INSERT_TAG(jl_method_table);
     INSERT_TAG(jl_module_init_order);
     INSERT_TAG(jl_typeinf_func);
+    INSERT_TAG(jl_methoddef_verifier);
     INSERT_TAG(jl_compile_and_emit_func);
     INSERT_TAG(jl_libdl_dlopen_func);
     // n.b. must update NUM_TAGS when you add something here
@@ -3133,6 +3134,7 @@ static void jl_save_system_image_to_stream(ios_t *f, jl_array_t *mod_array,
             // assert(world == precompilation_world); // This triggers on a normal build of julia
             write_uint(f, world);
             write_uint(f, jl_typeinf_world);
+            write_uint(f, jl_methoddef_verifier_world);
         }
         else {
             jl_write_value(&s, worklist);
@@ -3771,6 +3773,7 @@ static void jl_restore_system_image_from_stream_(ios_t *f, jl_image_t *image,
         jl_require_world = read_uint(f);
         jl_atomic_store_release(&jl_world_counter, jl_require_world);
         jl_typeinf_world = read_uint(f);
+        jl_methoddef_verifier_world = read_uint(f);
         jl_set_gs_ctr(gs_ctr);
     }
     else {

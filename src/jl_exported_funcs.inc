@@ -387,6 +387,7 @@
     XX(jl_read_verify_header) \
     XX(jl_realloc) \
     XX(jl_register_newmeth_tracer) \
+    XX(jl_set_methoddef_verifier) \
     XX(jl_resolve_definition_effects_in_ir) \
     XX(jl_resolve_typegroup) \
     XX(jl_restore_excstack) \

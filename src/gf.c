@@ -95,6 +95,21 @@ JL_DLLEXPORT void jl_register_newmeth_tracer(void (*callback)(jl_method_t *trace
     jl_newmeth_tracer = (tracer_cb)callback;
 }
 
+// The (single, Compiler-owned) method-definition verifier, invoked directly from
+// `jl_method_def` on each new method to detect type piracy (see
+// Compiler/src/typepiracy.jl). Modeled on `jl_typeinf_func`: it is *not* a
+// pluggable hook, but a dedicated entry called in its own pinned world
+// (`jl_methoddef_verifier_world`, captured at registration so the verifier — and
+// the `moduletype` methods it calls — are visible regardless of the caller's
+// world). NULL until installed. GC-rooted by the Compiler binding that holds it.
+jl_value_t *jl_methoddef_verifier JL_GLOBALLY_ROOTED = NULL;
+JL_DLLEXPORT size_t jl_methoddef_verifier_world = 1;
+JL_DLLEXPORT void jl_set_methoddef_verifier(jl_value_t *f)
+{
+    jl_methoddef_verifier = f;
+    jl_methoddef_verifier_world = jl_get_tls_world_age();
+}
+
 void jl_call_tracer(tracer_cb callback, jl_value_t *tracee)
 {
     jl_task_t *ct = jl_current_task;

@@ -15,6 +15,10 @@ function activate_codegen!()
                 Base.invoke_in_world($(Expr(:$, :typeinf_world_age)), typeinf_ext_toplevel, mi, Base.tls_world_age(), source_mode, Compiler.TRIM_NO)
         end
     end)
+    # NOTE: the type-piracy verifier is intentionally NOT registered here. Its
+    # `check_method` prints diagnostics via `show`, which is not defined this early
+    # in the bootstrap (base/show.jl loads much later). It is enabled from the end
+    # of base/Base.jl instead (see `TypePiracy.enable!`).
 end
 
 global bootstrapping_compiler::Bool = false

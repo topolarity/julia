@@ -517,6 +517,8 @@ extern JL_DLLEXPORT _Atomic(size_t) jl_world_counter;
 typedef void (*tracer_cb)(jl_value_t *tracee);
 extern tracer_cb jl_newmeth_tracer;
 void jl_call_tracer(tracer_cb callback, jl_value_t *tracee);
+extern JL_DLLEXPORT jl_value_t *jl_methoddef_verifier JL_GLOBALLY_ROOTED;
+extern JL_DLLEXPORT size_t jl_methoddef_verifier_world;
 void print_func_loc(JL_STREAM *s, jl_method_t *m);
 extern jl_array_t *_jl_debug_method_invalidation JL_GLOBALLY_ROOTED;
 

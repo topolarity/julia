@@ -192,6 +192,7 @@ include("bootstrap.jl")
 include("precompile.jl")
 include("reflection_interface.jl")
 include("opaque_closure.jl")
+include("typepiracy.jl")   # type-piracy detection (moduletype); registered as the verifier in activate_codegen!
 
 baremodule ReinferUtils end
 include(ReinferUtils, "reinfer.jl")

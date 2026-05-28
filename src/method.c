@@ -1385,6 +1385,35 @@ JL_DLLEXPORT jl_method_t* jl_method_def(jl_svec_t *argdata,
     m->line = line;
     jl_method_set_source(m, f);
 
+    // Run the method-definition verifier (type-piracy check), if installed, BEFORE
+    // inserting `m` into the method table: the verifier dispatches (and may compile)
+    // its own call graph, which must see a consistent method cache -- not the
+    // mid-`jl_method_table_insert` state. It runs in the world captured at
+    // registration, where the verifier and the `moduletype` methods it calls are
+    // visible. (Dispatching in that older world is fine; world age isolates it
+    // cleanly from any newer definitions.)
+    if (jl_methoddef_verifier != NULL && jl_methoddef_verifier != jl_nothing) {
+        jl_task_t *ct = jl_current_task;
+        if (getenv("JL_TP_VERBOSE"))
+            jl_safe_printf("[tp] verifier firing on `%s` (vworld=%zu cur=%zu)\n",
+                           jl_symbol_name(name), jl_methoddef_verifier_world, ct->world_age);
+        size_t last_age = ct->world_age;
+        ct->world_age = jl_methoddef_verifier_world;
+        JL_TRY {
+            jl_call1(jl_methoddef_verifier, (jl_value_t*)m);
+        }
+        JL_CATCH {
+            // Do not swallow: surface the real error (with a backtrace) loudly.
+            jl_printf((JL_STREAM*)STDERR_FILENO, "ERROR: type-piracy verifier threw while checking `");
+            jl_static_show((JL_STREAM*)STDERR_FILENO, (jl_value_t*)m->sig);
+            jl_printf((JL_STREAM*)STDERR_FILENO, "`:\n");
+            jl_static_show((JL_STREAM*)STDERR_FILENO, jl_current_exception(ct));
+            jl_printf((JL_STREAM*)STDERR_FILENO, "\n");
+            jlbacktrace();
+        }
+        ct->world_age = last_age;
+    }
+
     jl_method_table_insert(mt, m, NULL);
     if (jl_newmeth_tracer)
         jl_call_tracer(jl_newmeth_tracer, (jl_value_t*)m);
