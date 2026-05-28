@@ -9,6 +9,10 @@ function activate_codegen!()
     ccall(:jl_set_typeinf_func, Cvoid, (Any,), typeinf_ext_toplevel)
     # Register the new unified compile and emit function
     ccall(:jl_set_compile_and_emit_func, Cvoid, (Any,), compile_and_emit_native)
+    # Hook invoked once at end of every `jl_write_compiler_output` session (for
+    # both `.ji`-only and `.ji`+pkgimage outputs). Flushes accumulated type-piracy
+    # query data; no-op when `JULIA_DEBUG_TYPE_PIRACY_DIR` is unset.
+    ccall(:jl_set_precompile_done_func, Cvoid, (Any,), TypePiracy.dump_log!)
     Core.eval(Compiler, quote
         let typeinf_world_age = Base.tls_world_age()
             @eval Core.OptimizedGenerics.CompilerPlugins.typeinf(::Nothing, mi::MethodInstance, source_mode::UInt8) =

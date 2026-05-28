@@ -1042,6 +1042,7 @@ cleanup:
 
 jl_value_t *jl_typeinf_func JL_GLOBALLY_ROOTED = NULL;
 jl_value_t *jl_compile_and_emit_func JL_GLOBALLY_ROOTED = NULL;
+jl_value_t *jl_precompile_done_func JL_GLOBALLY_ROOTED = NULL;
 JL_DLLEXPORT size_t jl_typeinf_world = 1;
 
 // Force Compiler (and staticdata serialization) not to throw away Julia IR,
@@ -1067,6 +1068,11 @@ JL_DLLEXPORT void jl_set_typeinf_func(jl_value_t *f)
 JL_DLLEXPORT void jl_set_compile_and_emit_func(jl_value_t *f)
 {
     jl_compile_and_emit_func = (jl_value_t*)f;
+}
+
+JL_DLLEXPORT void jl_set_precompile_done_func(jl_value_t *f)
+{
+    jl_precompile_done_func = (jl_value_t*)f;
 }
 
 static int very_general_type(jl_value_t *t)

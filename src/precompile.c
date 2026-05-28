@@ -101,6 +101,29 @@ JL_DLLEXPORT void jl_write_compiler_output(void)
         return;
     }
 
+    // Precompile-output-done hook -- fires for *every* `jl_write_compiler_output`
+    // session (both `.ji`-only and `.ji`+pkgimage), in contrast to
+    // `jl_compile_and_emit_func` which only fires when native code is emitted.
+    // Used e.g. by `Compiler.TypePiracy.dump_log!` to flush per-method type-piracy
+    // query data as JSON. Runs in the latest world so the callback can reach
+    // late-loaded Base functions (`mkpath`, `open`, etc.) without world-pin issues.
+    if (jl_precompile_done_func != NULL && jl_precompile_done_func != jl_nothing) {
+        jl_task_t *ct0 = jl_current_task;
+        size_t last_age = ct0->world_age;
+        ct0->world_age = jl_get_world_counter(); // intentionally invokelatest for now
+        JL_TRY {
+            jl_call0(jl_precompile_done_func);
+        }
+        JL_CATCH {
+            jl_printf((JL_STREAM*)STDERR_FILENO,
+                      "WARNING: jl_precompile_done_func threw an error:\n");
+            jl_static_show((JL_STREAM*)STDERR_FILENO, jl_current_exception(ct0));
+            jl_printf((JL_STREAM*)STDERR_FILENO, "\n");
+            jlbacktrace();
+        }
+        ct0->world_age = last_age;
+    }
+
     jl_task_wait_empty(); // wait for most work to finish (except possibly finalizers)
     jl_gc_collect(JL_GC_FULL);
     jl_gc_collect(JL_GC_INCREMENTAL); // sweep finalizers

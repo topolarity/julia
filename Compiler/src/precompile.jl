@@ -427,6 +427,11 @@ function compile_and_emit_native(worlds::Vector{UInt},
         invokelatest(invokelatest(getglobal, Base, :exit), 1)
     end
 
+    # NOTE: type-piracy log flushing used to live here, but it now runs from the
+    # C `jl_precompile_done_func` hook in `jl_write_compiler_output`, which fires
+    # for both `.ji`-only and `.ji`+pkgimage outputs (this entry point only fires
+    # for native emission). See `TypePiracy.dump_log!`.
+
     return codeinfos
 
 end

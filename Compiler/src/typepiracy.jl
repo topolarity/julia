@@ -299,35 +299,199 @@ function pirated_function_module(m::Method)
     ft === nothing ? m.module : Base.parentmodule(ft)
 end
 
+# ---------------------------------------------------------------------------
+# precompilation logging
+# ---------------------------------------------------------------------------
+# Type-piracy warning printing is currently disabled in favour of accumulating
+# per-method query data and flushing it as JSON at end of precompilation. The
+# log is per-process (each precompile subprocess has its own copy) and is keyed
+# by defining root module; one `<RootModule>.json` is written under
+# `JULIA_DEBUG_TYPE_PIRACY_DIR` from `compile_and_emit_native` (see precompile.jl).
+# When the env var is unset, `check_method` is a near no-op (no `moduletype` work).
+const _log = IdDict{Module, Vector{Any}}()
+
+# `sprint(show, x)` is what users would see (overridable). `_raw_str` bypasses
+# user `show` overrides by routing the value through `jl_static_show` (the same
+# canonical C printer used by `jl_(x)` in gdb). `JL_STREAM` is `uv_stream_t`, so
+# we capture by writing into a `Pipe`'s libuv write end and reading the other.
+_show_str(@nospecialize x) =
+    try sprint(show, x) catch _; "<show failed>" end
+function _raw_str(@nospecialize x)
+    try
+        pipe = Base.Pipe()
+        Base.link_pipe!(pipe; reader_supports_async=false, writer_supports_async=false)
+        ccall(:jl_static_show, Csize_t, (Ptr{Cvoid}, Any), pipe.in.handle, x)
+        close(pipe.in)
+        s = read(pipe.out, String)
+        close(pipe.out)
+        return s
+    catch _
+        return "<raw failed>"
+    end
+end
+
+function _record!(m::Method)
+    # `Base.ENV` is defined deep in `base/Base.jl` (env.jl), AFTER the world at
+    # which `_record!` is loaded/inferred via the verifier's pinned world. Use
+    # `getenv` directly to stay world-agnostic. We type the ccall with the Core
+    # types `Ptr{UInt8}` (not `Cstring`/`C_NULL`) because those are not yet in
+    # `TypePiracy`'s scope at Compiler bootstrap (`UndefVarError(:Cstring)`).
+    ccall(:getenv, Ptr{UInt8}, (Ptr{UInt8},), "JULIA_DEBUG_TYPE_PIRACY_DIR") == Ptr{UInt8}() && return nothing
+    sig     = m.sig
+    fmod    = pirated_function_module(m)
+    defroot = moduleroot(m.module)
+    results = Any[]
+    for strict in (true, false)
+        mt = moduletype(sig; strict_bottom=strict)
+        is_piracy = !(defroot in mt)
+        wit = is_piracy ? witness_avoiding(sig, defroot) : nothing
+        push!(results, (strict, sort!(collect(mt); by=string), is_piracy, wit))
+    end
+    arr = Base.get!(() -> Any[], _log, defroot)
+    push!(arr, (fmod, m.name, sig, m.file, m.line, results))
+    return nothing
+end
+
+# JSON string escape -- mirrors `print_str_escape_json` (src/gc-heap-snapshot.c).
+function _print_json_string(io::IO, s::AbstractString)
+    print(io, '"')
+    for c in s
+        if     c == '"';  print(io, "\\\"")
+        elseif c == '\\'; print(io, "\\\\")
+        elseif c == '\b'; print(io, "\\b")
+        elseif c == '\f'; print(io, "\\f")
+        elseif c == '\n'; print(io, "\\n")
+        elseif c == '\r'; print(io, "\\r")
+        elseif c == '\t'; print(io, "\\t")
+        elseif c < ' '
+            print(io, "\\u", lpad(string(UInt32(c); base=16), 4, '0'))
+        else
+            print(io, c)
+        end
+    end
+    print(io, '"')
+end
+
+# Pretty-printed (2-space indented) JSON. `depth` is the indent level at which
+# the object's `{` is rendered; the caller is responsible for the leading indent
+# of the open brace, but the closing brace is indented by this function.
+function _print_indent(io::IO, depth::Int)
+    for _ in 1:depth
+        print(io, "  ")
+    end
+end
+
+function _print_json_entry(io::IO, e, depth::Int)
+    (fmod, name, sig, file, line, results) = e
+    print(io, "{\n")
+    _print_indent(io, depth+1); print(io, "\"function\": ");      _print_json_string(io, string(fmod) * "." * string(name)); print(io, ",\n")
+    # _print_indent(io, depth+1); print(io, "\"function_raw\": ");  _print_json_string(io, _raw_str(fmod) * "." * string(name)); print(io, ",\n")
+    _print_indent(io, depth+1); print(io, "\"signature\": ");     _print_json_string(io, _show_str(sig)); print(io, ",\n")
+    _print_indent(io, depth+1); print(io, "\"signature_raw\": "); _print_json_string(io, _raw_str(sig)); print(io, ",\n")
+    _print_indent(io, depth+1); print(io, "\"file\": ");          _print_json_string(io, string(file)); print(io, ",\n")
+    _print_indent(io, depth+1); print(io, "\"line\": ", line, ",\n")
+    _print_indent(io, depth+1); print(io, "\"results\": ")
+    if isempty(results)
+        print(io, "[]\n")
+    else
+        print(io, "[\n")
+        for (i, r) in enumerate(results)
+            (strict, mt, is_piracy, wit) = r
+            _print_indent(io, depth+2); print(io, "{\n")
+            _print_indent(io, depth+3); print(io, "\"strict_bottom\": ", strict, ",\n")
+            _print_indent(io, depth+3); print(io, "\"moduletype\": [")
+            for (j, mod) in enumerate(mt)
+                j > 1 && print(io, ", ")
+                _print_json_string(io, string(mod))
+            end
+            print(io, "],\n")
+            _print_indent(io, depth+3); print(io, "\"piracy\": ", is_piracy)
+            if is_piracy
+                print(io, ",\n")
+                _print_indent(io, depth+3); print(io, "\"witness\": ")
+                wit === nothing ? print(io, "null") : _print_json_string(io, _show_str(wit))
+                print(io, ",\n")
+                _print_indent(io, depth+3); print(io, "\"witness_raw\": ")
+                wit === nothing ? print(io, "null") : _print_json_string(io, _raw_str(wit))
+            end
+            print(io, "\n")
+            _print_indent(io, depth+2); print(io, "}")
+            i < length(results) && print(io, ",")
+            print(io, "\n")
+        end
+        _print_indent(io, depth+1); print(io, "]\n")
+    end
+    _print_indent(io, depth); print(io, "}")
+end
+
+"""
+    dump_log!()
+
+Flush the accumulated per-method type-piracy query data as one JSON file per
+defining root module under `JULIA_DEBUG_TYPE_PIRACY_DIR`. No-op when the env var
+is unset or no methods have been recorded. Called from `compile_and_emit_native`
+at the end of precompilation (object-file output time).
+"""
+function dump_log!()
+    # `getenv` with Core-only ccall types — see `_record!`.
+    ptr = ccall(:getenv, Ptr{UInt8}, (Ptr{UInt8},), "JULIA_DEBUG_TYPE_PIRACY_DIR")
+    (ptr == Ptr{UInt8}() || isempty(_log)) && return nothing
+    dir = unsafe_string(ptr)
+    Base.mkpath(dir)
+    for (mod, entries) in _log
+        path = Base.joinpath(dir, string(nameof(mod)) * ".json")
+        Base.open(path, "w") do io
+            if isempty(entries)
+                print(io, "[]\n")
+            else
+                print(io, "[\n")
+                for (i, e) in enumerate(entries)
+                    _print_indent(io, 1)
+                    _print_json_entry(io, e, 1)
+                    i < length(entries) && print(io, ",")
+                    print(io, "\n")
+                end
+                print(io, "]\n")
+            end
+        end
+    end
+    Base.empty!(_log)
+    return nothing
+end
+
 """
     check_method(m::Method)
 
-Warn if `m` is type piracy: the defining package's root module is not among
-`moduletype(m.sig)`. Installed as the `jl_method_def` hook via `enable!`.
+Record type-piracy query data for `m`. Currently the warning-printing path is
+disabled (commented out below); when `JULIA_DEBUG_TYPE_PIRACY_DIR` is set, the
+recorded entries are flushed as JSON by `dump_log!` at end of precompilation.
+Installed as the `jl_method_def` hook via `enable!`.
 """
 function check_method(m::Method)
-    sig = m.sig
-    defroot = moduleroot(m.module)
-    required = moduletype(sig)
-    (defroot in required) && return nothing          # owns f or a required arg type ⇒ OK
-    # `defroot` is (by definition of piracy) typically absent from `sig`, so the
-    # witness avoiding it is usually `sig` itself — a call matching this method
-    # that names none of the defining package's types. Compute it directly.
-    w = witness_avoiding(sig, defroot)
-    io = Core.stderr
-    print(io, "WARNING: possible type piracy: ", m.module, " extends `",
-                pirated_function_module(m), ".", m.name, "` at ", m.file, ":", m.line, "\n")
-    print(io, "    signature       : ")
-    ccall(:jl_, Cvoid, (Any,), sig)
-    print(io, "    required owners  : ")
-    first = true
-    for owner in required
-        !first && print(io, " & ")
-        print(io, owner)
-        first = false
-    end
-    print(io, "\n")
-    w === nothing || print(io, "    witness avoiding ", defroot, " : ", w, "\n")
+    _record!(m)
+    # ---- warning printing currently disabled; kept for future re-enable ----
+    # sig = m.sig
+    # defroot = moduleroot(m.module)
+    # required = moduletype(sig)
+    # (defroot in required) && return nothing          # owns f or a required arg type ⇒ OK
+    # # `defroot` is (by definition of piracy) typically absent from `sig`, so the
+    # # witness avoiding it is usually `sig` itself — a call matching this method
+    # # that names none of the defining package's types. Compute it directly.
+    # w = witness_avoiding(sig, defroot)
+    # io = Core.stderr
+    # print(io, "WARNING: possible type piracy: ", m.module, " extends `",
+    #             pirated_function_module(m), ".", m.name, "` at ", m.file, ":", m.line, "\n")
+    # print(io, "    signature       : ")
+    # ccall(:jl_, Cvoid, (Any,), sig)
+    # print(io, "    required owners  : ")
+    # first = true
+    # for owner in required
+    #     !first && print(io, " & ")
+    #     print(io, owner)
+    #     first = false
+    # end
+    # print(io, "\n")
+    # w === nothing || print(io, "    witness avoiding ", defroot, " : ", w, "\n")
     return nothing
 end
 
