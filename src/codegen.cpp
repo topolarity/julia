@@ -2099,7 +2099,6 @@ public:
     int nReqArgs = 0;
     int nargs = 0;
     int nvargs = -1;
-    bool is_opaque_closure = false;
 
     Value *pgcstack = NULL;
     Instruction *topalloca = NULL;
@@ -6634,72 +6633,6 @@ static void emit_stmtpos(jl_codectx_t &ctx, jl_value_t *expr, int ssaval_result)
     }
 }
 
-static std::pair<Function*, Function*> get_oc_function(jl_codectx_t &ctx, jl_method_t *closure_method, jl_tupletype_t *env_t, jl_tupletype_t *argt_typ, jl_value_t *rettype) JL_CANSAFEPOINT
-{
-    jl_svec_t *sig_args = NULL;
-    jl_value_t *sigtype = NULL;
-    JL_GC_PUSH2(&sig_args, &sigtype);
-
-    size_t nsig = 1 + jl_svec_len(argt_typ->parameters);
-    sig_args = jl_alloc_svec_uninit(nsig);
-    jl_svecset(sig_args, 0, env_t);
-    for (size_t i = 0; i < jl_svec_len(argt_typ->parameters); ++i) {
-        jl_svecset(sig_args, 1+i, jl_svecref(argt_typ->parameters, i));
-    }
-    sigtype = jl_apply_tuple_type_v(jl_svec_data(sig_args), nsig);
-
-    jl_method_instance_t *mi;
-    jl_code_instance_t *ci;
-
-    if (closure_method->source) {
-        mi = jl_specializations_get_linfo(closure_method, sigtype, jl_emptysvec);
-        ci = (jl_code_instance_t*)jl_rettype_inferred_addr(mi, ctx.min_world, ctx.max_world);
-    }
-    else {
-        mi = (jl_method_instance_t*)jl_atomic_load_relaxed(&closure_method->specializations);
-        assert(jl_is_method_instance(mi));
-        ci = jl_atomic_load_relaxed(&mi->cache);
-    }
-    if (ci == NULL || (jl_value_t*)ci == jl_nothing || ci->rettype != rettype || !jl_egal(sigtype, mi->specTypes)) { // TODO: correctly handle the ABI conversion if rettype != ci->rettype
-        JL_GC_POP();
-        return std::make_pair((Function*)NULL, (Function*)NULL);
-    }
-
-    // method lookup code (similar to emit_invoke, and the inverse of emit_specsig_oc_call)
-    bool specsig = uses_specsig(sigtype, false, rettype, true);
-    std::string name;
-    std::string oc;
-
-    StringRef protoname = ctx.emission_context.get_call_target(ci, true, false);
-    StringRef proto_oc = ctx.emission_context.get_call_target(ci, false, false);
-
-    // Get the fptr1 OC
-    Function *F = nullptr;
-    if (GlobalValue *V = jl_Module->getNamedValue(proto_oc)) {
-        F = cast<Function>(V);
-    }
-    else {
-        F = Function::Create(get_func_sig(ctx.builder.getContext()),
-                             Function::ExternalLinkage,
-                             proto_oc, jl_Module);
-        jl_init_function(F, ctx.emission_context);
-        jl_name_jlfunc_args(ctx.emission_context, F);
-        F->setAttributes(AttributeList::get(ctx.builder.getContext(), {get_func_attrs(ctx.builder.getContext()), F->getAttributes()}));
-    }
-
-    // Get the specsig (if applicable)
-    Function *specF = nullptr;
-    bool is_opaque_closure = jl_is_method(mi->def.value) && mi->def.method->is_for_opaque_closure;
-    assert(is_opaque_closure);
-    if (specsig) {
-        jl_returninfo_t returninfo = get_specsig_function(ctx.emission_context, jl_Module, nullptr, protoname, mi->specTypes, rettype, is_opaque_closure);
-        specF = cast<Function>(returninfo.decl.getCallee());
-    }
-
-    JL_GC_POP();
-    return std::make_pair(F, specF);
-}
-
 static void emit_latestworld(jl_codectx_t &ctx)
 {
     auto world_age_field = get_tls_world_age_field(ctx);
@@ -6941,70 +6874,17 @@ static jl_cgval_t emit_expr(jl_codectx_t &ctx, jl_value_t *expr, ssize_t ssaidx_
             emit_error(ctx, "(INTERNAL ERROR - IR Validity): opaque closure source must be constant");
             return jl_cgval_t();
         }
-        // The inline construction shortcut below installs `body_ci->{invoke,specptr}`
-        // directly into the OC, which matched today's "slippery" body ABI.
-        // After the body ABI cleanup (Stage 4 sub-step 2), the body specsig
-        // expects captures at argv[0] and the OC slots must instead be the
-        // intern-table adapters (see `opaque_closure.c`'s `new_opaque_closure`).
-        // Defer wiring up the adapter pointers inline; fall through to the
-        // runtime `jl_new_opaque_closure_jlcall` path which performs the
-        // adapter lookup correctly.
-        bool can_optimize = false;
         (void)argt; (void)lb; (void)ub; (void)source;
-
-
-        if (can_optimize) {
-            jl_value_t *closure_t = NULL;
-            jl_value_t *env_t = NULL;
-            JL_GC_PUSH2(&closure_t, &env_t);
-
-            size_t ncapture_args = nargs-5;
-            SmallVector<jl_value_t *, 0> env_component_ts(ncapture_args);
-            for (size_t i = 0; i < ncapture_args; ++i) {
-                jl_value_t *typ = argv[nargs-ncapture_args+i].typ;
-                if (typ == jl_bottom_type) {
-                    JL_GC_POP();
-                    return jl_cgval_t();
-                }
-                env_component_ts[i] = typ;
-            }
-
-            env_t = jl_apply_tuple_type_v(env_component_ts.data(), ncapture_args);
-            // we need to know the full env type to look up the right specialization
-            if (jl_is_concrete_type(env_t)) {
-                jl_tupletype_t *argt_typ = (jl_tupletype_t*)argt.constant;
-                Function *F, *specF;
-                std::tie(F, specF) = get_oc_function(ctx, (jl_method_t*)source.constant, (jl_tupletype_t*)env_t, argt_typ, ub.constant);
-                if (F) {
-                    jl_cgval_t jlcall_ptr = mark_julia_type(ctx, F, false, jl_voidpointer_type);
-                    jl_cgval_t world_age = mark_julia_type(ctx, get_tls_world_age(ctx), false, jl_long_type);
-                    jl_cgval_t fptr;
-                    if (specF)
-                        fptr = mark_julia_type(ctx, specF, false, jl_voidpointer_type);
-                    else
-                        fptr = mark_julia_type(ctx, Constant::getNullValue(ctx.types().T_size), false, jl_voidpointer_type);
-
-                    // TODO: Inline the env at the end of the opaque closure and generate a descriptor for GC
-                    jl_cgval_t env = emit_new_struct(ctx, env_t, ncapture_args, ArrayRef<jl_cgval_t>(argv).drop_front(nargs-ncapture_args));
-
-                    jl_cgval_t closure_fields[5] = {
-                        env,
-                        world_age,
-                        source,
-                        jlcall_ptr,
-                        fptr
-                    };
-
-                    closure_t = jl_apply_type2((jl_value_t*)jl_opaque_closure_type, (jl_value_t*)argt_typ, ub.constant);
-                    jl_cgval_t ret = emit_new_struct(ctx, closure_t, 5, closure_fields);
-
-                    JL_GC_POP();
-                    return ret;
-                }
-            }
-            JL_GC_POP();
-        }
-
+        // Previously this branch had an inline-construction shortcut that
+        // computed `(F, specF)` per concrete env type and built the OC struct
+        // in IR. That shortcut hardcoded `body_ci->{invoke,specptr}` into the
+        // OC fields, which was compatible with the pre-Stage-4 "slippery" body
+        // ABI but is wrong now that `oc->invoke` / `oc->specptr` must be
+        // intern-table adapters (see `new_opaque_closure` in `opaque_closure.c`).
+        // Re-introducing inline construction would require emitting a call to
+        // `jl_jit_abi_converter` at codegen time to fetch adapter pointers;
+        // left as a follow-up if profiling shows the runtime allocator path
+        // is hot.
         return mark_julia_type(ctx,
                 emit_jlcall(ctx, jl_new_opaque_closure_jlcall_func, Constant::getNullValue(ctx.types().T_prjlvalue), argv, nargs, julia_call),
                 true, jl_any_type);
@@ -8803,10 +8683,9 @@ static jl_llvm_functions_t
         nreq--;
     }
     // OpaqueClosure body methods compile as standard methods: slot 0 is the
-    // captures Tuple at both IR and LLVM level. The OC adapter (Stage 1
-    // intern-table entry, used as `oc->invoke` / `oc->specptr`) handles
-    // `oc->captures` extraction and the world-age switch on entry.
-    ctx.is_opaque_closure = 0;
+    // captures Tuple at both IR and LLVM level. The OC adapter (intern-table
+    // entry, used as `oc->invoke` / `oc->specptr`) handles `oc->captures`
+    // extraction and the world-age switch on entry.
     ctx.nReqArgs = nreq;
     if (va) {
         jl_sym_t *vn = slot_symbol(ctx, ctx.nargs-1);
@@ -8917,16 +8796,6 @@ static jl_llvm_functions_t
         jl_value_t *ty = jl_nth_slot_type(abi, i);
         // TODO: jl_nth_slot_type should call jl_rewrap_unionall
         //  specTypes is required to be a datatype by construction for specsig, but maybe not otherwise
-        // OpaqueClosure implicitly loads the env
-        if (i == 0 && ctx.is_opaque_closure) {
-            // n.b. this is not really needed, because ty was already supposed to be correct
-            if (jl_is_array(src->slottypes)) {
-                ty = jl_array_ptr_ref((jl_array_t*)src->slottypes, i);
-            }
-            else {
-                ty = (jl_value_t*)jl_any_type;
-            }
-        }
         varinfo.value = mark_julia_type(ctx, (Value*)NULL, false, ty);
     }
     if (va && ctx.vaSlot != -1) {
@@ -8988,7 +8857,7 @@ static jl_llvm_functions_t
         }
         returninfo =
             get_specsig_function(out, M, NULL, specptr_name, abi,
-                                 jlrettype, ctx.is_opaque_closure, ArgNames, nreq);
+                                 jlrettype, /*is_opaque_closure*/false, ArgNames, nreq);
         f = cast<Function>(returninfo.decl.getCallee());
         declarations.specptr = f;
         has_sret = (returninfo.cc == jl_returninfo_t::SRet || returninfo.cc == jl_returninfo_t::Union);
@@ -9022,7 +8891,7 @@ static jl_llvm_functions_t
         auto invoke_name = out.make_name(JL_SYMBOL_INVOKE_DEF, JL_INVOKE_SPECSIG, ctx.name);
         size_t nparams = jl_nparams(abi);
         gen_invoke_wrapper(lam, abi, jlrettype, jlrettype, returninfo, nparams, retarg,
-                           ctx.is_opaque_closure, /*extract_captures*/false, invoke_name, M,
+                           /*is_opaque_closure*/false, /*extract_captures*/false, invoke_name, M,
                            ctx.emission_context);
         declarations.invoke = M->getFunction(invoke_name);
         // TODO: add attributes: maybe_mark_argument_dereferenceable(Arg, argType)
@@ -9240,15 +9109,6 @@ static jl_llvm_functions_t
     if (out.safepoint_on_entry && JL_FEAT_TEST(ctx, safepoint_on_entry))
         emit_gc_safepoint(ctx.builder, ctx.types().T_size, get_current_ptls(ctx), ctx.tbaa().tbaa_const);
 
-    Value *last_age = NULL;
-    Value *world_age_field = NULL;
-    if (ctx.is_opaque_closure) {
-        world_age_field = get_tls_world_age_field(ctx);
-        jl_aliasinfo_t ai = jl_aliasinfo_t::fromTBAA(ctx, ctx.tbaa().tbaa_gcframe);
-        last_age = ai.decorateInst(ctx.builder.CreateAlignedLoad(
-                   ctx.types().T_size, world_age_field, ctx.types().alignof_ptr));
-    }
-
     // step 7. allocate local variables slots
     // must be in the first basic block for the llvm mem2reg pass to work
     auto allocate_local = [&ctx, &dbuilder, &debugcache, topdebugloc, va, debug_enabled](jl_varinfo_t &varinfo, jl_sym_t *s, int i) JL_CANSAFEPOINT {
@@ -9430,31 +9290,7 @@ static jl_llvm_functions_t
         jl_sym_t *s = slot_symbol(ctx, i);
         jl_varinfo_t &vi = ctx.slots[i];
         jl_cgval_t theArg;
-        if (i == 0 && ctx.is_opaque_closure) {
-            // If this is an opaque closure, implicitly load the env and switch
-            // the world age. The specTypes value is wrong for this field, so
-            // this needs to be handled first.
-            // jl_value_t *oc_type = get_oc_type(calltype, rettype);
-            Value *oc_this = decay_derived(ctx, &*AI);
-            ++AI; // both specsig (derived) and fptr1 (box) pass this argument as a distinct argument
-            // Load closure world
-            Value *worldaddr = emit_ptrgep(ctx, oc_this, offsetof(jl_opaque_closure_t, world));
-            Align alignof_ptr(ctx.types().alignof_ptr);
-            jl_cgval_t closure_world = typed_load(ctx, worldaddr, NULL, (jl_value_t*)jl_long_type,
-                nullptr, nullptr, false, AtomicOrdering::NotAtomic, false, alignof_ptr.value());
-            assert(ctx.world_age_at_entry == nullptr);
-            ctx.world_age_at_entry = closure_world.V; // The tls world in a OC is the world of the closure
-            emit_unbox_store(ctx, closure_world, world_age_field, ctx.tbaa().tbaa_gcframe, alignof_ptr, alignof_ptr);
-
-            if (s == jl_unused_sym || vi.value.constant)
-                continue;
-
-            // Load closure env, which is always a boxed value (usually some Tuple) currently
-            Value *envaddr = emit_ptrgep(ctx, oc_this, offsetof(jl_opaque_closure_t, captures));
-            theArg = typed_load(ctx, envaddr, NULL, (jl_value_t*)vi.value.typ,
-                nullptr, nullptr, /*isboxed*/true, AtomicOrdering::NotAtomic, false, sizeof(void*));
-        }
-        else {
+        {
             jl_value_t *argType = jl_nth_slot_type(abi, i);
             // TODO: jl_nth_slot_type should call jl_rewrap_unionall?
             //  specTypes is required to be a datatype by construction for specsig, but maybe not otherwise
@@ -9897,10 +9733,6 @@ static jl_llvm_functions_t
             // but where the assignment slot is the retval
             jl_cgval_t retvalinfo = emit_expr(ctx, retexpr);
 
-            if (ctx.is_opaque_closure) {
-                emit_typecheck(ctx, retvalinfo, jlrettype, "OpaqueClosure");
-            }
-
             retvalinfo = update_julia_type(ctx, retvalinfo, jlrettype);
             if (retvalinfo.typ == jl_bottom_type) {
                 CreateTrap(ctx.builder, false);
@@ -9987,10 +9819,6 @@ static jl_llvm_functions_t
             }
 
             mallocVisitStmt(sync_bytes, have_dbg_update);
-            // N.B.: For toplevel thunks, we expect world age restore to be handled
-            // by the interpreter which invokes us.
-            if (ctx.is_opaque_closure)
-                ctx.builder.CreateStore(last_age, world_age_field);
             assert(type_is_ghost(retty) || returninfo.cc == jl_returninfo_t::SRet ||
                 retval->getType() == ctx.f->getReturnType());
             ctx.builder.CreateRet(retval);
