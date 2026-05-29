@@ -7379,10 +7379,10 @@ static void emit_specsig_to_specsig(
                 continue;
             }
             // Non-extracting path: the target ABI also receives the OC pointer
-            // at argv[0] (used by `jl_emit_oc_wrapper` which forwards to
-            // `jl_f_opaque_closure_call`, and by the dispatcher / const-return
-            // flavors). Type the slot as the OC type so the downstream call
-            // site emits the pass-through correctly.
+            // at argv[0] (used by the dispatcher flavor that forwards to
+            // `jl_f_opaque_closure_call`, and by the const-return flavor).
+            // Type the slot as the OC type so the downstream call site emits
+            // the pass-through correctly.
             jl_value_t *oc_type = get_oc_type(calltype, rettype);
             myargs[i] = mark_julia_slot(arg_v, (jl_value_t*)oc_type, NULL, ctx.tbaa().tbaa_const);
             continue;
@@ -7681,10 +7681,21 @@ std::string emit_abi_dispatcher(jl_codegen_output_t &out, jl_abi_t from_abi, jl_
     // build a args1 -> invoke call (emit_tojlinvoke)
     Module *M = &out.get_module();
     Value *target;
-    if (!codeinst)
-        target = prepare_call_in(M, jlapplygeneric_func);
-    else
+    if (!codeinst) {
+        // No body CodeInstance.  Two flavors:
+        //  * Standard dispatch -- route through `jl_apply_generic` and let
+        //    the runtime method table find the actual implementation.
+        //  * OpaqueClosure do-not-compile -- argv[0] is the OC itself; the
+        //    "body" is just `jl_f_opaque_closure_call`, which type-checks
+        //    args and then calls `oc->invoke` (typically the interpreter
+        //    `jl_interpret_opaque_closure`).
+        target = from_abi.is_opaque_closure
+            ? prepare_call_in(M, jlopaque_closure_call_func)
+            : prepare_call_in(M, jlapplygeneric_func);
+    }
+    else {
         target = emit_tojlinvoke(codeinst, invoke, out); // TODO: inline this call?
+    }
     std::string gf_thunk_name;
     if (codeinst)
         raw_string_ostream(gf_thunk_name) << JL_SYM_INVOKE_SPECSIG << name_from_method_instance(jl_get_ci_mi(codeinst)) << "_";
@@ -10478,26 +10489,6 @@ std::optional<jl_llvm_functions_t> jl_emit_code(
     return ret;
 }
 
-static jl_llvm_functions_t jl_emit_oc_wrapper(jl_codegen_output_t &out, jl_method_instance_t *mi, jl_value_t *rettype) JL_CANSAFEPOINT
-{
-    jl_llvm_functions_t declarations{JL_INVOKE_ARGS};
-    if (uses_specsig(mi->specTypes, false, rettype, true)) {
-        Module *M = &out.get_module();
-        jl_codectx_t ctx(out, 0, 0);
-        ctx.name = M->getModuleIdentifier().data();
-        std::string funcName = get_function_name(true, false, ctx.name, ctx.emission_context.TargetTriple);
-        jl_returninfo_t returninfo = get_specsig_function(out, M, NULL, funcName, mi->specTypes, rettype, true);
-        Function *gf_thunk = cast<Function>(returninfo.decl.getCallee());
-        jl_init_function(gf_thunk, ctx.emission_context);
-        size_t nrealargs = jl_nparams(mi->specTypes);
-        emit_specsig_to_fptr1(gf_thunk, returninfo.cc, returninfo.return_roots,
-                mi->specTypes, rettype, true, nrealargs, ctx.emission_context,
-                prepare_call_in(gf_thunk->getParent(), jlopaque_closure_call_func)); // TODO: this could call emit_oc_call directly
-        declarations.specptr = gf_thunk;
-    }
-    return declarations;
-}
-
 
 std::optional<jl_llvm_functions_t> jl_emit_codeinst(
         jl_codegen_output_t &out,
@@ -10507,18 +10498,11 @@ std::optional<jl_llvm_functions_t> jl_emit_codeinst(
     JL_TIMING(CODEGEN, CODEGEN_Codeinst);
     jl_timing_show_method_instance(jl_get_ci_mi(codeinst), JL_TIMING_DEFAULT_BLOCK);
     jl_method_instance_t *mi = jl_get_ci_mi(codeinst);
-    std::optional<jl_llvm_functions_t> decls;
-    if (!src) {
-        // Assert that this this is the generic method for opaque closure wrappers:
-        // this signals to instead compile specptr such that it holds the specptr -> invoke wrapper
-        // to satisfy the dispatching implementation requirements of jl_f_opaque_closure_call
-        if (mi->def.method != jl_opaque_closure_method)
-            return {}; // user error
-        decls = jl_emit_oc_wrapper(out, mi, codeinst->rettype);
-    } else {
-        //assert(jl_egal((jl_value_t*)jl_atomic_load_relaxed(&codeinst->debuginfo), (jl_value_t*)src->debuginfo) && "trying to generate code for a codeinst for an incompatible src");
-        decls = jl_emit_code(out, mi, src, get_ci_abi(codeinst), codeinst->rettype, codeinst);
-    }
+    if (!src)
+        return {}; // user error: callers must provide IR for code generation
+    //assert(jl_egal((jl_value_t*)jl_atomic_load_relaxed(&codeinst->debuginfo), (jl_value_t*)src->debuginfo) && "trying to generate code for a codeinst for an incompatible src");
+    std::optional<jl_llvm_functions_t> decls = jl_emit_code(out, mi, src, get_ci_abi(codeinst), codeinst->rettype, codeinst);
+
     if (!decls)
         return {};
     out.ci_funcs[codeinst] = *decls;

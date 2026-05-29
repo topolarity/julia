@@ -109,19 +109,24 @@ static jl_opaque_closure_t *new_opaque_closure(jl_tupletype_t *argt, jl_value_t 
         callptr = (jl_fptr_args_t)jl_jit_abi_converter(ct, jlcall_abi, ci, NULL);
     }
     else {
-        // do_compile==0: no body CI to adapt to. Fall back to the original
-        // `jl_emit_oc_wrapper` path so the OC can still dispatch via the
-        // interpreter through `jl_f_opaque_closure_call`.
-        jl_method_instance_t *mi_generic = jl_specializations_get_linfo(jl_opaque_closure_method, sigtype, jl_emptysvec);
-
-        // OC wrapper methods are not world dependent and have no edges or other info
-        ci = jl_get_method_uninferred(mi_generic, selected_rt, 1, ~(size_t)0, NULL, NULL);
-        if (!jl_atomic_load_acquire(&ci->invoke)) {
-            jl_code_info_t *src = NULL;
-            jl_emit_codeinsts_to_jit(&ci, &src, 1); // confusing this actually calls jl_emit_oc_wrapper and never actually compiles ci (which would be impossible since it cannot have source)
-            jl_compile_codeinst(ci);
-        }
-        specptr = jl_atomic_load_relaxed(&ci->specptr.fptr);
+        // do_compile==0: no body CI to adapt to. We still need an `oc->specptr`
+        // that `emit_specsig_oc_call` can call with the OC's declared specsig
+        // ABI; that thunk just boxes its args and forwards to
+        // `jl_f_opaque_closure_call`, which type-checks args and calls
+        // `oc->invoke` (= `jl_interpret_opaque_closure` here).
+        //
+        // The adapter cache already produces exactly this thunk when
+        // queried with `codeinst == NULL` and `is_opaque_closure == 1`:
+        // `emit_abi_dispatcher` picks `jl_f_opaque_closure_call` as the
+        // forwarding target. Sharing across OCs of the same declared type is
+        // automatic via the (from_abi, NULL) key.
+        jl_value_t *adapter_sigt = jl_argtype_with_function_type(oc_type, (jl_value_t*)argt);
+        size_t adapter_nargs = jl_nparams(adapter_sigt);
+        jl_abi_t specsig_abi = {
+            adapter_sigt, selected_rt, adapter_nargs,
+            /* specsig */ 1, /* is_opaque_closure */ 1,
+        };
+        specptr = jl_jit_abi_converter(ct, specsig_abi, /*codeinst*/NULL, NULL);
         // callptr stays as jl_interpret_opaque_closure
     }
     jl_opaque_closure_t *oc = (jl_opaque_closure_t*)jl_gc_alloc(ct->ptls, sizeof(jl_opaque_closure_t), oc_type);
