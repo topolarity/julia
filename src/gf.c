@@ -3723,8 +3723,6 @@ void jl_read_codeinst_invoke(jl_code_instance_t *ci, uint8_t *specsigflags, jl_c
     }
 }
 
-JL_DLLEXPORT jl_method_instance_t *jl_normalize_to_compilable_mi(jl_method_instance_t *mi JL_PROPAGATES_ROOT) JL_CANSAFEPOINT;
-
 JL_DLLEXPORT void jl_add_codeinsts_to_jit(jl_array_t *codeinsts, jl_array_t *srcs)
 {
     assert(jl_array_dim0(codeinsts) == jl_array_dim0(srcs));
@@ -4172,7 +4170,7 @@ JL_DLLEXPORT jl_value_t *jl_normalize_to_compilable_sig(jl_tupletype_t *ti, jl_s
 JL_DLLEXPORT jl_method_instance_t *jl_normalize_to_compilable_mi(jl_method_instance_t *mi JL_PROPAGATES_ROOT)
 {
     jl_method_t *def = mi->def.method;
-    if (!jl_is_method(def) || !jl_is_datatype(mi->specTypes) || def->is_for_opaque_closure)
+    if (!jl_is_method(def) || !jl_is_datatype(mi->specTypes))
         return mi;
     jl_value_t *compilationsig = jl_normalize_to_compilable_sig((jl_datatype_t*)mi->specTypes, mi->sparam_vals, def, 1);
     if (compilationsig == jl_nothing || jl_egal(compilationsig, mi->specTypes))

@@ -157,6 +157,17 @@ JL_DLLEXPORT jl_opaque_closure_t *jl_new_opaque_closure_from_code_info_in_world(
     if (isinferred) {
         jl_value_t *argslotty = jl_array_ptr_ref(ci->slottypes, 0);
         sigtype = jl_argtype_with_function_type(argslotty, (jl_value_t*)argt);
+        // Normalize the sig *before* creating the MI so we install the
+        // inferred IR on the same MI that `jl_compile_method_internal` will
+        // later look up via `jl_normalize_to_compilable_mi`. Creating both
+        // an unnormalized and normalized MI would break the "single MI in
+        // `source->specializations`" invariant `new_opaque_closure` relies
+        // on; doing the normalization at the sig level guarantees we only
+        // ever install one.
+        jl_value_t *normsig = jl_normalize_to_compilable_sig(
+            (jl_datatype_t*)sigtype, jl_emptysvec, (jl_method_t*)root, /*return_if_compileable*/0);
+        if (normsig != jl_nothing)
+            sigtype = normsig;
         jl_method_instance_t *mi = jl_specializations_get_linfo((jl_method_t*)root, sigtype, jl_emptysvec);
         edges = (jl_svec_t*)ci->edges;
         if (!jl_is_svec(edges))

@@ -1410,6 +1410,8 @@ JL_DLLEXPORT jl_value_t *jl_methtable_lookup(jl_value_t *type, size_t world) JL_
 JL_DLLEXPORT jl_method_instance_t *jl_specializations_get_linfo(
     jl_method_t *m JL_PROPAGATES_ROOT, jl_value_t *type, jl_svec_t *sparams) JL_CANSAFEPOINT;
 jl_method_instance_t *jl_specializations_get_or_insert(jl_method_instance_t *mi_ins JL_PROPAGATES_ROOT) JL_CANSAFEPOINT;
+JL_DLLEXPORT jl_method_instance_t *jl_normalize_to_compilable_mi(jl_method_instance_t *mi JL_PROPAGATES_ROOT) JL_CANSAFEPOINT;
+JL_DLLEXPORT jl_value_t *jl_normalize_to_compilable_sig(jl_tupletype_t *ti, jl_svec_t *env, jl_method_t *m, int return_if_compileable) JL_CANSAFEPOINT;
 JL_DLLEXPORT void jl_method_instance_add_backedge(jl_method_instance_t *callee, jl_value_t *invokesig, jl_code_instance_t *caller) JL_CANSAFEPOINT;
 JL_DLLEXPORT void jl_method_table_add_backedge(jl_value_t *typ, jl_code_instance_t *caller) JL_CANSAFEPOINT;
 JL_DLLEXPORT void jl_mi_cache_insert(jl_method_instance_t *mi,
