@@ -3,16 +3,6 @@
 #include "julia.h"
 #include "julia_internal.h"
 
-static jl_value_t *jl_fptr_const_opaque_closure(jl_opaque_closure_t *oc, jl_value_t **args, size_t nargs)
-{
-    return oc->captures;
-}
-
-static jl_value_t *jl_fptr_const_opaque_closure_typeerror(jl_opaque_closure_t *oc, jl_value_t **args, size_t nargs)
-{
-    jl_type_error("OpaqueClosure", jl_tparam1(jl_typeof(oc)), oc->captures);
-}
-
 // determine whether `argt` is a valid argument type tuple for the given opaque closure method
 JL_DLLEXPORT int jl_is_valid_oc_argtype(jl_tupletype_t *argt, jl_method_t *source)
 {
