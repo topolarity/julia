@@ -272,17 +272,17 @@ StringRef jl_codegen_output_t::get_call_target(jl_code_instance_t *ci, bool spec
     target.external_linkage = !always_inline;
     target.private_linkage = always_inline;
     if (specsig) {
-        jl_method_instance_t *mi = jl_get_ci_mi(ci);
-        // The only ABI with OC-as-argv[0] today is `jl_opaque_closure_method`'s
-        // wrapper (used by the do-not-compile fallback in `opaque_closure.c`).
-        // OC-source body methods compile with a standard specsig (captures at
-        // argv[0]); the OC ABI is bridged on the call side by the adapter
-        // stored in `oc->invoke` / `oc->specptr`.
-        bool is_opaque_closure =
-            jl_is_method(mi->def.value) && mi->def.method == jl_opaque_closure_method;
+        // No CI emitted through this path should have an OC-shaped ABI today:
+        // OC source bodies compile with a standard specsig, and the do-not-compile
+        // `jl_opaque_closure_method` fallback never materializes a CI -- it goes
+        // through `jl_jit_abi_converter(..., /*codeinst*/NULL)` directly in
+        // `opaque_closure.c`.  Any new OC-ABI carrier would need its own kind
+        // derivation here.
+        assert(!jl_is_method(jl_get_ci_mi(ci)->def.value)
+               || jl_get_ci_mi(ci)->def.method != jl_opaque_closure_method);
         jl_returninfo_t info =
             get_specsig_function(*this, &get_module(), nullptr, protoname, get_ci_abi(ci),
-                                 ci->rettype, is_opaque_closure);
+                                 ci->rettype, JL_ABI_STD);
         target.decl = cast<Function>(info.decl.getCallee());
     }
     else {
@@ -391,7 +391,7 @@ static void *jl_get_abi_adapter(jl_abi_t from_abi, jl_code_instance_t *codeinst,
     }
     JL_LOCK(&jl_abi_adapters->writelock);
     jl_abi_adapter_t *e = jl_lookup_abi_adapter(from_abi.sigt, from_abi.rt, codeinst,
-            from_abi.specsig, from_abi.is_opaque_closure, from_abi.nargs);
+            from_abi.specsig, from_abi.kind, from_abi.nargs);
     JL_GC_PROMISE_ROOTED(e); // rooted by the cache
     if (e != nullptr && e->fptr != nullptr) {
         // lost the race: use the winner's thunk
@@ -410,7 +410,7 @@ static void *jl_get_abi_adapter(jl_abi_t from_abi, jl_code_instance_t *codeinst,
     }
     else {
         jl_abi_adapter_t *entry = jl_new_abi_adapter(from_abi.sigt, from_abi.rt, codeinst,
-                from_abi.specsig, from_abi.is_opaque_closure, from_abi.nargs, fptr);
+                from_abi.specsig, from_abi.kind, from_abi.nargs, fptr);
         JL_GC_PUSH1(&entry);
         // we hold the writelock (reentrant) and confirmed absence, so this inserts `entry`
         entry = jl_insert_abi_adapter(entry);

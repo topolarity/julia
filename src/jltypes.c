@@ -3729,7 +3729,7 @@ void jl_init_types(void) JL_GC_DISABLED
     jl_voidpointer_type = (jl_datatype_t*)pointer_void;
 
     // One record of the ABI-adapter cache (jl_abi_adapters->cache). The C-side `specsig`/
-    // `is_opaque_closure`/`nargs` bitfields pack into a single word exposed to Julia as
+    // `kind`/`nargs` bitfields pack into a single word exposed to Julia as
     // `flags`. The field order must match `jl_abi_adapter_t` in julia.h exactly: the GC
     // derives the pointer-field offsets from this datatype.
     jl_abi_adapter_type =
@@ -3744,7 +3744,7 @@ void jl_init_types(void) JL_GC_DISABLED
                         jl_svec(6,
                             jl_any_type,   // hash-consed Tuple type
                             jl_any_type,   // hash-consed return type
-                            jl_ulong_type, // packed specsig/is_opaque_closure/nargs
+                            jl_ulong_type, // packed specsig/kind/nargs
                             jl_any_type,   // CodeInstance (NULL/#undef for dynamic-dispatch adapters)
                             pointer_void,  // JITed adapter address
                             jl_any_type),  // next record in the sigt bucket chain (may be NULL)
@@ -3758,26 +3758,28 @@ void jl_init_types(void) JL_GC_DISABLED
     // polling protocol). The trailing fields may be #undef until first resolution.
     jl_dispatch_trampoline_type =
         jl_new_datatype(jl_symbol("DispatchTrampoline"), core, jl_any_type, jl_emptysvec,
-                        jl_perm_symsvec(7,
+                        jl_perm_symsvec(8,
                             "sigt", // resolution sig (also the adapter ABI sig)
                             "rt",   // declared return type (declrt for @cfunction)
                             "last_invokee", // resolved dispatch target: Union{CodeInstance, ABIAdapter}
                             "fptr", // ABI adapter
                             "last_world",
                             "specsig", // 1 if fptr is a specsig adapter
+                            "kind", // jl_abi_kind_t of the caller ABI
                             "next"), // next record in the `sigt` bucket chain (may be NULL)
-                        jl_svec(7,
+                        jl_svec(8,
                             jl_any_type,   // hash-consed Tuple type
                             jl_any_type,   // hash-consed return type
                             jl_any_type,   // Union{CodeInstance, ABIAdapter} (may be #undef)
                             pointer_void,  // cached resolved adapter (atomic)
                             jl_ulong_type, // last_world (atomic)
                             jl_uint8_type, // specsig
+                            jl_uint8_type, // kind
                             jl_any_type),  // next (atomic)
                         jl_emptysvec,
                         0, 1, 2);
-    // fptr (field 3), last_world (field 4), next (field 6) are atomic (0-indexed).
-    const static uint32_t dispatch_trampoline_atomicfields[1] = { 0b1011000 };
+    // fptr (field 3), last_world (field 4), next (field 7) are atomic (0-indexed).
+    const static uint32_t dispatch_trampoline_atomicfields[1] = { 0b10011000 };
     jl_dispatch_trampoline_type->name->atomicfields = dispatch_trampoline_atomicfields;
 
     // Singleton ABIAdapterCache type: holds the `adapters` TypeMap root (jl_nothing /

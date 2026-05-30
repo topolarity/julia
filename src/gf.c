@@ -4518,16 +4518,6 @@ JL_DLLEXPORT jl_value_t *jl_invoke_oneshot(jl_value_t *F, jl_value_t **args, uin
     return verify_type(res);
 }
 
-JL_DLLEXPORT jl_value_t *jl_invoke_oc(jl_value_t *F, jl_value_t **args, uint32_t nargs, jl_method_instance_t *mfunc)
-{
-    // Route directly to `oc->invoke`. The adapter installed there at OC
-    // construction handles `oc->captures` extraction and the world-age
-    // switch to `oc->world` (uniform across all adapter flavors).
-    (void)mfunc;
-    jl_opaque_closure_t *oc = (jl_opaque_closure_t*)F;
-    return oc->invoke(F, args, nargs);
-}
-
 STATIC_INLINE int sig_match_fast(jl_value_t *arg1t, jl_value_t **args, jl_value_t **sig, size_t n) JL_NOTSAFEPOINT
 {
     // NOTE: This function is a huge performance hot spot!!

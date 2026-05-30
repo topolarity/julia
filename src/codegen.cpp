@@ -983,11 +983,6 @@ static const auto jlinvoke_func = new JuliaFunction<>{
     get_func2_sig,
     get_func_attrs,
 };
-static const auto jlinvokeoc_func = new JuliaFunction<>{
-    XSTR(jl_invoke_oc),
-    get_func2_sig,
-    get_func_attrs,
-};
 static const auto jlopaque_closure_call_func = new JuliaFunction<>{
     XSTR(jl_f_opaque_closure_call),
     get_func_sig,
@@ -5475,7 +5470,7 @@ static CallInst *emit_jlcall(jl_codectx_t &ctx, JuliaFunction<> *theFptr, Value 
     return emit_jlcall(ctx, prepare_call(theFptr), theF, argv, nargs, trampoline);
 }
 
-static jl_cgval_t emit_call_specfun_other(jl_codectx_t &ctx, bool is_opaque_closure, jl_value_t *specTypes, jl_value_t *jlretty, jl_returninfo_t &returninfo, ArrayRef<jl_cgval_t> argv, size_t nargs) JL_CANSAFEPOINT
+static jl_cgval_t emit_call_specfun_other(jl_codectx_t &ctx, jl_abi_kind_t kind, jl_value_t *specTypes, jl_value_t *jlretty, jl_returninfo_t &returninfo, ArrayRef<jl_cgval_t> argv, size_t nargs) JL_CANSAFEPOINT
 {
     ++EmittedSpecfunCalls;
     // emit specialized call site
@@ -5515,12 +5510,12 @@ static jl_cgval_t emit_call_specfun_other(jl_codectx_t &ctx, bool is_opaque_clos
     }
     for (size_t i = 0; i < nargs; i++) {
         // n.b.: specTypes is required to be a datatype by construction for specsig
-        if (is_opaque_closure && i == 0) {
-            // Special implementation for opaque closures: their jt and thus
-            // julia_type_to_llvm values are likely wrong (based on captures instead of the OC), so override the
-            // behavior here to directly pass the expected pointer directly instead of
-            // computing it from the available information
-            // jl_value_t *oc_type = (jl_value_t*)jl_any_type; // more accurately: get_oc_type(specTypes, jlretty)
+        if (jl_abi_kind_erases_slot(kind, i)) {
+            // Type-erased argument: the formal `specTypes[i]` is ignored for
+            // ABI; we pass the argument as a single derived-address-space
+            // pointer. Today only OpaqueClosure adapters set this (the
+            // formal `specTypes[0]` would be the captures Tuple, but at the
+            // ABI level it's the OC object pointer).
             jl_cgval_t arg = argv[i];
             if (arg.isghost) {
                 argvals[idx] = Constant::getNullValue(ctx.builder.getPtrTy(AddressSpace::Derived));
@@ -5627,18 +5622,18 @@ static jl_cgval_t emit_call_specfun_other(jl_codectx_t &ctx, bool is_opaque_clos
     return retval;
 }
 
-static jl_cgval_t emit_call_specfun_other(jl_codectx_t &ctx, bool is_opaque_closure, jl_value_t *specTypes, jl_value_t *jlretty, llvm::Value *callee, StringRef specFunctionObject,
+static jl_cgval_t emit_call_specfun_other(jl_codectx_t &ctx, jl_abi_kind_t kind, jl_value_t *specTypes, jl_value_t *jlretty, llvm::Value *callee, StringRef specFunctionObject,
                                           ArrayRef<jl_cgval_t> argv, size_t nargs, jl_returninfo_t::CallingConv *cc, unsigned *nreturn_roots, jl_value_t *inferred_retty,
                                           std::optional<uint32_t> effects = std::nullopt) JL_CANSAFEPOINT
 {
     ++EmittedSpecfunCalls;
     // emit specialized call site
-    jl_returninfo_t returninfo = get_specsig_function(ctx.emission_context, jl_Module, callee, specFunctionObject, specTypes, jlretty, is_opaque_closure);
+    jl_returninfo_t returninfo = get_specsig_function(ctx.emission_context, jl_Module, callee, specFunctionObject, specTypes, jlretty, kind);
     *cc = returninfo.cc;
     *nreturn_roots = returninfo.return_roots;
     if (effects.has_value())
         returninfo.effects = *effects;
-    jl_cgval_t retval = emit_call_specfun_other(ctx, is_opaque_closure, specTypes, jlretty, returninfo, argv, nargs);
+    jl_cgval_t retval = emit_call_specfun_other(ctx, kind, specTypes, jlretty, returninfo, argv, nargs);
     // see if inference has a different / better type for the call than the lambda
     return update_julia_type(ctx, retval, inferred_retty);
 }
@@ -5646,17 +5641,17 @@ static jl_cgval_t emit_call_specfun_other(jl_codectx_t &ctx, bool is_opaque_clos
 static jl_cgval_t emit_call_specfun_other(jl_codectx_t &ctx, jl_method_instance_t *mi, jl_value_t *jlretty, StringRef specFunctionObject,
                                           ArrayRef<jl_cgval_t> argv, size_t nargs, jl_returninfo_t::CallingConv *cc, unsigned *return_roots, jl_value_t *inferred_retty) JL_CANSAFEPOINT
 {
-    bool is_opaque_closure = jl_is_method(mi->def.value) && mi->def.method->is_unregistered;
-    return emit_call_specfun_other(ctx, is_opaque_closure, mi->specTypes, jlretty, NULL,
+    // OC body methods (the only callers that used to set this) now compile
+    // with a standard specsig (captures at argv[0]). No type-erased-arg ABI
+    // here; the OC type-erasure is the responsibility of the adapter.
+    return emit_call_specfun_other(ctx, /*kind*/JL_ABI_STD, mi->specTypes, jlretty, NULL,
         specFunctionObject, argv, nargs, cc, return_roots, inferred_retty);
 }
 
 static jl_cgval_t emit_call_specfun_other(jl_codectx_t &ctx, jl_code_instance_t *ci, StringRef specFunctionObject,
     ArrayRef<jl_cgval_t> argv, size_t nargs, jl_returninfo_t::CallingConv *cc, unsigned *return_roots, jl_value_t *inferred_retty) JL_CANSAFEPOINT
 {
-    jl_method_instance_t *mi = jl_get_ci_mi(ci);
-    bool is_opaque_closure = jl_is_method(mi->def.value) && mi->def.method->is_unregistered;
-    return emit_call_specfun_other(ctx, is_opaque_closure, get_ci_abi(ci), ci->rettype, NULL,
+    return emit_call_specfun_other(ctx, /*kind*/JL_ABI_STD, get_ci_abi(ci), ci->rettype, NULL,
         specFunctionObject, argv, nargs, cc, return_roots, inferred_retty,
         jl_atomic_load_relaxed(&ci->ipo_purity_bits));
 }
@@ -5846,7 +5841,9 @@ static jl_cgval_t emit_specsig_oc_call(jl_codectx_t &ctx, jl_value_t *oc_type, j
     Value *specptr = emit_unbox(ctx, ctx.types().T_size, update_julia_type(ctx, closure_specptr, (jl_value_t*)jl_voidpointer_type));
     specptr = emit_inttoptr(ctx, specptr, ctx.types().T_ptr);
     JL_GC_PUSH1(&sigtype);
-    jl_cgval_t r = emit_call_specfun_other(ctx, true, sigtype, oc_rett, specptr, "", argv, nargs,
+    // The OC adapter's input ABI has the OpaqueClosure at argv[0]; pass that
+    // arg through to the (presumed-OC-typed) adapter target as a derived ptr.
+    jl_cgval_t r = emit_call_specfun_other(ctx, /*kind*/JL_ABI_OPAQUE_CLOSURE, sigtype, oc_rett, specptr, "", argv, nargs,
         &cc, &return_roots, oc_rett);
     JL_GC_POP();
     return r;
@@ -7061,8 +7058,9 @@ static std::string get_function_name(bool specsig, bool needsparams, const char 
     return funcName.str();
 }
 
-static void gen_invoke_wrapper(jl_method_instance_t *lam, jl_value_t *abi, jl_value_t *jlretty, jl_value_t *declrt, jl_returninfo_t &f, unsigned nargs, int retarg, bool is_opaque_closure, bool extract_captures, StringRef funcName,
+static void gen_invoke_wrapper(jl_method_instance_t *lam, jl_value_t *abi, jl_value_t *jlretty, jl_value_t *declrt, jl_returninfo_t &f, unsigned nargs, int retarg, jl_abi_kind_t kind, StringRef funcName,
         Module *M, jl_codegen_output_t &out) JL_CANSAFEPOINT;
+static jl_datatype_t *compute_va_type(jl_value_t *sig, size_t nreq) JL_CANSAFEPOINT;
 
 Function *get_or_emit_fptr1(StringRef preal_decl, Module *M)
 {
@@ -7163,8 +7161,7 @@ static Function *emit_tojlinvoke(jl_code_instance_t *codeinst, Value *theFunc, j
     }
     else {
         jl_method_instance_t *mi = jl_get_ci_mi(codeinst);
-        bool is_opaque_closure = jl_is_method(mi->def.value) && mi->def.method->is_unregistered;
-        theFunc = prepare_call(is_opaque_closure ? jlinvokeoc_func : jlinvoke_func);
+        theFunc = prepare_call(jlinvoke_func);
         theFarg = literal_pointer_val(ctx, (jl_value_t*)mi);
     }
     theFarg = track_pjlvalue(ctx, theFarg);
@@ -7195,10 +7192,22 @@ static jl_value_t *get_oc_type(jl_value_t *calltype, jl_value_t *rettype) JL_CAN
     return oc_type;
 }
 
+// Emit a specsig-input adapter whose target consumes the input's STD-ABI form.
+//
+// `kind` labels the input ABI:
+//  * `JL_ABI_STD`: standard ABI, no conversion -- slot 0 is whatever the
+//    caller put there, forwarded as-is.
+//  * `JL_ABI_OPAQUE_CLOSURE`: slot 0 is an `OpaqueClosure`.  At the adapter's
+//    entry we perform the OC->STD conversion: switch `task->world_age` to
+//    `oc->world` and substitute `oc->captures` for slot 0.  After conversion
+//    the adapter operates in STD ABI -- the target MUST consume STD ABI
+//    (e.g. body specsig, body's jlcall wrapper, `jl_invoke` wrapper).  An
+//    OC-consuming target like `jl_f_opaque_closure_call` is not a valid
+//    target here; for those cases the caller uses `kind=JL_ABI_STD` and the
+//    OC flows through as a plain value.
 static void emit_specsig_to_specsig(
         Function *gf_thunk, jl_returninfo_t::CallingConv cc, unsigned return_roots,
-        jl_value_t *calltype, jl_value_t *rettype, bool is_for_opaque_closure,
-        bool extract_captures,
+        jl_value_t *calltype, jl_value_t *rettype, jl_abi_kind_t kind,
         size_t nargs,
         jl_codegen_output_t &out,
         Value *target,
@@ -7226,49 +7235,49 @@ static void emit_specsig_to_specsig(
         ++AI; // gcstack_arg
     }
     allocate_gc_frame(ctx, b0);
-    // Every OC adapter switches `task->world_age` to `oc->world` for the
-    // call (uniform across specsig / jlcall / dispatcher / const-return
-    // flavors), so neither the body nor any C-side caller has to. The
-    // saved age is restored at each function-exit point below.
+    // For `JL_ABI_OPAQUE_CLOSURE`, perform the OC->STD conversion at entry:
+    // save the caller's world, install `oc->world`, and unpack `oc->captures`
+    // into slot 0.  After this point the adapter operates in STD ABI.  The
+    // saved world is restored at each function-exit point below.
     Value *saved_world_age = nullptr;
     Value *world_age_field = nullptr;
-    if (is_for_opaque_closure) {
+    if (kind == JL_ABI_OPAQUE_CLOSURE) {
         world_age_field = get_tls_world_age_field(ctx);
         jl_aliasinfo_t ai = jl_aliasinfo_t::fromTBAA(ctx, ctx.tbaa().tbaa_gcframe);
         saved_world_age = ai.decorateInst(ctx.builder.CreateAlignedLoad(
                 ctx.types().T_size, world_age_field, ctx.types().alignof_ptr));
     }
     for (size_t i = 0; i < nargs; i++) {
-        if (i == 0 && is_for_opaque_closure) {
+        if (jl_abi_kind_erases_slot(kind, i)) {
             Value *arg_v = &*AI;
             ++AI;
-            // Install `oc->world` for the duration of the call.
+            // OC->STD conversion: install `oc->world` and unpack `oc->captures`
+            // into slot 0.  Both happen together at the conversion boundary;
+            // see the comment on this function's `kind` parameter.
             Value *oc_this = decay_derived(ctx, arg_v);
             Align alignof_ptr(ctx.types().alignof_ptr);
             Value *worldaddr = emit_ptrgep(ctx, oc_this, offsetof(jl_opaque_closure_t, world));
             jl_cgval_t closure_world = typed_load(ctx, worldaddr, NULL, (jl_value_t*)jl_long_type,
                     nullptr, nullptr, false, AtomicOrdering::NotAtomic, false, alignof_ptr.value());
             emit_unbox_store(ctx, closure_world, world_age_field, ctx.tbaa().tbaa_gcframe, alignof_ptr, alignof_ptr);
-            if (extract_captures) {
-                // Unwrap to `oc->captures` so the body specsig (which expects
-                // its formal first-slot captures type) sees the right value.
-                jl_value_t *captures_jt = jl_nth_slot_type(targetsig, 0);
-                Value *envaddr = emit_ptrgep(ctx, oc_this, offsetof(jl_opaque_closure_t, captures));
-                myargs[i] = typed_load(ctx, envaddr, NULL, captures_jt,
-                        nullptr, nullptr, /*isboxed*/true, AtomicOrdering::NotAtomic, false, sizeof(void*));
-                continue;
-            }
-            // Non-extracting path: the target ABI also receives the OC pointer
-            // at argv[0] (used by the dispatcher flavor that forwards to
-            // `jl_f_opaque_closure_call`, and by the const-return flavor).
-            // Type the slot as the OC type so the downstream call site emits
-            // the pass-through correctly.
-            jl_value_t *oc_type = get_oc_type(calltype, rettype);
-            myargs[i] = mark_julia_slot(arg_v, (jl_value_t*)oc_type, NULL, ctx.tbaa().tbaa_const);
+            jl_value_t *captures_jt = jl_nth_slot_type(targetsig, 0);
+            Value *envaddr = emit_ptrgep(ctx, oc_this, offsetof(jl_opaque_closure_t, captures));
+            myargs[i] = typed_load(ctx, envaddr, NULL, captures_jt,
+                    nullptr, nullptr, /*isboxed*/true, AtomicOrdering::NotAtomic, false, sizeof(void*));
             continue;
         }
-        // n.b. calltype is required to be a datatype by construction for specsig
-        jl_value_t *jt = jl_nth_slot_type(calltype, i);
+        // n.b. calltype is required to be a datatype by construction for specsig.
+        // Use the same slot-type derivation `get_specsig_function` uses to emit
+        // this function's LLVM signature: `jl_tparam` (vararg slot stays as
+        // `Vararg{T}`), upgraded via `compute_va_type` to `Tuple{Vararg{T}}` so
+        // the cgval carries a proper Julia type (not the synthetic `Vararg`).
+        // `jl_nth_slot_type` would unwrap the Vararg to `T`, mismatching the
+        // LLVM-level boxed-pointer slot.
+        jl_value_t *calltype_unwrapped = jl_unwrap_unionall(calltype);
+        size_t nparams = jl_nparams(calltype_unwrapped);
+        jl_value_t *jt = jl_tparam(calltype_unwrapped, i);
+        if (i + 1 == nparams && jl_is_vararg(jt))
+            jt = (jl_value_t*)compute_va_type(calltype_unwrapped, i);
         bool isboxed = false;
         Type *et;
         if (deserves_argbox(jt)) {
@@ -7309,9 +7318,11 @@ static void emit_specsig_to_specsig(
         if (targetspec == nullptr)
             gf_retval = mark_julia_type(ctx, emit_jlcall(ctx, target, nullptr, myargs, nargs, julia_call), true, targetrt);
         else
-            // When extracting captures, the target call uses the body's
-            // standard ABI (captures at argv[0]), not the OC pass-through ABI.
-            gf_retval = emit_call_specfun_other(ctx, is_for_opaque_closure && !extract_captures, targetsig, targetrt, *targetspec, myargs, nargs);
+            // After OC->STD conversion at entry, the target call is in STD ABI
+            // (slot 0 = captures, not OC).  For `kind=STD` adapters there's no
+            // conversion -- pass through as STD.  Either way the downstream
+            // call sees STD ABI.
+            gf_retval = emit_call_specfun_other(ctx, JL_ABI_STD, targetsig, targetrt, *targetspec, myargs, nargs);
     }
     if (rettype_const)
         gf_retval = mark_julia_const(ctx, rettype_const);
@@ -7321,7 +7332,7 @@ static void emit_specsig_to_specsig(
     }
 
     auto restore_world = [&]() {
-        if (is_for_opaque_closure)
+        if (kind == JL_ABI_OPAQUE_CLOSURE)
             ctx.builder.CreateAlignedStore(saved_world_age, world_age_field, ctx.types().alignof_ptr);
     };
     switch (cc) {
@@ -7398,7 +7409,7 @@ static void emit_specsig_to_specsig(
 
 void emit_specsig_to_fptr1(
         Function *gf_thunk, jl_returninfo_t::CallingConv cc, unsigned return_roots,
-        jl_value_t *calltype, jl_value_t *rettype, bool is_for_opaque_closure,
+        jl_value_t *calltype, jl_value_t *rettype, jl_abi_kind_t kind,
         size_t nargs,
         jl_codegen_output_t &out,
         Value *target)
@@ -7406,7 +7417,7 @@ void emit_specsig_to_fptr1(
     // The fptr1 target receives the OC pointer at argv[0] (jlcall ABI: F=oc).
     // No captures extraction needed -- the adapter passes the OC straight
     // through to e.g. `jl_f_opaque_closure_call`.
-    emit_specsig_to_specsig(gf_thunk, cc, return_roots, calltype, rettype, is_for_opaque_closure, /*extract_captures*/false, nargs, out, target, calltype, rettype, nullptr, nullptr);
+    emit_specsig_to_specsig(gf_thunk, cc, return_roots, calltype, rettype, kind, nargs, out, target, calltype, rettype, nullptr, nullptr);
 }
 
 // Helper for JIT linking.
@@ -7415,10 +7426,9 @@ Function *emit_specsig_to_fptr1(jl_codegen_output_t &out, jl_code_instance_t *ci
 {
     jl_method_instance_t *mi = jl_get_ci_mi(ci);
     size_t nrealargs = jl_nparams(mi->specTypes); // number of actual arguments being passed
-    // OC-source body methods now compile with a standard specsig; only the
-    // `jl_opaque_closure_method` wrapper carries an OC-shaped argv[0] ABI.
-    bool is_opaque_closure =
-        jl_is_method(mi->def.value) && mi->def.method == jl_opaque_closure_method;
+    // No CI linked through this helper should have an OC-shaped ABI today --
+    // see the matching note in `get_call_target` above.
+    assert(!jl_is_method(mi->def.value) || mi->def.method != jl_opaque_closure_method);
 
     std::string gf_thunk_name =
         get_function_name(true, false, name_from_method_instance(mi), out.TargetTriple);
@@ -7427,14 +7437,19 @@ Function *emit_specsig_to_fptr1(jl_codegen_output_t &out, jl_code_instance_t *ci
     jl_value_t *specTypes = get_ci_abi(ci);
     jl_returninfo_t info =
         get_specsig_function(out, &out.get_module(), nullptr, gf_thunk_name, specTypes,
-                             ci->rettype, is_opaque_closure);
+                             ci->rettype, JL_ABI_STD);
     Function *spec_func = cast<Function>(info.decl.getCallee());
     emit_specsig_to_fptr1(spec_func, info.cc, info.return_roots, specTypes, ci->rettype,
-                          is_opaque_closure, nrealargs, out, func);
+                          JL_ABI_STD, nrealargs, out, func);
     return spec_func;
 }
 
-static void emit_fptr1_wrapper(Module *M, StringRef gf_thunk_name, Value *target, jl_value_t *rettype_const, jl_value_t *declrt, jl_value_t *jlrettype, bool is_for_opaque_closure, jl_codegen_output_t &out) JL_CANSAFEPOINT
+// Emit a jlcall-input adapter (`(F, args*, nargs) -> jl_value_t*`).  See the
+// comment on `emit_specsig_to_specsig` (specsig flavor) for the meaning of
+// `kind`.  For `JL_ABI_OPAQUE_CLOSURE`, `F` is the OC and we convert at entry
+// to STD ABI: install `oc->world` and substitute `oc->captures` for `F` in
+// the forwarded call.
+static void emit_fptr1_wrapper(Module *M, StringRef gf_thunk_name, Value *target, jl_value_t *rettype_const, jl_value_t *declrt, jl_value_t *jlrettype, jl_abi_kind_t kind, jl_codegen_output_t &out) JL_CANSAFEPOINT
 {
     Function *w = Function::Create(get_func_sig(M->getContext()), GlobalVariable::ExternalLinkage, gf_thunk_name, M);
     jl_init_function(w, out);
@@ -7452,10 +7467,14 @@ static void emit_fptr1_wrapper(Module *M, StringRef gf_thunk_name, Value *target
     ctx.builder.SetCurrentDebugLocation(noDbg);
     allocate_gc_frame(ctx, b0);
 
-    // OC adapter: install `oc->world` from funcArg (=F=oc) for the call.
+    // For `JL_ABI_OPAQUE_CLOSURE`, perform the OC->STD conversion at entry:
+    // save the caller's world, install `oc->world`, and load `oc->captures`
+    // to substitute for `F` in the forwarded call.  After this point the
+    // adapter operates in STD ABI.
     Value *saved_world_age = nullptr;
     Value *world_age_field = nullptr;
-    if (is_for_opaque_closure) {
+    Value *funcArg_for_target = &*w->arg_begin();
+    if (kind == JL_ABI_OPAQUE_CLOSURE) {
         world_age_field = get_tls_world_age_field(ctx);
         jl_aliasinfo_t wai = jl_aliasinfo_t::fromTBAA(ctx, ctx.tbaa().tbaa_gcframe);
         saved_world_age = wai.decorateInst(ctx.builder.CreateAlignedLoad(
@@ -7467,13 +7486,18 @@ static void emit_fptr1_wrapper(Module *M, StringRef gf_thunk_name, Value *target
         jl_cgval_t closure_world = typed_load(ctx, worldaddr, NULL, (jl_value_t*)jl_long_type,
                 nullptr, nullptr, false, AtomicOrdering::NotAtomic, false, alignof_ptr.value());
         emit_unbox_store(ctx, closure_world, world_age_field, ctx.tbaa().tbaa_gcframe, alignof_ptr, alignof_ptr);
+        Value *envaddr = emit_ptrgep(ctx, oc_this, offsetof(jl_opaque_closure_t, captures));
+        jl_aliasinfo_t cai = jl_aliasinfo_t::fromTBAA(ctx, ctx.tbaa().tbaa_const);
+        funcArg_for_target = cai.decorateInst(ctx.builder.CreateAlignedLoad(
+                ctx.types().T_prjlvalue, envaddr, alignof_ptr));
     }
 
     jl_cgval_t gf_retval;
     if (target) {
         FunctionCallee theFunc(w->getFunctionType(), target);
         auto args = w->arg_begin();
-        CallInst *r = ctx.builder.CreateCall(theFunc, { &*args, &*++args, &*++args }); // cf emit_tojlinvoke
+        ++args; // skip funcArg; we use funcArg_for_target instead
+        CallInst *r = ctx.builder.CreateCall(theFunc, { funcArg_for_target, &*args, &*++args }); // cf emit_tojlinvoke
         assert(++args == w->arg_end());
         r->setAttributes(w->getAttributes());
         gf_retval = mark_julia_type(ctx, r, true, jlrettype);
@@ -7483,15 +7507,14 @@ static void emit_fptr1_wrapper(Module *M, StringRef gf_thunk_name, Value *target
     if (jlrettype != declrt)
         emit_typecheck(ctx, gf_retval, declrt, "cfunction");
     Value *boxed_ret = boxed(ctx, gf_retval);
-    if (is_for_opaque_closure)
+    if (kind == JL_ABI_OPAQUE_CLOSURE)
         ctx.builder.CreateAlignedStore(saved_world_age, world_age_field, ctx.types().alignof_ptr);
     ctx.builder.CreateRet(boxed_ret);
 }
 
 static void emit_specsig_to_specsig(
         Module *M, StringRef gf_thunk_name,
-        jl_value_t *calltype, jl_value_t *rettype, bool is_for_opaque_closure,
-        bool extract_captures,
+        jl_value_t *calltype, jl_value_t *rettype, jl_abi_kind_t kind,
         size_t nargs,
         jl_codegen_output_t &out,
         Value *target,
@@ -7500,11 +7523,11 @@ static void emit_specsig_to_specsig(
         jl_returninfo_t *targetspec,
         jl_value_t *rettype_const) JL_CANSAFEPOINT
 {
-    jl_returninfo_t returninfo = get_specsig_function(out, M, nullptr, gf_thunk_name, calltype, rettype, is_for_opaque_closure);
+    jl_returninfo_t returninfo = get_specsig_function(out, M, nullptr, gf_thunk_name, calltype, rettype, kind);
     Function *gf_thunk = cast<Function>(returninfo.decl.getCallee());
     jl_init_function(gf_thunk, out);
     gf_thunk->setAttributes(AttributeList::get(gf_thunk->getContext(), {returninfo.attrs, gf_thunk->getAttributes()}));
-    emit_specsig_to_specsig(gf_thunk, returninfo.cc, returninfo.return_roots, calltype, rettype, is_for_opaque_closure, extract_captures, nargs, out, target, targetsig, targetrt, targetspec, rettype_const);
+    emit_specsig_to_specsig(gf_thunk, returninfo.cc, returninfo.return_roots, calltype, rettype, kind, nargs, out, target, targetsig, targetrt, targetspec, rettype_const);
 }
 
 std::string emit_abi_converter(jl_codegen_output_t &out, jl_abi_t from_abi, jl_code_instance_t *codeinst, Value *target, bool target_specsig)
@@ -7517,37 +7540,32 @@ std::string emit_abi_converter(jl_codegen_output_t &out, jl_abi_t from_abi, jl_c
     Module *M = &out.get_module();
     bool needsparams = false;
     jl_method_instance_t *mi = jl_get_ci_mi(codeinst);
-    // The target CodeInstance always has a standard specsig signature (slot 0
-    // is the formal captures-or-first-arg type). When `from_abi.is_opaque_closure`
-    // is set, the adapter receives an `OpaqueClosure` at argv[0] and unwraps
-    // it to `oc->captures` before tail-calling the target -- see the captures-
-    // extraction path in `emit_specsig_to_specsig`.
-    bool target_is_opaque_closure = false;
+    // The target CodeInstance has standard ABI -- slot 0 is the body's formal
+    // first arg (captures Tuple for OC bodies).  When `from_abi.kind` is
+    // `JL_ABI_OPAQUE_CLOSURE`, the adapter performs the OC->STD conversion
+    // at entry (world switch + captures unpack) so the target call is in STD
+    // ABI either way.  `JL_ABI_STD` adapters just pass through.
+    //
     // Unique per emission (like emit_abi_dispatcher / emit_abi_constreturn): each ABIAdapter record
     // gets its own distinct adapter Function, so the fvar table has no duplicates and `fptr_record`
     // stays 1:1 (fvar id -> one record) -- mirroring how each CodeInstance gets its own Function.
     std::string gf_thunk_name = get_function_name(from_abi.specsig, needsparams, name_from_method_instance(mi), out.TargetTriple);
     raw_string_ostream(gf_thunk_name) << "_" << jl_atomic_fetch_add_relaxed(&globalUniqueGeneratedNames, 1) << "_gfthunk";
-    // When the adapter's input has an OpaqueClosure at argv[0] (`from_abi.is_opaque_closure`),
-    // the target CodeInstance has a standard specsig that expects the body's
-    // formal captures Tuple at argv[0]. The adapter extracts `oc->captures`
-    // and switches `task->world_age` to `oc->world`.
-    bool extract_captures = from_abi.is_opaque_closure;
     if (target_specsig) {
         jl_value_t *abi = get_ci_abi(codeinst);
-        jl_returninfo_t targetspec = get_specsig_function(out, M, target, "", abi, codeinst->rettype, target_is_opaque_closure);
+        jl_returninfo_t targetspec = get_specsig_function(out, M, target, "", abi, codeinst->rettype, JL_ABI_STD);
         if (from_abi.specsig)
-            emit_specsig_to_specsig(M, gf_thunk_name, from_abi.sigt, from_abi.rt, from_abi.is_opaque_closure, extract_captures, from_abi.nargs, out,
+            emit_specsig_to_specsig(M, gf_thunk_name, from_abi.sigt, from_abi.rt, from_abi.kind, from_abi.nargs, out,
                     target, mi->specTypes, codeinst->rettype, &targetspec, nullptr);
         else
-            gen_invoke_wrapper(mi, abi, codeinst->rettype, from_abi.rt, targetspec, from_abi.nargs, -1, from_abi.is_opaque_closure, extract_captures, gf_thunk_name, M, out);
+            gen_invoke_wrapper(mi, abi, codeinst->rettype, from_abi.rt, targetspec, from_abi.nargs, -1, from_abi.kind, gf_thunk_name, M, out);
     }
     else {
         if (from_abi.specsig)
-            emit_specsig_to_specsig(M, gf_thunk_name, from_abi.sigt, from_abi.rt, from_abi.is_opaque_closure, extract_captures, from_abi.nargs, out,
+            emit_specsig_to_specsig(M, gf_thunk_name, from_abi.sigt, from_abi.rt, from_abi.kind, from_abi.nargs, out,
                     target, mi->specTypes, codeinst->rettype, nullptr, nullptr);
         else
-            emit_fptr1_wrapper(M, gf_thunk_name, target, nullptr, from_abi.rt, codeinst->rettype, from_abi.is_opaque_closure, out);
+            emit_fptr1_wrapper(M, gf_thunk_name, target, nullptr, from_abi.rt, codeinst->rettype, from_abi.kind, out);
     }
     return gf_thunk_name;
 }
@@ -7562,14 +7580,26 @@ std::string emit_abi_dispatcher(jl_codegen_output_t &out, jl_abi_t from_abi, jl_
     Module *M = &out.get_module();
     Value *target;
     if (!codeinst) {
-        // No body CodeInstance.  Two flavors:
-        //  * Standard dispatch -- route through `jl_apply_generic` and let
-        //    the runtime method table find the actual implementation.
-        //  * OpaqueClosure do-not-compile -- argv[0] is the OC itself; the
-        //    "body" is just `jl_f_opaque_closure_call`, which type-checks
-        //    args and then calls `oc->invoke` (typically the interpreter
-        //    `jl_interpret_opaque_closure`).
-        target = from_abi.is_opaque_closure
+        // No body CodeInstance.  By convention (see `emit_specsig_to_specsig`),
+        // `JL_ABI_OPAQUE_CLOSURE` requires a body CI to convert to -- without
+        // one, the caller uses `JL_ABI_STD` and the OC (if any) flows through
+        // as a plain value.
+        assert(from_abi.kind == JL_ABI_STD &&
+               "JL_ABI_OPAQUE_CLOSURE adapters require a body CodeInstance");
+        // Target-selection optimization: when `from_abi.sigt`'s slot 0 is
+        // statically an `OpaqueClosure`, target `jl_f_opaque_closure_call`
+        // directly -- it expects `F = oc` and saves one dispatch lookup over
+        // `jl_apply_generic` (which would also eventually route here via the
+        // OC builtin method).  Otherwise route through `jl_apply_generic`.
+        // Use `jl_is_opaque_closure_type` (a typename check) rather than
+        // `jl_subtype` so we don't pass a type with free typevars (which
+        // could be in `from_abi.sigt`'s tparams after unwrapping its outer
+        // UnionAlls) through a subtype query.
+        jl_value_t *sigt_unwrapped = jl_unwrap_unionall(from_abi.sigt);
+        bool slot0_is_oc = jl_is_datatype(sigt_unwrapped) &&
+                           jl_nparams(sigt_unwrapped) > 0 &&
+                           jl_is_opaque_closure_type(jl_tparam(sigt_unwrapped, 0));
+        target = slot0_is_oc
             ? prepare_call_in(M, jlopaque_closure_call_func)
             : prepare_call_in(M, jlapplygeneric_func);
     }
@@ -7582,15 +7612,11 @@ std::string emit_abi_dispatcher(jl_codegen_output_t &out, jl_abi_t from_abi, jl_
     else
         raw_string_ostream(gf_thunk_name) << JL_SYM_PROTO_SPECSIG;
     raw_string_ostream(gf_thunk_name) << jl_atomic_fetch_add_relaxed(&globalUniqueGeneratedNames, 1) << "_gfthunk";
-    // Dispatcher path routes back through `jl_apply_generic` / `emit_tojlinvoke`,
-    // so the OC is passed through as F=oc -- no captures extraction. The
-    // world-age switch (when `from_abi.is_opaque_closure`) is still applied
-    // uniformly inside `emit_specsig_to_specsig` / `emit_fptr1_wrapper`.
     if (from_abi.specsig)
-        emit_specsig_to_specsig(M, gf_thunk_name, from_abi.sigt, from_abi.rt, from_abi.is_opaque_closure, /*extract_captures*/false, from_abi.nargs, out,
+        emit_specsig_to_specsig(M, gf_thunk_name, from_abi.sigt, from_abi.rt, from_abi.kind, from_abi.nargs, out,
                 target, from_abi.sigt, codeinst ? codeinst->rettype : (jl_value_t*)jl_any_type, nullptr, nullptr);
     else
-        emit_fptr1_wrapper(M, gf_thunk_name, target, nullptr, from_abi.rt, codeinst ? codeinst->rettype : (jl_value_t*)jl_any_type, from_abi.is_opaque_closure, out);
+        emit_fptr1_wrapper(M, gf_thunk_name, target, nullptr, from_abi.rt, codeinst ? codeinst->rettype : (jl_value_t*)jl_any_type, from_abi.kind, out);
     return gf_thunk_name;
 }
 
@@ -7600,33 +7626,19 @@ std::string emit_abi_constreturn(jl_codegen_output_t &out, jl_abi_t from_abi, jl
     std::string gf_thunk_name;
     raw_string_ostream(gf_thunk_name) << JL_SYM_SPECPTR_CONST << jl_atomic_fetch_add_relaxed(&globalUniqueGeneratedNames, 1);
     if (from_abi.specsig) {
-        // No body call -- the const literal is baked into the thunk. The
-        // world-age switch (when `from_abi.is_opaque_closure`) is still
-        // applied for uniformity with the other adapter flavors.
-        emit_specsig_to_specsig(M, gf_thunk_name, from_abi.sigt, from_abi.rt, from_abi.is_opaque_closure, /*extract_captures*/false, from_abi.nargs, out,
+        // No body call -- the const literal is baked into the thunk.  The
+        // OC->STD conversion at entry (for `JL_ABI_OPAQUE_CLOSURE`) still
+        // happens for uniformity, but is mostly inert here since nothing
+        // downstream uses the unpacked captures.
+        emit_specsig_to_specsig(M, gf_thunk_name, from_abi.sigt, from_abi.rt, from_abi.kind, from_abi.nargs, out,
                 nullptr, from_abi.sigt, jl_typeof(rettype_const), nullptr, rettype_const);
     }
     else {
-        emit_fptr1_wrapper(M, gf_thunk_name, nullptr, rettype_const, from_abi.rt, jl_typeof(rettype_const), from_abi.is_opaque_closure, out);
+        emit_fptr1_wrapper(M, gf_thunk_name, nullptr, rettype_const, from_abi.rt, jl_typeof(rettype_const), from_abi.kind, out);
     }
     return gf_thunk_name;
 }
 
-std::string emit_abi_constreturn(jl_codegen_output_t &out, bool specsig, jl_code_instance_t *codeinst)
-{
-    jl_value_t *sigt = get_ci_abi(codeinst);
-    jl_value_t *rt = codeinst->rettype;
-
-    jl_method_instance_t *mi = jl_get_ci_mi(codeinst);
-    bool is_opaque_closure = jl_is_method(mi->def.value) && mi->def.method->is_unregistered;
-
-    size_t nargs = specsig ? jl_nparams(sigt) : 0;
-    jl_abi_t abi = {sigt, rt, nargs, specsig, is_opaque_closure};
-
-    return emit_abi_constreturn(out, abi, codeinst->rettype_const);
-}
-
-// (get_abi_converter / method table mutating thread)
 // release jl_world_counter
 // release theFptr
 // release last_world_v
@@ -7646,7 +7658,7 @@ static jl_cgval_t emit_abi_call(jl_codectx_t &ctx, jl_value_t *declrt, jl_value_
         jl_temporary_root(ctx, sigt);
         assert(nargs == jl_nparams(sigt));
         bool needsparams = false;
-        bool is_opaque_closure = false;
+        jl_abi_kind_t kind = JL_ABI_STD;
         bool specsig = uses_specsig(sigt, needsparams, declrt, ctx.params->prefer_specsig);
         Type *T_size = ctx.types().T_size;
         Module *M = jl_Module;
@@ -7657,10 +7669,10 @@ static jl_cgval_t emit_abi_call(jl_codectx_t &ctx, jl_value_t *declrt, jl_value_
         // (AOT).
         jl_dispatch_trampoline_t *tr = NULL;
         JL_GC_PUSH1(&tr);
-        tr = jl_get_dispatch_trampoline(sigt, declrt, specsig);
+        tr = jl_get_dispatch_trampoline(sigt, declrt, specsig, kind);
         jl_temporary_root(ctx, (jl_value_t*)tr); // keep alive through codegen + serialization
         JL_GC_POP();
-        jl_abi_t cfuncabi = {sigt, declrt, nargs, specsig, is_opaque_closure};
+        jl_abi_t cfuncabi = {sigt, declrt, nargs, specsig, kind};
         ctx.emission_context.cfuncs.push_back({cfuncabi, tr});
         Value *tramp_box = boxed(ctx, mark_julia_const(ctx, (jl_value_t*)tr));
         Value *tramp_d = decay_derived(ctx, tramp_box);
@@ -7695,8 +7707,8 @@ static jl_cgval_t emit_abi_call(jl_codectx_t &ctx, jl_value_t *declrt, jl_value_
             // aren't closures, but sometimes there are cases like that because of
             // `::Function` de-specialization heuristics, such as for the `Returns` callable
             // given that it is `@nospecialize`.
-            jl_returninfo_t targetspec = get_specsig_function(ctx.emission_context, M, target, "", sigt, declrt, is_opaque_closure);
-            retval = emit_call_specfun_other(ctx, is_opaque_closure, sigt, declrt, targetspec, inputargs, nargs);
+            jl_returninfo_t targetspec = get_specsig_function(ctx.emission_context, M, target, "", sigt, declrt, kind);
+            retval = emit_call_specfun_other(ctx, kind, sigt, declrt, targetspec, inputargs, nargs);
         }
         else {
             retval = mark_julia_type(ctx, emit_jlcall(ctx, target, nullptr, inputargs, nargs, julia_call), true, declrt);
@@ -8278,9 +8290,11 @@ const char *jl_generate_ccallable(jl_codegen_output_t &out, jl_value_t *nameval,
     jl_throw(err);
 }
 
-// generate a julia-callable function that calls f (AKA lam)
-// if is_opaque_closure, then generate the OC invoke, rather than a real invoke
-static void gen_invoke_wrapper(jl_method_instance_t *lam, jl_value_t *abi, jl_value_t *jlretty, jl_value_t *declrt, jl_returninfo_t &f, unsigned nargs, int retarg, bool is_opaque_closure, bool extract_captures, StringRef funcName,
+// Emit a jlcall-input -> specsig-output invoke wrapper for the method `lam`.
+// See the comment on `emit_specsig_to_specsig` for the meaning of `kind`.
+// For `JL_ABI_OPAQUE_CLOSURE`, the wrapper performs the OC->STD conversion
+// at entry: install `oc->world` and unpack `oc->captures` into slot 0.
+static void gen_invoke_wrapper(jl_method_instance_t *lam, jl_value_t *abi, jl_value_t *jlretty, jl_value_t *declrt, jl_returninfo_t &f, unsigned nargs, int retarg, jl_abi_kind_t kind, StringRef funcName,
         Module *M, jl_codegen_output_t &out)
 {
     ++GeneratedInvokeWrappers;
@@ -8308,11 +8322,12 @@ static void gen_invoke_wrapper(jl_method_instance_t *lam, jl_value_t *abi, jl_va
     ctx.builder.SetCurrentDebugLocation(noDbg);
     allocate_gc_frame(ctx, b0);
 
-    // OC adapter: load `oc->world` from funcArg and install it for the
-    // duration of the body call; restored before return.
+    // For `JL_ABI_OPAQUE_CLOSURE`, perform the OC->STD conversion at entry:
+    // save the caller's world, install `oc->world`.  The captures unpack
+    // happens in the slot-0 branch of the arg loop below.
     Value *saved_world_age = nullptr;
     Value *world_age_field = nullptr;
-    if (is_opaque_closure) {
+    if (kind == JL_ABI_OPAQUE_CLOSURE) {
         world_age_field = get_tls_world_age_field(ctx);
         jl_aliasinfo_t wai = jl_aliasinfo_t::fromTBAA(ctx, ctx.tbaa().tbaa_gcframe);
         saved_world_age = wai.decorateInst(ctx.builder.CreateAlignedLoad(
@@ -8328,19 +8343,15 @@ static void gen_invoke_wrapper(jl_method_instance_t *lam, jl_value_t *abi, jl_va
     SmallVector<jl_cgval_t, 0> argv(nargs);
     jl_aliasinfo_t ai = jl_aliasinfo_t::fromTBAA(ctx, ctx.tbaa().tbaa_const);
     for (size_t i = 0; i < nargs; ++i) {
-        if (i == 0 && is_opaque_closure) {
-            if (extract_captures) {
-                // Unwrap `oc->captures` so the body's standard-ABI specsig
-                // sees its formal first-slot captures type.
-                jl_value_t *captures_jt = jl_nth_slot_type(abi, 0);
-                Value *oc_this = decay_derived(ctx, funcArg);
-                Value *envaddr = emit_ptrgep(ctx, oc_this, offsetof(jl_opaque_closure_t, captures));
-                argv[i] = typed_load(ctx, envaddr, NULL, captures_jt,
-                        nullptr, nullptr, /*isboxed*/true, AtomicOrdering::NotAtomic, false, sizeof(void*));
-                continue;
-            }
-            jl_value_t *oc_type = (jl_value_t*)jl_any_type; // more accurately: get_oc_type(lam->specTypes, jlretty)
-            argv[i] = mark_julia_slot(funcArg, oc_type, NULL, ctx.tbaa().tbaa_const);
+        if (jl_abi_kind_erases_slot(kind, i)) {
+            // OC->STD conversion (continued from the world switch above):
+            // unpack `oc->captures` so the body's STD specsig sees its formal
+            // slot-0 captures type.
+            jl_value_t *captures_jt = jl_nth_slot_type(abi, 0);
+            Value *oc_this = decay_derived(ctx, funcArg);
+            Value *envaddr = emit_ptrgep(ctx, oc_this, offsetof(jl_opaque_closure_t, captures));
+            argv[i] = typed_load(ctx, envaddr, NULL, captures_jt,
+                    nullptr, nullptr, /*isboxed*/true, AtomicOrdering::NotAtomic, false, sizeof(void*));
             continue;
         }
         jl_value_t *ty = jl_nth_slot_type(abi, i);
@@ -8357,8 +8368,9 @@ static void gen_invoke_wrapper(jl_method_instance_t *lam, jl_value_t *abi, jl_va
         }
         argv[i] = mark_julia_type(ctx, theArg, true, ty);
     }
-    // Target call passes captures (not OC) when extracting.
-    jl_cgval_t retval = emit_call_specfun_other(ctx, is_opaque_closure && !extract_captures, abi, jlretty, f, argv, nargs);
+    // Target call is STD ABI -- either the input was already STD, or we
+    // converted at entry above (captures unpacked into argv[0]).
+    jl_cgval_t retval = emit_call_specfun_other(ctx, JL_ABI_STD, abi, jlretty, f, argv, nargs);
     if (declrt != jlretty) {
         emit_typecheck(ctx, retval, declrt, "cfunction");
         retval = update_julia_type(ctx, retval, declrt);
@@ -8378,7 +8390,7 @@ static void gen_invoke_wrapper(jl_method_instance_t *lam, jl_value_t *abi, jl_va
     }
     else {
         Value *boxed_ret = boxed(ctx, retval);
-        if (is_opaque_closure)
+        if (kind == JL_ABI_OPAQUE_CLOSURE)
             ctx.builder.CreateAlignedStore(saved_world_age, world_age_field, ctx.types().alignof_ptr);
         ctx.builder.CreateRet(boxed_ret);
     }
@@ -8388,7 +8400,7 @@ static void gen_invoke_wrapper(jl_method_instance_t *lam, jl_value_t *abi, jl_va
     }
 }
 
-jl_returninfo_t get_specsig_function(jl_codegen_output_t &out, Module *M, Value *fval, StringRef name, jl_value_t *sig, jl_value_t *jlrettype, bool is_opaque_closure,
+jl_returninfo_t get_specsig_function(jl_codegen_output_t &out, Module *M, Value *fval, StringRef name, jl_value_t *sig, jl_value_t *jlrettype, jl_abi_kind_t kind,
         ArrayRef<const char*> ArgNames, unsigned nreq)
 {
     bool gcstack_arg = out.params->gcstack_arg;
@@ -8523,7 +8535,7 @@ jl_returninfo_t get_specsig_function(jl_codegen_output_t &out, Module *M, Value 
         jl_value_t *jt = jl_tparam(sig, i);
         bool isboxed = false;
         Type *et = nullptr;
-        if (i != 0 || !is_opaque_closure) { // special token for OC argument
+        if (!jl_abi_kind_erases_slot(kind, i)) { // type-erased slot is passed as a derived ptr
             if (is_uniquerep_Type(jt))
                 continue;
             isboxed = deserves_argbox(jt);
@@ -8857,7 +8869,7 @@ static jl_llvm_functions_t
         }
         returninfo =
             get_specsig_function(out, M, NULL, specptr_name, abi,
-                                 jlrettype, /*is_opaque_closure*/false, ArgNames, nreq);
+                                 jlrettype, /*kind*/JL_ABI_STD, ArgNames, nreq);
         f = cast<Function>(returninfo.decl.getCallee());
         declarations.specptr = f;
         has_sret = (returninfo.cc == jl_returninfo_t::SRet || returninfo.cc == jl_returninfo_t::Union);
@@ -8891,7 +8903,7 @@ static jl_llvm_functions_t
         auto invoke_name = out.make_name(JL_SYMBOL_INVOKE_DEF, JL_INVOKE_SPECSIG, ctx.name);
         size_t nparams = jl_nparams(abi);
         gen_invoke_wrapper(lam, abi, jlrettype, jlrettype, returninfo, nparams, retarg,
-                           /*is_opaque_closure*/false, /*extract_captures*/false, invoke_name, M,
+                           /*kind*/JL_ABI_STD, invoke_name, M,
                            ctx.emission_context);
         declarations.invoke = M->getFunction(invoke_name);
         // TODO: add attributes: maybe_mark_argument_dereferenceable(Arg, argType)

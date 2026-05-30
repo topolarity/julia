@@ -665,7 +665,7 @@ static void emit_trampoline_adapter(jl_codegen_output_t &out, jl_dispatch_trampo
     // serializer's `last_invokee` override (and ext_foreign_code); the first post-load call
     // restores `fptr` straight from it.
     jl_abi_adapter_t *rec = jl_new_abi_adapter(sigt, declrt, codeinst,
-            from_abi.specsig, from_abi.is_opaque_closure, from_abi.nargs, /*fptr*/nullptr);
+            from_abi.specsig, from_abi.kind, from_abi.nargs, /*fptr*/nullptr);
     // Nothing else roots the record until it is reported to ext_foreign_code.
     JL_GC_PUSH1(&rec);
     jl_array_ptr_1d_push(out.temporary_roots, (jl_value_t*)rec);
@@ -703,7 +703,7 @@ static void generate_cfunc_thunks(jl_codegen_output_t &out) JL_CANSAFEPOINT
         if (!jl_options.trim) {
             Function *uf = aot_abi_converter(out, cfunc.abi, nullptr, nullptr, nullptr, false);
             jl_abi_adapter_t *urec = jl_new_abi_adapter(cfunc.abi.sigt, cfunc.abi.rt,
-                    /*ci*/nullptr, cfunc.abi.specsig, cfunc.abi.is_opaque_closure, cfunc.abi.nargs,
+                    /*ci*/nullptr, cfunc.abi.specsig, cfunc.abi.kind, cfunc.abi.nargs,
                     /*fptr*/nullptr);
             JL_GC_PUSH1(&urec);
             // Nothing else roots the record until it is reported to ext_foreign_code.

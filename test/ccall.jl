@@ -2255,8 +2255,8 @@ end
     tramp_target(x::Int) = x
     entries() = ccall(:jl_typemap_count, Csize_t, (Any,),
                       getfield(Core.dispatch_trampolines, :cache))
-    get_tramp(sigt, rt, specsig=true) = ccall(:jl_get_dispatch_trampoline, Any,
-                             (Any, Any, Cint), sigt, rt, Cint(specsig))::Core.DispatchTrampoline
+    get_tramp(sigt, rt, specsig=true, kind=0) = ccall(:jl_get_dispatch_trampoline, Any,
+                             (Any, Any, Cint, Cint), sigt, rt, Cint(specsig), Cint(kind))::Core.DispatchTrampoline
     sigt = Tuple{typeof(tramp_target), Int}
     n0 = entries()
     a = get_tramp(sigt, Int)

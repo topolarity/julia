@@ -430,14 +430,34 @@ static inline void memassign_safe(int hasptr, char *dst, const jl_value_t *src, 
 #define GC_OLD_MARKED (GC_OLD | GC_MARKED) // reachable and old
 #define GC_IN_IMAGE_NOT_REMSET (GC_IN_IMAGE) // permalloc'd and not yet modified
 
+// Discriminator for an `jl_abi_t`'s call-frame setup. Each non-`STD` kind
+// bundles two coupled ABI properties: the layout of a type-erased argv slot
+// (so the adapter knows where to find subfields like `.world`) and the
+// world-age policy applied around the body call (e.g. switch to the closure's
+// frozen world, save/restore on entry/exit). Keep the two together so the
+// dispatcher / adapter emitter doesn't have to gate world handling on
+// "is some argv slot type-erased" -- the kind itself implies what to do.
+typedef enum {
+    JL_ABI_STD = 0,                 // standard ABI: no type-erased argv slot, no world switch
+    JL_ABI_OPAQUE_CLOSURE = 1,      // argv[0] is an OpaqueClosure (type-erased);
+                                    // install `oc->world` into `task->world_age` around the call
+} jl_abi_kind_t;
+
+// Returns 1 iff the `i`th argv slot is passed as a single derived-address-space
+// pointer (its formal type is bypassed for unboxing).  Each kind that uses a
+// type-erased slot today places it at argv[0].
+STATIC_INLINE int jl_abi_kind_erases_slot(jl_abi_kind_t kind, size_t i) JL_NOTSAFEPOINT
+{
+    return kind == JL_ABI_OPAQUE_CLOSURE && i == 0;
+}
+
 // data structures for runtime codegen
 typedef struct _jl_abi_t {
     jl_value_t *sigt;
     jl_value_t *rt;
     size_t nargs;
     int specsig; // bool
-    // OpaqueClosure Methods override the first argument of their signature
-    int is_opaque_closure;
+    jl_abi_kind_t kind;
 } jl_abi_t;
 
 // The compiler uses the specific integer values returned by jl_invoke_api
@@ -1751,15 +1771,15 @@ JL_DLLEXPORT int jl_abi_matches_invoke_api(jl_abi_t from_abi, jl_invoke_api_t ap
 // is needed), else NULL.
 JL_DLLEXPORT void *jl_abi_matching_specptr(jl_abi_t from_abi, jl_code_instance_t *codeinst) JL_CANSAFEPOINT;
 JL_DLLEXPORT jl_abi_adapter_t *jl_lookup_abi_adapter(jl_value_t *sigt, jl_value_t *rt,
-        jl_code_instance_t *ci, int specsig, int is_opaque_closure, size_t nargs) JL_CANSAFEPOINT;
+        jl_code_instance_t *ci, int specsig, jl_abi_kind_t kind, size_t nargs) JL_CANSAFEPOINT;
 // Find an existing adapter (or the target's own matching specptr) without JITing; NULL means
 // none exists. `*invokee` (optional) receives the Union{CodeInstance, ABIAdapter} behind a
 // non-NULL return.
 JL_DLLEXPORT void *jl_lookup_abi_converter(jl_abi_t from_abi, jl_code_instance_t *codeinst,
         void **target, int *target_specsig, jl_callptr_t *invoke, jl_value_t **invokee) JL_CANSAFEPOINT;
 JL_DLLEXPORT jl_abi_adapter_t *jl_new_abi_adapter(jl_value_t *sigt, jl_value_t *rt,
-        jl_code_instance_t *ci, int specsig, int is_opaque_closure, size_t nargs, void *fptr) JL_CANSAFEPOINT;
-JL_DLLEXPORT jl_dispatch_trampoline_t *jl_get_dispatch_trampoline(jl_value_t *sigt, jl_value_t *rt, int specsig) JL_CANSAFEPOINT;
+        jl_code_instance_t *ci, int specsig, jl_abi_kind_t kind, size_t nargs, void *fptr) JL_CANSAFEPOINT;
+JL_DLLEXPORT jl_dispatch_trampoline_t *jl_get_dispatch_trampoline(jl_value_t *sigt, jl_value_t *rt, int specsig, jl_abi_kind_t kind) JL_CANSAFEPOINT;
 JL_DLLEXPORT jl_dispatch_trampoline_t *jl_insert_dispatch_trampoline(jl_dispatch_trampoline_t *tr) JL_CANSAFEPOINT;
 // Insert the record if its key is absent and return the canonical record; keep-first, like
 // jl_specializations_get_or_insert.

@@ -93,8 +93,7 @@ static jl_opaque_closure_t *new_opaque_closure(jl_tupletype_t *argt, jl_value_t 
         // The OC's two callable slots are both cache-backed adapters that bridge
         // from "OC-as-first-arg" calling conventions to the body CI's specptr.
         // - `oc->specptr`: specsig adapter, called from `emit_specsig_oc_call`.
-        // - `oc->invoke`:  jlcall adapter, called via generic dispatch and from
-        //   `jl_invoke_oc`.
+        // - `oc->invoke`:  jlcall adapter, called via generic dispatch.
         // Both target the same body CI; the only difference is the source ABI.
         // For const-return bodies (`ci->invoke == jl_fptr_const_return_addr`),
         // `jl_jit_abi_converter` routes through `emit_abi_constreturn` which
@@ -103,32 +102,39 @@ static jl_opaque_closure_t *new_opaque_closure(jl_tupletype_t *argt, jl_value_t 
         size_t adapter_nargs = jl_nparams(adapter_sigt);
         jl_abi_t specsig_abi = {
             adapter_sigt, selected_rt, adapter_nargs,
-            /* specsig */ 1, /* is_opaque_closure */ 1,
+            /* specsig */ 1, /* kind */ JL_ABI_OPAQUE_CLOSURE,
         };
         jl_abi_t jlcall_abi = {
             adapter_sigt, selected_rt, adapter_nargs,
-            /* specsig */ 0, /* is_opaque_closure */ 1,
+            /* specsig */ 0, /* kind */ JL_ABI_OPAQUE_CLOSURE,
         };
         specptr = jl_jit_abi_converter(ct, specsig_abi, ci, NULL);
         callptr = (jl_fptr_args_t)jl_jit_abi_converter(ct, jlcall_abi, ci, NULL);
     }
     else {
-        // do_compile==0: no body CI to adapt to. We still need an `oc->specptr`
-        // that `emit_specsig_oc_call` can call with the OC's declared specsig
-        // ABI; that thunk just boxes its args and forwards to
-        // `jl_f_opaque_closure_call`, which type-checks args and calls
-        // `oc->invoke` (= `jl_interpret_opaque_closure` here).
+        // do_compile==0: no body CI to adapt to.  We still need an `oc->specptr`
+        // for `emit_specsig_oc_call` to call.  That thunk just boxes its args
+        // and forwards to `jl_f_opaque_closure_call`, which type-checks args
+        // and calls `oc->invoke` (= `jl_interpret_opaque_closure` here, which
+        // already installs `oc->world` itself).
         //
-        // The adapter cache already produces exactly this thunk when
-        // queried with `codeinst == NULL` and `is_opaque_closure == 1`:
-        // `emit_abi_dispatcher` picks `jl_f_opaque_closure_call` as the
-        // forwarding target. Sharing across OCs of the same declared type is
-        // automatic via the (from_abi, NULL) key.
+        // Kind is `JL_ABI_STD` (not `JL_ABI_OPAQUE_CLOSURE`): the adapter is a
+        // pure ABI repackaging (specsig -> jlcall, boxing args), not an
+        // OC->STD conversion.  The OC->STD conversion -- world-age switch and
+        // captures unpack -- is the job of `oc->invoke`
+        // (= `jl_interpret_opaque_closure`).  Using `JL_ABI_OPAQUE_CLOSURE`
+        // here would do the conversion in the adapter too, loading and
+        // installing `oc->world` twice in a row.
+        //
+        // `emit_abi_dispatcher` recognizes that slot 0 is statically an OC
+        // (from `adapter_sigt`) and targets `jl_f_opaque_closure_call`
+        // directly -- saving one dispatch lookup over `jl_apply_generic`,
+        // which would otherwise route here via the OC builtin method.
         jl_value_t *adapter_sigt = jl_argtype_with_function_type(oc_type, (jl_value_t*)argt);
         size_t adapter_nargs = jl_nparams(adapter_sigt);
         jl_abi_t specsig_abi = {
             adapter_sigt, selected_rt, adapter_nargs,
-            /* specsig */ 1, /* is_opaque_closure */ 1,
+            /* specsig */ 1, /* kind */ JL_ABI_STD,
         };
         specptr = jl_jit_abi_converter(ct, specsig_abi, /*codeinst*/NULL, NULL);
         // callptr stays as jl_interpret_opaque_closure

@@ -10,7 +10,7 @@
 // A TypeMap keyed on the adapter `sigt` alone (its
 // slot 0 is the function type, never `Union{}`). Each TypeMap entry holds a *bucket* of
 // jl_abi_adapter_t records that share one `sigt` but differ in (rt, ci, specsig,
-// is_opaque_closure, nargs). Because an adapter `sigt` may be shared by many distinct target
+// kind, nargs). Because an adapter `sigt` may be shared by many distinct target
 // `ci`, the bucket is adaptive, mirroring the TypeMap's own single/list/cache trichotomy:
 //   tier 1-2: `entry->func.value` is a `.next`-chained list of records (kept while
 //             count <= MAX_ADAPTER_LIST_COUNT); appended at the tail so the head
@@ -32,7 +32,7 @@ typedef struct {
     jl_value_t *rt;
     jl_code_instance_t *ci;
     int specsig;
-    int is_opaque_closure;
+    jl_abi_kind_t kind;
     size_t nargs;
 } abi_adapter_key_t;
 
@@ -44,7 +44,7 @@ static int abi_adapter_match(jl_value_t *rec, void *keyv) JL_CANSAFEPOINT
     abi_adapter_key_t *k = (abi_adapter_key_t*)keyv;
     return e->ci == k->ci
         && (int)e->specsig == (k->specsig ? 1 : 0)
-        && (int)e->is_opaque_closure == (k->is_opaque_closure ? 1 : 0)
+        && (jl_abi_kind_t)e->kind == k->kind
         && e->nargs == k->nargs
         && (e->rt == k->rt || jl_types_equal(e->rt, k->rt)); // rt lives in the bucket (key is sigt alone)
 }
@@ -76,6 +76,11 @@ static jl_abi_adapter_t *abi_adapter_bucket_find(jl_typemap_entry_t *te, abi_ada
 JL_DLLEXPORT int jl_abi_matches_invoke_api(jl_abi_t from_abi, jl_invoke_api_t api,
         jl_method_instance_t *mi, jl_value_t *rettype) JL_CANSAFEPOINT
 {
+    // A non-STD caller ABI can never be satisfied by the target's own entry point:
+    // the kind obliges the adapter to perform a call-frame conversion (e.g. OC->STD
+    // world switch + captures unpack) that the raw target does not do.
+    if (from_abi.kind != JL_ABI_STD)
+        return 0;
     if (api == JL_INVOKE_ARGS)
         return !from_abi.specsig && jl_subtype(rettype, from_abi.rt);
     if (api == JL_INVOKE_SPECSIG)
@@ -137,14 +142,14 @@ JL_DLLEXPORT void *jl_abi_matching_specptr(jl_abi_t from_abi, jl_code_instance_t
     return abi_adapter_resolve_target(from_abi, codeinst, &target, &target_specsig, &invoke);
 }
 
-// Lock-free lookup of the adapter record for (sigt, rt, ci, specsig, is_opaque_closure,
+// Lock-free lookup of the adapter record for (sigt, rt, ci, specsig, kind,
 // nargs). Returns the record or NULL. Safe to call with or without the writelock held.
 JL_DLLEXPORT jl_abi_adapter_t *jl_lookup_abi_adapter(jl_value_t *sigt, jl_value_t *rt,
-        jl_code_instance_t *ci, int specsig, int is_opaque_closure, size_t nargs) JL_CANSAFEPOINT
+        jl_code_instance_t *ci, int specsig, jl_abi_kind_t kind, size_t nargs) JL_CANSAFEPOINT
 {
     // Key on `sigt` alone (its slot 0 is the function type, never Union{}); the remaining
     // fields are disambiguated in the bucket (abi_adapter_match).
-    abi_adapter_key_t key = { rt, ci, specsig, is_opaque_closure, nargs };
+    abi_adapter_key_t key = { rt, ci, specsig, kind, nargs };
     jl_typemap_entry_t *te = jl_typemap_list_entry(&jl_abi_adapters->cache, sigt);
     if (te == NULL)
         return NULL;
@@ -180,11 +185,11 @@ JL_DLLEXPORT void *jl_lookup_abi_converter(jl_abi_t from_abi, jl_code_instance_t
         return shortcut;
     }
     jl_abi_adapter_t *e = jl_lookup_abi_adapter(from_abi.sigt, from_abi.rt, codeinst,
-            from_abi.specsig, from_abi.is_opaque_closure, from_abi.nargs);
+            from_abi.specsig, from_abi.kind, from_abi.nargs);
     if (e == NULL || e->fptr == NULL) {
         JL_LOCK(&jl_abi_adapters->writelock);
         e = jl_lookup_abi_adapter(from_abi.sigt, from_abi.rt, codeinst,
-                from_abi.specsig, from_abi.is_opaque_closure, from_abi.nargs);
+                from_abi.specsig, from_abi.kind, from_abi.nargs);
         JL_UNLOCK(&jl_abi_adapters->writelock);
     }
     // A record without a compiled thunk (fptr == NULL) cannot be served; report a miss so the
@@ -265,14 +270,14 @@ static void abi_adapter_insert(jl_abi_adapter_t *entry) JL_CANSAFEPOINT
 // Allocate an ABI-adapter cache record. Caller keeps the key fields (`sigt`/`rt`/`ci`)
 // rooted. `next` starts as the chain tail.
 JL_DLLEXPORT jl_abi_adapter_t *jl_new_abi_adapter(jl_value_t *sigt, jl_value_t *rt,
-        jl_code_instance_t *ci, int specsig, int is_opaque_closure, size_t nargs, void *fptr) JL_CANSAFEPOINT
+        jl_code_instance_t *ci, int specsig, jl_abi_kind_t kind, size_t nargs, void *fptr) JL_CANSAFEPOINT
 {
     jl_task_t *ct = jl_current_task;
     jl_abi_adapter_t *e = (jl_abi_adapter_t*)jl_gc_alloc(ct->ptls, sizeof(jl_abi_adapter_t), jl_abi_adapter_type);
     e->sigt = sigt;
     e->rt = rt;
     e->specsig = specsig ? 1 : 0;
-    e->is_opaque_closure = is_opaque_closure ? 1 : 0;
+    e->kind = (size_t)kind;
     e->nargs = nargs;
     e->ci = ci;
     e->fptr = fptr;
@@ -290,7 +295,7 @@ JL_DLLEXPORT jl_abi_adapter_t *jl_insert_abi_adapter(jl_abi_adapter_t *e) JL_CAN
     jl_abi_adapter_t *canonical = NULL;
     JL_GC_PUSH2(&e, &canonical);
     JL_LOCK(&jl_abi_adapters->writelock);
-    canonical = jl_lookup_abi_adapter(e->sigt, e->rt, e->ci, e->specsig, e->is_opaque_closure, e->nargs);
+    canonical = jl_lookup_abi_adapter(e->sigt, e->rt, e->ci, e->specsig, (jl_abi_kind_t)e->kind, e->nargs);
     if (canonical == NULL) {
         abi_adapter_insert(e);
         canonical = e;

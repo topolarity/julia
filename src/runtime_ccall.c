@@ -384,7 +384,7 @@ void *jl_update_dispatch_trampoline(jl_task_t *ct, jl_dispatch_trampoline_t *tr)
     jl_value_t *rt = tr->rt;
     JL_GC_PROMISE_ROOTED(rt);
     size_t nargs = jl_nparams(sigt);
-    jl_abi_t from_abi = { sigt, rt, nargs, tr->specsig, /*is_opaque_closure*/0 };
+    jl_abi_t from_abi = { sigt, rt, nargs, tr->specsig, (jl_abi_kind_t)tr->kind };
     jl_value_t *mi;
     jl_code_instance_t *codeinst;
     size_t world;

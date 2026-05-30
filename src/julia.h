@@ -1057,8 +1057,8 @@ typedef struct _jl_abi_adapter_t {
     jl_value_t *sigt;            // hash-consed Julia type (Tuple type)
     jl_value_t *rt;              // hash-consed Julia type (return type)
     size_t specsig : 1;          // whether the caller passes args in specsig (vs. boxed) form
-    size_t is_opaque_closure : 1; // whether the adapter bridges an OpaqueClosure caller ABI
-    size_t nargs : 8 * sizeof(size_t) - 2; // number of arguments in `sigt`
+    size_t kind : 8;             // jl_abi_kind_t -- bundles type-erased-arg layout + world-age policy
+    size_t nargs : 8 * sizeof(size_t) - 9; // number of arguments in `sigt`
 
     // callee target
     jl_code_instance_t *ci;      // target CodeInstance; may be NULL for dispatcher adapters
@@ -1066,8 +1066,8 @@ typedef struct _jl_abi_adapter_t {
     // adapter function pointer
     void *fptr;                  // JITed adapter address (not GC-tracked)
     // Bucket chain: the adapters cache is a TypeMap keyed on `sigt`; records sharing one
-    // `sigt` entry are chained here and disambiguated by (rt, ci, specsig, is_opaque_closure,
-    // nargs). Append-only (the head in the TypeMap entry's value never changes), so the chain
+    // `sigt` entry are chained here and disambiguated by (rt, ci, specsig, kind, nargs).
+    // Append-only (the head in the TypeMap entry's value never changes), so the chain
     // is safe to walk lock-free. NULL = tail.
     _Atomic(struct _jl_abi_adapter_t*) next;
 } jl_abi_adapter_t;
@@ -1087,9 +1087,10 @@ typedef struct _jl_dispatch_trampoline_t {
     _Atomic(void*) fptr;         // redundant cached fptr (== last_invokee's specptr/adapter fptr) for the hot-path poll
     _Atomic(size_t) last_world;  // world for which `fptr`/`last_invokee` are valid (0 = unresolved)
     uint8_t specsig;             // key: 1 if `fptr` is a specsig adapter, 0 if jlcall (cgparams-dependent)
+    uint8_t kind;                // key: jl_abi_kind_t of the caller ABI `fptr` is emitted for
     // Bucket chain: the trampolines cache is a TypeMap keyed on `sigt`; records sharing one
-    // `sigt` entry are chained here and disambiguated by (rt, specsig). Append-only, safe to
-    // walk lock-free. NULL = tail.
+    // `sigt` entry are chained here and disambiguated by (rt, specsig, kind). Append-only,
+    // safe to walk lock-free. NULL = tail.
     _Atomic(struct _jl_dispatch_trampoline_t*) next;
 } jl_dispatch_trampoline_t;
 
@@ -2558,7 +2559,6 @@ STATIC_INLINE int jl_vinfo_usedundef(uint8_t vi)
 
 JL_DLLEXPORT jl_value_t *jl_apply_generic(jl_value_t *F, jl_value_t **args, uint32_t nargs) JL_CANSAFEPOINT;
 JL_DLLEXPORT jl_value_t *jl_invoke(jl_value_t *F, jl_value_t **args, uint32_t nargs, jl_method_instance_t *meth) JL_CANSAFEPOINT;
-JL_DLLEXPORT jl_value_t *jl_invoke_oc(jl_value_t *F, jl_value_t **args, uint32_t nargs, jl_method_instance_t *meth) JL_CANSAFEPOINT;
 JL_DLLEXPORT int32_t jl_invoke_api(jl_code_instance_t *linfo);
 
 STATIC_INLINE jl_value_t *jl_apply(jl_value_t **args, uint32_t nargs) JL_CANSAFEPOINT
