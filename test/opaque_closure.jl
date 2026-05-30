@@ -246,6 +246,18 @@ end
 
 @test_throws MethodError (@opaque x->x+1)(1, 2)
 
+# Dynamic dispatch through `oc->invoke` (the jlcall adapter): vararg
+# arg-collection and const-return bodies must produce correct results when the
+# OC type is erased at the call site (rather than going through `oc->specptr`).
+let oc = @opaque (x...)->x
+    b = Base.inferencebarrier(oc)
+    @test b(1) == (1,)
+    @test b(1, 2, 3) == (1, 2, 3)
+end
+let oc = @opaque () -> 123
+    @test Base.inferencebarrier(oc)() == 123
+end
+
 # https://github.com/JuliaLang/julia/issues/40409
 const GLOBAL_OPAQUE_CLOSURE = @opaque () -> 123
 call_global_opaque_closure() = GLOBAL_OPAQUE_CLOSURE()
@@ -465,6 +477,20 @@ let ir = first(only(Base.code_ircode(sin, (Int,))))
     ir.argtypes[1] = Tuple{}
     oc = Core.OpaqueClosure(ir; do_compile=false)
     @test oc(1) == sin(1)
+    # ...and via dynamic dispatch (through the interpreter `oc->invoke`).
+    @test Base.inferencebarrier(oc)(1) == sin(1)
+end
+
+# do_compile=false vararg OpaqueClosure, exercised through both its specsig
+# adapter and dynamic dispatch into the interpreter.
+let src = code_typed((Int,Int)) do x, y...
+        return (x, y)
+    end |> only |> first
+    src.slottypes[1] = Tuple{}
+    oc = OpaqueClosure(src; rettype=Tuple{Int, Tuple{Int}}, sig=Tuple{Int, Int}, nargs=2, isva=true, do_compile=false)
+    @test oc(1, 2) === (1, (2,))
+    @test Base.inferencebarrier(oc)(1, 2) === (1, (2,))
+    @test_throws MethodError oc(1, 2, 3)
 end
 
 function typed_add54236(::Type{T}) where T
@@ -498,4 +524,19 @@ end
         oc = @opaque (x::Int) -> x + c
         @test invoke(oc, Tuple{Int}, 5) == 15
     end
+end
+# `invoke` reaches `oc->invoke` through the invoke-lookup path (distinct from
+# generic dispatch); cover it over vararg, do_compile=false, and explicit-world
+# (`Core.invoke_in_world`) variants as well.
+let oc = @opaque (x...)->x
+    @test invoke(oc, Tuple{Vararg{Any}}, 1) == (1,)
+    @test invoke(oc, Tuple{Vararg{Any}}, 1, 2, 3) == (1, 2, 3)
+end
+let ir = first(only(Base.code_ircode(sin, (Int,))))
+    ir.argtypes[1] = Tuple{}
+    oc = Core.OpaqueClosure(ir; do_compile=false)
+    @test invoke(oc, Tuple{Int}, 1) == sin(1)
+end
+let oc = @opaque (x::Int) -> x + 1
+    @test Core.invoke_in_world(Base.get_world_counter(), oc, 5) == 6
 end
