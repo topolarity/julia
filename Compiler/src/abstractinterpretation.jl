@@ -933,7 +933,8 @@ end
 
 function abstract_call_method_with_const_args(interp::AbstractInterpreter,
     result::MethodCallResult, @nospecialize(f), arginfo::ArgInfo, si::StmtInfo,
-    match::MethodMatch, sv::AbsIntState, invokecall::Union{Nothing,InvokeCall}=nothing)
+    match::MethodMatch, sv::AbsIntState, invokecall::Union{Nothing,InvokeCall}=nothing,
+    assume_const_prop_profitable::Bool=false)
     if bail_out_const_call(interp, result, si, match, sv)
         return nothing
     end
@@ -952,7 +953,7 @@ function abstract_call_method_with_const_args(interp::AbstractInterpreter,
         end
         # TODO allow semi-concrete interp for this call?
     end
-    mi = maybe_get_const_prop_profitable(interp, result, f, arginfo, si, match, sv)
+    mi = maybe_get_const_prop_profitable(interp, result, f, arginfo, si, match, sv, assume_const_prop_profitable)
     mi === nothing && return concrete_eval_result
     if is_constprop_recursed(result, mi, sv)
         add_remark!(interp, sv, "[constprop] Edge cycle encountered")
@@ -1151,7 +1152,7 @@ end
 # (hopefully without doing too much work), returns `MethodInstance`, or nothing otherwise
 function maybe_get_const_prop_profitable(interp::AbstractInterpreter,
     result::MethodCallResult, @nospecialize(f), arginfo::ArgInfo, si::StmtInfo,
-    match::MethodMatch, sv::AbsIntState)
+    match::MethodMatch, sv::AbsIntState, assume_const_prop_profitable::Bool=false)
     method = match.method
     force = force_const_prop(interp, f, method)
     if !const_prop_rettype_heuristic(interp, result, si, sv, force)
@@ -1176,7 +1177,11 @@ function maybe_get_const_prop_profitable(interp::AbstractInterpreter,
     mi = mi::MethodInstance
     inf_result = result.call_result
     inf_result = inf_result isa InferenceResult ? inf_result : nothing
-    if !force && !const_prop_methodinstance_heuristic(interp, inf_result, mi, arginfo, sv)
+    # Not inlining an opaque closure can be very expensive, so be generous
+    # with the const-prop-ability. It is quite possible that we can't infer
+    # anything at all without const-propping, so the inlining check below
+    # isn't particularly helpful here.
+    if !force && !assume_const_prop_profitable && !const_prop_methodinstance_heuristic(interp, inf_result, mi, arginfo, sv)
         add_remark!(interp, sv, "[constprop] Disabled by method instance heuristic")
         return nothing
     end
@@ -1333,13 +1338,6 @@ end
 function const_prop_methodinstance_heuristic(interp::AbstractInterpreter,
     inf_result::Union{InferenceResult,Nothing}, mi::MethodInstance, ::ArgInfo, sv::AbsIntState)
     method = mi.def::Method
-    if method.is_for_opaque_closure
-        # Not inlining an opaque closure can be very expensive, so be generous
-        # with the const-prop-ability. It is quite possible that we can't infer
-        # anything at all without const-propping, so the inlining check below
-        # isn't particularly helpful here.
-        return true
-    end
     # now check if the source of this method instance is inlineable, since the extended type
     # information we have here would be discarded if it is not inlined into a callee context
     # (modulo the inferred return type that can be potentially refined)
@@ -3093,7 +3091,8 @@ function abstract_call_opaque_closure(interp::AbstractInterpreter, closure::Part
         ⊑, ⋤, ⊔ = partialorder(𝕃ₚ), strictneqpartialorder(𝕃ₚ), join(𝕃ₚ)
         if !edgecycle
             const_call_result = abstract_call_method_with_const_args(interp, result,
-                #=f=#nothing, arginfo, si, match, sv)
+                #=f=#nothing, arginfo, si, match, sv, #=invokecall=#nothing,
+                #=assume_const_prop_profitable=#true)
             if const_call_result !== nothing
                 const_result = const_edge = nothing
                 if const_call_result.rt ⊑ rt
