@@ -4068,7 +4068,7 @@ void jl_init_types(void) JL_GC_DISABLED
                             "nospecialize",
                             "nkw",
                             "isva",
-                            "is_for_opaque_closure",
+                            "is_unregistered",
                             "nospecializeinfer",
                             "did_scan_source",
                             "constprop",

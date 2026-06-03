@@ -894,7 +894,7 @@ static void jl_add_methods(jl_array_t *external) JL_CANSAFEPOINT
     for (i = 0; i < l; i++) {
         jl_method_t *meth = (jl_method_t*)jl_array_ptr_ref(external, i);
         assert(jl_is_method(meth));
-        assert(!meth->is_for_opaque_closure);
+        assert(!meth->is_unregistered); // we are entering `meth` into a method table
         jl_methtable_t *mt = jl_method_get_table(meth);
         assert((jl_value_t*)mt != jl_nothing);
         jl_typemap_entry_t *entry = jl_method_table_add(mt, meth, NULL);

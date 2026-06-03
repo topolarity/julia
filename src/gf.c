@@ -174,7 +174,7 @@ static int jl_is_builtinfunc(jl_method_t *m)
 {
     return m->source == NULL && m->generator == NULL &&
         jl_atomic_load_relaxed(&m->unspecialized) != NULL &&
-        m != jl_opaque_closure_method && !m->is_for_opaque_closure;
+        m != jl_opaque_closure_method && !m->is_unregistered;
     // jl_value_t *tt = m->sig;
     // if (!jl_is_datatype(tt) || jl_nparams(tt) != 2)
     //     return 0;
@@ -2820,7 +2820,7 @@ static void jl_method_table_invalidate(jl_method_t *replaced, size_t max_world) 
 {
     if (jl_options.incremental && jl_generating_output())
         jl_error("Method deletion is not possible during Module precompile.");
-    assert(!replaced->is_for_opaque_closure);
+    assert(!replaced->is_unregistered); // unregistered methods are not in a table to be invalidated
     assert(jl_atomic_load_relaxed(&jl_world_counter) == max_world);
     // Invalidate the backedges
     int invalidated = 0;
@@ -3585,8 +3585,8 @@ static void record_precompile_statement(jl_method_instance_t *mi, double compila
         return;
     if (!jl_is_method(def) || jl_is_builtinfunc(def))
         return;
-    if (def->is_for_opaque_closure)
-        return; // OpaqueClosure methods cannot be looked up by their types, so are incompatible with `precompile(...)`
+    if (def->is_unregistered)
+        return; // unregistered methods cannot be looked up by their types, so are incompatible with `precompile(...)`
 
     JL_LOCK(&precomp_statement_out_lock);
     if (s_precompile == NULL) {

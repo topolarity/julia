@@ -17,7 +17,7 @@ include("tempdepot.jl")
 for (T, c) in (
         (Core.CodeInfo, []),
         (Core.CodeInstance, [:def, :owner, :rettype, :exctype, :rettype_const, :time_infer_total, :time_infer_cache_saved, :time_infer_self]),
-        (Core.Method, [#=:name, :module, :file, :line, :primary_world, :sig, :slot_syms, :external_mt, :nargs, :called, :nospecialize, :nkw, :isva, :is_for_opaque_closure, :constprop=#]),
+        (Core.Method, [#=:name, :module, :file, :line, :primary_world, :sig, :slot_syms, :external_mt, :nargs, :called, :nospecialize, :nkw, :isva, :is_unregistered, :constprop=#]),
         (Core.MethodInstance, [#=:def, :specTypes, :sparam_vals=#]),
         (Core.MethodTable, [:cache, :module, :name]),
         (Core.MethodCache, []),

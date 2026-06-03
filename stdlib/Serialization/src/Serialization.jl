@@ -536,7 +536,7 @@ function serialize(s::AbstractSerializer, meth::Method)
     serialize(s, meth.slot_syms)
     serialize(s, meth.nargs)
     serialize(s, meth.isva)
-    serialize(s, meth.is_for_opaque_closure)
+    serialize(s, meth.is_unregistered)
     serialize(s, meth.nospecializeinfer)
     serialize(s, meth.constprop)
     serialize(s, meth.purity)
@@ -1158,7 +1158,7 @@ function deserialize(s::AbstractSerializer, ::Type{Method})
     end
     nargs = deserialize(s)::Int32
     isva = deserialize(s)::Bool
-    is_for_opaque_closure = false
+    is_unregistered = false
     nospecializeinfer = false
     constprop = 0x00
     purity = 0x0000
@@ -1166,7 +1166,7 @@ function deserialize(s::AbstractSerializer, ::Type{Method})
         deserialize(s)
     end
     template = if isa(template_or_is_opaque, Bool)
-        is_for_opaque_closure = template_or_is_opaque
+        is_unregistered = template_or_is_opaque
         if format_version(s) >= 24
             nospecializeinfer = deserialize(s)::Bool
         end
@@ -1198,7 +1198,7 @@ function deserialize(s::AbstractSerializer, ::Type{Method})
         meth.sig = sig
         meth.nargs = nargs
         meth.isva = isva
-        meth.is_for_opaque_closure = is_for_opaque_closure
+        meth.is_unregistered = is_unregistered
         meth.nospecializeinfer = nospecializeinfer
         meth.constprop = constprop
         meth.purity = purity
@@ -1222,7 +1222,7 @@ function deserialize(s::AbstractSerializer, ::Type{Method})
         if recursion_relation !== nothing
             meth.recursion_relation = recursion_relation
         end
-        if !is_for_opaque_closure
+        if !is_unregistered
             mt = Core.methodtable
             if nothing === ccall(:jl_methtable_lookup, Any, (Any, UInt), sig, Base.get_world_counter()) # XXX: quite sketchy?
                 ccall(:jl_method_table_insert, Cvoid, (Any, Any, Ptr{Cvoid}), mt, meth, C_NULL)

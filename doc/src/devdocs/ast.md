@@ -586,7 +586,7 @@ A unique'd container describing the shared metadata for a single method.
     Pointers to non-AST things that have been interpolated into the AST, required by
     compression of the AST, type-inference, or the generation of native code.
 
-  * `nargs`, `isva`, `called`, `is_for_opaque_closure`,
+  * `nargs`, `isva`, `called`, `is_unregistered`,
 
     Descriptive bit-fields for the source code of this Method.
 

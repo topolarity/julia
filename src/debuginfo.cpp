@@ -418,15 +418,15 @@ void jl_register_jit_object(const object::ObjectFile &Object,
                             std::function<uint64_t(const StringRef &)> getLoadAddress,
                             const jl_linker_info_t &Info)
 {
-    // Opaque-closure code instances are not otherwise reachable through their
-    // method, so promote them to global roots here, before entering the
+    // Code instances of unregistered methods are not otherwise reachable through
+    // their method (which is in no method table), so promote them to global roots here, before entering the
     // JL_NOTSAFEPOINT registerJITObject body. Scanning the list is safe in the
     // GC-safe materialization state (registerJITObject reads the same fields),
     // so only switch to GC-unsafe around the rare allocating promotion.
     jl_task_t *ct = jl_current_task;
     for (auto &[ci, funcs] : Info.ci_funcs) {
         jl_method_instance_t *mi = jl_get_ci_mi(ci);
-        if (jl_is_method(mi->def.method) && mi->def.method->is_for_opaque_closure) {
+        if (jl_is_method(mi->def.method) && mi->def.method->is_unregistered) {
             jl_code_instance_t *ci_root = ci;
             // jl_gc_unsafe_enter may safepoint, so root before the transition.
             JL_GC_PUSH1(&ci_root);

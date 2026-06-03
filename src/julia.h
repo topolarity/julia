@@ -458,7 +458,7 @@ typedef struct _jl_method_t {
                             // of another method.
     // various boolean properties
     uint8_t isva;
-    uint8_t is_for_opaque_closure;
+    uint8_t is_unregistered; // not entered in any method table (e.g. opaque closure bodies); not dispatched by signature
     uint8_t nospecializeinfer;
     // bit flags, 0x01 = scanned
     // 0x02 = added to module scanned list (either from scanning or inference edge)

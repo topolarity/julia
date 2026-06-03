@@ -1084,7 +1084,7 @@ JL_DLLEXPORT jl_method_t *jl_new_method_uninit(jl_module_t *module)
     jl_atomic_store_relaxed(&m->primary_world, ~(size_t)0);
     jl_atomic_store_relaxed(&m->dispatch_status, 0);
     jl_atomic_store_relaxed(&m->interferences, (jl_genericmemory_t*)jl_an_empty_memory_any);
-    m->is_for_opaque_closure = 0;
+    m->is_unregistered = 0;
     m->nospecializeinfer = 0;
     jl_atomic_store_relaxed(&m->did_scan_source, 0);
     m->constprop = 0;
@@ -1187,7 +1187,8 @@ jl_method_t *jl_make_opaque_closure_method(jl_module_t *module, jl_value_t *name
     // TODO: Maybe have a signature of (parent method, stmt#)?
     m->sig = (jl_value_t*)jl_anytuple_type;
     m->isva = isva;
-    m->is_for_opaque_closure = 1;
+    // Opaque-closure bodies are not entered in any method table.
+    m->is_unregistered = 1;
     if (name == jl_nothing) {
         m->name = jl_symbol("opaque closure");
     } else {

@@ -53,7 +53,7 @@ const SSAFLAGS_MISMATCH = "not all SSAValues have a corresponding `ssaflags`"
 const NON_TOP_LEVEL_METHOD = "encountered `Expr` head `:method` in non-top-level code (i.e. `nargs` > 0)"
 const SIGNATURE_NARGS_MISMATCH = "method signature does not match number of method arguments"
 const SLOTNAMES_NARGS_MISMATCH = "CodeInfo for method contains fewer slotnames than the number of method arguments"
-const INVALID_SIGNATURE_OPAQUE_CLOSURE = "invalid signature of method for opaque closure - `sig` field must always be set to `Tuple`"
+const INVALID_SIGNATURE_UNREGISTERED = "invalid signature of unregistered method - `sig` field must always be set to `Tuple`"
 
 struct InvalidCodeError <: Exception
     kind::String
@@ -218,8 +218,8 @@ function validate_code!(errors::Vector{InvalidCodeError}, mi::Core.MethodInstanc
         m = mi.def::Method
         mnargs = Int(m.nargs)
         n_sig_params = length((unwrap_unionall(m.sig)::DataType).parameters)
-        if m.is_for_opaque_closure
-            m.sig === Tuple || push!(errors, InvalidCodeError(INVALID_SIGNATURE_OPAQUE_CLOSURE, (m.sig, m.isva)))
+        if m.is_unregistered
+            m.sig === Tuple || push!(errors, InvalidCodeError(INVALID_SIGNATURE_UNREGISTERED, (m.sig, m.isva)))
         elseif (m.isva ? (n_sig_params < (mnargs - 1)) : (n_sig_params != mnargs))
             push!(errors, InvalidCodeError(SIGNATURE_NARGS_MISMATCH, (m.isva, n_sig_params, mnargs)))
         end

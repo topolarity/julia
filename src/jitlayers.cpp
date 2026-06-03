@@ -526,10 +526,10 @@ jl_emit_codeinsts_to_jit_impl(jl_code_instance_t **codeinsts, jl_code_info_t **s
         jl_promote_method_roots(out, mi);
         emit_always_inline(out, jl_get_method_ir); // contains safepoints
 
-        // Non-opaque-closure MethodInstances are considered globally rooted
-        // through their methods, but for OC, we need to create a global root
-        // here.
-        if (jl_is_method(mi->def.value) && mi->def.method->is_for_opaque_closure)
+        // MethodInstances of registered methods are considered globally rooted
+        // through their (table-reachable) methods; an unregistered method is not,
+        // so create a global root here.
+        if (jl_is_method(mi->def.value) && mi->def.method->is_unregistered)
             jl_as_global_root((jl_value_t*)mi, 1);
     }
 

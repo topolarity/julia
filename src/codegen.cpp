@@ -5646,7 +5646,7 @@ static jl_cgval_t emit_call_specfun_other(jl_codectx_t &ctx, bool is_opaque_clos
 static jl_cgval_t emit_call_specfun_other(jl_codectx_t &ctx, jl_method_instance_t *mi, jl_value_t *jlretty, StringRef specFunctionObject,
                                           ArrayRef<jl_cgval_t> argv, size_t nargs, jl_returninfo_t::CallingConv *cc, unsigned *return_roots, jl_value_t *inferred_retty) JL_CANSAFEPOINT
 {
-    bool is_opaque_closure = jl_is_method(mi->def.value) && mi->def.method->is_for_opaque_closure;
+    bool is_opaque_closure = jl_is_method(mi->def.value) && mi->def.method->is_unregistered;
     return emit_call_specfun_other(ctx, is_opaque_closure, mi->specTypes, jlretty, NULL,
         specFunctionObject, argv, nargs, cc, return_roots, inferred_retty);
 }
@@ -5655,7 +5655,7 @@ static jl_cgval_t emit_call_specfun_other(jl_codectx_t &ctx, jl_code_instance_t 
     ArrayRef<jl_cgval_t> argv, size_t nargs, jl_returninfo_t::CallingConv *cc, unsigned *return_roots, jl_value_t *inferred_retty) JL_CANSAFEPOINT
 {
     jl_method_instance_t *mi = jl_get_ci_mi(ci);
-    bool is_opaque_closure = jl_is_method(mi->def.value) && mi->def.method->is_for_opaque_closure;
+    bool is_opaque_closure = jl_is_method(mi->def.value) && mi->def.method->is_unregistered;
     return emit_call_specfun_other(ctx, is_opaque_closure, get_ci_abi(ci), ci->rettype, NULL,
         specFunctionObject, argv, nargs, cc, return_roots, inferred_retty,
         jl_atomic_load_relaxed(&ci->ipo_purity_bits));
@@ -7163,7 +7163,7 @@ static Function *emit_tojlinvoke(jl_code_instance_t *codeinst, Value *theFunc, j
     }
     else {
         jl_method_instance_t *mi = jl_get_ci_mi(codeinst);
-        bool is_opaque_closure = jl_is_method(mi->def.value) && mi->def.method->is_for_opaque_closure;
+        bool is_opaque_closure = jl_is_method(mi->def.value) && mi->def.method->is_unregistered;
         theFunc = prepare_call(is_opaque_closure ? jlinvokeoc_func : jlinvoke_func);
         theFarg = literal_pointer_val(ctx, (jl_value_t*)mi);
     }
@@ -7618,7 +7618,7 @@ std::string emit_abi_constreturn(jl_codegen_output_t &out, bool specsig, jl_code
     jl_value_t *rt = codeinst->rettype;
 
     jl_method_instance_t *mi = jl_get_ci_mi(codeinst);
-    bool is_opaque_closure = jl_is_method(mi->def.value) && mi->def.method->is_for_opaque_closure;
+    bool is_opaque_closure = jl_is_method(mi->def.value) && mi->def.method->is_unregistered;
 
     size_t nargs = specsig ? jl_nparams(sigt) : 0;
     jl_abi_t abi = {sigt, rt, nargs, specsig, is_opaque_closure};
