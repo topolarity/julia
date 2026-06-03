@@ -1068,11 +1068,6 @@ JL_DLLEXPORT jl_string_t *jl_compress_ir(jl_method_t *m, jl_code_info_t *code)
     if (flags.bits.has_ssaflags)
         ios_write(s.s, (const char*)ssaflags_data, l * sizeof(*ssaflags_data));
 
-    // For opaque closure, also save the slottypes. We technically only need the first slot type,
-    // but this is simpler for now. We may want to refactor where this gets stored in the future.
-    if (m->is_for_opaque_closure)
-        jl_encode_value_(&s, code->slottypes, 1);
-
     jl_string_t *v = NULL;
     JL_GC_PUSH1(&v);
     // Slotnames. For regular methods, we require that m->slot_syms matches the
@@ -1163,10 +1158,6 @@ JL_DLLEXPORT jl_code_info_t *jl_uncompress_ir(jl_method_t *m, jl_code_instance_t
         ios_readall(s.s, (char*)ssaflags_data, l * sizeof(*ssaflags_data));
     else
         memset(ssaflags_data, 0, l * sizeof(*ssaflags_data));
-
-    if (m->is_for_opaque_closure) {
-        jl_gc_write(code, code->slottypes, jl_value_t, jl_decode_value(&s));
-    }
 
     slotnames = jl_decode_value(&s);
     if (!jl_is_string(slotnames))
