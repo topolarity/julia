@@ -1036,9 +1036,21 @@ static int typekey_eq(jl_datatype_t *tt, jl_value_t **key, size_t n)
 
 // These `value` functions return the same values as the primary functions,
 // but operate on the typeof/Typeof each object in an array
-static int typekeyvalue_eq(jl_datatype_t *tt, jl_value_t *key1, jl_value_t **key, size_t n, int leaf)
+// The type-value contributed by argument i when building/looking up a tuple type
+// under the requested `leaf` semantics: for a leaf (dispatch) tuple a type-valued
+// argument contributes `Type{...}` (so this returns its type-value); for a non-leaf
+// (value) tuple every argument contributes its plain type, so this returns NULL.
+// `typeof_arg(f, args, types, i)` always gives the argument's plain type.
+STATIC_INLINE jl_value_t *typearg_for_leaf(jl_value_t *f, jl_value_t **args, size_t i, int leaf) JL_NOTSAFEPOINT
 {
-    size_t j;
+    return leaf ? valueof_typearg(f, args, i) : NULL;
+}
+
+// Compare a cached candidate tuple type `tt` against the call's arguments (f, args, types)
+// interpreted under `leaf`. This is the value-keyed counterpart of typekey_eq.
+static int typekeyvalue_eq(jl_datatype_t *tt, jl_value_t *f, jl_value_t **args, jl_value_t **types, size_t nargs, int leaf)
+{
+    size_t j, n = nargs;
     // TODO: This shouldn't be necessary
     JL_GC_PROMISE_ROOTED(tt);
     size_t tnp = jl_nparams(tt);
@@ -1049,22 +1061,26 @@ static int typekeyvalue_eq(jl_datatype_t *tt, jl_value_t *key1, jl_value_t **key
         // dispatch from changing the type of something.
         // this should work because `Type`s don't have uids, and aren't the
         // direct tags of values so we don't rely on pointer equality.
-        jl_value_t *kj = key1;
+        jl_value_t *kj = f;
         jl_value_t *tj = jl_tparam0(tt);
         return (kj == tj || (jl_typeof(tj) == jl_typeof(kj) && jl_types_equal(tj, kj)));
     }
     for (j = 0; j < n; j++) {
-        jl_value_t *kj = j == 0 ? key1 : key[j - 1];
         jl_value_t *tj = jl_svecref(tt->parameters, j);
+        jl_value_t *tval = typearg_for_leaf(f, args, j, leaf);
         if (leaf && jl_is_type_type(tj)) {
             jl_value_t *tp0 = jl_tparam0(tj);
-            if (!(kj == tp0 || (jl_typeof(tp0) == jl_typeof(kj) && jl_types_equal(tp0, kj))))
+            // a `Type{tp0}` parameter only matches a type-valued argument equal to tp0
+            if (tval == NULL)
+                return 0;
+            if (!(tval == tp0 || (jl_typeof(tp0) == jl_typeof(tval) && jl_types_equal(tp0, tval))))
                 return 0;
         }
-        else if (jl_typeof(kj) != tj) {
+        else if (typeof_arg(f, args, types, j) != tj) {
             return 0;
         }
-        else if (leaf && jl_is_kind(tj)) {
+        else if (tval != NULL && jl_is_kind(tj)) {
+            // a type-valued argument matches `Type{...}`, never the bare kind
             return 0;
         }
     }
@@ -1072,7 +1088,7 @@ static int typekeyvalue_eq(jl_datatype_t *tt, jl_value_t *key1, jl_value_t **key
 }
 
 static unsigned typekey_hash(jl_typename_t *tn, jl_value_t **key, size_t n, int nofail) JL_NOTSAFEPOINT;
-static unsigned typekeyvalue_hash(jl_typename_t *tn, jl_value_t *key1, jl_value_t **key, size_t n, int leaf) JL_NOTSAFEPOINT;
+static unsigned typekeyvalue_hash(jl_typename_t *tn, jl_value_t *f, jl_value_t **args, jl_value_t **types, size_t nargs, int leaf) JL_NOTSAFEPOINT;
 
 /* returns val if key is in hash, otherwise NULL */
 static jl_datatype_t *lookup_type_set(jl_svec_t *cache, jl_value_t **key, size_t n, uint_t hv)
@@ -1098,7 +1114,7 @@ static jl_datatype_t *lookup_type_set(jl_svec_t *cache, jl_value_t **key, size_t
 }
 
 /* returns val if key is in hash, otherwise NULL */
-static jl_datatype_t *lookup_type_setvalue(jl_svec_t *cache, jl_value_t *key1, jl_value_t **key, size_t n, uint_t hv, int leaf)
+static jl_datatype_t *lookup_type_setvalue(jl_svec_t *cache, jl_value_t *f, jl_value_t **args, jl_value_t **types, size_t nargs, uint_t hv, int leaf)
 {
     size_t sz = jl_svec_len(cache);
     if (sz == 0)
@@ -1112,7 +1128,7 @@ static jl_datatype_t *lookup_type_setvalue(jl_svec_t *cache, jl_value_t *key1, j
         jl_datatype_t *val = jl_atomic_load_relaxed(&tab[index]);
         if ((jl_value_t*)val == jl_nothing)
             return NULL;
-        if (val->hash == hv && typekeyvalue_eq(val, key1, key, n, leaf))
+        if (val->hash == hv && typekeyvalue_eq(val, f, args, types, nargs, leaf))
             return val;
         index = (index + 1) & (sz - 1);
         iter++;
@@ -1140,9 +1156,9 @@ static ssize_t lookup_type_idx_linear(jl_svec_t *cache, jl_value_t **key, size_t
     return ~cl;
 }
 
-static ssize_t lookup_type_idx_linearvalue(jl_svec_t *cache, jl_value_t *key1, jl_value_t **key, size_t n)
+static ssize_t lookup_type_idx_linearvalue(jl_svec_t *cache, jl_value_t *f, jl_value_t **args, jl_value_t **types, size_t nargs, int leaf)
 {
-    if (n == 0)
+    if (nargs == 0)
         return -1;
     _Atomic(jl_datatype_t*) *data = (_Atomic(jl_datatype_t*)*)jl_svec_data(cache);
     size_t cl = jl_svec_len(cache);
@@ -1151,7 +1167,7 @@ static ssize_t lookup_type_idx_linearvalue(jl_svec_t *cache, jl_value_t *key1, j
         jl_datatype_t *tt = jl_atomic_load_relaxed(&data[i]);
         if ((jl_value_t*)tt == jl_nothing)
             return ~i;
-        if (typekeyvalue_eq(tt, key1, key, n, 1))
+        if (typekeyvalue_eq(tt, f, args, types, nargs, leaf))
             return i;
     }
     return ~cl;
@@ -1178,18 +1194,18 @@ static jl_value_t *lookup_type(jl_typename_t *tn JL_PROPAGATES_ROOT, jl_value_t 
     }
 }
 
-static jl_value_t *lookup_typevalue(jl_typename_t *tn, jl_value_t *key1, jl_value_t **key, size_t n, int leaf)
+static jl_value_t *lookup_typevalue(jl_typename_t *tn, jl_value_t *f, jl_value_t **args, jl_value_t **types, size_t nargs, int leaf)
 {
     JL_TIMING(TYPE_CACHE_LOOKUP, TYPE_CACHE_LOOKUP);
-    unsigned hv = typekeyvalue_hash(tn, key1, key, n, leaf);
+    unsigned hv = typekeyvalue_hash(tn, f, args, types, nargs, leaf);
     if (hv) {
         jl_svec_t *cache = jl_atomic_load_relaxed(&tn->cache);
-        return (jl_value_t*)lookup_type_setvalue(cache, key1, key, n, hv, leaf);
+        return (jl_value_t*)lookup_type_setvalue(cache, f, args, types, nargs, hv, leaf);
     }
     else {
         assert(leaf);
         jl_svec_t *linearcache = jl_atomic_load_relaxed(&tn->linearcache);
-        ssize_t idx = lookup_type_idx_linearvalue(linearcache, key1, key, n);
+        ssize_t idx = lookup_type_idx_linearvalue(linearcache, f, args, types, nargs, leaf);
         return (idx < 0) ? NULL : jl_svecref(linearcache, idx);
     }
 }
@@ -1860,20 +1876,21 @@ static unsigned typekey_hash(jl_typename_t *tn, jl_value_t **key, size_t n, int 
     return hash ? hash : 1;
 }
 
-static unsigned typekeyvalue_hash(jl_typename_t *tn, jl_value_t *key1, jl_value_t **key, size_t n, int leaf) JL_NOTSAFEPOINT
+static unsigned typekeyvalue_hash(jl_typename_t *tn, jl_value_t *f, jl_value_t **args, jl_value_t **types, size_t nargs, int leaf) JL_NOTSAFEPOINT
 {
-    size_t j;
+    size_t j, n = nargs;
     unsigned hash = 3;
     for (j = 0; j < n; j++) {
-        jl_value_t *kj = j == 0 ? key1 : key[j - 1];
+        jl_value_t *tval = typearg_for_leaf(f, args, j, leaf);
         uint_t hj;
-        if (leaf && jl_is_kind(jl_typeof(kj))) {
-            hj = typekey_hash(jl_type_typename, &kj, 1, 0);
+        if (tval != NULL) {
+            // type-valued argument: hash its dispatch element Type{tval}
+            hj = typekey_hash(jl_type_typename, &tval, 1, 0);
             if (hj == 0)
                 return 0;
         }
         else {
-            hj = ((jl_datatype_t*)jl_typeof(kj))->hash;
+            hj = ((jl_datatype_t*)typeof_arg(f, args, types, j))->hash;
         }
         hash = bitmix(hj, hash);
     }
@@ -2517,33 +2534,32 @@ JL_DLLEXPORT jl_value_t *jl_apply_tuple_type_v(jl_value_t **p, size_t np)
     return jl_apply_tuple_type_v_(p, np, NULL, 1);
 }
 
-jl_tupletype_t *jl_lookup_arg_tuple_type(jl_value_t *arg1, jl_value_t **args, size_t nargs, int leaf)
+jl_tupletype_t *jl_lookup_arg_tuple_type(jl_value_t *f, jl_value_t **args, jl_value_t **types, size_t nargs, int leaf)
 {
-    return (jl_datatype_t*)lookup_typevalue(jl_tuple_typename, arg1, args, nargs, leaf);
+    return (jl_datatype_t*)lookup_typevalue(jl_tuple_typename, f, args, types, nargs, leaf);
 }
 
-jl_tupletype_t *jl_inst_arg_tuple_type(jl_value_t *arg1, jl_value_t **args, size_t nargs, int leaf)
+// Build the argument tuple type for the call's arguments (f, args, types; see
+// julia_internal.h), interpreted under `leaf`: a leaf (dispatch) tuple contributes
+// `Type{value i}` for each type-valued argument, while a non-leaf (value) tuple
+// contributes each argument's plain type. Does an allocation-free cache probe first,
+// only building the parameter vector on a miss.
+jl_tupletype_t *jl_inst_arg_tuple_type(jl_value_t *f, jl_value_t **args, jl_value_t **types, size_t nargs, int leaf)
 {
-    jl_tupletype_t *tt = (jl_datatype_t*)lookup_typevalue(jl_tuple_typename, arg1, args, nargs, leaf);
+    jl_tupletype_t *tt = (jl_datatype_t*)lookup_typevalue(jl_tuple_typename, f, args, types, nargs, leaf);
     if (tt == NULL) {
-        size_t i;
-        jl_svec_t *params = jl_alloc_svec(nargs);
+        size_t i, n = nargs;
+        jl_svec_t *params = jl_alloc_svec(n);
         JL_GC_PUSH1(&params);
-        for (i = 0; i < nargs; i++) {
-            jl_value_t *ai = (i == 0 ? arg1 : args[i - 1]);
-            if (leaf && jl_is_type(ai)) {
-                // if `ai` has free type vars this will not be a valid (concrete) type.
-                // TODO: it would be really nice to only dispatch and cache those as
-                // `jl_typeof(ai)`, but that will require some redesign of the caching
-                // logic.
-                ai = (jl_value_t*)jl_wrap_Type(ai);
-            }
-            else {
-                ai = jl_typeof(ai);
-            }
-            jl_svecset(params, i, ai);
+        for (i = 0; i < n; i++) {
+            jl_value_t *tval = typearg_for_leaf(f, args, i, leaf);
+            // if `tval` has free type vars this will not be a valid (concrete) type.
+            // TODO: it would be really nice to only dispatch and cache those as
+            // `jl_typeof`, but that will require some redesign of the caching logic.
+            jl_value_t *ci = tval != NULL ? (jl_value_t*)jl_wrap_Type(tval) : typeof_arg(f, args, types, i);
+            jl_svecset(params, i, ci);
         }
-        tt = (jl_datatype_t*)inst_datatype_inner(jl_anytuple_type, params, jl_svec_data(params), nargs, NULL, NULL, 1, 0);
+        tt = (jl_datatype_t*)jl_apply_tuple_type((jl_svec_t*)params, 1);
         JL_GC_POP();
     }
     return tt;

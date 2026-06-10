@@ -961,7 +961,7 @@ JL_CALLABLE(jl_f__call_in_world_total)
 static jl_value_t *arg_tuple(jl_value_t *a1, jl_value_t **args, size_t nargs)
 {
     size_t i;
-    jl_datatype_t *tt = jl_inst_arg_tuple_type(a1, args, nargs, 0);
+    jl_datatype_t *tt = jl_inst_arg_tuple_type(a1, args, /*types*/NULL, nargs, 0);
     JL_GC_PROMISE_ROOTED(tt); // it is a concrete type
     if (tt->instance != NULL)
         return tt->instance;
@@ -1712,7 +1712,7 @@ JL_CALLABLE(jl_f_invoke)
     jl_value_t *argtypes = args[1];
     if (jl_is_method(argtypes)) {
         jl_method_t *m = (jl_method_t*)argtypes;
-        if (!jl_tuple1_isa(args[0], &args[2], nargs - 1, (jl_datatype_t*)m->sig))
+        if (!jl_arg_tuple1_isa(args[0], &args[2], /*types*/NULL, nargs - 1, (jl_datatype_t*)m->sig))
             jl_type_error("invoke: argument type error", argtypes, arg_tuple(args[0], &args[2], nargs - 1));
         return jl_gf_invoke_by_method(m, args[0], &args[2], nargs - 1);
     } else if (jl_is_code_instance(argtypes)) {
@@ -1722,12 +1722,12 @@ JL_CALLABLE(jl_f_invoke)
         // N.B.: specTypes need not be a subtype of the method signature. We need to check both.
         if (jl_is_abioverride(codeinst->def)) {
             jl_datatype_t *abi = (jl_datatype_t*)((jl_abi_override_t*)(codeinst->def))->abi;
-            if (!jl_tuple1_isa(args[0], &args[2], nargs - 1, abi)) {
+            if (!jl_arg_tuple1_isa(args[0], &args[2], /*types*/NULL, nargs - 1, abi)) {
                 jl_type_error("invoke: argument type error (ABI overwrite)", (jl_value_t*)abi, arg_tuple(args[0], &args[2], nargs - 1));
             }
         } else {
-            if (!jl_tuple1_isa(args[0], &args[2], nargs - 1, (jl_datatype_t*)mi->specTypes) ||
-                (jl_is_method(mi->def.value) && !jl_tuple1_isa(args[0], &args[2], nargs - 1, (jl_datatype_t*)mi->def.method->sig))) {
+            if (!jl_arg_tuple1_isa(args[0], &args[2], /*types*/NULL, nargs - 1, (jl_datatype_t*)mi->specTypes) ||
+                (jl_is_method(mi->def.value) && !jl_arg_tuple1_isa(args[0], &args[2], /*types*/NULL, nargs - 1, (jl_datatype_t*)mi->def.method->sig))) {
                 jl_type_error("invoke: argument type error", mi->specTypes, arg_tuple(args[0], &args[2], nargs - 1));
             }
         }
@@ -2224,7 +2224,7 @@ JL_CALLABLE(jl_f__compute_sparams)
     JL_NARGSV(_compute_sparams, 1);
     jl_method_t *m = (jl_method_t*)args[0];
     JL_TYPECHK(_compute_sparams, method, (jl_value_t*)m);
-    jl_datatype_t *tt = jl_inst_arg_tuple_type(args[1], &args[2], nargs-1, 1);
+    jl_datatype_t *tt = jl_inst_arg_tuple_type(args[1], &args[2], /*types*/NULL, nargs-1, 1);
     jl_svec_t *env = jl_emptysvec;
     JL_GC_PUSH2(&env, &tt);
     jl_type_intersection_env((jl_value_t*)tt, m->sig, &env);

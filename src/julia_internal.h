@@ -916,7 +916,7 @@ typedef struct jl_typeenv_t {
 } jl_typeenv_t;
 
 int jl_tuple_isa(jl_value_t **child, size_t cl, jl_datatype_t *pdt);
-int jl_tuple1_isa(jl_value_t *child1, jl_value_t **child, size_t cl, jl_datatype_t *pdt);
+int jl_arg_tuple1_isa(jl_value_t *f, jl_value_t **args, jl_value_t **types, size_t nargs, jl_datatype_t *pdt);
 
 enum atomic_kind {
     isatomic_none = 0,
@@ -927,8 +927,8 @@ enum atomic_kind {
 JL_DLLEXPORT int jl_has_intersect_type_not_kind(jl_value_t *t);
 int jl_subtype_invariant(jl_value_t *a, jl_value_t *b, int ta);
 JL_DLLEXPORT int jl_has_concrete_subtype(jl_value_t *typ);
-jl_tupletype_t *jl_inst_arg_tuple_type(jl_value_t *arg1, jl_value_t **args, size_t nargs, int leaf);
-jl_tupletype_t *jl_lookup_arg_tuple_type(jl_value_t *arg1 JL_PROPAGATES_ROOT, jl_value_t **args, size_t nargs, int leaf);
+jl_tupletype_t *jl_inst_arg_tuple_type(jl_value_t *f, jl_value_t **args, jl_value_t **types, size_t nargs, int leaf);
+jl_tupletype_t *jl_lookup_arg_tuple_type(jl_value_t *f, jl_value_t **args, jl_value_t **types, size_t nargs, int leaf);
 JL_DLLEXPORT void jl_method_table_insert(jl_methtable_t *mt, jl_method_t *method, jl_tupletype_t *simpletype);
 void jl_method_table_activate(jl_typemap_entry_t *newentry);
 jl_typemap_entry_t *jl_method_table_add(jl_methtable_t *mt, jl_method_t *method, jl_tupletype_t *simpletype);
@@ -1926,20 +1926,77 @@ jl_typemap_entry_t *jl_typemap_assoc_by_type(
         struct jl_typemap_assoc *search,
         int8_t offs, uint8_t subtype);
 
-jl_typemap_entry_t *jl_typemap_level_assoc_exact(jl_typemap_level_t *cache, jl_value_t *arg1, jl_value_t **args, size_t n, int8_t offs, size_t world);
-jl_typemap_entry_t *jl_typemap_entry_assoc_exact(jl_typemap_entry_t *mn, jl_value_t *arg1, jl_value_t **args, size_t n, size_t world);
+// Exact-match dispatch and argument-tuple construction operate on the call's arguments
+// passed as explicit components (kept in registers; no struct, no copy):
+//   f      : the function (argument 0)
+//   args   : the remaining argument values (args[i-1] is argument i), head-split from f
+//   types  : optional precomputed per-argument types for the by-types entrypoint, or NULL
+//            on the value path (each argument's type is then derived lazily via jl_typeof).
+//            A slot may be NULL for a type-valued argument, whose value in (f/args) carries
+//            the `Type{}` dispatch element.
+//   nargs  : total argument count (including f)
+// The small accessors below give, for argument i, its matching-type (`typeof_arg`), its
+// `Type{}` dispatch value if it is a type (`valueof_typearg`), or an `isa` test (`arg_isa`).
+
+// Whether argument i is a type-valued argument (dispatch element `Type{value i}`).
+STATIC_INLINE int is_typearg(jl_value_t *f, jl_value_t **args, size_t i) JL_NOTSAFEPOINT
+{
+    jl_value_t *v = (i == 0) ? f : args[i - 1];
+    return v != NULL && jl_is_type(v);
+}
+// The type used for ordinary (subtype/equality) matching at argument i.
+STATIC_INLINE jl_value_t *typeof_arg(jl_value_t *f, jl_value_t **args, jl_value_t **types, size_t i) JL_NOTSAFEPOINT
+{
+    jl_value_t *value = (i == 0) ? f : args[i - 1];
+    if (types == NULL)
+        // value path: jl_typeof is correct for every argument, including a type-valued
+        // one (which yields its kind, e.g. DataType) -- no need to special-case it.
+        return jl_typeof(value);
+    // by-types path: `types` is populated only for non-type arguments; a type-valued
+    // argument (its value populated in f/args) contributes its value's kind instead.
+    jl_value_t *type = types[i];
+    return type ? type : jl_typeof(value);
+}
+// The type-value for `Type{}`/kind matching at argument i, or NULL if argument i
+// is not a type-valued argument.
+STATIC_INLINE jl_value_t *valueof_typearg(jl_value_t *f, jl_value_t **args, size_t i) JL_NOTSAFEPOINT
+{
+    jl_value_t *v = (i == 0) ? f : args[i - 1];
+    return (v != NULL && jl_is_type(v)) ? v : NULL;
+}
+// Whether argument i is an instance of `t` (i.e. `isa(arg_i, t)`), evaluated from the
+// arguments alone. A type-valued argument tests its value directly; an ordinary argument
+// reduces to a subtype test on its matching-type. The fast prefix mirrors jl_isa (t is
+// Any / an exact match / a leaf type that can only match exactly), so this stays as
+// cheap as the value-based jl_isa while remaining usable by type-based callers (which
+// have no boxed value for ordinary arguments).
+STATIC_INLINE int arg_isa(jl_value_t *f, jl_value_t **args, jl_value_t **types, size_t i, jl_value_t *t)
+{
+    jl_value_t *kv = valueof_typearg(f, args, i);
+    if (kv != NULL)
+        return jl_isa(kv, t);
+    jl_value_t *s = typeof_arg(f, args, types, i);
+    if (t == (jl_value_t*)jl_any_type || s == t)
+        return 1;
+    if (jl_is_concrete_type(t))
+        return 0;
+    return jl_subtype(s, t);
+}
+
+jl_typemap_entry_t *jl_typemap_level_assoc_exact(jl_typemap_level_t *cache, jl_value_t *f, jl_value_t **args, jl_value_t **types, size_t nargs, int8_t offs, size_t world);
+jl_typemap_entry_t *jl_typemap_entry_assoc_exact(jl_typemap_entry_t *mn, jl_value_t *f, jl_value_t **args, jl_value_t **types, size_t nargs, size_t world);
 STATIC_INLINE jl_typemap_entry_t *jl_typemap_assoc_exact(
     jl_typemap_t *ml_or_cache JL_PROPAGATES_ROOT,
-    jl_value_t *arg1, jl_value_t **args, size_t n, int8_t offs, size_t world)
+    jl_value_t *f, jl_value_t **args, jl_value_t **types, size_t nargs, int8_t offs, size_t world)
 {
     // NOTE: This function is a huge performance hot spot!!
     if (jl_typeof(ml_or_cache) == (jl_value_t *)jl_typemap_entry_type) {
         return jl_typemap_entry_assoc_exact(
-            (jl_typemap_entry_t *)ml_or_cache, arg1, args, n, world);
+            (jl_typemap_entry_t *)ml_or_cache, f, args, types, nargs, world);
     }
     else if (jl_typeof(ml_or_cache) == (jl_value_t*)jl_typemap_level_type) {
         return jl_typemap_level_assoc_exact(
-            (jl_typemap_level_t *)ml_or_cache, arg1, args, n, offs, world);
+            (jl_typemap_level_t *)ml_or_cache, f, args, types, nargs, offs, world);
     }
     return NULL;
 }

@@ -3222,7 +3222,7 @@ JL_DLLEXPORT jl_method_instance_t *jl_method_lookup(jl_value_t **args, size_t na
     assert(nargs > 0 && "expected caller to handle this case");
     jl_methcache_t *mc = jl_method_table->cache;
     jl_typemap_t *cache = jl_atomic_load_relaxed(&mc->cache); // XXX: gc root for this?
-    jl_typemap_entry_t *entry = jl_typemap_assoc_exact(cache, args[0], &args[1], nargs, jl_cachearg_offset(), world);
+    jl_typemap_entry_t *entry = jl_typemap_assoc_exact(cache, args[0], &args[1], /*types*/NULL, nargs, jl_cachearg_offset(), world);
     if (entry)
         return entry->func.linfo;
     jl_tupletype_t *tt = arg_type_tuple(args[0], &args[1], nargs);
@@ -4179,16 +4179,18 @@ JL_DLLEXPORT jl_value_t *jl_invoke_oc(jl_value_t *F, jl_value_t **args, uint32_t
     return ret;
 }
 
-STATIC_INLINE int sig_match_fast(jl_value_t *arg1t, jl_value_t **args, jl_value_t **sig, size_t n)
+STATIC_INLINE int sig_match_fast(jl_value_t *arg1t, jl_value_t *f, jl_value_t **args, jl_value_t **types, jl_value_t **sig, size_t n) JL_NOTSAFEPOINT
 {
     // NOTE: This function is a huge performance hot spot!!
+    // On the value path (types == NULL) typeof_arg is just jl_typeof(arg), so this is
+    // identical to the old hot loop; the by-types entrypoint reuses the same call_cache
+    // by supplying precomputed per-argument types instead.
     if (arg1t != sig[0])
         return 0;
     size_t i;
     for (i = 1; i < n; i++) {
         jl_value_t *decl = sig[i];
-        jl_value_t *a = args[i - 1];
-        if (jl_typeof(a) != decl) {
+        if (typeof_arg(f, args, types, i) != decl) {
             /*
               we are only matching concrete types here, and those types are
               hash-consed, so pointer comparison should work.
@@ -4218,7 +4220,12 @@ void call_cache_stats()
 }
 #endif
 
-STATIC_INLINE jl_method_instance_t *jl_lookup_generic_(jl_value_t *F, jl_value_t **args, uint32_t nargs,
+// Shared exact-match dispatch lookup (used by both jl_apply_generic and the by-types
+// ambiguity guard). `types` is NULL on the value path; on the by-types path it carries the
+// precomputed per-argument types so the same call_cache / leafcache / typemap tiers apply
+// without boxing. Returns NULL when there is no unique match; the caller raises the
+// appropriate MethodError (value-based or by-types).
+STATIC_INLINE jl_method_instance_t *jl_lookup_generic_(jl_value_t *F, jl_value_t **args, jl_value_t **types, uint32_t nargs,
                                                        uint32_t callsite, size_t world)
 {
 #ifdef JL_GF_PROFILE
@@ -4230,7 +4237,7 @@ STATIC_INLINE jl_method_instance_t *jl_lookup_generic_(jl_value_t *F, jl_value_t
         show_call(F, args, nargs);
 #endif
     nargs++; // add F to argument count
-    jl_value_t *FT = jl_typeof(F);
+    jl_value_t *FT = typeof_arg(F, args, types, 0);
 
     /*
       search order:
@@ -4264,7 +4271,7 @@ STATIC_INLINE jl_method_instance_t *jl_lookup_generic_(jl_value_t *F, jl_value_t
             i = _i; \
             entry = jl_atomic_load_relaxed(&call_cache[cache_idx[i]]); \
             if (entry && nargs == jl_svec_len(entry->sig->parameters) && \
-                sig_match_fast(FT, args, jl_svec_data(entry->sig->parameters), nargs) && \
+                sig_match_fast(FT, F, args, types, jl_svec_data(entry->sig->parameters), nargs) && \
                 world >= jl_atomic_load_relaxed(&entry->min_world) && world <= jl_atomic_load_relaxed(&entry->max_world)) { \
                 goto have_entry; \
             } \
@@ -4284,17 +4291,17 @@ STATIC_INLINE jl_method_instance_t *jl_lookup_generic_(jl_value_t *F, jl_value_t
         int cache_entry_count = jl_atomic_load_relaxed(&((jl_datatype_t*)FT)->name->cache_entry_count);
         if (leafcache != (jl_genericmemory_t*)jl_an_empty_memory_any && (cache_entry_count == 0 || cache_entry_count >= 8)) {
             // hashing args is expensive, but so do that only if looking at mc->cache is probably even more expensive
-            tt = lookup_arg_type_tuple(F, args, nargs);
+            tt = jl_lookup_arg_tuple_type(F, args, types, nargs, 1);
             if (tt != NULL)
                 entry = lookup_leafcache(leafcache, (jl_value_t*)tt, world);
         }
         if (entry == NULL) {
             jl_typemap_t *cache = jl_atomic_load_relaxed(&mc->cache); // XXX: gc root required?
-            entry = jl_typemap_assoc_exact(cache, F, args, nargs, jl_cachearg_offset(), world);
+            entry = jl_typemap_assoc_exact(cache, F, args, types, nargs, jl_cachearg_offset(), world);
             if (entry == NULL) {
                 last_alloc = jl_options.malloc_log ? jl_gc_diff_total_bytes() : 0;
                 if (tt == NULL) {
-                    tt = arg_type_tuple(F, args, nargs);
+                    tt = jl_inst_arg_tuple_type(F, args, types, nargs, 1);
                     entry = lookup_leafcache(leafcache, (jl_value_t*)tt, world);
                 }
             }
@@ -4327,14 +4334,8 @@ have_entry:
         mfunc = jl_mt_assoc_by_type(jl_method_table, mc, tt, world);
         if (jl_options.malloc_log)
             jl_gc_sync_total_bytes(last_alloc); // discard allocation count from compilation
-        if (mfunc == NULL) {
-#ifdef JL_TRACE
-            if (error_en)
-                show_call(F, args, nargs);
-#endif
-            jl_method_error(F, args, nargs, world);
-            // unreachable
-        }
+        if (mfunc == NULL)
+            return NULL; // no unique match; the caller raises the appropriate MethodError
         // mfunc was found in slow path, so log --trace-dispatch
         record_dispatch_statement_on_first_dispatch(mfunc);
     }
@@ -4350,9 +4351,16 @@ have_entry:
 JL_DLLEXPORT jl_value_t *jl_apply_generic(jl_value_t *F, jl_value_t **args, uint32_t nargs)
 {
     size_t world = jl_current_task->world_age;
-    jl_method_instance_t *mfunc = jl_lookup_generic_(F, args, nargs,
+    jl_method_instance_t *mfunc = jl_lookup_generic_(F, args, /*types*/NULL, nargs,
                                                      jl_int32hash_fast(jl_return_address()),
                                                      world);
+    if (__unlikely(mfunc == NULL)) {
+#ifdef JL_TRACE
+        if (error_en)
+            show_call(F, args, nargs);
+#endif
+        jl_method_error(F, args, nargs + 1, world); // not reached
+    }
     JL_GC_PROMISE_ROOTED(mfunc);
     return _jl_invoke(F, args, nargs, mfunc, world);
 }
@@ -4431,7 +4439,7 @@ jl_value_t *jl_gf_invoke_by_method(jl_method_t *method, jl_value_t *gf, jl_value
     jl_typemap_entry_t *tm = NULL;
     jl_typemap_t *invokes = jl_atomic_load_relaxed(&method->invokes);
     if (invokes != jl_nothing)
-        tm = jl_typemap_assoc_exact(invokes, gf, args, nargs, 1, 1);
+        tm = jl_typemap_assoc_exact(invokes, gf, args, /*types*/NULL, nargs, 1, 1);
     if (tm) {
         mfunc = tm->func.linfo;
     }
@@ -4442,7 +4450,7 @@ jl_value_t *jl_gf_invoke_by_method(jl_method_t *method, jl_value_t *gf, jl_value
         JL_GC_PUSH2(&tpenv, &tt);
         JL_LOCK(&method->writelock);
         invokes = jl_atomic_load_relaxed(&method->invokes);
-        tm = jl_typemap_assoc_exact(invokes, gf, args, nargs, 1, 1);
+        tm = jl_typemap_assoc_exact(invokes, gf, args, /*types*/NULL, nargs, 1, 1);
         if (tm) {
             mfunc = tm->func.linfo;
         }

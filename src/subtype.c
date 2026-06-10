@@ -2950,21 +2950,23 @@ JL_DLLEXPORT int jl_is_not_broken_subtype(jl_value_t *a, jl_value_t *b)
     return !jl_is_kind(b) || !jl_is_type_type(a); // || jl_is_datatype_singleton((jl_datatype_t*)jl_tparam0(a));
 }
 
-int jl_tuple1_isa(jl_value_t *child1, jl_value_t **child, size_t cl, jl_datatype_t *pdt)
+// Whether the head-split arguments (f, args[0..nargs-2]) form an instance of tuple type
+// `pdt`. `types` is the optional per-argument precomputed types (NULL on the value path,
+// where each argument's type is its jl_typeof); a type-valued argument's dispatch element
+// is Type{value}.
+int jl_arg_tuple1_isa(jl_value_t *f, jl_value_t **args, jl_value_t **types, size_t nargs, jl_datatype_t *pdt)
 {
     if (jl_is_tuple_type(pdt) && !jl_is_va_tuple(pdt)) {
-        if (cl != jl_nparams(pdt))
+        if (nargs != jl_nparams(pdt))
             return 0;
         size_t i;
-        if (!jl_isa(child1, jl_tparam(pdt, 0)))
-            return 0;
-        for (i = 1; i < cl; i++) {
-            if (!jl_isa(child[i - 1], jl_tparam(pdt, i)))
+        for (i = 0; i < nargs; i++) {
+            if (!arg_isa(f, args, types, i, jl_tparam(pdt, i)))
                 return 0;
         }
         return 1;
     }
-    jl_value_t *tu = (jl_value_t*)arg_type_tuple(child1, child, cl);
+    jl_value_t *tu = (jl_value_t*)jl_inst_arg_tuple_type(f, args, types, nargs, /*leaf*/1);
     int ans;
     JL_GC_PUSH1(&tu);
     ans = jl_subtype(tu, (jl_value_t*)pdt);
@@ -2981,7 +2983,7 @@ int jl_tuple_isa(jl_value_t **child, size_t cl, jl_datatype_t *pdt)
             return 0;
         return jl_isa(jl_emptytuple, (jl_value_t*)pdt);
     }
-    return jl_tuple1_isa(child[0], &child[1], cl, pdt);
+    return jl_arg_tuple1_isa(child[0], &child[1], /*types*/NULL, cl, pdt);
 }
 
 // returns true if the intersection of `t` and `Type` is non-empty and not a kind
