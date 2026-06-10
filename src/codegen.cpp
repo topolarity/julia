@@ -986,6 +986,20 @@ static const auto jlinvokeoc_func = new JuliaFunction<>{
     get_func2_sig,
     get_func_attrs,
 };
+static const auto jlthrowmethoderrorifambiguous_func = new JuliaFunction<TypeFnContextAndSizeT>{
+    XSTR(jl_throw_methoderror_if_ambiguous),
+    [](LLVMContext &C, Type *T_size) {
+        auto T_prjlvalue = JuliaType::get_prjlvalue_ty(C);
+        auto T_pprjlvalue = JuliaType::get_pprjlvalue_ty(C);
+        return FunctionType::get(getVoidTy(C),
+                {T_prjlvalue,    // m (target Method)
+                 T_prjlvalue,    // f (boxed function value)
+                 T_pprjlvalue,   // args
+                 T_pprjlvalue,   // types
+                 T_size},        // nargs
+                false); },
+    get_attrs_basic, // returns on success, throws a MethodError on ambiguity
+};
 static const auto jlopaque_closure_call_func = new JuliaFunction<>{
     XSTR(jl_f_opaque_closure_call),
     get_func_sig,
@@ -5617,6 +5631,125 @@ static jl_cgval_t emit_invoke(jl_codectx_t &ctx, jl_expr_t *ex, jl_value_t *rt)
     return emit_invoke(ctx, lival, argv, nargs, rt, false);
 }
 
+// Load `obj->dispatch_status` (a mutable _Atomic(uint8_t) field) as an i8 at compile time.
+static Value *emit_dispatch_status(jl_codectx_t &ctx, jl_value_t *obj, size_t offset)
+{
+    Value *addr = emit_ptrgep(ctx, literal_pointer_val(ctx, obj), offset);
+    LoadInst *status = ctx.builder.CreateAlignedLoad(getInt8Ty(ctx.builder.getContext()), addr, Align(1));
+    status->setOrdering(AtomicOrdering::Monotonic); // relaxed: dispatch_status changes only monotonically for ALWAYS_ONLY
+    return status;
+}
+
+// Return the boxed object pointer for `p` if it is currently a heap object (so the runtime
+// can inspect whether it is a `Type`), or a null pointer if `p` is an unboxed value (which
+// therefore cannot be a `Type`). Never allocates: it reuses the value's existing boxed
+// representation, including the already-boxed variant of a tagged union.
+static Value *emit_maybe_boxed_value(jl_codectx_t &ctx, const jl_cgval_t &p)
+{
+    Type *T_prjlvalue = ctx.types().T_prjlvalue;
+    Constant *null = Constant::getNullValue(T_prjlvalue);
+    if (p.constant)
+        return track_pjlvalue(ctx, literal_pointer_val(ctx, p.constant));
+    if (p.isboxed) {
+        assert(p.V != NULL);
+        return p.V; // == p.Vboxed, a tracked boxed pointer
+    }
+    if (p.Vboxed) {
+        // tagged union with a boxed variant: `Vboxed` is the value exactly when the
+        // box-marker bit of the tindex is set, else this slot holds an unboxed variant.
+        assert(p.TIndex != NULL);
+        Type *T_int8 = getInt8Ty(ctx.builder.getContext());
+        Value *isbox = ctx.builder.CreateICmpNE(
+            ctx.builder.CreateAnd(p.TIndex, ConstantInt::get(T_int8, UNION_BOX_MARKER)),
+            ConstantInt::get(T_int8, 0));
+        return ctx.builder.CreateSelect(isbox, p.Vboxed, null);
+    }
+    return null; // unboxed (or ghost): not a heap object, so cannot be a `Type`
+}
+
+// Emit the guard for Expr(:invoke_if_not_ambiguous, ...). On return, the builder is
+// positioned on the path where invoking the target method `m` is the unique, unambiguous
+// dispatch result for `argv` (== {f, call args...}); the failure path throws a MethodError
+// and does not fall through. `mi` is the target's MethodInstance.
+static void emit_ambiguity_guard(jl_codectx_t &ctx, jl_method_t *m, jl_method_instance_t *mi,
+                                 ArrayRef<jl_cgval_t> argv, size_t nargs)
+{
+    assert(m != NULL && mi != NULL && nargs >= 1);
+    LLVMContext &C = ctx.builder.getContext();
+    Type *T_int8 = getInt8Ty(C);
+    Type *T_pprjlvalue = ctx.types().T_pprjlvalue;
+
+    // Fast path: a method (or this specialization) that has never been intersected by
+    // another method in any registered world can never produce an ambiguity, regardless
+    // of the task's world age, so the runtime check can be skipped entirely.
+    Value *m_status = emit_dispatch_status(ctx, (jl_value_t*)m, offsetof(jl_method_t, dispatch_status));
+    Value *mi_status = emit_dispatch_status(ctx, (jl_value_t*)mi, offsetof(jl_method_instance_t, dispatch_status));
+    Value *status = ctx.builder.CreateOr(m_status, mi_status);
+    Value *always = ctx.builder.CreateAnd(status, ConstantInt::get(T_int8, METHOD_SIG_ALWAYS_ONLY));
+    Value *skip = ctx.builder.CreateICmpNE(always, ConstantInt::get(T_int8, 0));
+    setName(ctx.emission_context, skip, "always_only");
+
+    BasicBlock *checkBB = BasicBlock::Create(C, "ambig_check", ctx.f);
+    BasicBlock *contBB = BasicBlock::Create(C, "ambig_ok", ctx.f);
+    ctx.builder.CreateCondBr(skip, contBB, checkBB);
+
+    // Slow path: confirm dispatch resolves uniquely to `m`, else throw a MethodError. The
+    // ordinary arguments are passed by the by-types ABI (built below) so they need not be
+    // boxed; only the function is boxed (unconditionally on this cold path), since the error
+    // message needs its value. jl_throw_methoderror_if_ambiguous returns iff `m` is the
+    // unique match, so control falls through to the invoke; otherwise it throws.
+    ctx.builder.SetInsertPoint(checkBB);
+    AllocaInst *args_arr = nargs > 1 ? emit_static_roots(ctx, nargs - 1) : nullptr;
+    AllocaInst *types_arr = emit_static_alloca(ctx, nargs * sizeof(void*), Align(sizeof(void*)));
+    for (size_t i = 0; i < nargs; i++) {
+        // emit_typeof gives the per-argument type (a literal for concrete/constant cgvals, an
+        // inline tag otherwise) used for ordinary (non-`Type`) arguments; emit_maybe_boxed_value
+        // gives an argument's existing boxed pointer when it is a heap object (null otherwise),
+        // so the runtime can detect a `Type` value and form its `Type{}` dispatch element. No
+        // ordinary argument is boxed here.
+        ctx.builder.CreateAlignedStore(emit_typeof(ctx, argv[i]), emit_ptrgep(ctx, types_arr, i * sizeof(void*)), Align(sizeof(void*)));
+        if (i > 0)
+            ctx.builder.CreateAlignedStore(emit_maybe_boxed_value(ctx, argv[i]), emit_ptrgep(ctx, args_arr, (i - 1) * sizeof(void*)), Align(sizeof(void*)));
+    }
+    Value *m_val = track_pjlvalue(ctx, literal_pointer_val(ctx, (jl_value_t*)m));
+    Value *args_ptr = args_arr ? (Value*)args_arr : Constant::getNullValue(T_pprjlvalue);
+    ctx.builder.CreateCall(prepare_call(jlthrowmethoderrorifambiguous_func),
+                           {m_val, boxed(ctx, argv[0]), args_ptr, types_arr, ConstantInt::get(ctx.types().T_size, nargs)});
+    ctx.builder.CreateBr(contBB);
+
+    ctx.builder.SetInsertPoint(contBB);
+}
+
+static jl_cgval_t emit_invoke_if_not_ambiguous(jl_codectx_t &ctx, jl_expr_t *ex, jl_value_t *rt)
+{
+    jl_value_t **args = jl_array_data(ex->args, jl_value_t*);
+    size_t arglen = jl_array_dim0(ex->args);
+    size_t nargs = arglen - 1;
+    assert(arglen >= 2);
+
+    jl_cgval_t lival = emit_expr(ctx, args[0]);
+    SmallVector<jl_cgval_t, 0> argv(nargs);
+    for (size_t i = 0; i < nargs; ++i) {
+        argv[i] = emit_expr(ctx, args[i + 1]);
+        if (argv[i].typ == jl_bottom_type)
+            return jl_cgval_t();
+    }
+
+    // If the target is a known MethodInstance/CodeInstance constant we can derive the
+    // target Method and emit the ambiguity guard before the (otherwise identical) invoke.
+    // Otherwise there is nothing to guard against statically, so just invoke.
+    if (lival.constant) {
+        jl_method_instance_t *mi = NULL;
+        if (jl_is_method_instance(lival.constant))
+            mi = (jl_method_instance_t*)lival.constant;
+        else if (jl_is_code_instance(lival.constant))
+            mi = jl_get_ci_mi((jl_code_instance_t*)lival.constant);
+        if (mi != NULL && jl_is_method(mi->def.value))
+            emit_ambiguity_guard(ctx, mi->def.method, mi, argv, nargs);
+    }
+    return emit_invoke(ctx, lival, argv, nargs, rt, false);
+}
+
 static jl_cgval_t emit_invoke(jl_codectx_t &ctx, const jl_cgval_t &lival, ArrayRef<jl_cgval_t> argv, size_t nargs, jl_value_t *rt, bool always_inline)
 {
     ++EmittedInvokes;
@@ -6701,6 +6834,12 @@ static jl_cgval_t emit_expr(jl_codectx_t &ctx, jl_value_t *expr, ssize_t ssaidx_
         jl_value_t *expr_t = jl_is_long(ctx.source->ssavaluetypes) ? (jl_value_t*)jl_any_type :
             jl_array_ptr_ref(ctx.source->ssavaluetypes, ssaidx_0based);
         return emit_invoke(ctx, ex, expr_t);
+    }
+    else if (head == jl_invoke_if_not_ambiguous_sym) {
+        assert(ssaidx_0based >= 0);
+        jl_value_t *expr_t = jl_is_long(ctx.source->ssavaluetypes) ? (jl_value_t*)jl_any_type :
+            jl_array_ptr_ref(ctx.source->ssavaluetypes, ssaidx_0based);
+        return emit_invoke_if_not_ambiguous(ctx, ex, expr_t);
     }
     else if (head == jl_invoke_modify_sym) {
         assert(ssaidx_0based >= 0);

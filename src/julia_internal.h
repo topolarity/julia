@@ -802,6 +802,14 @@ typedef union {
 #define METHOD_SIG_LATEST_WHICH             0b0001
 #define METHOD_SIG_LATEST_ONLY              0b0010
 #define METHOD_SIG_PRECOMPILE_MANY          0b0100
+// METHOD_SIG_ALWAYS_ONLY: this method has never intersected any other method in
+// any world in which it was registered in the method table (i.e. it has been the
+// unique most-specific match for its whole signature in every such world). Unlike
+// METHOD_SIG_LATEST_ONLY (which concerns only the latest world), this bit is
+// monotonic: it is set when the method is added and only ever cleared, never
+// re-set, so it remains a sound "no ambiguity possible" predicate for a Task
+// running at any world age. Used by `Expr(:invoke_if_not_ambiguous, ...)`.
+#define METHOD_SIG_ALWAYS_ONLY              0b1000
 
 void jl_init_engine(void);
 void jl_engine_sweep(jl_ptls_t *gc_all_tls_states) JL_NOTSAFEPOINT;
@@ -894,6 +902,7 @@ int jl_valid_type_param(jl_value_t *v);
 JL_DLLEXPORT jl_value_t *jl_apply_2va(jl_value_t *f, jl_value_t **args, uint32_t nargs);
 
 void JL_NORETURN jl_method_error(jl_value_t *F, jl_value_t **args, size_t na, size_t world);
+JL_DLLEXPORT void JL_NORETURN jl_method_error_by_types(jl_value_t *f, jl_value_t **args, jl_value_t **types, size_t nargs);
 JL_DLLEXPORT jl_value_t *jl_get_exceptionf(jl_datatype_t *exception_type, const char *fmt, ...);
 
 JL_DLLEXPORT void jl_typeassert(jl_value_t *x, jl_value_t *t);
@@ -1044,6 +1053,7 @@ int jl_isa_ast_node(jl_value_t *e) JL_NOTSAFEPOINT;
 
 JL_DLLEXPORT jl_value_t *jl_method_lookup_by_tt(jl_tupletype_t *tt, size_t world, jl_value_t *_mt);
 JL_DLLEXPORT jl_method_instance_t *jl_method_lookup(jl_value_t **args, size_t nargs, size_t world);
+JL_DLLEXPORT void jl_throw_methoderror_if_ambiguous(jl_method_t *m, jl_value_t *f, jl_value_t **args, jl_value_t **types, size_t nargs);
 
 jl_value_t *jl_gf_invoke_by_method(jl_method_t *method, jl_value_t *gf, jl_value_t **args, size_t nargs);
 jl_value_t *jl_gf_invoke(jl_value_t *types, jl_value_t *f, jl_value_t **args, size_t nargs);
@@ -2106,6 +2116,7 @@ JL_DLLEXPORT int jl_isabspath(const char *in) JL_NOTSAFEPOINT;
     XX(inert_sym) \
     XX(infer_sym) \
     XX(inline_sym) \
+    XX(invoke_if_not_ambiguous_sym) \
     XX(invoke_modify_sym) \
     XX(invoke_sym) \
     XX(isdefined_sym) \

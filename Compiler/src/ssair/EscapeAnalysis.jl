@@ -578,7 +578,7 @@ function analyze_escapes(ir::IRCode, nargs::Int, 𝕃ₒ::AbstractLattice, get_e
                 head = stmt.head
                 if head === :call
                     escape_call!(astate, pc, stmt.args)
-                elseif head === :invoke
+                elseif head === :invoke || head === :invoke_if_not_ambiguous
                     escape_invoke!(astate, pc, stmt.args)
                 elseif head === :new || head === :splatnew
                     escape_new!(astate, pc, stmt.args)

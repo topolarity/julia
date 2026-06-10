@@ -66,7 +66,7 @@ has_flag(curr::UInt32, flag::UInt32) = (curr & flag) == flag
 function iscallstmt(@nospecialize stmt)
     stmt isa Expr || return false
     head = stmt.head
-    return head === :call || head === :invoke || head === :foreigncall
+    return head === :call || head === :invoke || head === :invoke_if_not_ambiguous || head === :foreigncall
 end
 
 function flags_for_effects(effects::Effects)
@@ -738,7 +738,7 @@ end
 function check_all_args_noescape!(sv::PostOptAnalysisState, ir::IRCode, @nospecialize(stmt),
                                   estate::EscapeAnalysis.EscapeState)
     stmt isa Expr || return false
-    if isexpr(stmt, :invoke)
+    if isexpr(stmt, :invoke) || isexpr(stmt, :invoke_if_not_ambiguous)
         startidx = 2
     elseif isexpr(stmt, :new)
         startidx = 1
@@ -814,7 +814,7 @@ function scan_non_dataflow_flags!(inst::Instruction, sv::PostOptAnalysisState)
             sv.all_effect_free &= has_flag(flag, IR_FLAG_EFFECT_FREE)
         end
     elseif sv.all_effect_free
-        if (isexpr(stmt, :invoke) || isexpr(stmt, :new) ||
+        if (isexpr(stmt, :invoke) || isexpr(stmt, :invoke_if_not_ambiguous) || isexpr(stmt, :new) ||
             # HACK for performance: limit the scope of EA to code with object field access only,
             # since its abilities to reason about e.g. arrays are currently very limited anyways.
             is_known_call(stmt, setfield!, sv.ir))
@@ -1440,7 +1440,7 @@ function statement_cost(ex::Expr, line::Int, src::Union{CodeInfo, IRCode}, sptyp
             end
         end
         return 20
-    elseif head === :invoke || head === :invoke_modify
+    elseif head === :invoke || head === :invoke_if_not_ambiguous || head === :invoke_modify
         # Calls whose "return type" is Union{} do not actually return:
         # they are errors. Since these are not part of the typical
         # run-time of the function, we omit them from

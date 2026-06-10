@@ -125,16 +125,11 @@ static jl_value_t *do_call(jl_value_t **args, size_t nargs, interpreter_state *s
     return result;
 }
 
-static jl_value_t *do_invoke(jl_value_t **args, size_t nargs, interpreter_state *s)
+// Invoke the target `c` (a MethodInstance or CodeInstance) with the already-evaluated
+// arguments in `argv` (which holds the nargs-1 values f, args...). Shared by the plain
+// `:invoke` and the guarded `:invoke_if_not_ambiguous` paths.
+static jl_value_t *do_invoke_target(jl_value_t *c, jl_value_t **argv, size_t nargs)
 {
-    jl_value_t **argv;
-    assert(nargs >= 2);
-    JL_GC_PUSHARGS(argv, nargs - 1);
-    size_t i;
-    for (i = 1; i < nargs; i++)
-        argv[i-1] = eval_value(args[i], s);
-    jl_value_t *c = args[0];
-    assert(jl_is_code_instance(c) || jl_is_method_instance(c));
     jl_value_t *result = NULL;
     if (jl_is_code_instance(c)) {
         jl_code_instance_t *codeinst = (jl_code_instance_t*)c;
@@ -157,6 +152,46 @@ static jl_value_t *do_invoke(jl_value_t **args, size_t nargs, interpreter_state 
     } else {
         result = jl_invoke(argv[0], nargs == 2 ? NULL : &argv[1], nargs - 2, (jl_method_instance_t*)c);
     }
+    return result;
+}
+
+static jl_value_t *do_invoke(jl_value_t **args, size_t nargs, interpreter_state *s)
+{
+    jl_value_t **argv;
+    assert(nargs >= 2);
+    JL_GC_PUSHARGS(argv, nargs - 1);
+    size_t i;
+    for (i = 1; i < nargs; i++)
+        argv[i-1] = eval_value(args[i], s);
+    jl_value_t *c = args[0];
+    assert(jl_is_code_instance(c) || jl_is_method_instance(c));
+    jl_value_t *result = do_invoke_target(c, argv, nargs);
+    JL_GC_POP();
+    return result;
+}
+
+static jl_value_t *do_invoke_if_not_ambiguous(jl_value_t **args, size_t nargs, interpreter_state *s)
+{
+    jl_value_t **argv;
+    assert(nargs >= 2);
+    JL_GC_PUSHARGS(argv, nargs - 1);
+    size_t i;
+    for (i = 1; i < nargs; i++)
+        argv[i-1] = eval_value(args[i], s);
+    jl_value_t *c = args[0];
+    assert(jl_is_code_instance(c) || jl_is_method_instance(c));
+    jl_method_instance_t *mi = jl_is_code_instance(c) ? jl_get_ci_mi((jl_code_instance_t*)c) : (jl_method_instance_t*)c;
+    jl_method_t *m = mi->def.method;
+    assert(jl_is_method(m));
+    // Fast path: a method that has never been intersected by another method in any world
+    // in which it was registered can never produce an ambiguity, regardless of the task's
+    // world age, so the check can be skipped. Otherwise confirm that dispatch resolves
+    // uniquely to `m` at the current world (throwing a MethodError if not). The interpreter
+    // holds boxed argument values, so the by-types ABI can derive every type lazily (types == NULL).
+    uint8_t status = jl_atomic_load_relaxed(&m->dispatch_status) | jl_atomic_load_relaxed(&mi->dispatch_status);
+    if (!(status & METHOD_SIG_ALWAYS_ONLY))
+        jl_throw_methoderror_if_ambiguous(m, argv[0], &argv[1], /*types*/NULL, nargs - 1);
+    jl_value_t *result = do_invoke_target(c, argv, nargs);
     JL_GC_POP();
     return result;
 }
@@ -244,6 +279,9 @@ static jl_value_t *eval_value(jl_value_t *e, interpreter_state *s)
     }
     else if (head == jl_invoke_sym) {
         return do_invoke(args, nargs, s);
+    }
+    else if (head == jl_invoke_if_not_ambiguous_sym) {
+        return do_invoke_if_not_ambiguous(args, nargs, s);
     }
     else if (head == jl_invoke_modify_sym) {
         return do_call(args + 1, nargs - 1, s);

@@ -1619,7 +1619,7 @@ function collectinvokes!(workqueue::CompilationQueue, ci::CodeInfo, sptypes::Vec
     for i = 1:length(src)
         stmt = src[i]
         isexpr(stmt, :(=)) && (stmt = stmt.args[2])
-        if isexpr(stmt, :invoke) || isexpr(stmt, :invoke_modify)
+        if isexpr(stmt, :invoke) || isexpr(stmt, :invoke_if_not_ambiguous) || isexpr(stmt, :invoke_modify)
             edge = stmt.args[1]
             edge isa CodeInstance && isdefined(edge, :inferred) && push!(workqueue, edge)
         end

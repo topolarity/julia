@@ -316,7 +316,7 @@ jl_method_t *jl_mk_builtin_func(jl_datatype_t *dt, jl_sym_t *sname, jl_fptr_args
     m->isva = 1;
     m->nargs = 2;
     jl_atomic_store_relaxed(&m->primary_world, 1);
-    jl_atomic_store_relaxed(&m->dispatch_status, METHOD_SIG_LATEST_ONLY | METHOD_SIG_LATEST_WHICH);
+    jl_atomic_store_relaxed(&m->dispatch_status, METHOD_SIG_ALWAYS_ONLY | METHOD_SIG_LATEST_ONLY | METHOD_SIG_LATEST_WHICH);
     m->sig = (jl_value_t*)tuptyp;
     m->slot_syms = jl_an_empty_string;
     m->nospecialize = 0;
@@ -369,7 +369,8 @@ static int emit_codeinst_and_edges(jl_code_instance_t *codeinst)
                         jl_value_t *stmt = jl_array_ptr_ref(src, i);
                         if (jl_is_expr(stmt) && ((jl_expr_t*)stmt)->head == jl_assign_sym)
                             stmt = jl_exprarg(stmt, 1);
-                        if (jl_is_expr(stmt) && ((jl_expr_t*)stmt)->head == jl_invoke_sym) {
+                        if (jl_is_expr(stmt) && (((jl_expr_t*)stmt)->head == jl_invoke_sym ||
+                                                 ((jl_expr_t*)stmt)->head == jl_invoke_if_not_ambiguous_sym)) {
                             jl_value_t *invoke = jl_exprarg(stmt, 0);
                             if (jl_is_code_instance(invoke))
                                 emit_codeinst_and_edges((jl_code_instance_t*)invoke);
@@ -2927,7 +2928,9 @@ void jl_method_table_activate(jl_typemap_entry_t *newentry)
     int precompiled_status = jl_atomic_load_relaxed(&method->dispatch_status);
     if (!(precompiled_status & METHOD_SIG_PRECOMPILE_MANY))
         // This will store if this method will be currently the only result that would returned from `ml_matches` given `sig`.
-        dispatch_bits |= METHOD_SIG_LATEST_ONLY; // Tentatively set, will be cleared if not applicable
+        // METHOD_SIG_ALWAYS_ONLY is the monotonic counterpart: tentatively set here and only ever cleared (below, and never
+        // re-set on deletion), so it records whether this method has been intersection-free in *every* world since insertion.
+        dispatch_bits |= METHOD_SIG_LATEST_ONLY | METHOD_SIG_ALWAYS_ONLY; // Tentatively set, will be cleared if not applicable
     // Holds the set of all intersecting methods not more specific than this one.
     // Note: this set may be incomplete (may exclude methods whose intersection
     // is covered by another method that is morespecific than both, causing them
@@ -2947,6 +2950,10 @@ void jl_method_table_activate(jl_typemap_entry_t *newentry)
             jl_atomic_store_relaxed(&m->dispatch_status, 0);
             if (!(m_dispatch & METHOD_SIG_LATEST_ONLY))
                 dispatch_bits &= ~METHOD_SIG_LATEST_ONLY;
+            // The replacement inherits the replaced method's ambiguity history: it can
+            // only be "always only" if the method it replaced was too.
+            if (!(m_dispatch & METHOD_SIG_ALWAYS_ONLY))
+                dispatch_bits &= ~METHOD_SIG_ALWAYS_ONLY;
             // Take over the interference list from the replaced method
             jl_genericmemory_t *m_interferences = jl_atomic_load_relaxed(&m->interferences);
             if (interferences->length == 0) {
@@ -3008,15 +3015,16 @@ void jl_method_table_activate(jl_typemap_entry_t *newentry)
                 int m_dispatch = jl_atomic_load_relaxed(&m->dispatch_status);
                 if (morespec[j] || ambig) {
                     // !morespecific(new, old)
-                    dispatch_bits &= ~METHOD_SIG_LATEST_ONLY;
+                    dispatch_bits &= ~(METHOD_SIG_LATEST_ONLY | METHOD_SIG_ALWAYS_ONLY);
                     // Add the old method to this interference set
                     ssize_t idx;
                     if (!has_key(interferences, (jl_value_t*)m))
                         interferences = jl_idset_put_key(interferences, (jl_value_t*)m, &idx);
                 }
                 if (!morespec[j]) {
-                    // !morespecific(old, new)
-                    m_dispatch &= ~METHOD_SIG_LATEST_ONLY;
+                    // !morespecific(old, new): the new method intersects `m` from this world
+                    // on, so `m` is no longer intersection-free in every world it is registered.
+                    m_dispatch &= ~(METHOD_SIG_LATEST_ONLY | METHOD_SIG_ALWAYS_ONLY);
                     // Add the new method to its interference set
                     jl_genericmemory_t *m_interferences = jl_atomic_load_relaxed(&m->interferences);
                     ssize_t idx;
@@ -3191,6 +3199,25 @@ void JL_NORETURN jl_method_error(jl_value_t *f, jl_value_t **args, size_t na, si
     jl_value_t *argtup = jl_f_tuple(NULL, args, na - 1);
     JL_GC_PUSH1(&argtup);
     jl_method_error_bare(f, argtup, world, jl_call_sym);
+    // not reached
+    JL_GC_POP();
+}
+
+// Throw a `:call` MethodError described by the by-types ABI (f, args, types, nargs): the
+// argument signature is built directly via jl_inst_arg_tuple_type and stored as the
+// MethodError's `args` (a tuple type), so the ordinary arguments need not be boxed. The
+// function `f`, however, is needed by value for the `f` field (a functor's value cannot be
+// recovered from its type), so the caller boxes it unconditionally on this cold path. The
+// stored tuple type excludes the function, matching the value-tuple convention.
+JL_DLLEXPORT void JL_NORETURN jl_method_error_by_types(jl_value_t *f, jl_value_t **args, jl_value_t **types, size_t nargs)
+{
+    size_t world = jl_current_task->world_age;
+    // arguments are head-split as (f, args, types) at indices (0, 1.., 1..); build the tuple
+    // type over just the arguments (original indices 1..nargs-1), i.e. excluding f.
+    jl_value_t *argtypes = nargs <= 1 ? (jl_value_t*)jl_emptytuple_type :
+        (jl_value_t*)jl_inst_arg_tuple_type(args[0], &args[1], types ? &types[1] : NULL, nargs - 1, /*leaf*/1);
+    JL_GC_PUSH1(&argtypes);
+    jl_method_error_bare(f, argtypes, world, jl_call_sym);
     // not reached
     JL_GC_POP();
 }
@@ -4363,6 +4390,22 @@ JL_DLLEXPORT jl_value_t *jl_apply_generic(jl_value_t *F, jl_value_t **args, uint
     }
     JL_GC_PROMISE_ROOTED(mfunc);
     return _jl_invoke(F, args, nargs, mfunc, world);
+}
+
+// Runtime check backing Expr(:invoke_if_not_ambiguous, ...): if dispatching the call
+// (f, args, types, nargs) at the current task's world age does not resolve uniquely to `m`
+// -- a genuine ambiguity, or a more-specific method having become applicable -- throw a
+// `:call` MethodError directly; otherwise return so the caller can invoke `m`. `f` must be
+// the boxed function value (needed to construct the error). Reuses the full dispatch
+// machinery, including the per-callsite call_cache, via the by-types ABI so that ordinary
+// arguments need not be boxed.
+JL_DLLEXPORT void jl_throw_methoderror_if_ambiguous(jl_method_t *m, jl_value_t *f, jl_value_t **args, jl_value_t **types, size_t nargs)
+{
+    size_t world = jl_current_task->world_age;
+    uint32_t callsite = jl_int32hash_fast(jl_return_address());
+    jl_method_instance_t *mfunc = jl_lookup_generic_(f, args, types, nargs - 1, callsite, world);
+    if (mfunc == NULL || mfunc->def.value != (jl_value_t*)m)
+        jl_method_error_by_types(f, args, types, nargs); // noreturn
 }
 
 static jl_method_match_t *_gf_invoke_lookup(jl_value_t *types JL_PROPAGATES_ROOT, jl_methtable_t *mt, size_t world, int cache_result, size_t *min_valid, size_t *max_valid)

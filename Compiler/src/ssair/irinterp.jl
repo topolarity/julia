@@ -165,7 +165,7 @@ function reprocess_instruction!(interp::AbstractInterpreter, inst::Instruction, 
             result isa Future && (result = result[])
             (; rt, effects) = result
             add_flag!(inst, flags_for_effects(effects))
-        elseif head === :invoke  # COMBAK: || head === :invoke_modifyfield (similar to call, but for args[2:end])
+        elseif head === :invoke || head === :invoke_if_not_ambiguous  # COMBAK: || head === :invoke_modifyfield (similar to call, but for args[2:end])
             rt, (nothrow, noub) = abstract_eval_invoke_inst(interp, inst, irsv)
             if nothrow
                 add_flag!(inst, IR_FLAG_NOTHROW)

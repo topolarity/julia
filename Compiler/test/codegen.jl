@@ -1218,3 +1218,81 @@ _blackbox_licmloop_simple(1.0)
     @test count(re_licmcall, ir_bb_simple) == 5  # unrolled, not hoisted
     @test !occursin(re_raw_arg, ir_bb_simple)
 end
+
+# An ambiguous functor used to check the by-type function case below (its value carries
+# data not recoverable from its type).
+struct InaFunctor; x::Int; end
+(g::InaFunctor)(a::Int, b) = (:a, g.x, a, b)
+(g::InaFunctor)(a, b::Int) = (:b, g.x, a, b)
+
+# Codegen for Expr(:invoke_if_not_ambiguous, ...): same as Expr(:invoke, ...) plus an inline
+# `dispatch_status & METHOD_SIG_ALWAYS_ONLY` fast-path check; on the slow path it calls
+# jl_method_dispatch_unambiguous (by-types ABI, no argument boxing) and throws a MethodError
+# if dispatch does not resolve uniquely to the target. Drive it through OpaqueClosure(::IRCode),
+# which compiles already-optimized IR (the only context where this head is valid).
+@testset "Expr(:invoke_if_not_ambiguous)" begin
+    inacg_single(x::Int) = x + 100
+    inacg_amb(x::Int, y) = (:a, x, y)
+    inacg_amb(x, y::Int) = (:b, x, y)
+    inacg_single(1); inacg_amb(1, "x")
+
+    getmi(m::Method, @nospecialize(specTypes)) =
+        ccall(:jl_specializations_get_linfo, Ref{Core.MethodInstance}, (Any, Any, Any), m, specTypes, Core.svec())
+    # build an OpaqueClosure whose body is `head(mi, f, args...)`; `f` is embedded as a
+    # constant (the functions are testset-local, so a GlobalRef would not resolve).
+    function build_oc(head, mi, @nospecialize(f), slottypes, nargs)
+        m = Meta.@lower 1 + 1
+        src = m.args[1]::Core.CodeInfo
+        src.code = Any[Expr(head, mi, f,
+                            (Core.Argument(i+1) for i in 1:nargs)...), Core.ReturnNode(Core.SSAValue(1))]
+        n = length(src.code)
+        src.ssavaluetypes = n
+        src.ssaflags = fill(zero(UInt32), n)
+        src.debuginfo = Core.DebugInfo(:none)
+        src.slottypes = slottypes
+        src.slotflags = fill(0x00, length(slottypes))
+        Core.OpaqueClosure(Compiler.inflate_ir(src, slottypes))
+    end
+
+    m_single = only(methods(inacg_single))
+    m_int_any = which(inacg_amb, (Int, AbstractString))
+
+    # fast path (target method is METHOD_SIG_ALWAYS_ONLY)
+    oc_fast = build_oc(:invoke_if_not_ambiguous, getmi(m_single, Tuple{typeof(inacg_single), Int}), inacg_single, Any[Any, Int], 1)
+    @test oc_fast(7) == 107
+    # the generated code contains the inline ALWAYS_ONLY check and the runtime fallthrough call
+    ir = sprint(code_llvm, oc_fast, Tuple{Int}; context = :debuginfo => :none)
+    @test occursin("jl_throw_methoderror_if_ambiguous", ir)
+
+    # slow path, unambiguous region: invokes inacg_amb(::Int, ::Any)
+    oc_clean = build_oc(:invoke_if_not_ambiguous, getmi(m_int_any, Tuple{typeof(inacg_amb), Int, String}), inacg_amb, Any[Any, Int, String], 2)
+    @test oc_clean(1, "x") == (:a, 1, "x")
+    # slow path, ambiguous region (Int, Int) => MethodError (a `:call`, thrown box-free from C)
+    oc_amb = build_oc(:invoke_if_not_ambiguous, getmi(m_int_any, Tuple{typeof(inacg_amb), Int, Int}), inacg_amb, Any[Any, Int, Int], 2)
+    err = (@test_throws MethodError oc_amb(1, 2)).value
+    @test err.dispatch_kind === :call
+
+    # the function itself passed *by type*: an unboxed isbits functor whose value is not
+    # recoverable from its type. The cold error path boxes the function so `ex.f` is the
+    # functor (with its data); only its argument signature is captured by type.
+    let mfun = which(InaFunctor(0), (Int, AbstractString))
+        mi_fun = getmi(mfun, Tuple{InaFunctor, Int, Int})
+        src = (Meta.@lower(1 + 1)).args[1]::Core.CodeInfo
+        src.code = Any[Expr(:invoke_if_not_ambiguous, mi_fun, Core.Argument(2), Core.Argument(3), Core.Argument(4)),
+                       Core.ReturnNode(Core.SSAValue(1))]
+        src.ssavaluetypes = 2; src.ssaflags = fill(zero(UInt32), 2); src.debuginfo = Core.DebugInfo(:none)
+        slottypes = Any[Any, InaFunctor, Int, Int]
+        src.slottypes = slottypes; src.slotflags = fill(0x00, length(slottypes))
+        oc_fun = Core.OpaqueClosure(Compiler.inflate_ir(src, slottypes))
+        efun = (@test_throws MethodError oc_fun(InaFunctor(13), 1, 2)).value
+        @test efun.dispatch_kind === :call
+        @test efun.f === InaFunctor(13) # the functor value (carrying x=13) is recovered for the error
+    end
+
+    # the guard adds no boxing on either non-throwing path (compare to a plain :invoke of the
+    # same target; the difference is the guard alone). Use a large, uncached integer box.
+    bigv = (1 << 50) + 7
+    plain = build_oc(:invoke, getmi(m_single, Tuple{typeof(inacg_single), Int}), inacg_single, Any[Any, Int], 1)
+    plain(bigv); oc_fast(bigv) # warmup
+    @test (@allocated oc_fast(bigv)) == (@allocated plain(bigv))
+end

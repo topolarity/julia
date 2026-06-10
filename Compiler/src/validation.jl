@@ -4,6 +4,7 @@
 const VALID_EXPR_HEADS = IdDict{Symbol,UnitRange{Int}}(
     :call => 1:typemax(Int),
     :invoke => 2:typemax(Int),
+    :invoke_if_not_ambiguous => 2:typemax(Int),
     :invoke_modify => 3:typemax(Int),
     :static_parameter => 1:1,
     :(&) => 1:1,
@@ -82,7 +83,7 @@ end
 
 function _validate_val!(@nospecialize(x), errors, ssavals::BitSet)
     if isa(x, Expr)
-        if x.head === :call || x.head === :invoke || x.head === :invoke_modify
+        if x.head === :call || x.head === :invoke || x.head === :invoke_if_not_ambiguous || x.head === :invoke_modify
             f = x.args[1]
             if f isa GlobalRef && (f.name === :cglobal) && x.head === :call
                 # TODO: these are not yet linearized
@@ -141,7 +142,7 @@ function validate_code!(errors::Vector{InvalidCodeError}, c::CodeInfo, is_top_le
                 end
                 validate_val!(lhs)
                 validate_val!(rhs)
-            elseif head === :call || head === :invoke || x.head === :invoke_modify ||
+            elseif head === :call || head === :invoke || x.head === :invoke_if_not_ambiguous || x.head === :invoke_modify ||
                 head === :gc_preserve_end || head === :meta ||
                 head === :inbounds || head === :foreigncall || head === :cfunction ||
                 head === :leave || head === :pop_exception ||
@@ -255,7 +256,7 @@ end
 function is_valid_rvalue(@nospecialize(x))
     is_valid_argument(x) && return true
     if isa(x, Expr) && x.head in (:new, :splatnew, :the_exception, :isdefined, :call,
-        :invoke, :invoke_modify, :foreigncall, :cfunction, :gc_preserve_begin, :copyast,
+        :invoke, :invoke_if_not_ambiguous, :invoke_modify, :foreigncall, :cfunction, :gc_preserve_begin, :copyast,
         :new_opaque_closure)
         return true
     end

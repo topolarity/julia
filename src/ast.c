@@ -233,6 +233,7 @@ void jl_init_common_symbols(void)
     jl_empty_sym = jl_symbol("");
     jl_call_sym = jl_symbol("call");
     jl_invoke_sym = jl_symbol("invoke");
+    jl_invoke_if_not_ambiguous_sym = jl_symbol("invoke_if_not_ambiguous");
     jl_invoke_modify_sym = jl_symbol("invoke_modify");
     jl_foreigncall_sym = jl_symbol("foreigncall");
     jl_cfunction_sym = jl_symbol("cfunction");

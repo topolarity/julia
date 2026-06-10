@@ -112,3 +112,44 @@ let m = Meta.@lower 1 + 1
     @test :b === @eval $m
     @test isempty(current_exceptions())
 end
+
+# Expr(:invoke_if_not_ambiguous, ...) has the same semantics as Expr(:invoke, ...), but
+# guards the call with a runtime check that dispatch resolves uniquely to the target method,
+# throwing a MethodError otherwise. Exercise the interpreter path (top-level thunks are
+# interpreted, so the head is executed directly by the interpreter).
+const METHOD_SIG_ALWAYS_ONLY = 0x08
+ina_single(x::Int) = x + 100
+ina_amb(x::Int, y) = (:a, x, y)
+ina_amb(x, y::Int) = (:b, x, y)
+let
+    ina_single(1); ina_amb(1, "x") # realize/register the methods
+    # a lone method is intersection-free in every world => METHOD_SIG_ALWAYS_ONLY (fast path)
+    @test (only(methods(ina_single)).dispatch_status & METHOD_SIG_ALWAYS_ONLY) != 0
+    # mutually-ambiguous methods are never ALWAYS_ONLY
+    @test all(m -> (m.dispatch_status & METHOD_SIG_ALWAYS_ONLY) == 0, methods(ina_amb))
+
+    getmi(m::Method, @nospecialize(specTypes)) =
+        ccall(:jl_specializations_get_linfo, Ref{Core.MethodInstance}, (Any, Any, Any), m, specTypes, Core.svec())
+    function run_ina(mi, fname, args...)
+        m = Meta.@lower 1 + 1
+        src = m.args[1]::CodeInfo
+        src.code = Any[Expr(:invoke_if_not_ambiguous, mi, GlobalRef(@__MODULE__, fname), args...),
+                       ReturnNode(SSAValue(1))]
+        n = length(src.code)
+        src.ssavaluetypes = n
+        src.ssaflags = fill(zero(UInt32), n)
+        src.debuginfo = Core.DebugInfo(:none)
+        @eval $m
+    end
+
+    m_single = only(methods(ina_single))
+    m_int_any = which(ina_amb, (Int, AbstractString)) # ina_amb(::Int, ::Any)
+    # fast path (ALWAYS_ONLY): invokes the target
+    @test run_ina(getmi(m_single, Tuple{typeof(ina_single), Int}), :ina_single, 7) == 107
+    # slow path, unambiguous region: dispatch uniquely picks ina_amb(::Int, ::Any)
+    @test run_ina(getmi(m_int_any, Tuple{typeof(ina_amb), Int, String}), :ina_amb, 1, "x") == (:a, 1, "x")
+    # slow path, ambiguous region: (Int, Int) is ambiguous => MethodError (a `:call`, not invoke)
+    err = (@test_throws MethodError run_ina(getmi(m_int_any, Tuple{typeof(ina_amb), Int, Int}), :ina_amb, 1, 2)).value
+    @test err.dispatch_kind === :call
+    @test isempty(current_exceptions())
+end
