@@ -3154,16 +3154,23 @@ JL_DLLEXPORT void jl_method_table_insert(jl_methtable_t *mt, jl_method_t *method
     JL_GC_POP();
 }
 
-static void JL_NORETURN jl_method_error_bare(jl_value_t *f, jl_value_t *args, size_t world)
+// Throw a MethodError. `args` is either a tuple of the argument values or, when the values
+// are not available (e.g. the by-types path or an invoke), a tuple type giving the argument
+// signature -- the overload MethodError has always supported (see errorshow.jl).
+// `dispatch_kind` is jl_call_sym for a failed call or jl_invoke_sym for a failed invoke; it
+// disambiguates the two even when `args` is a tuple type in both cases.
+static void JL_NORETURN jl_method_error_bare(jl_value_t *f, jl_value_t *args, size_t world, jl_sym_t *dispatch_kind)
 {
     if (jl_methoderror_type) {
         jl_value_t *e = jl_new_struct_uninit(jl_methoderror_type);
+        // layout must match struct MethodError in boot.jl: f, args, world, dispatch_kind
         struct jl_method_error {
             jl_value_t *f;
             jl_value_t *args;
             size_t world;
+            jl_value_t *dispatch_kind;
         } *pe = (struct jl_method_error*)e,
-           ee = {f, args, world};
+           ee = {f, args, world, (jl_value_t*)dispatch_kind};
         *pe = ee;
         jl_throw(e);
     }
@@ -3183,18 +3190,14 @@ void JL_NORETURN jl_method_error(jl_value_t *f, jl_value_t **args, size_t na, si
 {
     jl_value_t *argtup = jl_f_tuple(NULL, args, na - 1);
     JL_GC_PUSH1(&argtup);
-    jl_method_error_bare(f, argtup, world);
+    jl_method_error_bare(f, argtup, world, jl_call_sym);
     // not reached
+    JL_GC_POP();
 }
 
 jl_tupletype_t *arg_type_tuple(jl_value_t *arg1, jl_value_t **args, size_t nargs)
 {
-    return jl_inst_arg_tuple_type(arg1, args, nargs, 1);
-}
-
-static jl_tupletype_t *lookup_arg_type_tuple(jl_value_t *arg1 JL_PROPAGATES_ROOT, jl_value_t **args, size_t nargs)
-{
-    return jl_lookup_arg_tuple_type(arg1, args, nargs, 1);
+    return jl_inst_arg_tuple_type(arg1, args, /*types*/NULL, nargs, 1);
 }
 
 JL_DLLEXPORT jl_value_t *jl_method_lookup_by_tt(jl_tupletype_t *tt, size_t world, jl_value_t *_mt)
@@ -4412,7 +4415,7 @@ jl_value_t *jl_gf_invoke(jl_value_t *types0, jl_value_t *gf, jl_value_t **args, 
     JL_GC_PROMISE_ROOTED(method);
 
     if ((jl_value_t*)method == jl_nothing) {
-        jl_method_error_bare(gf, types0, world);
+        jl_method_error_bare(gf, types0, world, jl_invoke_sym);
         // unreachable
     }
 

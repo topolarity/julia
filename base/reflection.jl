@@ -983,7 +983,9 @@ function which(@nospecialize(f), @nospecialize(t))
     world = get_world_counter()
     match, _ = invoke_default_compiler(:_findsup, tt, nothing, world)
     if match === nothing
-        me = MethodError(f, t, world)
+        # `t` may be given as a tuple of types or as a tuple type; preserve the historical
+        # display (only the latter renders as an `invoke`).
+        me = MethodError(f, t, world, isa(t, Tuple) ? :call : :invoke)
         ee = ErrorException(sprint(io -> begin
             println(io, "Calling invoke(f, t, args...) would throw:");
             Base.showerror(io, me);

@@ -459,11 +459,15 @@ const typemax_Int = Core.Intrinsics.udiv_int(Core.Intrinsics.sext_int(Int, 0xFF)
 
 struct MethodError <: Exception
     f
-    args
+    args  # a tuple of the argument values, or a tuple type giving just the argument signature
     world::UInt
-    MethodError(@nospecialize(f), @nospecialize(args), world::UInt) = new(f, args, world)
+    dispatch_kind::Symbol # `:call` or `:invoke`; an `Expr(:invoke_if_not_ambiguous)` is a `:call`
+    function MethodError(@nospecialize(f), @nospecialize(args), world::UInt, dispatch_kind::Symbol)
+        return new(f, args, world, dispatch_kind)
+    end
 end
-MethodError(@nospecialize(f), @nospecialize(args)) = MethodError(f, args, typemax_UInt)
+MethodError(@nospecialize(f), @nospecialize(args), world::UInt) = MethodError(f, args, world, :call)
+MethodError(@nospecialize(f), @nospecialize(args)) = MethodError(f, args, typemax_UInt, :call)
 
 struct AssertionError <: Exception
     msg::AbstractString

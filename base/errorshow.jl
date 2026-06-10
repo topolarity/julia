@@ -257,8 +257,9 @@ end
 
 function showerror(io::IO, ex::MethodError)
     @nospecialize io
-    # ex.args is a tuple type if it was thrown from `invoke` and is
-    # a tuple of the arguments otherwise.
+    # ex.args is a tuple type if it was thrown from `invoke` (or a by-types call) and is
+    # a tuple of the arguments otherwise; ex.dispatch_kind records whether this was a `:call`
+    # or an `:invoke`.
     is_arg_types = !isa(ex.args, Tuple)
     arg_types = is_arg_types ? ex.args : typesof(ex.args...)
     arg_types_param::SimpleVector = (unwrap_unionall(arg_types)::DataType).parameters
@@ -301,7 +302,7 @@ function showerror(io::IO, ex::MethodError)
         if ft <: Function && isempty(ft.parameters) && _isself(ft)
             f_is_function = true
         end
-        if is_arg_types
+        if ex.dispatch_kind === :invoke
             print(io, "no method matching invoke ")
         else
             print(io, "no method matching ")
