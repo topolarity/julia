@@ -3529,6 +3529,12 @@ end
 # load for a long time and must be rebuilt. Returns whether the files were purged.
 function maybe_purge_blocked_cachefile!(load_error, cachefile::String, ocachefile::Union{String,Nothing})
     load_error isa ImageLoadBlockedError || return false
+    # TEMPORARY TEST HARNESS (remove before merging): keep blocked images in place
+    # so they can be accumulated for testing the existing-pkgimage recovery paths.
+    if haskey(ENV, "JULIA_DISABLE_PKGIMAGE_PURGE")
+        @warn "OS blocked loading $cachefile; leaving it in place (JULIA_DISABLE_PKGIMAGE_PURGE)" exception=load_error
+        return false
+    end
     @debug "Deleting cache file $cachefile: the OS blocked loading its image." exception=load_error
     rm(cachefile; force=true)
     ocachefile === nothing || rm(ocachefile; force=true)
@@ -3543,6 +3549,11 @@ if the operating system refuses to load `ocachefile` because an Application Cont
 Policy, such as Smart App Control / WDAC blocked it.
 """
 function check_pkgimage_not_blocked(ocachefile::Union{String,Nothing})
+    # TEMPORARY TEST HARNESS (remove before merging): report "not blocked" from the
+    # probe so the post-build and proactive checks pass, while the reactive in-process
+    # load (jl_restore_package_image_from_file) still honors JULIA_FORCE_PKGIMAGE_BLOCKED.
+    # Lets the post-build-reload recovery path be reached with purge active.
+    haskey(ENV, "JULIA_DISABLE_PKGIMAGE_PROBE") && return nothing
     @static if !Sys.iswindows()
         return nothing
     else

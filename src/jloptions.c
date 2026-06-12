@@ -1062,6 +1062,10 @@ restart_switch:
             break;
         case opt_probe_image_load:
         {
+            // TEMPORARY TEST HARNESS (remove before merging): force a block for matching images.
+            extern int jl_pkgimage_forced_blocked(const char *path);
+            if (jl_pkgimage_forced_blocked(optarg))
+                exit(0x11C7);
 #if defined(_OS_WINDOWS_)
             // This is used as a quick test to check whether `LoadLibrary`
             // will allow us to load an image file or if Smart App Control,

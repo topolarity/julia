@@ -4404,8 +4404,62 @@ JL_DLLEXPORT void jl_restore_system_image(jl_image_t *image, jl_image_buf_t buf)
 #define APPLICATION_CONTROL_POLICY_ERROR 0x11C7
 #endif
 
+// TEMPORARY TEST HARNESS (remove before merging): force an application control
+// policy block for any pkgimage whose path contains, or whose crc32c hex equals,
+// a `;`-separated entry of JULIA_FORCE_PKGIMAGE_BLOCKED. Lets the recovery paths
+// be exercised without a real Smart App Control block. Also called from src/jloptions.c.
+int jl_pkgimage_forced_blocked(const char *path)
+{
+    const char *env = getenv("JULIA_FORCE_PKGIMAGE_BLOCKED");
+    if (env == NULL || *env == '\0' || path == NULL)
+        return 0;
+    uint32_t crc = 0;
+    int have_crc = 0;
+    ios_t f;
+    if (ios_file(&f, path, 1, 0, 0, 0) != NULL) {
+        char rbuf[8192];
+        size_t n;
+        while ((n = ios_readall(&f, rbuf, sizeof(rbuf))) > 0) {
+            crc = jl_crc32c(crc, rbuf, n);
+            if (n < sizeof(rbuf))
+                break;
+        }
+        ios_close(&f);
+        have_crc = 1;
+    }
+    for (const char *p = env; *p; ) {
+        const char *semi = strchr(p, ';');
+        size_t len = semi ? (size_t)(semi - p) : strlen(p);
+        if (len > 0 && len < 1024) {
+            char entry[1024];
+            memcpy(entry, p, len);
+            entry[len] = '\0';
+            if (strstr(path, entry) != NULL)
+                return 1;
+            if (have_crc) {
+                char *end;
+                unsigned long v = strtoul(entry, &end, 16);
+                if (end != entry && *end == '\0' && (uint32_t)v == crc)
+                    return 1;
+            }
+        }
+        if (semi == NULL)
+            break;
+        p = semi + 1;
+    }
+    return 0;
+}
+
 JL_DLLEXPORT jl_value_t *jl_restore_package_image_from_file(const char *fname, jl_array_t *depmods, int completeinfo, const char *pkgname, int ignore_native)
 {
+    // TEMPORARY TEST HARNESS (remove before merging): force a block for matching images.
+    if (jl_pkgimage_forced_blocked(fname) && jl_imageloadblockederror_type != NULL) {
+        jl_value_t *path = NULL, *code = NULL;
+        JL_GC_PUSH2(&path, &code);
+        path = jl_cstr_to_string(fname);
+        code = jl_box_uint32(0x11C7);
+        jl_throw(jl_new_struct(jl_imageloadblockederror_type, path, code));
+    }
     void *pkgimg_handle = jl_dlopen(fname, JL_RTLD_LAZY);
     if (!pkgimg_handle) {
 #ifdef _OS_WINDOWS_
