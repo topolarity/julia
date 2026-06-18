@@ -75,6 +75,10 @@ static size_t get_max_varargs(
     if (may_increase != NULL)
         *may_increase = 0;
 
+    if (m->is_unregistered)
+        return UINT8_MAX; // unregistered methods (e.g. opaque-closure bodies) aren't in any
+                          // method table, so the max_args-based heuristic below doesn't apply
+
     if (m->max_varargs != UINT8_MAX) {
         max_varargs = m->max_varargs;
     }

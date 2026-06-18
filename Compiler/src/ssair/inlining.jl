@@ -1174,24 +1174,38 @@ function invoke_signature(argtypes::Vector{Any})
     return rewrap_unionall(Tuple{ft, unwrap_unionall(argtyps).parameters...}, argtyps)
 end
 
-function narrow_opaque_closure!(ir::IRCode, stmt::Expr, @nospecialize(info::CallInfo), state::InliningState)
-    if isa(info, OpaqueClosureCreateInfo)
-        lbt = argextype(stmt.args[2], ir)
-        lb, exact = instanceof_tfunc(lbt)
-        exact || return
-        ubt = argextype(stmt.args[3], ir)
-        ub, exact = instanceof_tfunc(ubt)
-        exact || return
-        # Narrow opaque closure type
-        𝕃ₒ = optimizer_lattice(state.interp)
-        newT = widenconst(tmeet(𝕃ₒ, tmerge(𝕃ₒ, lb, info.unspec.rt), ub))
-        if newT != ub
-            # N.B.: Narrowing the ub requires a backedge on the mi whose type
-            # information we're using, since a change in that function may
-            # invalidate ub result.
-            stmt.args[3] = newT
-        end
+function handle_new_opaque_closure_call!(ir::IRCode, idx::Int, stmt::Expr,
+                                         @nospecialize(info::CallInfo), state::InliningState)
+    isa(info, OpaqueClosureCreateInfo) || return nothing
+    unspec = info.unspec
+    lbt = argextype(stmt.args[2], ir)
+    lb, exact = instanceof_tfunc(lbt)
+    exact || return nothing
+    ubt = argextype(stmt.args[3], ir)
+    ub, exact = instanceof_tfunc(ubt)
+    exact || return nothing
+    # Narrow opaque closure type from the unspecialized inference result.
+    𝕃ₒ = optimizer_lattice(state.interp)
+    newT = widenconst(tmeet(𝕃ₒ, tmerge(𝕃ₒ, lb, unspec.rt), ub))
+    if newT != ub
+        # N.B.: Narrowing the ub requires a backedge on the mi whose type
+        # information we're using, since a change in that function may
+        # invalidate ub result.
+        stmt.args[3] = newT
     end
+    # Bake the resolved body CodeInstance, replacing the source Method at args[5], so
+    # the construction uses it directly rather than re-resolving the method -- analogous
+    # to the `:call` -> `:invoke` devirtualization and the 4-arg `_typed_callable`. Only
+    # applies when the unspecialized OC call carries a concrete match and resolves to a
+    # compiled CodeInstance.
+    callinfo = unspec.info
+    isa(callinfo, OpaqueClosureCallInfo) || return nothing
+    mi = specialize_method(callinfo.match)
+    case = compileable_specialization(mi, Effects(), InliningEdgeTracker(state), callinfo, state)
+    case === nothing && return nothing
+    isa(case.invoke, CodeInstance) || return nothing
+    stmt.args[5] = case.invoke
+    return nothing
 end
 
 # As a matter of convenience, this pass also computes effect-freenes.
@@ -1222,7 +1236,7 @@ function process_simple!(todo::Vector{Pair{Int,Any}}, ir::IRCode, idx::Int, flag
         if head === :splatnew
             inline_splatnew!(ir, idx, stmt, rt, state)
         elseif head === :new_opaque_closure
-            narrow_opaque_closure!(ir, stmt, inst[:info], state)
+            handle_new_opaque_closure_call!(ir, idx, stmt, inst[:info], state)
         elseif head === :invoke
             sig = call_sig(ir, stmt)
             sig === nothing && return nothing

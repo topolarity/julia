@@ -2422,9 +2422,15 @@ end
     t = (argt_exact ? Core.OpaqueClosure{argt, T} : Core.OpaqueClosure{<:argt, T}) where T
     t = lbt == ubt ? t{ubt} : (t{T} where lbt <: T <: ubt)
 
-    (isa(source, Const) && isa(source.val, Method)) || return t
-
-    return PartialOpaque(t, tuple_tfunc(𝕃, env), mi, source.val)
+    isa(source, Const) || return t
+    if source.val isa Method
+        return PartialOpaque(t, tuple_tfunc(𝕃, env), mi, source.val)
+    elseif source.val isa CodeInstance
+        # Optimized form: the source has been resolved to a CodeInstance (see the
+        # inlining bake in handle_new_opaque_closure_call!). Recover its defining Method.
+        return PartialOpaque(t, tuple_tfunc(𝕃, env), mi, get_ci_mi(source.val).def)
+    end
+    return t
 end
 
 # whether getindex for the elements can potentially throw UndefRef
