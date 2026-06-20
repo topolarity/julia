@@ -503,6 +503,16 @@ struct ABIOverride
     ABIOverride(@nospecialize(abi::Type), def::MethodInstance) = new(abi, def)
 end
 
+# Wraps inferred source (a `CodeInfo`, possibly compressed to a `String`) that is
+# stored in `CodeInstance.inferred` purely for introspection/debugging (see
+# `jl_set_type_infer_preserve_ir`). The compiler treats a wrapped value exactly as
+# if the source had been discarded, so preserving IR cannot affect caching or
+# compilation decisions.
+struct PreservedIRForDebug
+    ir::Any
+    PreservedIRForDebug(@nospecialize(ir)) = new(ir)
+end
+
 struct PrecompilableError <: Exception
     PrecompilableError() = new()
 end

@@ -496,6 +496,9 @@ typedef struct _jl_code_instance_t {
     // - jl_nothing, indicating that inference was completed, but the result was
     //               deleted to save space.
     // - UInt8, indicating that inference recorded the estimated inlining cost, but deleted the result to save space
+    // - Core.PreservedIRForDebug, wrapping IR that would have been deleted but was kept
+    //   for introspection only (see `jl_set_type_infer_preserve_ir`); the compiler must
+    //   treat this exactly like jl_nothing
     // - NULL, indicating that inference was not yet completed or did not succeed
     _Atomic(jl_value_t *) inferred;
     _Atomic(jl_debuginfo_t *) debuginfo; // stored information about edges from this object (set once, with a happens-before both source and invoke)

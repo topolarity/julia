@@ -495,11 +495,23 @@ function add_remark! end
 may_optimize(::AbstractInterpreter) = true
 may_compress(::AbstractInterpreter) = true
 may_discard_trees(::AbstractInterpreter) = true
-may_discard_trees(::NativeInterpreter) =
-    ccall(:jl_get_type_infer_preserve_ir, Int8, ()) == 0
 precompile_keep_ir(::AbstractInterpreter) = false
 precompile_keep_ir(::NativeInterpreter) =
     ccall(:jl_get_precompile_keep_ir, Int8, ()) != 0
+
+"""
+    preserve_ir_for_debug(interp::AbstractInterpreter) -> Bool
+
+When `true`, source that inference would otherwise discard from the global cache is
+kept in `CodeInstance.inferred`, wrapped in `Core.PreservedIRForDebug`. The wrapped
+source is visible to introspection/debugging tools only: the compiler treats it
+exactly as if it had been discarded, so enabling this cannot affect any caching or
+compilation decisions. Toggled for the `NativeInterpreter` via
+`ccall(:jl_set_type_infer_preserve_ir, Cvoid, (Int8,), 1)`.
+"""
+preserve_ir_for_debug(::AbstractInterpreter) = false
+preserve_ir_for_debug(::NativeInterpreter) =
+    ccall(:jl_get_type_infer_preserve_ir, Int8, ()) != 0
 
 """
     method_table(interp::AbstractInterpreter)::MethodTableView

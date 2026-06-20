@@ -686,11 +686,16 @@ static void jl_insert_into_serialization_queue(jl_serializer_state *s, jl_value_
         if (inferred && inferred != jl_nothing && !jl_is_uint8(inferred)) { // disregard if there is nothing here to delete (e.g. builtins, unspecialized)
             jl_method_t *def = mi->def.method;
             if (jl_is_method(def)) { // don't delete toplevel code
-                int is_relocatable = !s->incremental || jl_is_code_info(inferred) ||
-                    (jl_is_string(inferred) && jl_string_len(inferred) > 0 && jl_string_data(inferred)[jl_string_len(inferred) - 1]);
-                int may_discard_trees = !jl_get_type_infer_preserve_ir();
+                // IR kept only for debugging (`jl_set_type_infer_preserve_ir`) is invisible
+                // to the compiler: it is exempt from the usual discard heuristics, but when
+                // it cannot be kept as-is it is dropped entirely (never converted to a stub),
+                // matching what the field would contain if the debug flag were off.
+                int debug_only = jl_is_preserved_ir_for_debug(inferred);
+                jl_value_t *src = debug_only ? jl_fieldref_noalloc(inferred, 0) : inferred;
+                int is_relocatable = !s->incremental || jl_is_code_info(src) ||
+                    (jl_is_string(src) && jl_string_len(src) > 0 && jl_string_data(src)[jl_string_len(src) - 1]);
                 int discard = 0;
-                if (may_discard_trees && s->incremental && native_functions &&
+                if (s->incremental && native_functions &&
                     jl_options.outputo != NULL && ci->owner == jl_nothing && def->source != NULL &&
                     jl_is_code_info(inferred) && jl_ir_inlining_cost(inferred) == UINT16_MAX) {
                     // Backstop: CodeInstance cached by a task racing the end of
@@ -705,28 +710,28 @@ static void jl_insert_into_serialization_queue(jl_serializer_state *s, jl_value_
                 else if (def->source == NULL) {
                     // don't delete code from optimized opaque closures that can't be reconstructed (and builtins)
                 }
-                else if (may_discard_trees && // if allowed to delete
+                else if (!debug_only &&
                          (!codeinst_may_be_runnable(ci, s->incremental) || // delete all code that cannot run
                           jl_atomic_load_relaxed(&ci->invoke) == jl_fptr_const_return)) { // delete all code that just returns a constant
                     discard = 1;
                 }
-                else if (may_discard_trees &&
+                else if (!debug_only &&
                          native_functions && // don't delete any code if making a ji file
                          (ci->owner == jl_nothing) && // don't delete code for external interpreters
                          !effects_foldable(jl_atomic_load_relaxed(&ci->ipo_purity_bits)) && // don't delete code we may want for irinterp
-                         jl_ir_inlining_cost(inferred) == UINT16_MAX) { // don't delete inlineable code
+                         jl_ir_inlining_cost(src) == UINT16_MAX) { // don't delete inlineable code
                     // delete the code now: if we thought it was worth keeping, it would have been converted to object code
                     discard = 1;
                 }
                 if (discard) {
                     // keep only the inlining cost, so inference can later decide if it is worth getting the source back
-                    if (jl_is_string(inferred) || jl_is_code_info(inferred))
-                        inferred = jl_box_uint8(jl_encode_inlining_cost(jl_ir_inlining_cost(inferred)));
+                    if (!debug_only && (jl_is_string(src) || jl_is_code_info(src)))
+                        inferred = jl_box_uint8(jl_encode_inlining_cost(jl_ir_inlining_cost(src)));
                     else
                         inferred = jl_nothing;
                     record_field_change((jl_value_t**)&ci->inferred, inferred);
                 }
-                else if (s->incremental && jl_is_string(inferred)) {
+                else if (s->incremental && jl_is_string(src)) {
                     // New roots for external methods
                     if (jl_object_in_image((jl_value_t*)def)) {
                         void **pfound = ptrhash_bp(&s->method_roots_index, def);
@@ -2484,6 +2489,10 @@ static void strip_specializations_(jl_method_instance_t *mi)
         jl_value_t *inferred = jl_atomic_load_relaxed(&codeinst->inferred);
         if (inferred && inferred != jl_nothing && !jl_is_uint8(inferred)) {
             if (jl_options.strip_ir) {
+                record_field_change((jl_value_t**)&codeinst->inferred, jl_nothing);
+            }
+            else if (jl_options.strip_metadata && jl_is_preserved_ir_for_debug(inferred)) {
+                // debug-only IR is just the metadata being stripped, so drop it
                 record_field_change((jl_value_t**)&codeinst->inferred, jl_nothing);
             }
             else if (jl_options.strip_metadata) {

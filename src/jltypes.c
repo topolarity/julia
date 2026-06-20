@@ -4232,6 +4232,7 @@ void post_boot_hooks(void)
     jl_weakref_type = (jl_datatype_t*)core("WeakRef");
     jl_vecelement_typename = ((jl_datatype_t*)jl_unwrap_unionall(core("VecElement")))->name;
     jl_abioverride_type = (jl_datatype_t*)core("ABIOverride");
+    jl_preserved_ir_for_debug_type = (jl_datatype_t*)core("PreservedIRForDebug");
 
     jl_const_type = (jl_datatype_t*)core("Const");
     jl_partial_struct_type = (jl_datatype_t*)core("PartialStruct");

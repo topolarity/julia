@@ -141,9 +141,21 @@ function finish!(interp::AbstractInterpreter, caller::InferenceState, validation
         debuginfo = nothing
         const_flag = is_result_constabi_eligible(result)
         discard_src = caller.cache_mode === CACHE_MODE_NULL || (const_flag && may_discard_trees(interp))
+        # If requested, source that would otherwise be discarded is kept in the cache,
+        # wrapped in `PreservedIRForDebug` where introspection can find it but the
+        # compiler itself never looks, so that all other behavior is identical.
+        preserve_debug = caller.cache_mode !== CACHE_MODE_NULL && ci.owner === nothing &&
+            preserve_ir_for_debug(interp)
+        can_discard_trees = !preserve_debug && may_discard_trees(interp)
         if !discard_src
-            inferred_result = transform_result_for_cache(interp, result, edges)
-            if inferred_result !== nothing
+            was_optimized = result.src isa OptimizationState
+            inferred_result = transform_result_for_cache(interp, result, edges, can_discard_trees)
+            # (preserve mode only) whether `transform_result_for_cache` would have returned
+            # `nothing` with `can_discard_trees` enabled: keep `result.src` and `debuginfo`
+            # on the same path they would have taken in that case
+            discarded_by_transform = preserve_debug && was_optimized &&
+                inferred_result isa CodeInfo && !is_inlineable(inferred_result)
+            if inferred_result !== nothing && !discarded_by_transform
                 result.src = inferred_result
                 debuginfo = get_debuginfo(inferred_result)
                 # Inlining may fast-path the global cache via InferenceResult, so store it back here
@@ -162,12 +174,30 @@ function finish!(interp::AbstractInterpreter, caller::InferenceState, validation
                     resize!(inferred_result.slottypes::Vector{Any}, nslots)
                     resize!(inferred_result.slotnames, nslots)
                 end
-                inferred_result = maybe_compress_codeinfo(interp, mi, inferred_result)
+                inferred_result = maybe_compress_codeinfo(interp, mi, inferred_result, can_discard_trees)
+                if preserve_debug && !is_inlineable(inferred_result) && (was_optimized || mi.def isa Method)
+                    # `may_discard_trees` would have discarded this source
+                    inferred_result = PreservedIRForDebug(inferred_result)
+                end
             elseif ci.owner === nothing
                 # The global cache can only handle objects that codegen understands (nothing or CodeInfo)
                 inferred_result = nothing
             end
         else
+            if preserve_debug
+                debug_src = transform_result_for_cache(interp, result, edges, #=can_discard_trees=#false)
+                if debug_src isa CodeInfo
+                    if may_compress(interp)
+                        nslots = length(debug_src.slotflags)
+                        resize!(debug_src.slottypes::Vector{Any}, nslots)
+                        resize!(debug_src.slotnames, nslots)
+                    end
+                    debug_src = maybe_compress_codeinfo(interp, mi, debug_src, #=can_discard_trees=#false)
+                end
+                if debug_src isa MaybeCompressed
+                    inferred_result = PreservedIRForDebug(debug_src)
+                end
+            end
             result.src = nothing
         end
         if debuginfo === nothing
@@ -472,13 +502,14 @@ function transform_result_for_local_cache(interp::AbstractInterpreter, result::I
     return src
 end
 
-function transform_result_for_cache(interp::AbstractInterpreter, result::InferenceResult, edges::SimpleVector)
+function transform_result_for_cache(interp::AbstractInterpreter, result::InferenceResult, edges::SimpleVector,
+                                    can_discard_trees::Bool=may_discard_trees(interp))
     inlining_cost = nothing
     src = result.src
     if isa(src, OptimizationState)
         opt = src
         inlining_cost = compute_inlining_cost(interp, result, opt.optresult)
-        discard_optimized_result(interp, inlining_cost) && return nothing
+        discard_optimized_result(interp, inlining_cost, can_discard_trees) && return nothing
         src = ir_to_codeinf!(opt)
     end
     if isa(src, CodeInfo)
@@ -492,17 +523,17 @@ function transform_result_for_cache(interp::AbstractInterpreter, result::Inferen
     return src
 end
 
-function discard_optimized_result(interp::AbstractInterpreter, inlining_cost::InlineCostType)
-    may_discard_trees(interp) || return false
+function discard_optimized_result(interp::AbstractInterpreter, inlining_cost::InlineCostType, can_discard_trees::Bool)
+    can_discard_trees || return false
     inlining_cost == MAX_INLINE_COST || return false
     precompile_keep_ir(interp) && return false
     return true
 end
 
-function maybe_compress_codeinfo(interp::AbstractInterpreter, mi::MethodInstance, ci::CodeInfo)
+function maybe_compress_codeinfo(interp::AbstractInterpreter, mi::MethodInstance, ci::CodeInfo,
+                                 can_discard_trees::Bool=may_discard_trees(interp))
     def = mi.def
     isa(def, Method) || return ci # don't compress toplevel code
-    can_discard_trees = may_discard_trees(interp)
     inlineable = is_inlineable(ci)
     if can_discard_trees && !inlineable
         # Precompile-keep-ir mode: retain non-inlineable IR as raw CodeInfo so

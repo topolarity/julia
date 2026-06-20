@@ -1024,8 +1024,10 @@ jl_value_t *jl_typeinf_func JL_GLOBALLY_ROOTED = NULL;
 jl_value_t *jl_compile_and_emit_func JL_GLOBALLY_ROOTED = NULL;
 JL_DLLEXPORT size_t jl_typeinf_world = 1;
 
-// Force Compiler (and staticdata serialization) not to throw away Julia IR,
-// even when it is not needed for inlining, etc. - intended for debugging only
+// Ask the Compiler (and staticdata serialization) to keep Julia IR that it would
+// otherwise throw away, wrapped in `Core.PreservedIRForDebug` so that the extra
+// source is visible to introspection only and cannot affect any caching or
+// compilation decisions - intended for debugging only
 static _Atomic(int8_t) jl_type_infer_preserve_ir = 0;
 
 JL_DLLEXPORT int8_t jl_get_type_infer_preserve_ir(void)
@@ -1052,6 +1054,13 @@ JL_DLLEXPORT int8_t jl_get_precompile_keep_ir(void)
 JL_DLLEXPORT void jl_set_precompile_keep_ir(int8_t v)
 {
     jl_atomic_store_relaxed(&jl_precompile_keep_ir, v);
+}
+
+jl_datatype_t *jl_preserved_ir_for_debug_type JL_GLOBALLY_ROOTED = NULL;
+
+int jl_is_preserved_ir_for_debug(jl_value_t *v) JL_NOTSAFEPOINT
+{
+    return jl_preserved_ir_for_debug_type != NULL && jl_typetagis(v, jl_preserved_ir_for_debug_type);
 }
 
 static int invalidate_all_entries(jl_typemap_entry_t *entry, void *env)

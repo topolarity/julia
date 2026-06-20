@@ -1273,6 +1273,8 @@ JL_DLLEXPORT uint16_t jl_ir_inlining_cost(jl_value_t *data)
         return jl_decode_inlining_cost(*(uint8_t*)data);
     if (jl_is_code_info(data))
         return ((jl_code_info_t*)data)->inlining_cost;
+    if (jl_is_preserved_ir_for_debug(data))
+        return jl_ir_inlining_cost(jl_fieldref_noalloc(data, 0));
     assert(jl_is_string(data));
     uint16_t res = jl_decode_inlining_cost(*(uint8_t*)(jl_string_data(data) + ir_offset_inlining_cost));
     return res;

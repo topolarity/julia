@@ -323,8 +323,9 @@ function enqueue_specialization!(all::Bool, worklist, mi::MethodInstance)
             do_compile = true
         elseif !do_compile && isdefined(codeinst, :inferred)
             inferred = codeinst.inferred
-            # Check compilation options and inlining cost
-            if (all || inferred === nothing ||
+            # Check compilation options and inlining cost (debug-only preserved IR is
+            # treated exactly like discarded source)
+            if (all || inferred === nothing || inferred isa PreservedIRForDebug ||
                 ((isa(inferred, String) || isa(inferred, CodeInfo) || isa(inferred, UInt8)) &&
                  ccall(:jl_ir_inlining_cost, UInt16, (Any,), inferred) == typemax(UInt16)))
                 do_compile = true
