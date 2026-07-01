@@ -1075,7 +1075,7 @@ typedef struct _jl_abi_adapter_t {
 // Latest-world dispatch trampoline record (`jl_dispatch_trampolines->cache`), used by
 // @cfunction/@ccallable: holds a *signature*, not a fixed CodeInstance, and re-resolves the
 // target as the world advances (the inline call site polls `last_world` vs the world counter
-// and re-resolves via jl_resolve_trampoline). Mutable; `fptr`/`last_world` are atomic.
+// and re-resolves via jl_update_dispatch_trampoline). Mutable; `fptr`/`last_world` are atomic.
 typedef struct _jl_dispatch_trampoline_t {
     JL_DATA_TYPE
     jl_value_t *sigt;            // key: resolution sig Tuple{typeof(f), A...} (for jl_get_specialization1)

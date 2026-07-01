@@ -1735,14 +1735,14 @@ JL_DLLEXPORT jl_value_t *jl_get_cfunction_trampoline(
     jl_value_t *fobj, jl_datatype_t *result, htable_t *cache, jl_svec_t *fill,
     void *(*init_trampoline)(void *tramp, void **nval),
     jl_unionall_t *env, jl_value_t **vals) JL_CANSAFEPOINT;
-JL_DLLEXPORT void *jl_get_abi_converter(jl_task_t *ct, void *data) JL_CANSAFEPOINT;
 // Returns the adapter fptr; `*invokee` (optional) receives the Union{CodeInstance, ABIAdapter}
 // it was derived from.
 JL_DLLIMPORT void *jl_jit_abi_converter(jl_task_t *ct, jl_abi_t from_abi, jl_code_instance_t *codeinst, jl_value_t **invokee) JL_CANSAFEPOINT;
 
-// ABI-adapter cache (src/abi_adapter.c). The bucketed TypeMap
+// ABI-adapter / dispatch-trampoline caches (src/abi_adapter.c, src/dispatch_trampoline.c). The bucketed TypeMap
 // bookkeeping lives in libjulia-internal; the JIT half (jl_get_abi_adapter) is in codegen.
 JL_DLLEXPORT jl_abi_adapter_cache_t *jl_new_abi_adapter_cache(void) JL_CANSAFEPOINT;
+JL_DLLEXPORT jl_dispatch_trampoline_cache_t *jl_new_dispatch_trampoline_cache(void) JL_CANSAFEPOINT;
 JL_DLLEXPORT int jl_abi_matches_invoke_api(jl_abi_t from_abi, jl_invoke_api_t api,
         jl_method_instance_t *mi, jl_value_t *rettype) JL_CANSAFEPOINT;
 // The target's own compiled entry point when it already satisfies `from_abi` (so no adapter
@@ -1757,9 +1757,14 @@ JL_DLLEXPORT void *jl_lookup_abi_converter(jl_abi_t from_abi, jl_code_instance_t
         void **target, int *target_specsig, jl_callptr_t *invoke, jl_value_t **invokee) JL_CANSAFEPOINT;
 JL_DLLEXPORT jl_abi_adapter_t *jl_new_abi_adapter(jl_value_t *sigt, jl_value_t *rt,
         jl_code_instance_t *ci, int specsig, int is_opaque_closure, size_t nargs, void *fptr) JL_CANSAFEPOINT;
+JL_DLLEXPORT jl_dispatch_trampoline_t *jl_get_dispatch_trampoline(jl_value_t *sigt, jl_value_t *rt, int specsig) JL_CANSAFEPOINT;
+JL_DLLEXPORT jl_dispatch_trampoline_t *jl_insert_dispatch_trampoline(jl_dispatch_trampoline_t *tr) JL_CANSAFEPOINT;
 // Insert the record if its key is absent and return the canonical record; keep-first, like
 // jl_specializations_get_or_insert.
 JL_DLLEXPORT jl_abi_adapter_t *jl_insert_abi_adapter(jl_abi_adapter_t *e) JL_CANSAFEPOINT;
+// The @cfunction/@ccallable dispatch-trampoline resolver (runtime_ccall.c); the codegen
+// poll calls it (as jlupdatetrampoline_func) when its cached world is stale.
+JL_DLLEXPORT void *jl_update_dispatch_trampoline(jl_task_t *ct, jl_dispatch_trampoline_t *tr) JL_CANSAFEPOINT;
 
 
 // Special filenames used to refer to internal julia libraries

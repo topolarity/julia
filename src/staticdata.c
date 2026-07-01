@@ -744,6 +744,19 @@ static void jl_insert_into_serialization_queue(jl_serializer_state *s, jl_value_
         jl_abi_adapter_cache_t *c = (jl_abi_adapter_cache_t*)v;
         record_field_change((jl_value_t**)&c->cache, jl_nothing);
     }
+    if (jl_typetagis(v, jl_dispatch_trampoline_cache_type)) {
+        // Likewise the trampoline cache: serialize it empty and re-insert each restored
+        // trampoline on load.
+        jl_dispatch_trampoline_cache_t *c = (jl_dispatch_trampoline_cache_t*)v;
+        record_field_change((jl_value_t**)&c->cache, jl_nothing);
+    }
+    if (jl_is_dispatch_trampoline(v)) {
+        // The `sigt` bucket chain is a process-local runtime cache, rebuilt on load
+        // (jl_insert_dispatch_trampoline); drop `next` so we neither relocate it nor drag an
+        // unreachable sibling trampoline into the image (mirrors ci->next handling).
+        jl_dispatch_trampoline_t *tr = (jl_dispatch_trampoline_t*)v;
+        record_field_change((jl_value_t**)&tr->next, NULL);
+    }
     if (jl_is_abi_adapter(v)) {
         // Like the cache itself, the adapter's `sigt` bucket chain is process-local and
         // rebuilt on load (jl_insert_abi_adapter), so drop `next`.
@@ -1829,6 +1842,20 @@ static void jl_write_values(jl_serializer_state *s) JL_CANSAFEPOINT JL_GC_DISABL
                     arraylist_push(&s->relocs_list, (void*)(((uintptr_t)FunctionRef << RELOC_TAG_OFFSET) + BuiltinFunctionTag + builtin_id - 2)); // relocation target
                 }
             }
+            else if (jl_is_dispatch_trampoline(v)) {
+                assert(f == s->s);
+                // `fptr` is a process-local address (a redundant cache of `last_invokee`'s
+                // fptr); null it and reset `last_world` to the unresolved sentinel. The first
+                // call after load re-validates `last_invokee` and restores `fptr` from it
+                // (jl_update_dispatch_trampoline). The adapter thunk itself is wired via the
+                // ABIAdapter record's own fptr_record entry, not the trampoline's.
+                jl_dispatch_trampoline_t *newtr = (jl_dispatch_trampoline_t*)&f->buf[reloc_offset];
+                jl_atomic_store_relaxed(&newtr->fptr, NULL);
+                jl_atomic_store_relaxed(&newtr->last_world, 0);
+                // Re-insert this trampoline into the running cache on load, so a later
+                // @cfunction with the same (sigt, rt, specsig) shares it.
+                arraylist_push(&s->fixup_objs, (void*)reloc_offset);
+            }
             else if (jl_is_abi_adapter(v)) {
                 assert(f == s->s);
                 // The compiled adapter thunk lives in the image as an fvar. Null the record's
@@ -1854,12 +1881,14 @@ static void jl_write_values(jl_serializer_state *s) JL_CANSAFEPOINT JL_GC_DISABL
                     arraylist_push(&s->fixup_objs, (void*)reloc_offset);
                 }
             }
-            else if (jl_typetagis(v, jl_abi_adapter_cache_type)) {
+            else if (jl_typetagis(v, jl_abi_adapter_cache_type) || jl_typetagis(v, jl_dispatch_trampoline_cache_type)) {
                 assert(f == s->s);
                 // The cache's `writelock` is a hidden trailing C field (not a datatype field);
                 // pad the serialized object out to the full struct size so the restored lock
                 // is zero-initialized (mirrors the jl_method_t writelock handling above).
-                write_padding(f, sizeof(jl_abi_adapter_cache_t) - tot);
+                size_t fullsz = jl_typetagis(v, jl_abi_adapter_cache_type)
+                    ? sizeof(jl_abi_adapter_cache_t) : sizeof(jl_dispatch_trampoline_cache_t);
+                write_padding(f, fullsz - tot);
             }
             else if (jl_is_datatype(v)) {
                 assert(f == s->s);
@@ -4257,7 +4286,7 @@ static void jl_restore_system_image_from_stream_(ios_t *f, jl_image_t *image,
         o->bits.in_image = 1;
     }
     arraylist_free(&cleanup_list);
-    // Restored ABI-adapter records, re-inserted into the running cache after
+    // Restored trampolines / ABI-adapter records, re-inserted into the running caches after
     // jl_update_all_fptrs below (see the comment there).
     arraylist_t reinsert_objs;
     arraylist_new(&reinsert_objs, 0);
@@ -4268,7 +4297,7 @@ static void jl_restore_system_image_from_stream_(ios_t *f, jl_image_t *image,
             jl_array_ptr_1d_push(*internal_methods, obj);
             assert(s.incremental);
         }
-        else if (jl_is_abi_adapter(obj)) {
+        else if (jl_is_dispatch_trampoline(obj) || jl_is_abi_adapter(obj)) {
             // Deferred (see reinsert_objs above): re-inserted after jl_update_all_fptrs.
             arraylist_push(&reinsert_objs, (void*)obj);
         }
@@ -4377,13 +4406,18 @@ static void jl_restore_system_image_from_stream_(ios_t *f, jl_image_t *image,
     jl_update_all_fptrs(&s, image); // fptr relocs and registration
     s.s = NULL;
 
-    // Re-insert the restored ABI-adapter records into the running cache, so matching
-    // consumers share them (and reuse the compiled adapters without a JIT). This publishes
-    // the records to lock-free readers, so it must happen only now, after
+    // Re-insert the restored trampolines and ABI-adapter records into the running caches, so
+    // matching consumers share them (and reuse the compiled adapters without a JIT). This
+    // publishes the records to lock-free readers, so it must happen only now, after
     // jl_update_all_fptrs wired each record's `fptr`: a reader must never observe a NULL
     // `fptr`.
-    for (size_t i = 0; i < reinsert_objs.len; i++)
-        jl_insert_abi_adapter((jl_abi_adapter_t*)reinsert_objs.items[i]);
+    for (size_t i = 0; i < reinsert_objs.len; i++) {
+        jl_value_t *obj = (jl_value_t*)reinsert_objs.items[i];
+        if (jl_is_dispatch_trampoline(obj))
+            jl_insert_dispatch_trampoline((jl_dispatch_trampoline_t*)obj);
+        else
+            jl_insert_abi_adapter((jl_abi_adapter_t*)obj);
+    }
     arraylist_free(&reinsert_objs);
 
     ios_close(&fptr_record);
