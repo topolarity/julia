@@ -756,6 +756,13 @@ static void jl_insert_into_serialization_queue(jl_serializer_state *s, jl_value_
         // unreachable sibling trampoline into the image (mirrors ci->next handling).
         jl_dispatch_trampoline_t *tr = (jl_dispatch_trampoline_t*)v;
         record_field_change((jl_value_t**)&tr->next, NULL);
+        // Serialize `last_invokee` as the target this emission compiled (from the native-code
+        // side table), never as the live runtime state: a JIT-resolved record's `fptr` is a
+        // process address that cannot be wired on load. With no entry (or no native code) the
+        // trampoline serializes as unresolved, and the first post-load call resolves fresh.
+        jl_value_t *invokee = native_functions ?
+            jl_get_trampoline_invokee(native_functions, tr) : NULL;
+        record_field_change((jl_value_t**)&tr->last_invokee, invokee);
     }
     if (jl_is_abi_adapter(v)) {
         // Like the cache itself, the adapter's `sigt` bucket chain is process-local and

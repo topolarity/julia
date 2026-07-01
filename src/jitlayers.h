@@ -375,10 +375,12 @@ struct jl_codegen_call_target_t {
     // neither = unused
 };
 
-// reification of a call to jl_jit_abi_convert, so that it isn't necessary to parse the Modules to recover this info
+// reification of a @cfunction/@ccallable construction: the interned dispatch trampoline
+// whose adapter generate_cfunc_thunks compiles into the image (replacing the old per-call-site
+// cfuncdata global), plus the caller ABI it was emitted for.
 struct cfunc_decl_t {
     jl_abi_t abi;
-    llvm::GlobalVariable *cfuncdata;
+    jl_dispatch_trampoline_t *tramp;
 };
 
 std::unique_ptr<Module> jl_create_llvm_module(StringRef name, LLVMContext &ctx,
@@ -465,7 +467,12 @@ public:
     // ABIAdapter records compiled for @cfunction/@ccallable serialization: each entry pairs a
     // materialized ABIAdapter record with the Function emitted for its resolved target, so the
     // serialized record's `fptr` is wired to that Function on load without a JIT.
-    SmallVector<std::pair<jl_abi_adapter_t*, Function*>, 0> abi_adapter_records;
+    SmallVector<std::pair<jl_abi_adapter_t*, Function*>, 0> adapter_funcs;
+    // The AOT-resolved target per @cfunction/@ccallable trampoline: Union{CodeInstance,
+    // ABIAdapter} (a bare CodeInstance when the declared ABI matches its specptr). Consulted
+    // by the serializer (jl_get_trampoline_invokee) when writing a trampoline's
+    // `last_invokee`.
+    DenseMap<jl_dispatch_trampoline_t*, jl_value_t*> tramp_invokees;
     std::map<void*, GlobalVariable*> global_targets;
     jl_array_t *temporary_roots = nullptr;
     SmallSet<jl_value_t *, 8> temporary_roots_set;

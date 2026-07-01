@@ -598,7 +598,7 @@ static Function *aot_abi_converter(jl_codegen_output_t &out, jl_abi_t from_abi, 
     return F;
 }
 
-// AOT counterpart of jl_resolve_trampoline: resolve the target for `tr` at the build world,
+// AOT counterpart of jl_update_dispatch_trampoline: resolve the target for `tr` at the build world,
 // emit its ABI adapter, and record the materialized ABIAdapter record in
 // `out.tramp_invokees` / `out.adapter_funcs`. When the target's compiled ABI already
 // satisfies the declared C ABI, `tramp_invokees` maps to the bare `CodeInstance` instead and
@@ -664,7 +664,7 @@ static void emit_trampoline_adapter(jl_codegen_output_t &out, jl_dispatch_trampo
     // fvar on load) and map the trampoline to it. The record reaches the image via the
     // serializer's `last_invokee` override (and ext_foreign_code); the first post-load call
     // restores `fptr` straight from it.
-    jl_abi_adapter_t *rec = jl_new_abi_adapter_record(sigt, declrt, codeinst,
+    jl_abi_adapter_t *rec = jl_new_abi_adapter(sigt, declrt, codeinst,
             from_abi.specsig, from_abi.is_opaque_closure, from_abi.nargs, /*fptr*/nullptr);
     // Nothing else roots the record until it is reported to ext_foreign_code.
     JL_GC_PUSH1(&rec);
@@ -677,7 +677,7 @@ static void emit_trampoline_adapter(jl_codegen_output_t &out, jl_dispatch_trampo
 // Emit the adapter for each @cfunction/@ccallable dispatch trampoline (kind=STD, so the
 // adapter sig is the call sig as-is). Replaces the old cfuncdata-array fill; the serializer
 // wires the adapter into the image trampoline's `last_invokee` (jl_get_trampoline_invokee).
-// Call sites sharing one interned trampoline (same sigt/rt/specsig) are deduplicated here, so
+// Call sites sharing one trampoline (same sigt/rt/specsig) are deduplicated here, so
 // each trampoline yields exactly one adapter record and one unspecialized record.
 static void generate_cfunc_thunks(jl_codegen_output_t &out) JL_CANSAFEPOINT
 {
@@ -702,7 +702,7 @@ static void generate_cfunc_thunks(jl_codegen_output_t &out) JL_CANSAFEPOINT
         // jl_create_native_impl). Under --trim, dynamic dispatch is unavailable, so skip it.
         if (!jl_options.trim) {
             Function *uf = aot_abi_converter(out, cfunc.abi, nullptr, nullptr, nullptr, false);
-            jl_abi_adapter_t *urec = jl_new_abi_adapter_record(cfunc.abi.sigt, cfunc.abi.rt,
+            jl_abi_adapter_t *urec = jl_new_abi_adapter(cfunc.abi.sigt, cfunc.abi.rt,
                     /*ci*/nullptr, cfunc.abi.specsig, cfunc.abi.is_opaque_closure, cfunc.abi.nargs,
                     /*fptr*/nullptr);
             JL_GC_PUSH1(&urec);
