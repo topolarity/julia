@@ -3728,6 +3728,38 @@ void jl_init_types(void) JL_GC_DISABLED
     jl_value_t *pointer_void = jl_apply_type1((jl_value_t*)jl_pointer_type, (jl_value_t*)jl_nothing_type);
     jl_voidpointer_type = (jl_datatype_t*)pointer_void;
 
+    jl_abi_adapter_type =
+        jl_new_datatype(jl_symbol("ABIAdapter"), core, jl_any_type, jl_emptysvec,
+                        jl_perm_symsvec(6,
+                            "sigt",
+                            "rt",
+                            "flags",
+                            "ci",
+                            "fptr",
+                            "next"),
+                        jl_svec(6,
+                            jl_any_type,   // hash-consed Tuple type
+                            jl_any_type,   // hash-consed return type
+                            jl_ulong_type, // packed specsig/kind
+                            jl_any_type,   // CodeInstance (NULL/#undef for dynamic-dispatch adapters)
+                            pointer_void,  // JITed adapter address
+                            jl_any_type),  // next record in the sigt bucket chain (may be NULL)
+                        jl_emptysvec,
+                        0, 1, 3);
+    const static uint32_t abi_adapter_atomicfields[1] = { 0b110000 }; // fptr (field 4), next (field 5)
+    jl_abi_adapter_type->name->atomicfields = abi_adapter_atomicfields;
+
+    // N.B. `jl_abi_adapter_cache_t` has trailing hidden fields (typemap-list config,
+    // writelock) excluded here, similar to jl_method_t
+    jl_abi_adapter_cache_type =
+        jl_new_datatype(jl_symbol("ABIAdapterCache"), core, jl_any_type, jl_emptysvec,
+                        jl_perm_symsvec(1, "cache"),
+                        jl_svec1(jl_any_type), // adapters: TypeMap root (jl_nothing when empty)
+                        jl_emptysvec,
+                        0, 1, 1);
+    const static uint32_t abi_adapter_cache_atomicfields[1] = { 0b1 }; // adapters
+    jl_abi_adapter_cache_type->name->atomicfields = abi_adapter_cache_atomicfields;
+
     tv = jl_svec2(tvar("T"), tvar("N"));
     jl_abstractarray_type = (jl_unionall_t*)
         jl_new_abstracttype((jl_value_t*)jl_symbol("AbstractArray"), core,
@@ -3789,6 +3821,7 @@ void jl_init_types(void) JL_GC_DISABLED
     jl_array_uint64_type = jl_apply_type2((jl_value_t*)jl_array_type, (jl_value_t*)jl_uint64_type, jl_box_long(1));
     jl_an_empty_vec_any = (jl_value_t*)jl_alloc_vec_any(0); // used internally
     jl_an_empty_memory_any = (jl_value_t*)jl_alloc_memory_any(0); // used internally
+    jl_abi_adapters = jl_new_abi_adapter_cache(); // process-global ABI-adapter cache
 
     // finish initializing module Core
     core = jl_core_module;
