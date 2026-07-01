@@ -1750,7 +1750,6 @@ JL_DLLEXPORT jl_value_t *jl_get_cfunction_trampoline(
     jl_value_t *fobj, jl_datatype_t *result, htable_t *cache, jl_svec_t *fill,
     void *(*init_trampoline)(void *tramp, void **nval),
     jl_unionall_t *env, jl_value_t **vals) JL_CANSAFEPOINT;
-JL_DLLEXPORT void *jl_get_abi_converter(jl_task_t *ct, void *data) JL_CANSAFEPOINT;
 
 // Returns the adapter fptr; `*invokee`, when non-NULL, receives the CI / ABIAdapter is was derived from.
 JL_DLLIMPORT void *jl_jit_abi_converter(jl_task_t *ct, jl_abi_t from_abi, jl_code_instance_t *codeinst, jl_value_t **invokee) JL_CANSAFEPOINT;
@@ -2273,6 +2272,7 @@ JL_DLLIMPORT void jl_get_llvm_external_fns(void *native_code, size_t *num_els,
                                            jl_code_instance_t *fns);
 JL_DLLIMPORT void jl_get_function_id(void *native_code, jl_value_t *codeinst_or_adapter,
         int32_t *func_idx, int32_t *specfunc_idx);
+JL_DLLIMPORT jl_value_t *jl_get_trampoline_invokee(void *native_code, jl_dispatch_trampoline_t *tr);
 JL_DLLIMPORT void jl_register_fptrs(uint64_t image_base, const struct _jl_image_fptrs_t *fptrs,
                                     jl_code_instance_t **linfos, size_t n);
 JL_DLLIMPORT void jl_get_llvm_cis(void *native_code, size_t *num_els,
