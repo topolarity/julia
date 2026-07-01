@@ -2769,6 +2769,9 @@ void jl_init_primitives(void) JL_GC_DISABLED
     add_builtin("ABIAdapter", (jl_value_t*)jl_abi_adapter_type);
     add_builtin("ABIAdapterCache", (jl_value_t*)jl_abi_adapter_cache_type);
     add_builtin("abi_adapters", (jl_value_t*)jl_abi_adapters);
+    add_builtin("DispatchTrampoline", (jl_value_t*)jl_dispatch_trampoline_type);
+    add_builtin("DispatchTrampolineCache", (jl_value_t*)jl_dispatch_trampoline_cache_type);
+    add_builtin("dispatch_trampolines", (jl_value_t*)jl_dispatch_trampolines);
     add_builtin("Symbol", (jl_value_t*)jl_symbol_type);
     add_builtin("SSAValue", (jl_value_t*)jl_ssavalue_type);
     add_builtin("SlotNumber", (jl_value_t*)jl_slotnumber_type);
