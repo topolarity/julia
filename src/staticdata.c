@@ -737,6 +737,19 @@ static void jl_insert_into_serialization_queue(jl_serializer_state *s, jl_value_
             }
         }
     }
+    if (jl_typetagis(v, jl_abi_adapter_cache_type)) {
+        // The adapter cache is process-local JIT state (its `fptr`s are process addresses);
+        // serialize it empty. Any adapter that must survive stays reachable through the code
+        // that references it and is re-inserted on load, not via this cache.
+        jl_abi_adapter_cache_t *c = (jl_abi_adapter_cache_t*)v;
+        record_field_change((jl_value_t**)&c->cache, jl_nothing);
+    }
+    if (jl_is_abi_adapter(v)) {
+        // Like the cache itself, the adapter's `sigt` bucket chain is process-local and
+        // rebuilt on load (jl_insert_abi_adapter), so drop `next`.
+        jl_abi_adapter_t *ad = (jl_abi_adapter_t*)v;
+        record_field_change((jl_value_t**)&ad->next, NULL);
+    }
     if (jl_is_code_instance(v)) {
         jl_code_instance_t *ci = (jl_code_instance_t*)v;
         jl_method_instance_t *mi = jl_get_ci_mi(ci);
@@ -1816,6 +1829,38 @@ static void jl_write_values(jl_serializer_state *s) JL_CANSAFEPOINT JL_GC_DISABL
                     arraylist_push(&s->relocs_list, (void*)(((uintptr_t)FunctionRef << RELOC_TAG_OFFSET) + BuiltinFunctionTag + builtin_id - 2)); // relocation target
                 }
             }
+            else if (jl_is_abi_adapter(v)) {
+                assert(f == s->s);
+                // The compiled adapter thunk lives in the image as an fvar. Null the record's
+                // process-local `fptr` and record the wiring in `fptr_record` keyed on that fvar
+                // id, so jl_update_all_fptrs sets `fptr` from the fvar on load (parallels the
+                // CodeInstance specptr; CI vs record disambiguated by the object's type tag).
+                jl_abi_adapter_t *newad = (jl_abi_adapter_t*)&f->buf[reloc_offset];
+                newad->fptr = NULL;
+                int32_t adapter_id = 0;
+                jl_get_adapter_id(native_functions, (jl_abi_adapter_t*)v, &adapter_id);
+                if (adapter_id > 0) {
+                    ios_ensureroom(s->fptr_record, adapter_id * sizeof(void*));
+                    ios_seek(s->fptr_record, (adapter_id - 1) * sizeof(void*));
+                    write_reloc_t(s->fptr_record, reloc_offset);
+#ifdef _P64
+                    if (sizeof(reloc_t) < 8)
+                        write_padding(s->fptr_record, 8 - sizeof(reloc_t));
+#endif
+                    // Re-insert this record into the running adapters cache on load. Records
+                    // with no fvar slot (adapter_id == 0, e.g. a runtime-created record
+                    // reached through user data) have no thunk to wire, so they serialize as
+                    // inert data and are never published to the cache.
+                    arraylist_push(&s->fixup_objs, (void*)reloc_offset);
+                }
+            }
+            else if (jl_typetagis(v, jl_abi_adapter_cache_type)) {
+                assert(f == s->s);
+                // The cache's `writelock` is a hidden trailing C field (not a datatype field);
+                // pad the serialized object out to the full struct size so the restored lock
+                // is zero-initialized (mirrors the jl_method_t writelock handling above).
+                write_padding(f, sizeof(jl_abi_adapter_cache_t) - tot);
+            }
             else if (jl_is_datatype(v)) {
                 assert(f == s->s);
                 jl_datatype_t *dt = (jl_datatype_t*)v;
@@ -2264,10 +2309,7 @@ static void jl_update_all_fptrs(jl_serializer_state *s, jl_image_t *image)
                 specfunc = 0;
                 offset = ~offset;
             }
-            jl_code_instance_t *codeinst = (jl_code_instance_t*)(base + offset);
-            assert(jl_is_method(jl_get_ci_mi(codeinst)->def.method) && jl_atomic_load_relaxed(&codeinst->invoke) != jl_fptr_const_return);
-            assert(specfunc ? jl_atomic_load_relaxed(&codeinst->invoke) != NULL : jl_atomic_load_relaxed(&codeinst->invoke) == NULL);
-            linfos[i] = codeinst;
+            void *obj = (void*)(base + offset);
             void *fptr = fvars.ptrs[i];
             for (; clone_idx < fvars.nclones; clone_idx++) {
                 uint32_t idx = fvars.clone_idxs[clone_idx] & jl_sysimg_val_mask;
@@ -2277,6 +2319,22 @@ static void jl_update_all_fptrs(jl_serializer_state *s, jl_image_t *image)
                     fptr = fvars.clone_ptrs[clone_idx];
                 break;
             }
+            if (jl_typeof((jl_value_t*)obj) == (jl_value_t*)jl_abi_adapter_type) {
+                // @cfunction/@ccallable ABI-adapter record: wire the compiled adapter thunk into
+                // the record's `fptr` (disambiguated from a CodeInstance by the object's type
+                // tag). A consumer that points at this record reads this `fptr` on its first
+                // post-load call, re-resolving against the current world only if a redefinition
+                // shifted dispatch since image build.
+                jl_abi_adapter_t *ad = (jl_abi_adapter_t*)obj;
+                assert(specfunc); // adapter slots are written without the ~offset inversion
+                assert(ad->fptr == NULL && fptr != NULL);
+                ad->fptr = fptr;
+                continue;
+            }
+            jl_code_instance_t *codeinst = (jl_code_instance_t*)obj;
+            assert(jl_is_method(jl_get_ci_mi(codeinst)->def.method) && jl_atomic_load_relaxed(&codeinst->invoke) != jl_fptr_const_return);
+            assert(specfunc ? jl_atomic_load_relaxed(&codeinst->invoke) != NULL : jl_atomic_load_relaxed(&codeinst->invoke) == NULL);
+            linfos[i] = codeinst;
             if (specfunc) {
                 uint8_t flags = jl_atomic_load_relaxed(&codeinst->flags);
                 flags |= JL_CI_FLAGS_INVOKE_MATCHES_SPECPTR | JL_CI_FLAGS_FROM_IMAGE;
@@ -3065,8 +3123,17 @@ static void jl_save_system_image_to_stream(ios_t *f, jl_array_t *mod_array,
         if (extext_methods) {
             // Queue method extensions
             jl_queue_for_serialization(&s, extext_methods);
-            // Queue the new specializations
-            jl_queue_for_serialization(&s, new_ext);
+        }
+        // Queue `new_ext` (external CodeInstances + reported ABI adapters). Incremental images
+        // read the array back as a root (the external-method-cache CIs); the full/AOT image does
+        // not, so there we queue only the elements for reachability -- each is written and handled
+        // per-type by the load fixup (adapters -> jl_insert_abi_adapter), no array root needed.
+        if (new_ext) {
+            if (s.incremental)
+                jl_queue_for_serialization(&s, new_ext);
+            else
+                for (size_t i = 0; i < jl_array_nrows(new_ext); i++)
+                    jl_queue_for_serialization(&s, jl_array_ptr_ref(new_ext, i));
         }
         jl_serialize_reachable(&s);
         // step 1.2: ensure all gvars are part of the sysimage too
@@ -3359,20 +3426,20 @@ JL_DLLEXPORT void jl_create_system_image(void **_native_data, jl_array_t *workli
         ff = f;
     }
 
-    jl_array_t *mod_array = NULL, *extext_methods = NULL, *new_ext = NULL, *ext_foreign_cis = NULL;
+    jl_array_t *mod_array = NULL, *extext_methods = NULL, *new_ext = NULL, *ext_foreign_code = NULL;
     int64_t checksumpos = 0;
     int64_t checksumpos_ff = 0;
     int64_t datastartpos = 0;
-    JL_GC_PUSH4(&mod_array, &extext_methods, &new_ext, &ext_foreign_cis);
+    JL_GC_PUSH4(&mod_array, &extext_methods, &new_ext, &ext_foreign_code);
 
-    ext_foreign_cis = jl_alloc_vec_any(0);
+    ext_foreign_code = jl_alloc_vec_any(0);
 
     mod_array = jl_get_loaded_modules();  // __toplevel__ modules loaded in this session (from Base.loaded_modules_array)
     if (worklist) {
         if (_native_data != NULL) {
             if (suppress_precompile)
                 newly_inferred = NULL;
-            *_native_data = jl_create_native(NULL, 0, 1, jl_atomic_load_acquire(&jl_world_counter), NULL, suppress_precompile ? (jl_array_t*)jl_an_empty_vec_any : worklist, 0, module_init_order, ext_foreign_cis);
+            *_native_data = jl_create_native(NULL, 0, 1, jl_atomic_load_acquire(&jl_world_counter), NULL, suppress_precompile ? (jl_array_t*)jl_an_empty_vec_any : worklist, 0, module_init_order, ext_foreign_code);
         }
         jl_write_header_for_incremental(f, worklist, mod_array, udeps, srctextpos, &checksumpos);
         if (emit_split) {
@@ -3386,7 +3453,7 @@ JL_DLLEXPORT void jl_create_system_image(void **_native_data, jl_array_t *workli
         }
     }
     else if (_native_data != NULL) {
-        *_native_data = jl_create_native(NULL, jl_options.trim, 0, jl_atomic_load_acquire(&jl_world_counter), mod_array, NULL, jl_options.compile_enabled == JL_OPTIONS_COMPILE_ALL, module_init_order, ext_foreign_cis);
+        *_native_data = jl_create_native(NULL, jl_options.trim, 0, jl_atomic_load_acquire(&jl_world_counter), mod_array, NULL, jl_options.compile_enabled == JL_OPTIONS_COMPILE_ALL, module_init_order, ext_foreign_code);
     }
     if (_native_data != NULL)
         native_functions = *_native_data;
@@ -3399,7 +3466,9 @@ JL_DLLEXPORT void jl_create_system_image(void **_native_data, jl_array_t *workli
     assert((ct->reentrant_timing & 0b1110) == 0);
     ct->reentrant_timing |= 0b1000;
     if (worklist) {
-        // new_exts: [code_instances, ...], anything to add to the image just for side-effects
+        // new_ext: [code_instance | abi_adapter, ...], code to add to the image for side-effects
+        // (external CodeInstances, plus ABI adapters reported via ext_foreign_code that
+        // nothing else owns). Elements are handled per-type by the load fixup, not iterated as CIs.
         // Save the inferred code from newly inferred, external methods
         arraylist_t CIs;
         arraylist_new(&CIs, 0);
@@ -3419,11 +3488,11 @@ JL_DLLEXPORT void jl_create_system_image(void **_native_data, jl_array_t *workli
                 jl_array_ptr_1d_push(new_ext, (jl_value_t*)ci);
         }
         arraylist_free(&CIs);
-        // Merge foreign & external CIs
-        size_t n_ext = jl_array_nrows(ext_foreign_cis);
+        // Merge foreign & external code (external CodeInstances + reported ABI adapters)
+        size_t n_ext = jl_array_nrows(ext_foreign_code);
         for (size_t i = 0; i < n_ext; i++)
-            jl_array_ptr_1d_push(new_ext, jl_array_ptr_ref(ext_foreign_cis, i));
-        ext_foreign_cis = NULL; // not needed anymore, free it
+            jl_array_ptr_1d_push(new_ext, jl_array_ptr_ref(ext_foreign_code, i));
+        ext_foreign_code = NULL; // not needed anymore, free it
 
         // Collect method extensions
         // extext_methods: [method1, ...], worklist-owned "extending external" methods added to functions owned by modules outside the worklist
@@ -3439,6 +3508,18 @@ JL_DLLEXPORT void jl_create_system_image(void **_native_data, jl_array_t *workli
         }
         datastartpos = ios_pos(ff);
     }
+    else if (ext_foreign_code != NULL && jl_array_nrows(ext_foreign_code) > 0) {
+        // Non-worklist (full / AOT / --trim) image: the incremental `new_ext` machinery above is
+        // skipped, so report the compiled ABI adapters here as extra image code. They have no
+        // trampoline/code owner of their own, so this is what roots them through the pre-dump GC
+        // and gets them serialized + reinterned on load (see jl_create_native_impl's
+        // ext_foreign_code reporting; each is fvar-wired and re-inserted on load).
+        new_ext = jl_alloc_vec_any(0);
+        size_t n_ext = jl_array_nrows(ext_foreign_code);
+        for (size_t i = 0; i < n_ext; i++)
+            jl_array_ptr_1d_push(new_ext, jl_array_ptr_ref(ext_foreign_code, i));
+    }
+    ext_foreign_code = NULL; // consumed
 
     jl_query_cache query_cache;
     init_query_cache(&query_cache);
@@ -4176,12 +4257,20 @@ static void jl_restore_system_image_from_stream_(ios_t *f, jl_image_t *image,
         o->bits.in_image = 1;
     }
     arraylist_free(&cleanup_list);
+    // Restored ABI-adapter records, re-inserted into the running cache after
+    // jl_update_all_fptrs below (see the comment there).
+    arraylist_t reinsert_objs;
+    arraylist_new(&reinsert_objs, 0);
     for (size_t i = 0; i < s.fixup_objs.len; i++) {
         uintptr_t item = (uintptr_t)s.fixup_objs.items[i];
         jl_value_t *obj = (jl_value_t*)(image_base + item);
         if (jl_typetagis(obj, jl_typemap_entry_type) || jl_is_method(obj) || jl_is_code_instance(obj)) {
             jl_array_ptr_1d_push(*internal_methods, obj);
             assert(s.incremental);
+        }
+        else if (jl_is_abi_adapter(obj)) {
+            // Deferred (see reinsert_objs above): re-inserted after jl_update_all_fptrs.
+            arraylist_push(&reinsert_objs, (void*)obj);
         }
         else if (jl_is_method_instance(obj)) {
             jl_method_instance_t *newobj = jl_specializations_get_or_insert((jl_method_instance_t*)obj);
@@ -4287,6 +4376,15 @@ static void jl_restore_system_image_from_stream_(ios_t *f, jl_image_t *image,
     s.s = &sysimg;
     jl_update_all_fptrs(&s, image); // fptr relocs and registration
     s.s = NULL;
+
+    // Re-insert the restored ABI-adapter records into the running cache, so matching
+    // consumers share them (and reuse the compiled adapters without a JIT). This publishes
+    // the records to lock-free readers, so it must happen only now, after
+    // jl_update_all_fptrs wired each record's `fptr`: a reader must never observe a NULL
+    // `fptr`.
+    for (size_t i = 0; i < reinsert_objs.len; i++)
+        jl_insert_abi_adapter((jl_abi_adapter_t*)reinsert_objs.items[i]);
+    arraylist_free(&reinsert_objs);
 
     ios_close(&fptr_record);
     ios_close(&sysimg);

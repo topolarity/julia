@@ -103,7 +103,7 @@ JL_DLLEXPORT void jl_jit_unregister_ci_fallback(jl_code_instance_t *ci)
 {
 }
 
-JL_DLLEXPORT void *jl_create_native_fallback(LLVMOrcThreadSafeModuleRef llvmmod, int trim, int cache, size_t world, jl_array_t *mod_array, jl_array_t *worklist, int all, jl_array_t *module_init_order, jl_array_t *ext_foreign_cis) UNAVAILABLE
+JL_DLLEXPORT void *jl_create_native_fallback(LLVMOrcThreadSafeModuleRef llvmmod, int trim, int cache, size_t world, jl_array_t *mod_array, jl_array_t *worklist, int all, jl_array_t *module_init_order, jl_array_t *ext_foreign_code) UNAVAILABLE
 JL_DLLEXPORT void *jl_emit_native_fallback(jl_array_t *codeinfos, jl_array_t *ci_order, LLVMOrcThreadSafeModuleRef llvmmod, const jl_cgparams_t *cgparams, int _external_linkage) UNAVAILABLE
 
 JL_DLLEXPORT void jl_dump_compiles_fallback(void *s)
@@ -124,6 +124,17 @@ JL_DLLEXPORT jl_value_t *jl_dump_function_asm_fallback(jl_llvmf_dump_t* dump, ch
 
 JL_DLLEXPORT void jl_get_function_id_fallback(void *native_code, jl_code_instance_t *ncode,
         int32_t *func_idx, int32_t *specfunc_idx) UNAVAILABLE
+
+JL_DLLEXPORT void jl_get_adapter_id_fallback(void *native_code, jl_abi_adapter_t *rec,
+        int32_t *adapter_idx) UNAVAILABLE
+
+// NULL = "this emission resolved no target": without codegen there is no emission, so the
+// serializer writes every trampoline's `last_invokee` as unresolved.
+JL_DLLEXPORT jl_value_t *jl_get_trampoline_invokee_fallback(void *native_code, jl_dispatch_trampoline_t *tr)
+{
+    (void)native_code; (void)tr;
+    return NULL;
+}
 
 
 JL_DLLEXPORT void *jl_get_llvm_function_fallback(void *native_code, uint32_t idx) UNAVAILABLE
@@ -146,7 +157,22 @@ JL_DLLEXPORT uint64_t jl_getUnwindInfo_fallback(uint64_t dwAddr) JL_NOTSAFEPOINT
 
 JL_DLLEXPORT void jl_register_passbuilder_callbacks_fallback(void *PB) { }
 
-JL_DLLEXPORT void *jl_jit_abi_converter_fallback(jl_task_t *ct, jl_abi_t from_abi, jl_code_instance_t *codeinst) UNAVAILABLE
+JL_DLLEXPORT void *jl_jit_abi_converter_fallback(jl_task_t *ct, jl_abi_t from_abi, jl_code_instance_t *codeinst, jl_value_t **invokee) JL_CANSAFEPOINT
+{
+    // Without codegen we cannot JIT a fresh adapter, so use an existing one: the target's own
+    // specptr, an adapter compiled into a loaded image, or (the codeinst == NULL re-query)
+    // the signature's dynamic-dispatch adapter, which dispatches at call time and so stays
+    // correct when the resolved target shifts after load (julia#61949).
+    (void)ct;
+    void *f = jl_lookup_abi_converter(from_abi, codeinst, NULL, NULL, NULL, invokee);
+    if (f == NULL && codeinst != NULL)
+        f = jl_lookup_abi_converter(from_abi, NULL, NULL, NULL, NULL, invokee);
+    if (f != NULL)
+        return f;
+    jl_errorf("cfunction: no ABI adapter is available for this signature in a build without "
+              "codegen (none was compiled into a loaded image)");
+    return NULL;
+}
 
 //LLVM C api to the julia JIT
 JL_DLLEXPORT void* JLJITGetLLVMOrcExecutionSession_fallback(void* JIT) UNAVAILABLE

@@ -1048,6 +1048,72 @@ typedef struct _jl_methtable_t {
     jl_genericmemory_t *backedges; // IdDict{top typenames, Vector{uncovered (sig => caller::CodeInstance)}}
 } jl_methtable_t;
 
+// One record of the global ABI-adapter cache (`jl_abi_adapters->cache`): a JIT'd adapter
+// thunk that bridges the caller ABI (from_abi) to a target CodeInstance. Cached so
+// `jl_jit_abi_converter` emits one adapter per distinct key rather than one per call site.
+typedef struct _jl_abi_adapter_t {
+    JL_DATA_TYPE
+    // caller ABI
+    jl_value_t *sigt;            // hash-consed Julia type (Tuple type)
+    jl_value_t *rt;              // hash-consed Julia type (return type)
+    size_t specsig : 1;          // whether the caller passes args in specsig (vs. boxed) form
+    size_t is_opaque_closure : 1; // whether the adapter bridges an OpaqueClosure caller ABI
+    size_t nargs : 8 * sizeof(size_t) - 2; // number of arguments in `sigt`
+
+    // callee target
+    jl_code_instance_t *ci;      // target CodeInstance; may be NULL for dispatcher adapters
+
+    // adapter function pointer
+    void *fptr;                  // JITed adapter address (not GC-tracked)
+    // Bucket chain: the adapters cache is a TypeMap keyed on `sigt`; records sharing one
+    // `sigt` entry are chained here and disambiguated by (rt, ci, specsig, is_opaque_closure,
+    // nargs). Append-only (the head in the TypeMap entry's value never changes), so the chain
+    // is safe to walk lock-free. NULL = tail.
+    _Atomic(struct _jl_abi_adapter_t*) next;
+} jl_abi_adapter_t;
+
+// Latest-world dispatch trampoline record (`jl_dispatch_trampolines->cache`), used by
+// @cfunction/@ccallable: holds a *signature*, not a fixed CodeInstance, and re-resolves the
+// target as the world advances (the inline call site polls `last_world` vs the world counter
+// and re-resolves via jl_resolve_trampoline). Mutable; `fptr`/`last_world` are atomic.
+typedef struct _jl_dispatch_trampoline_t {
+    JL_DATA_TYPE
+    jl_value_t *sigt;            // key: resolution sig Tuple{typeof(f), A...} (for jl_get_specialization1)
+    jl_value_t *rt;              // key: declared return type (declrt for @cfunction)
+    // Last resolved target, as a Union{CodeInstance, ABIAdapter} (NULL = unresolved): a bare
+    // `CodeInstance` when the declared ABI matches its specptr (no adapter needed), otherwise
+    // the `ABIAdapter` record whose `fptr` is the compiled thunk.
+    jl_value_t *last_invokee;
+    _Atomic(void*) fptr;         // redundant cached fptr (== last_invokee's specptr/adapter fptr) for the hot-path poll
+    _Atomic(size_t) last_world;  // world for which `fptr`/`last_invokee` are valid (0 = unresolved)
+    uint8_t specsig;             // key: 1 if `fptr` is a specsig adapter, 0 if jlcall (cgparams-dependent)
+    // Bucket chain: the trampolines cache is a TypeMap keyed on `sigt`; records sharing one
+    // `sigt` entry are chained here and disambiguated by (rt, specsig). Append-only, safe to
+    // walk lock-free. NULL = tail.
+    _Atomic(struct _jl_dispatch_trampoline_t*) next;
+} jl_dispatch_trampoline_t;
+
+// Process-global cache of JIT'd ABI adapters. The singleton instance is `jl_abi_adapters`
+// (bound in Core as `abi_adapters`). Holds a TypeMap keyed on `sigt`, guarded by its own
+// `writelock`; reads are lock-free. `jl_nothing` is the empty cache.
+typedef struct _jl_abi_adapter_cache_t {
+    JL_DATA_TYPE
+    _Atomic(jl_typemap_t*) cache;    // (sigt) -> bucket of jl_abi_adapter_t
+// hidden fields:
+    jl_mutex_t writelock;               // guards mutation of the adapters cache
+} jl_abi_adapter_cache_t;
+
+// Process-global cache of @cfunction/@ccallable dispatch trampolines. The singleton instance
+// is `jl_dispatch_trampolines` (bound in Core as `dispatch_trampolines`). Holds a TypeMap keyed on
+// `sigt`, guarded by its own `writelock` (separate from the adapter cache's); reads are
+// lock-free. `jl_nothing` is the empty cache.
+typedef struct _jl_dispatch_trampoline_cache_t {
+    JL_DATA_TYPE
+    _Atomic(jl_typemap_t*) cache; // (sigt) -> bucket of jl_dispatch_trampoline_t
+// hidden fields:
+    jl_mutex_t writelock;               // guards mutation of the trampolines cache
+} jl_dispatch_trampoline_cache_t;
+
 typedef struct {
     JL_DATA_TYPE
     jl_sym_t *head;
@@ -1756,6 +1822,8 @@ static inline int jl_field_isconst(jl_datatype_t *st, int i) JL_NOTSAFEPOINT
 #define jl_is_module(v)      jl_typetagis(v,jl_module_tag<<4)
 #define jl_is_mtable(v)      jl_typetagis(v,jl_methtable_type)
 #define jl_is_mcache(v)      jl_typetagis(v,jl_methcache_type)
+#define jl_is_dispatch_trampoline(v)  jl_typetagis(v,jl_dispatch_trampoline_type)
+#define jl_is_abi_adapter(v) jl_typetagis(v,jl_abi_adapter_type)
 #define jl_is_task(v)        jl_typetagis(v,jl_task_tag<<4)
 #define jl_is_string(v)      jl_typetagis(v,jl_string_tag<<4)
 #define jl_is_cpointer(v)    jl_is_cpointer_type(jl_typeof(v))

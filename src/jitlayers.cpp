@@ -317,43 +317,12 @@ jl_emitted_output_t jl_codegen_output_t::finish(std::unique_ptr<LLVMContext> ctx
 //
 // If `codeinst` is NULL, the returned specptr instead performs a standard `apply_generic`
 // call via a dynamic dispatch.
-extern "C" JL_DLLEXPORT_CODEGEN
-void *jl_jit_abi_converter_impl(jl_task_t *ct, jl_abi_t from_abi,
-                                jl_code_instance_t *codeinst)
+
+// JIT the adapter thunk bridging `from_abi` to `codeinst` (via `target`/`invoke`), returning
+// its address.
+static void *jit_adapter(jl_abi_t from_abi, jl_code_instance_t *codeinst,
+                         void *target, bool target_specsig, jl_callptr_t invoke) JL_CANSAFEPOINT
 {
-    void *target = nullptr;
-    bool target_specsig = false;
-    jl_callptr_t invoke = nullptr;
-    if (codeinst != nullptr) {
-        uint8_t specsigflags;
-        jl_method_instance_t *mi = jl_get_ci_mi(codeinst);
-        void *specptr = nullptr;
-        jl_read_codeinst_invoke(codeinst, &specsigflags, &invoke, &specptr, /* waitcompile */ 1);
-        if (invoke != nullptr) {
-            if (invoke == jl_fptr_const_return_addr) {
-                target = nullptr;
-                target_specsig = false;
-            }
-            else if (invoke == jl_fptr_args_addr) {
-                assert(specptr != nullptr);
-                if (!from_abi.specsig && jl_subtype(codeinst->rettype, from_abi.rt))
-                    return specptr; // no adapter required
-
-                target = specptr;
-                target_specsig = false;
-            }
-            else if (specsigflags & JL_CI_FLAGS_SPECPTR_SPECIALIZED) {
-                assert(specptr != nullptr);
-                if (from_abi.specsig && jl_egal(mi->specTypes, from_abi.sigt) && jl_egal(codeinst->rettype, from_abi.rt))
-                    return specptr; // no adapter required
-
-                target = specptr;
-                target_specsig = true;
-            }
-        }
-    }
-
-    orc::ThreadSafeModule result_m;
     std::string gf_thunk_name;
     auto ctx = std::make_unique<LLVMContext>();
     auto mod = jl_create_llvm_module("gfthunk", *ctx, jl_ExecutionEngine->getDataLayout(),
@@ -388,6 +357,72 @@ void *jl_jit_abi_converter_impl(jl_task_t *ct, jl_abi_t from_abi,
     uintptr_t Addr = jl_ExecutionEngine->getFunctionAddress(gf_thunk_name);
     assert(Addr);
     return (void*)Addr;
+}
+
+// Resolve + cache the ABI adapter for (from_abi, codeinst): one adapter is JIT'd per
+// distinct key rather than one per call site. Some paths short-circuit to the CI's own
+// specptr without a wrapping adapter (and so aren't cached).
+static void *jl_get_abi_adapter(jl_abi_t from_abi, jl_code_instance_t *codeinst,
+                                jl_value_t **invokee) JL_CANSAFEPOINT
+{
+    void *target = nullptr;
+    int target_specsig = 0;
+    jl_callptr_t invoke = nullptr;
+    void *f = jl_lookup_abi_converter(from_abi, codeinst, &target, &target_specsig, &invoke, invokee);
+    if (f != nullptr)
+        return f;
+
+    // JIT outside the writelock: compilation is slow and must not serialize unrelated cache
+    // users. A concurrent resolution of the same key may compile a duplicate thunk; the
+    // recheck below then discards the loser's.
+    void *fptr = jit_adapter(from_abi, codeinst, target, target_specsig, invoke);
+    if (codeinst != nullptr && invoke == nullptr) {
+        // The target's entry points were unreadable (e.g. mid-publication, see the TODO in
+        // jl_read_codeinst_invoke), so this thunk was built from transient state: return it
+        // uncached rather than caching a permanently degraded record for the key. The
+        // caller holds it for as long as it needs; the next resolution of this key rebuilds
+        // the proper adapter.
+        return fptr;
+    }
+    JL_LOCK(&jl_abi_adapters->writelock);
+    jl_abi_adapter_t *e = jl_lookup_abi_adapter(from_abi.sigt, from_abi.rt, codeinst,
+            from_abi.specsig, from_abi.is_opaque_closure, from_abi.nargs);
+    JL_GC_PROMISE_ROOTED(e); // rooted by the cache
+    if (e != nullptr && e->fptr != nullptr) {
+        // lost the race: use the winner's thunk
+        JL_UNLOCK(&jl_abi_adapters->writelock);
+        if (invokee)
+            *invokee = (jl_value_t*)e;
+        return e->fptr;
+    }
+    if (e != nullptr) {
+        // A cached record without a compiled thunk (e.g. restored from user data with no
+        // fvar slot): fill it in place. Installing a fresh record instead would leave this
+        // one permanently shadowing the key.
+        e->fptr = fptr;
+        if (invokee)
+            *invokee = (jl_value_t*)e;
+    }
+    else {
+        jl_abi_adapter_t *entry = jl_new_abi_adapter(from_abi.sigt, from_abi.rt, codeinst,
+                from_abi.specsig, from_abi.is_opaque_closure, from_abi.nargs, fptr);
+        JL_GC_PUSH1(&entry);
+        // we hold the writelock (reentrant) and confirmed absence, so this inserts `entry`
+        entry = jl_insert_abi_adapter(entry);
+        if (invokee)
+            *invokee = (jl_value_t*)entry;
+        JL_GC_POP();
+    }
+    JL_UNLOCK(&jl_abi_adapters->writelock);
+    return fptr;
+}
+
+extern "C" JL_DLLEXPORT_CODEGEN
+void *jl_jit_abi_converter_impl(jl_task_t *ct, jl_abi_t from_abi,
+                                jl_code_instance_t *codeinst, jl_value_t **invokee) JL_CANSAFEPOINT
+{
+    (void)ct;
+    return jl_get_abi_adapter(from_abi, codeinst, invokee);
 }
 
   // lock for places where only single threaded behavior is implemented, so we need GC support

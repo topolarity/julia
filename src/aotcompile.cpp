@@ -176,6 +176,14 @@ typedef struct {
     // were presented in `codeinfos`; consumed by staticdata.c to rewrite each
     // MethodInstance's `cache` field into a `next`-linked list
     SmallVector<jl_code_instance_t*, 0> jl_ci_order;
+    // ABI-adapter records emitted by the AOT @cfunction/@ccallable path. They are
+    // registered as fvars lazily, only when the
+    // serializer reaches an ABIAdapter record and calls jl_get_adapter_id for it, so the image
+    // compiles adapters only for records that are actually serialized. Each record gets its own
+    // fvar slot (jl_get_adapter_id), so `fptr_record` stays 1:1 (fvar id -> one record) even when
+    // records share an adapter Function -- exactly as CodeInstances get a fvar slot each.
+    std::map<jl_abi_adapter_t*, Function*> pending_adapters;          // emitted, maybe-unregistered
+    std::map<jl_abi_adapter_t*, uint32_t> adapter_fvar_map;           // record -> fvar index
 } jl_native_code_desc_t;
 
 extern "C" JL_DLLEXPORT_CODEGEN
@@ -190,6 +198,40 @@ void jl_get_function_id_impl(void *native_code, jl_code_instance_t *codeinst,
             std::tie(*func_idx, *specfunc_idx) = it->second;
         }
     }
+}
+
+// Look up (registering on first use) the fvar index of the compiled adapter behind ABIAdapter
+// record `rec`. The serializer calls this once per serialized record, which drives the lazy
+// registration: only serialized records' adapters become fvars and survive into the image. Sets
+// `*adapter_idx` to the 1-based index, or leaves it untouched (0) if no adapter was emitted.
+extern "C" JL_DLLEXPORT_CODEGEN
+void jl_get_adapter_id_impl(void *native_code, jl_abi_adapter_t *rec, int32_t *adapter_idx)
+{
+    jl_native_code_desc_t *data = (jl_native_code_desc_t*)native_code;
+    if (!data)
+        return;
+    auto it = data->adapter_fvar_map.find(rec);
+    if (it != data->adapter_fvar_map.end()) {
+        *adapter_idx = it->second;
+        return;
+    }
+    auto pit = data->pending_adapters.find(rec);
+    if (pit == data->pending_adapters.end())
+        return; // no adapter was emitted for this record
+    Function *F = pit->second;
+    // Allocate a fresh fvar slot for this record -- mirroring the per-CodeInstance fvar allocation
+    // in jl_emit_native_to_output, which pushes an fvar per CI unconditionally. `fptr_record` is
+    // keyed by fvar id and stores a *single* record location per slot; the load-time restore
+    // (jl_update_all_fptrs) walks fvar ids and writes each slot's one object. A per-record slot
+    // therefore keeps that mapping 1:1 by construction, even when two records happen to share an
+    // adapter Function (the fvar table tolerates the same llvm::Function at multiple indices --
+    // CodeInstances that share code via get_ci_equiv already do exactly that). Deduping the slot
+    // by Function instead would funnel two records into one `fptr_record` slot, dropping one
+    // record's `fptr` on load (a consumer pointing at it would then call a null pointer).
+    data->jl_sysimg_fvars.push_back(F);
+    uint32_t idx = data->jl_sysimg_fvars.size();
+    data->adapter_fvar_map[rec] = idx;
+    *adapter_idx = idx;
 }
 
 extern "C" JL_DLLEXPORT_CODEGEN void
@@ -523,6 +565,11 @@ static void aot_optimize_roots(jl_codegen_output_t &out, egal_set &method_roots)
     }
 }
 
+// Emit a fresh, uniquely-named adapter Function. Like each CodeInstance, every ABIAdapter record
+// gets its own distinct Function, so the fvar table has no duplicates (get_fvars_gvars) and
+// `fptr_record` stays 1:1 (fvar id -> one record). Two @cfunctions resolving to equivalent adapters
+// emit their own thunks -- as CodeInstances do for equivalent code -- rather than sharing one
+// (which would break that 1:1 mapping); adapters are not deduplicated at emission.
 static Function *aot_abi_converter(jl_codegen_output_t &out, jl_abi_t from_abi, jl_code_instance_t *codeinst, Function *func, Function *specfunc, bool target_specsig) JL_CANSAFEPOINT
 {
     std::string gf_thunk_name;
@@ -630,7 +677,7 @@ static bool canPartition(const Function &F)
 // `external_linkage` create linkages between pkgimages.
 extern "C" JL_DLLEXPORT_CODEGEN
 void *jl_create_native_impl(LLVMOrcThreadSafeModuleRef llvmmod, int trim, int external_linkage, size_t world,
-                           jl_array_t *mod_array, jl_array_t *worklist, int all, jl_array_t *module_init_order, jl_array_t *ext_foreign_cis)
+                           jl_array_t *mod_array, jl_array_t *worklist, int all, jl_array_t *module_init_order, jl_array_t *ext_foreign_code)
 {
     JL_TIMING(INFERENCE, INFERENCE);
     auto ct = jl_current_task;
@@ -667,7 +714,7 @@ void *jl_create_native_impl(LLVMOrcThreadSafeModuleRef llvmmod, int trim, int ex
     fargs[5] = mod_array ? (jl_value_t*)mod_array : jl_nothing; // mod_array (or nothing)
     fargs[6] = jl_box_bool(all);
     fargs[7] = (jl_value_t*)module_init_order; // module_init_order
-    fargs[8] = ext_foreign_cis ? (jl_value_t*)ext_foreign_cis : jl_nothing; // ext_foreign_cis (or nothing)
+    fargs[8] = ext_foreign_code ? (jl_value_t*)ext_foreign_code : jl_nothing; // ext_foreign_code (or nothing)
     size_t last_age = ct->world_age;
     ct->world_age = jl_typeinf_world;
     fargs[0] = jl_apply(fargs, 9);
@@ -683,6 +730,17 @@ void *jl_create_native_impl(LLVMOrcThreadSafeModuleRef llvmmod, int trim, int ex
     JL_TYPECHK(jl_create_native, array_any, codeinfos);
     JL_TYPECHK(jl_create_native, array_any, ci_order);
     auto data = (jl_native_code_desc_t *)jl_emit_native((jl_array_t*)codeinfos, (jl_array_t*)ci_order, llvmmod, NULL, external_linkage ? 1 : 0);
+    // Report each compiled ABI adapter as extra image code (via `ext_foreign_code`, like an
+    // external CodeInstance), which roots it through the pre-dump GC and gets it serialized +
+    // reinterned on load even when nothing else owns it. The records are kept alive across
+    // emission in `data->out->temporary_roots`; re-root that array so the pushes are GC-safe.
+    if (ext_foreign_code && data->out && data->out->temporary_roots) {
+        jl_array_t *troots = data->out->temporary_roots;
+        JL_GC_PUSH1(&troots);
+        for (auto &kv : data->pending_adapters)
+            jl_array_ptr_1d_push(ext_foreign_code, (jl_value_t*)kv.first);
+        JL_GC_POP();
+    }
     JL_GC_POP();
 
     // move everything inside, now that we've merged everything
@@ -995,6 +1053,12 @@ static void jl_emit_native_to_output(jl_native_code_desc_t *data, jl_array_t *co
         }
         data->jl_fvar_map[ci] = {invoke_id, specptr_id};
     }
+    // Record the emitted ABIAdapter records as *pending* (registered as fvars lazily by
+    // jl_get_adapter_id when the serializer reaches each record). Reporting them to
+    // `ext_foreign_code` (so they're rooted + serialized even when nothing else owns them) is
+    // done by the caller (jl_create_native_impl), which has that array in scope.
+    for (auto &[rec, F] : out.abi_adapter_records)
+        data->pending_adapters[rec] = F;
 }
 
 // also be used by extern consumers like GPUCompiler.jl to obtain a module containing
