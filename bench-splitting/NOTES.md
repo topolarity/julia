@@ -200,3 +200,14 @@ Diagnostic now prints privatized/candidates and notes silent skip classes.
 - [x] 7 MaxBlocks 4096 + clamp cuts instead of silent no-op
 - [ ] 8 finalize defaults + docs + whitespace + clang static analysis
 - [x] 9 privatization 0-candidates legitimate (SROA promotes scalars pre-pass)
+
+## Boundary-delta static examination (post-commit addendum)
+
+SLP-off, c400, 64k vs 256k: per-boundary asm identical (~118 insts constant);
+root glue frames 776B / 264B — spill structs are sunk into parent frames
+(data side L1-resident per parent, ~1KB); hierarchy 2 vs 3 levels (bounds a
+~10% effect via cross-parent transitions). Nothing static accounts for the
+11ns -> 35ns per-boundary growth; the delta is dynamic fetch behavior of the
+2.0MB vs 8.2MB once-through code footprint at prefetch-breaking region
+entries. PMU experiment (PERF.md) is the discriminator: L1i/L2 residency vs
+iTLB vs BTB.

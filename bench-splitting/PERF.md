@@ -50,6 +50,13 @@ prefetch stream. Candidate mechanisms the counters must separate:
 - C: BTB capacity / front-end re-steers (per-branch-site effect;
      note the JIT emits region calls as movabs+`call rax`, i.e. indirect)
 
+Static candidates already ELIMINATED by asm inspection (do not re-chase):
+the per-boundary instruction sequence is identical at both scales (~118
+insts/boundary); root frames are tiny (spill structs are sunk into parent
+frames, data working set ~1KB/parent, L1-resident); the one structural
+difference is hierarchy depth (2 levels at 64k/c400 vs 3 at 256k/c400),
+which affects only ~1/16 of transitions and bounds at ~10%, not 3x.
+
 ## Setup
 
 1. Build this branch of julia (`make -j`). The pass and the benchmark
