@@ -211,3 +211,19 @@ root glue frames 776B / 264B — spill structs are sunk into parent frames
 2.0MB vs 8.2MB once-through code footprint at prefetch-breaking region
 entries. PMU experiment (PERF.md) is the discriminator: L1i/L2 residency vs
 iTLB vs BTB.
+
+## Boundary-delta: layout, code-model, and site-count probes (addendum 2)
+
+- JIT layout (from module function-list order): root, then all parent glue
+  clustered, then per-parent leaf bands — execution is 2-3 interleaved
+  sequential streams, not scattered jumps.
+- All region calls are INDIRECT (movabs+call rax): x86-64 JIT hardwires
+  CodeModel::Large. Flipping to Medium crashes (Pointer32Signed relocations
+  to anonymous data out of range of JIT allocations) — direct calls would
+  need allocator colocation, not a code-model flip.
+- Site-count (indirect-BTB) hypothesis REFUTED: SLP-off 256k, c565 (914
+  sites, 7.1MB) = 18.8ns/boundary vs c800 (711 sites, 7.7MB) = 23.4ns —
+  ordering follows footprint, not sites.
+- Surviving model: per-boundary = ~10ns marshalling + fetch term monotone in
+  total once-through code footprint (~4ns @6.9MB -> ~25ns @8.2MB), boundary
+  count only multiplies. PMU task: confirm L1i/L2 vs iTLB at region entries.

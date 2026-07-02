@@ -50,6 +50,15 @@ prefetch stream. Candidate mechanisms the counters must separate:
 - C: BTB capacity / front-end re-steers (per-branch-site effect;
      note the JIT emits region calls as movabs+`call rax`, i.e. indirect)
 
+Behavioral evidence gathered without PMU (see NOTES.md addendum 2):
+per-boundary cost is monotone in total code footprint at fixed boundary
+structure (6.9/7.1/7.7/8.2 MB -> ~14-24/18.8/23.4/34.7 ns), and the
+indirect-site-count (C) hypothesis is REFUTED behaviorally (c565: 914 sites,
+7.1MB, 18.8ns vs c800: 711 sites, 7.7MB, 23.4ns — ordering follows footprint,
+not sites). Region calls ARE all indirect (movabs+call rax; JIT is
+CodeModel::Large, Medium crashes on out-of-range data relocations), so C is
+still worth one look, but A vs B is the main question.
+
 Static candidates already ELIMINATED by asm inspection (do not re-chase):
 the per-boundary instruction sequence is identical at both scales (~118
 insts/boundary); root frames are tiny (spill structs are sunk into parent
