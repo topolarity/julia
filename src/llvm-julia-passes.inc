@@ -3,6 +3,7 @@
 MODULE_PASS("CPUFeatures", CPUFeaturesPass())
 MODULE_PASS("RemoveNI", RemoveNIPass())
 MODULE_PASS("JuliaMultiVersioning", MultiVersioningPass())
+MODULE_PASS("JuliaFunctionSplitting", FunctionSplittingPass())
 MODULE_PASS("RemoveJuliaAddrspaces", RemoveJuliaAddrspacesPass())
 MODULE_PASS("RemoveAddrspaces", RemoveAddrspacesPass())
 MODULE_PASS("LowerPTLSPass", LowerPTLSPass())

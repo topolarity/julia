@@ -72,9 +72,11 @@ void PropagateJuliaAddrspacesVisitor::PoisonValues(SmallVectorImpl<Value *> &Wor
         Value *CurrentV = Worklist.back();
         Worklist.pop_back();
         for (Value *User : CurrentV->users()) {
-            if (Visited.count(User))
+            // Mark the user itself before queueing it: marking only CurrentV
+            // lets the same user be pushed once per predecessor, which walks
+            // dense use-DAGs a quadratic number of times.
+            if (!Visited.insert(User).second)
                 continue;
-            Visited.insert(CurrentV);
             Worklist.push_back(User);
         }
     }
@@ -83,7 +85,7 @@ void PropagateJuliaAddrspacesVisitor::PoisonValues(SmallVectorImpl<Value *> &Wor
 Value *PropagateJuliaAddrspacesVisitor::LiftPointer(Module *M, Value *V, Instruction *InsertPt) {
     SmallVector<Value *, 4> Stack;
     SmallVector<Value *, 0> Worklist;
-    std::set<Value *> LocalVisited;
+    SmallPtrSet<Value *, 16> LocalVisited;
     unsigned allocaAddressSpace = M->getDataLayout().getAllocaAddrSpace();
     Worklist.push_back(V);
     // Follow pointer casts back, see if we're based on a pointer in
@@ -142,11 +144,16 @@ Value *PropagateJuliaAddrspacesVisitor::LiftPointer(Module *M, Value *V, Instruc
                 if (!CurrentV->getType()->isPtrOrPtrVectorTy() ||
                     isSpecialAS(getValueAddrSpace(CurrentV))) {
                     // If not, poison all (recursive) users of this value, to prevent
-                    // looking at them again in future iterations.
+                    // looking at them again in future iterations. Only do the
+                    // user walk the first time this leaf is seen: high-fanout
+                    // leaves (e.g. tracked arguments) are rediscovered by
+                    // every memop deriving from them, and rescanning their
+                    // whole user list each time is quadratic.
                     Worklist.clear();
-                    Worklist.push_back(CurrentV);
-                    Visited.insert(CurrentV);
-                    PoisonValues(Worklist);
+                    if (Visited.insert(CurrentV).second) {
+                        Worklist.push_back(CurrentV);
+                        PoisonValues(Worklist);
+                    }
                     return nullptr;
                 }
                 break;

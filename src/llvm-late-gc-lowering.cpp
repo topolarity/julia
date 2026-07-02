@@ -1454,9 +1454,16 @@ State LateLowerGCFrame::LocalScan(Function &F) {
                     MaybeNoteDef(S, BBS, ASCI, std::move(RefinedPtr));
                 }
             } else if (auto *AI = dyn_cast<AllocaInst>(&I)) {
+                // Register any static alloca that holds only tracked pointers
+                // as GC frame slots up front, not just scalar `ptr as(10)`
+                // ones. Registration must not depend on seeing a store in this
+                // function (cf. MaybeTrackStore): FunctionSplittingPass may
+                // outline all the stores into a callee that writes through the
+                // alloca pointer, assuming the slots are scanned.
                 Type *ElT = AI->getAllocatedType();
-                if (AI->isStaticAlloca() && isa<PointerType>(ElT) && ElT->getPointerAddressSpace() == AddressSpace::Tracked) {
-                    S.ArrayAllocas[AI] = cast<ConstantInt>(AI->getArraySize())->getZExtValue();
+                auto tracked = CountTrackedPointers(ElT);
+                if (AI->isStaticAlloca() && tracked.count && tracked.all && !tracked.derived) {
+                    S.ArrayAllocas[AI] = tracked.count * cast<ConstantInt>(AI->getArraySize())->getZExtValue();
                 }
             }
         }

@@ -66,6 +66,10 @@ struct MultiVersioningPass : PassInfoMixin<MultiVersioningPass> {
     static bool isRequired() { return true; }
 };
 
+struct FunctionSplittingPass : PassInfoMixin<FunctionSplittingPass> {
+    PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM) JL_NOTSAFEPOINT;
+};
+
 struct RemoveJuliaAddrspacesPass : PassInfoMixin<RemoveJuliaAddrspacesPass> {
     PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM) JL_NOTSAFEPOINT;
     static bool isRequired() { return true; }

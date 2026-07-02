@@ -121,6 +121,18 @@ Julia does not have the concept of a program stack as a place to allocate mutabl
 
 This pass is used to propagate Julia-specific address spaces through operations on pointers. LLVM is not allowed to introduce or remove addrspacecast instructions by optimizations, so this pass acts to eliminate redundant addrspace casts by replacing operations with their equivalent in a Julia address space. For more information on Julia's address spaces, see (TODO link to llvm.md).
 
+### JuliaFunctionSplitting
+
+* Filename: `llvm-function-splitting.cpp`
+* Class Name: `FunctionSplittingPass`
+* Opt Name: `JuliaFunctionSplitting`
+
+This pass bounds the size of functions and basic blocks reaching the rest of the pipeline, to avoid super-linear compile-time scaling in GVN, loop analyses, `LateLowerGCFrame`, instruction selection, register allocation and basic block placement on very large (usually machine-generated) functions. It works in three steps: oversized basic blocks are first chunked at cut points chosen to minimize the number of live values crossing the cut; then chunk-sized multi-block regions are formed by interval growing (adding blocks whose predecessors all lie inside the group, cutting at the unique non-cold escape target, which is split into a small caller-resident boundary block); finally each region is outlined into a new internal `noinline` function with `CodeExtractor`. Cold edges (paths that only throw) become extra exits of the outlined function.
+
+The pass runs before `LateLowerGCFrame`, while GC-tracked pointers are still SSA values in addrspace(10). This makes outlining sound without special handling in the GC lowering: tracked arguments are assumed rooted by the caller for the duration of the call, the call to the outlined function is an ordinary safepoint (so the caller re-roots everything live across it), and tracked outputs are returned through `ptr addrspace(10)` allocas which the caller's GC lowering turns into GC frame slots. Derived (addrspace 11/13) pointers may enter a region as arguments but never leave one: their derivation spines are rematerialized in the caller, either hoisted into the region's preheader (when computable from values available before the region, including duplicable immutable field loads) or re-cloned at each external use site with the spine's roots routed through stack slots. Callee-rooted (addrspace 12) pointers, tokens, and exception-handler frames (`returns_twice` calls and handler push/pop) never cross the boundary. When a region's interface exceeds `-julia-split-direct-arg-limit`, values are spilled through a pair of stack aggregates (an all-tracked array that becomes GC frame slots, and a plain struct for untracked values); spilled outputs are re-read at each use site rather than at the region boundary so that boundaries on cycles remain correct.
+
+The pass is a no-op unless `-julia-split-function-threshold=N` (outline regions from any function above N instructions) or `-julia-split-block-threshold=N` (chunk oversized blocks, and treat their functions as above) is passed, e.g. via `JULIA_LLVM_ARGS`; `-julia-split-chunk-size` controls the target region size.
+
 ### JuliaLICM
 
 * Filename: `llvm-julia-licm.cpp`

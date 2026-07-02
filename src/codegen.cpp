@@ -1046,18 +1046,34 @@ static const auto jlunlockfield_func = new JuliaFunction<>{
             AttributeSet(),
             {Attributes(C, {}, {NoCaptureAttr(C)})}); },
 };
+// "julia.eh_state" marks runtime calls that read or write the task's
+// exception-handler state (ct->eh linkage, the jl_handler_t snapshots, or the
+// exception stack). jl_enter_handler snapshots ct->gcstack into a
+// frame-resident jl_handler_t whose jmp_buf records this frame's stack
+// pointer, and jl_eh_restore_state (via the pop_handler family) restores that
+// snapshot under the precondition that every GC frame pushed since enter has
+// been popped again. Outlining one of these calls into another function
+// violates that: the callee's own prologue pushes a GC frame the snapshot
+// does not cover, so the restore would unlink a live GC frame (asserted in
+// debug builds). Transforms must therefore keep these calls in the function
+// invocation that entered the handler.
+static AttributeList eh_state_attrs(LLVMContext &C, AttrBuilder FnAttrs)
+{
+    FnAttrs.addAttribute("julia.eh_state");
+    return AttributeList::get(C, AttributeSet::get(C, FnAttrs), AttributeSet(), {});
+}
 static const auto jlenter_func = new JuliaFunction<>{
     XSTR(jl_enter_handler),
     [](LLVMContext &C) {
         auto T_pjlvalue = JuliaType::get_pjlvalue_ty(C);
         return FunctionType::get(getVoidTy(C),
             {T_pjlvalue, getPointerTy(C)}, false); },
-    nullptr,
+    [](LLVMContext &C) { return eh_state_attrs(C, AttrBuilder(C)); },
 };
 static const auto jl_current_exception_func = new JuliaFunction<>{
     XSTR(jl_current_exception),
     [](LLVMContext &C) { return FunctionType::get(JuliaType::get_prjlvalue_ty(C), {JuliaType::get_pjlvalue_ty(C)}, false); },
-    nullptr,
+    [](LLVMContext &C) { return eh_state_attrs(C, AttrBuilder(C)); },
 };
 static const auto jlleave_func = new JuliaFunction<>{
     XSTR(jl_pop_handler),
@@ -1069,11 +1085,7 @@ static const auto jlleave_func = new JuliaFunction<>{
             auto FnAttrs = AttrBuilder(C);
             FnAttrs.addAttribute(Attribute::WillReturn);
             FnAttrs.addAttribute(Attribute::NoUnwind);
-            auto RetAttrs = AttrBuilder(C);
-            return AttributeList::get(C,
-                AttributeSet::get(C, FnAttrs),
-                AttributeSet(),
-                {});
+            return eh_state_attrs(C, std::move(FnAttrs));
         },
 };
 static const auto jlleave_noexcept_func = new JuliaFunction<>{
@@ -1086,11 +1098,7 @@ static const auto jlleave_noexcept_func = new JuliaFunction<>{
             auto FnAttrs = AttrBuilder(C);
             FnAttrs.addAttribute(Attribute::WillReturn);
             FnAttrs.addAttribute(Attribute::NoUnwind);
-            auto RetAttrs = AttrBuilder(C);
-            return AttributeList::get(C,
-                AttributeSet::get(C, FnAttrs),
-                AttributeSet(),
-                {});
+            return eh_state_attrs(C, std::move(FnAttrs));
         },
 };
 static const auto jl_restore_excstack_func = new JuliaFunction<TypeFnContextAndSizeT>{
@@ -1099,7 +1107,7 @@ static const auto jl_restore_excstack_func = new JuliaFunction<TypeFnContextAndS
         auto T_pjlvalue = JuliaType::get_pjlvalue_ty(C);
         return FunctionType::get(getVoidTy(C),
             {T_pjlvalue, T_size}, false); },
-    nullptr,
+    [](LLVMContext &C) { return eh_state_attrs(C, AttrBuilder(C)); },
 };
 static const auto jl_excstack_state_func = new JuliaFunction<TypeFnContextAndSizeT>{
     XSTR(jl_excstack_state),
@@ -1111,10 +1119,7 @@ static const auto jl_excstack_state_func = new JuliaFunction<TypeFnContextAndSiz
             FnAttrs.addAttribute(Attribute::WillReturn);
             FnAttrs.addAttribute(Attribute::NoUnwind);
             FnAttrs.addMemoryAttr(MemoryEffects::readOnly());
-            return AttributeList::get(C,
-                AttributeSet::get(C, FnAttrs),
-                AttributeSet(),
-                {});
+            return eh_state_attrs(C, std::move(FnAttrs));
         },
 };
 static const auto jlegalx_func = new JuliaFunction<TypeFnContextAndSizeT>{
