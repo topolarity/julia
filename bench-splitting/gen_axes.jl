@@ -130,7 +130,7 @@ if get(ENV, "PERFMODE", "0") == "1"
     t0p = time()
     while time() < t_end
         Base.invokelatest(bench_f, 1.5)
-        it += 1
+        global it += 1
     end
     println(stderr, "PERFDONE iters=", it, " secs=", round(time() - t0p; digits=3))
     flush(stderr)

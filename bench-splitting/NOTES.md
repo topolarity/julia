@@ -18,13 +18,29 @@ Splitting bounds all of them per region. Runtime effects of splitting:
    (call/ret, arg pushes, vzeroupper, 8x store-load round trip, selector),
    total = boundaries x constant. Call-heavy code: boundaries are FREE
    (runtime flat from c200 through unsplit at 16k calls).
+   PMU attribution DONE 2026-07-02 on Zen 4 (PERF.md "RESULTS"): the constant
+   is pure marshalling instructions at UNCHANGED IPC (64k split = 2.52 vs
+   2.51 unsplit); the super-linear term is demand L1i fills sourced beyond L2
+   (~8-10 cyc each; prefetch-hidden when unsplit — unsplit-256k streams 5.5k
+   sys fills/iter at IPC 2.34 — demand-exposed at region entry/exit) plus a
+   secondary BTB/indirect-target capacity term (5-10 mispredicts+resteers per
+   boundary at 256k); iTLB refuted (<=10-15% priced at full walk latency).
+   Reframing: per-boundary normalization misleads once footprint >> L2 —
+   penalty/iter ~= marshalling/IPC + ~9cyc x demand code fills, where fills
+   track FOOTPRINT streamed per iteration; boundary count enters mainly by
+   inflating footprint (+118 insts each). Fewer, larger regions on call-free
+   code — now with the mechanism attached.
 2. Code-size/front-end term: post-opt module size varies up to 72% with CUT
    PHASE because SLP vector width is decided by store-seed adjacency — the
    output-spill stores of the 8 chains form contiguous 4-wide seeds only for
    some cut spacings (256k: c565/c1600 -> 223-224k insts, 20-25us; c400/c800
    -> 369-385k insts, 36-49us; identical 595,840 before-insts). Runtime of
    once-through code tracks final code size, not boundary count.
-3. SLP seed effect can make splitting a runtime WIN on straightline float:
+3. [ADL-specific, does NOT reproduce on Zen 4 — runtime identical at the FMA
+   bound there; Zen 4's decode sustains the 2-wide stream (74% backend-bound,
+   op-cache miss but IPC-neutral). SLP's ~cubic COMPILE cost reproduces on
+   both: 39.5s vs 14.1s.] SLP seed effect can make splitting a runtime WIN
+   on straightline float (on ADL):
    unsplit has only a scalar reduction sink -> 2-wide (at every size 1k-32k);
    store-seed probe: same block with array-store sink -> 4-wide. Split regions
    end in aggregate stores -> 4-wide -> unsplit 13.4us vs split 8.0us at 64k.

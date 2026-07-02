@@ -129,3 +129,86 @@ each event. A short table is enough to pick between A/B/C, or to conclude a
 mix. If none of the three moves, the residual suspects are RSB behavior and
 store-forwarding stalls (measure ld_blocks.store_forward, and
 frontend_retired.ms_flows for good measure).
+
+## RESULTS (2026-07-02, AMD EPYC 9354 / Zen 4, ~3.2 GHz, 32K L1i / 1M L2 / 32M L3-per-CCX)
+
+Measured on a different microarch than the question was posed on (Zen 4, not
+ADL); event mapping: frontend_retired.l2_miss -> ic_cache_fill_sys (L1i
+demand fills sourced beyond L2), l1i_miss -> ic_cache_fill_l2, itlb/stlb ->
+bp_l1_tlb_miss_l2_tlb_hit / bp_l1_tlb_miss_l2_tlb_miss.all, baclears ->
+bp_de_redirect, idq_uops_not_delivered ->
+de_no_dispatch_per_slot.no_ops_from_frontend. Only 5 hw counters free (NMI
+watchdog holds the 6th; no sudo), so 4 groups of <=5 events were attached
+back-to-back to ONE julia process per config (perf_matrix.sh; per-boundary
+normalization in perf_analyze.jl; raw output in perfout/). Harness fix
+required first: gen_axes.jl's PERFMODE loop hit top-level soft scope
+(`it += 1` -> unbound local, process died ~2s after PERFREADY) -> now
+`global it += 1`. Cross-check: measured cycle deltas match wall-time deltas
+within 5% in all four split cells.
+
+The boundary tax is larger on this machine (ns/boundary: 20/8 at 64k
+c400/c1600, 81/170 at 256k) but the attribution is clean. Per-boundary
+deltas (split minus off, divided by boundary count):
+
+| event per boundary       | 64k c400 | 64k c1600 | 256k c400 | 256k c1600 |
+|---|---|---|---|---|
+| ns (wall)                | 20.1  | 7.8   | 81.1  | 170.2 |
+| cycles                   | 61.7  | 18.6  | 245.9 | 533.3 |
+| instructions             | 155.9 | 116.7 | 112.2 | 139.0 |
+| ic_cache_fill_l2         | 15.7  | 19.1  | -5.4  | -20.9 |
+| ic_cache_fill_sys        | 1.7   | 0.1   | 25.4  | 65.6  |
+| iTLB full walks          | 0.02  | 0.02  | 0.40  | 1.52  |
+| branch-misses            | 0.23  | 0.02  | 5.1   | 10.0  |
+| bp_de_redirect           | 0.17  | 0.01  | 5.6   | 9.1   |
+| FE-starved slots (/6=cyc)| 470   | 56    | 1709  | 3968  |
+
+IPC: unsplit 2.51 (64k) / 2.34 (256k); split 64k c400 2.52 (unchanged!);
+split 256k collapses to 0.80 / 0.87 — the added time at 256k is entirely
+front-end starvation (starved-slot cycles ~= the whole cycle delta).
+
+Verdict: **A dominant, C secondary, B refuted.**
+
+- The ~10ns core is confirmed and is ALL of the 64k cost: at 64k the split
+  config runs at the SAME IPC as unsplit — the tax is exactly the ~118-156
+  marshalling instructions/boundary executing at full throughput, with no
+  stall signature (sys fills ~0, starved slots ~78 cyc/b at c400, ~9 at
+  c1600). ~20ns/b here vs ~10-11 on ADL is clock + uarch, not structure.
+- A (code residency): ic_cache_fill_sys jumps 0-2 -> 25-66/boundary at 256k,
+  the predicted signature, at an effective ~8-10 cycles per demand fill
+  after overlap (Delta-cycles/Delta-sys-fills = 9.7 at c400, 8.1 at c1600).
+  Key contrast: unsplit-256k already streams 5.5k sys fills/iter at IPC
+  2.34 — sequential prefetch hides L3-sourced code fetch completely;
+  splitting both multiplies demand fills 3-7x and exposes them (region
+  call/ret breaks the fetch-ahead stream at every entry/exit).
+- C (predictor capacity) is real but secondary: branch-misses and decode
+  resteers go from ~0 to 5-10/boundary at 256k with identical per-boundary
+  branch structure -> BTB/indirect-target/RAS capacity (the movabs+call rax
+  boundary calls have 1284 distinct targets at 256k/c400). Upper bound
+  ~75-150 cyc/b at ~15 cyc each, and it overlaps the fetch misses.
+- B (iTLB): <=1.5 full walks/boundary at worst; L1->L2-iTLB hits flat or
+  negative. <=10-15% of the cycle delta even priced at full walk latency.
+
+Reframing that matters for the pass: per-boundary normalization misleads at
+256k — c1600 is WORSE per boundary here (170 vs 81 ns) yet better per
+iteration (+54.6us vs +104.2us vs off 22.3us). The capacity term scales
+with code footprint streamed per iteration (demand sys fills/iter: 32.6k at
+c400 = 8.2MB footprint vs 21.1k at c1600 = 6.9MB), not with boundary count.
+NOTES.md's "runtime of once-through code tracks final code size, not
+boundary count" is confirmed dynamically:
+
+    penalty/iter ~= marshalling_insts/IPC + ~9 cyc x demand_code_fills
+                    (+ mispredict term), fills ~ footprint once >> L2
+
+Boundary count enters mainly by inflating the footprint (+118 insts x 1284
+boundaries = +151k insts at 256k/c400), which argues again for fewer,
+larger regions on call-free code — now with a mechanism attached.
+
+Secondary question (straight-64k SLP on vs off): does NOT reproduce on
+Zen 4. Runtime identical (8.63 vs 8.65 us, 0.135 ns/op both, i.e. at the
+FMA bound); SLP-on is 74% backend-stalled, only 3.8% FE-starved, running
+from the legacy decoder (op-cache miss, 0 loop buffer) at IPC 1.03; scalar
+runs 2x the instructions at IPC 2.01 in the same wall time. The ADL
+"2-wide SLP is a 2x front-end-bound pessimization" is machine-specific;
+Zen 4's decode path keeps up with the L2-resident ~650KB stream. (SLP's
+~cubic COMPILE cost does reproduce: 39.5s vs 14.1s total compile, LLVM
+share 27.3s vs 1.0s.)
