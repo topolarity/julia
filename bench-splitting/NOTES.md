@@ -278,3 +278,15 @@ lever in either regime. Sharpens the model: in overflow, target resolution
 (control) gates fetch, not data movement — consistent with the A/C coupling.
 Remaining levers: capacity-aware region sizing (deciding sweep pending) and
 direct-call emission (Medium+PIC).
+
+## OPEN: failed asymptote on branch-free chain code (see FAILED_ASYMPTOTE.md)
+
+Split straight-shape code (SLP off) never converges to unsplit as regions
+grow — 3.5x at a SINGLE boundary (c51200). Not boundaries, not code size
+(module insts identical), not block size (unsplit scan monotone-good), not
+MISched/SDAG-sched (flag-nulled). Machine code of pass-produced functions is
+CHAIN-GROUPED (runs of 1420-1600 FMAs on one accumulator vs 8-way source
+interleave) => latency serialization. Producer unknown; handed to the Zen
+machine (FAILED_ASYMPTOTE.md, scripts in asymptote/). With SLP on this shape
+is flat, and branchy converges — sizing conclusions stand — but this is the
+one known case where split code is pessimized without a structural limit.
