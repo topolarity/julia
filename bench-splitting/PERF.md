@@ -212,3 +212,33 @@ runs 2x the instructions at IPC 2.01 in the same wall time. The ADL
 Zen 4's decode path keeps up with the L2-resident ~650KB stream. (SLP's
 ~cubic COMPILE cost does reproduce: 39.5s vs 14.1s total compile, LLVM
 share 27.3s vs 1.0s.)
+
+## FOLLOW-UP: does region sizing alone obviate the CodeModel change?
+
+Decides whether the pass needs Medium+PIC or whether capacity-aware region
+sizing suffices under the stock Large model. The open cell: does the Large
+model's per-boundary cost (~170ns at 256k/c1600 here) shrink as regions
+grow, or does blind-entry fetch + mispredict-flush impose a per-entry floor?
+
+Runs (stock jitlayers = CodeModel::Large, SLP off as before; ~35s each):
+
+    for CH in 1600 3200 6400 12800 off; do
+      bash perf_one.sh 256000 $CH "$EV1" | tee perf_L_256000_${CH}_ev1.txt
+      bash perf_one.sh 256000 $CH "$EV2" | tee perf_L_256000_${CH}_ev2.txt
+    done
+
+(c1600/off re-baselined in-session for comparability; realized region counts
+are ~321/160/80/40 — verify with -julia-split-time if in doubt. 2 reps if
+time permits; single runs were reproducible to ~2% on this harness here.)
+
+Interpretation:
+- If penalty/iter keeps falling roughly with boundary count (c12800 within
+  ~10% of off), sizing alone suffices: the pass scales its region target
+  with function size and Medium+PIC becomes an independent JIT-wide track
+  (it likely still pays: every JIT'd specsig call is movabs+call rax today).
+- If per-boundary cost floors at >=~150ns (penalty stuck around +6-8us at
+  c6400 and beyond), the Large model has a blind-entry cost that sizing
+  cannot amortize on this uarch, and Medium+PIC (or equivalent direct-call
+  emission) is required for acceptable split-code runtime on call-free code.
+- Optionally run the same sweep under Medium+PIC for the paired curve; the
+  delta curve directly prices the CodeModel change per region size.
