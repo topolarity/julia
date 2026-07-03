@@ -290,3 +290,26 @@ interleave) => latency serialization. Producer unknown; handed to the Zen
 machine (FAILED_ASYMPTOTE.md, scripts in asymptote/). With SLP on this shape
 is flat, and branchy converges — sizing conclusions stand — but this is the
 one known case where split code is pessimized without a structural limit.
+
+## RESOLVED + DIRECTION REVISED: seam sinking fixed (2026-07-03)
+
+FAILED_ASYMPTOTE.md is now SOLVED (Zen root cause: InstCombine
+TryToSinkInstruction cascading whole dependency chains across the pass's
+unconditional seams, chain-grouping them; run length = chunk/8 => damage
+grew with region size). Fix: mergeStraightSeams + caller call-block merge
+in processLevel (822b725af3). ADL post-fix verification:
+
+- straight SLP-off: FLAT 0.114-0.120 ns/op at every chunk 400..51200,
+  BEATING unsplit (0.145) everywhere. The old "branch-free prefers small
+  regions" (incl. the original chunk-sweep optimum at 400-800) was this
+  artifact end to end.
+- blocks tax unchanged: 64k ~12ns/boundary, 256k c1600 ~16ns, c400-256k
+  still BTB-overflow-dominated. Sinking was never the branchy story.
+
+Sizing direction is now UNIFORM: no call-free shape pulls toward small
+regions. Call-free (branchy or straight) -> large regions (runtime tax ~
+boundary count; compile flat to ~25k; BTB sites favor large too);
+call-heavy -> small regions (GreedyRA compile), runtime-indifferent.
+Dual cap reconciles; the instruction-side cap should be set well above the
+old chunk-sweep optimum, and block-cut spacing (chunk) decouples from the
+region target.
