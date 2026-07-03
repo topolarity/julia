@@ -1,98 +1,96 @@
-# FAILED ASYMPTOTE: split straight-line code never converges to unsplit
+# SOLVED: split straight-line code now converges to unsplit
 
-Handoff for the Zen/PMU machine. Helper scripts in `asymptote/` (run from
-`bench-splitting/`; they include their own generator, no envs needed).
+Resolution of the failed-asymptote handoff (this file's previous contents).
+Root-caused and fixed on the Zen 4 box (EPYC 9354), 2026-07-03. The fix is
+committed alongside this note in `src/llvm-function-splitting.cpp`
+(`mergeStraightSeams` + caller-side call-block merge in `processLevel`).
 
-## The phenomenon (so far only measured on the ADL/WSL box)
+## Root cause: InstCombine's single-use code sinking
 
-Shape: `straight` (GEN=straight, one giant FMA block over 8 round-robin
-chains), SLP DISABLED everywhere. As regions grow, split runtime should
-converge to unsplit; instead it diverges monotonically AWAY from it
-(ns per executed op, S=65536):
+Not our transform, not the backend, and (as suspected) not a boundary cost.
+InstCombine canonicalization `TryToSinkInstruction`: an instruction with
+exactly one use in a DIFFERENT block is moved to that block's FIRST insertion
+point, and its operands go back on the worklist. Across the unconditional
+seams the splitting pass leaves behind, that cascades: sinking a chain's tail
+makes its producer single-use-cross-block too, so the entire dependency chain
+relocates one instruction at a time, each landing above the previously sunk
+one. Result: interleaved independent chains come out CHAIN-GROUPED (the
+observed runs of 1240-1600 consecutive vfmadd on one accumulator), i.e. one
+serial 4-cycle latency chain at a time. Run length = chunk/8 per chain, so
+the damage GROWS with region size: the anti-asymptote.
 
-    off    c400   c1600  c3200  c6400  c12800 c25600 c51200
-    0.16-0.18  0.16-0.20  0.23   0.32   0.41-0.45  0.56   0.54   0.56-0.61
+Two seams trigger it; one shape is immune:
 
-At c51200 there is ONE region + residual (a single boundary): 3.5x slowdown
-from one boundary is impossible, so this is NOT a boundary cost. The blocks
-(branchy) shape converges normally on both machines — this is specific to
-branch-free chain code.
+- parent: chunkA -> [codeRepl: call @region] — chain tails are call args in
+  the next block => ALL of chunkA sinks into the call block, grouped.
+- region: chunkB -> chunkC inside a multi-chunk region body — same cascade.
+- immune: the LAST chunk of each function (parent reduction tree, region
+  output stores placed at defs) consumes chain ends IN-BLOCK: no single-use
+  value crosses, nothing sinks. This was the handoff's untested
+  "spill stores vs reduction tree" hypothesis — right structural cue.
 
-## Eliminated (do not re-chase)
+## Evidence chain (all on Zen 4; machine-independent mechanism)
 
-- Boundary marshalling: one boundary at c51200; excess is ~25us.
-- Code bloat: post-opt module insts identical (off 131,777 / c6400 132,404 /
-  c51200 131,810; STATS=1 in gen_axes.jl).
-- Block size per se: UNSPLIT functions of S=1600..65536 (single block, no
-  pass) improve monotonically 0.30 -> 0.175 ns/op. No hump.
-- MachineScheduler: -enable-misched=false -> bit-identical runtimes
-  (compile time changed, so the flag was live).
-- SelectionDAG scheduler: -pre-RA-sched=source -> bit-identical.
-- Constant pool: dumped region rodata is the expected 128B, deduplicated.
+1. Repro: straight S=65536, SLP off — off 0.135, c1600 0.139, c6400 0.136,
+   c12800 0.168, c25600 0.200, c51200 0.270 ns/op (tiny variance). Same
+   phenomenon as ADL, knee shifted right (bigger OOO window).
+2. Machine code (parent_bytes.jl + objdump): ~7800 of ~10900 parent FMAs in
+   serial runs of 1242-1420 on %xmm1. Same smoking gun as ADL.
+3. IR dataflow distance test (asymptote/chain_dist.py, d0=grouped,
+   d7=interleaved): final IR already grouped => IR-level producer.
+4. -print-after bisect (chain_dist_seq.py over
+   -print-after=JuliaFunctionSplitting,instcombine,... -filter-print-funcs):
+   IR is 100% d7 immediately after FunctionSplittingPass; the FIRST
+   InstCombine after it (pipeline.cpp GlobalFPM) flips half the links to d0.
+   Block accounting is unambiguous: parent entry 25,602 insts -> 9; the
+   2-inst call block -> 25,594, chain-grouped.
+5. Decisive control: -instcombine-code-sinking=false => EVERY chunk size runs
+   exactly 0.135 = unsplit.
 
-## The smoking gun
+## The fix
 
-Runtime machine-code dump of the residual parent at c51200 (F retains
-~14k FMAs + 1 region call; see `asymptote/parent_bytes.jl`, then
-`objdump -D -b binary -m i386:x86-64`): the FMAs are CHAIN-GROUPED —
-runs of 1420-1600 consecutive `vfmadd213sd` on a SINGLE accumulator
-(pattern: 6 x [1420 xmm1 + 179 xmmK], then 1599 xmm1 + 1600 xmm0; addends
-are the 7 in-register constants rotating, multiplier in xmm15). The source
-order interleaves 8 independent chains per 8 instructions. Grouped order =
-one 4-cycle dependency chain at a time, OOO window can only overlap run
-tails => latency serialization; magnitude matches the slowdown.
+At the end of processLevel, after all nested extraction (so no child
+Region::Blocks pointer is used after a merge erases a block):
 
-Critically: a same-size UNSPLIT function does not exhibit this (u6400 runs
-fine), so the grouping afflicts pass-produced functions specifically.
-Untested hypothesis for the trigger: region bodies END in 8 independent
-spill stores (our aggregate output marshalling), unsplit ends in an 8-way
-reduction tree — different DAG roots may steer whatever does the grouping.
-Since both backend schedulers are nulled by flags, either (a) some other
-codegen component orders it, or (b) the FINAL LLVM IR is already grouped.
+- mergeStraightSeams(NewF, Cap): MergeBlockIntoPredecessor for every block
+  with unique pred / single-successor pred (SimplifyCFG's own merge rule —
+  cannot fuse real control flow), capped at 4*SplitChunkSize (mirrors
+  growRegion MaxSize) so hierarchical-parent glue can't fuse unboundedly.
+- caller side: each region's codeRepl block folds into its unique
+  predecessor, so call operands stay in the same block as their defs.
+  Residual chunk-chunk seams in the caller are KEPT (block-size bound);
+  only output reloads cross them, and loads have no chains to cascade.
 
-## Next steps (in order)
+## Validation (Zen 4, straight S=65536, SLP off, stock InstCombine)
 
-1. Reproduce on Zen: from bench-splitting/,
-   `FL="-vectorize-slp=false -julia-split-function-threshold=64
-   -julia-split-block-threshold=64 -julia-split-max-region-blocks=8192"`
-   then GEN=straight S=65536 with JULIA_LLVM_ARGS="$FL
-   -julia-split-chunk-size=..." for off/c400/c6400/c51200 via gen_axes.jl.
-   Watch the ns_per_op column. (If it does NOT reproduce on Zen, that is
-   itself decisive: uarch-specific like the SLP-width effect — then just
-   PMU the ADL... i.e. report and stop.)
-2. Confirm grouping: `asymptote/parent_bytes.jl` (region address extraction
-   via CodeInstance.specptr + movabs scan; parent = residual F) and the
-   accumulator run-length awk from NOTES history:
-   `grep -oE 'vfmadd213sd xmm[0-9]+' | uniq -c`-style.
-3. Decide IR vs backend: `asymptote/ir_order.jl` dumps the final module IR
-   (code_llvm raw dump_module optimize=true). NOTE: muladd is fmul+fadd
-   with `contract` flags in optimized IR, NOT llvm.fmuladd — test chain
-   grouping via dataflow distance between consecutive `fadd contract`
-   results (interleaved: producer ~8 instructions back; grouped: previous
-   instruction). The first parse attempt matched on "fmuladd" and found 0.
-4. If the final IR is grouped, bisect the producer pass:
-   `JULIA_LLVM_ARGS="$FL -julia-split-chunk-size=6400 -print-after-all
-   -filter-print-funcs=julia_bench_f_0"` (filter makes the volume sane),
-   apply the distance test to each snapshot, find the first grouped one.
-   Suspects worth pre-checking: anything with reassociation semantics
-   (fadd here carries only `contract`, which should NOT license
-   reordering), and our own pass's insertion order around the spill
-   stores.
-5. If the final IR is NOT grouped: the producer is in ISel/regalloc despite
-   the two null flags. Controls: verify the flags change ANYTHING
-   (-pre-RA-sched=list-burr vs source should at least perturb); then
-   llc-replay the dumped IR with -print-after-all at the MI level.
-6. PMU sanity along the way: the serialization signature is low IPC with
-   NO elevated fills/mispredicts (pure dependency stalls, backend-bound,
-   long fp_ret latency) — cheap to confirm the mechanism class before
-   bisecting.
+    chunk    off    c400   c1600  c6400  c12800 c25600 c51200
+    before   0.135  0.151  0.139  0.136  0.168  0.200  0.270
+    after    0.135  0.148  0.138  0.136  0.135  0.135  0.135
 
-## Why it matters / scope
+Monotone convergence to the exact unsplit value; final IR 100% d7 in both
+parent and region. No regressions: calls on/off 9.61/9.57 ns/op; blocks
+forced-on ratio matches the historical pre-fix sweep (the known c400 tax);
+function-splitting.ll lit test passes; llvmpasses suite otherwise green
+(pipeline-o2.jl fails from an unrelated /tmp/.julia permission collision on
+the shared box); clang-sa/clang-tidy/clang-sagc clean.
 
-With SLP ON this shape is flat across region sizes (packing hides it), and
-the branchy shape is unaffected — so current sizing conclusions stand. But
-non-vectorizable chain code (mixed-latency scalar math) is a real workload
-class, and if some pass/backend component serializes chains in extracted
-functions, that is a genuine transform-induced pessimization with no
-structural limit — the one place where "split code = unsplit code + small
-tax" is currently false.
+## For the ADL/WSL session
+
+- Re-run the original divergence table (this file's git history has the
+  commands); expect flat 0.16-0.18 at every chunk size now.
+- Prior small-chunk "boundary tax" numbers on chain-heavy shapes include a
+  sinking component (here c400 only dropped 0.151->0.148, but ADL diverged
+  from c1600 already — its tax numbers may shift more). Worth re-running
+  any sizing sweep whose conclusions leaned on straight/chain workloads.
+- Verify tooling: asymptote/chain_dist.py (final-module d0/d7 histogram) and
+  asymptote/chain_dist_seq.py (same test over -print-after dump streams).
+
+## Known residual exposure (deliberately not covered)
+
+- Adjacent UNEXTRACTED chunks in the parent (growRegion-failure paths) still
+  have sinkable seams; a chain crossing several retained seams drains through
+  all of them, so a size-capped merge would NOT contain it — if this ever
+  matters, break the single-use property at the seam (store at def, like the
+  region output path) instead of partial merging.
+- The Regions.empty() early return (blocks chunked, nothing extracted)
+  leaves all chunk seams in place.

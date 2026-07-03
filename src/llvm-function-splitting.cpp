@@ -1692,6 +1692,30 @@ static std::vector<HNode> formParents(Function &F, std::vector<HNode> Nodes,
     return Out;
 }
 
+// InstCombine's single-use code sinking moves an instruction into its user's
+// block (at that block's first insertion point) whenever the two differ.
+// Across the straight-line seams this pass leaves behind — chunk cuts and the
+// block CodeExtractor replaces a region with — that canonicalization cascades:
+// once a dependency chain's tail sinks, its producer becomes single-use-cross-
+// block too, so the whole chain relocates one instruction at a time, each
+// landing above the previously sunk one. Interleaved independent chains come
+// out as consecutive serial runs whose length grows with the chunk size: a
+// latency pessimization with no structural limit. Sinking across an
+// unconditional seam has no benefit in the first place, so fold the seams
+// away instead: Cap bounds the resulting block sizes (region bodies stay
+// within the region size ceiling, cf. growRegion's MaxSize).
+static void mergeStraightSeams(Function &F, unsigned Cap) JL_NOTSAFEPOINT
+{
+    for (BasicBlock &B : make_early_inc_range(F)) {
+        BasicBlock *P = B.getUniquePredecessor();
+        if (!P || P->getSingleSuccessor() != &B)
+            continue;
+        if (P->size() + B.size() > Cap)
+            continue;
+        MergeBlockIntoPredecessor(&B);
+    }
+}
+
 // Prepare and extract one level of the hierarchy inside F, then recurse into
 // each extracted parent to place its children. Children of a parent that
 // could not be extracted are processed at this level instead.
@@ -1737,16 +1761,39 @@ static void processLevel(Function &F, std::vector<HNode> &Items,
                        BasicBlock::Create(F.getContext(), "", CEDummy));
     CodeExtractorAnalysisCache CEAC(*CEDummy);
     SmallVector<std::pair<HNode *, Function *>, 16> Sub;
+    SmallVector<Function *, 16> Extracted;
     for (HNode &N : Items) {
         Function *NewF = nullptr;
         if (Prepared.count(&N))
             NewF = extractRegion(F, N.R, ctx, CEAC);
+        if (NewF)
+            Extracted.push_back(NewF);
         if (!N.Kids.empty())
             Sub.push_back({&N, NewF});
     }
     CEDummy->eraseFromParent();
     for (auto &[N, NewF] : Sub)
         processLevel(NewF ? *NewF : F, N->Kids, ctx);
+    // Fold the seams InstCombine would otherwise sink dependency chains
+    // across (see mergeStraightSeams). Runs after the recursion so that no
+    // Region::Blocks list of a child refers to a merged-away block. Region
+    // bodies merge wholesale under the cap; in the caller only the region's
+    // call block is folded into its feeding predecessor (so call operands
+    // stay in the same block as their defs) — remaining residual chunk seams
+    // are kept to preserve the block-size bound, and the values crossing
+    // them (region output reloads) have no chains behind them to cascade.
+    unsigned Cap = 4 * std::max(16u, SplitChunkSize.getValue());
+    for (Function *NewF : Extracted) {
+        for (User *U : NewF->users()) {
+            auto *CI = dyn_cast<CallBase>(U);
+            if (CI && CI->getCalledFunction() == NewF &&
+                CI->getParent()->getParent() == &F) {
+                MergeBlockIntoPredecessor(CI->getParent());
+                break;
+            }
+        }
+        mergeStraightSeams(*NewF, Cap);
+    }
 }
 
 // Chunk one oversized straight-line block at low-live-count cut points (the
