@@ -313,3 +313,28 @@ call-heavy -> small regions (GreedyRA compile), runtime-indifferent.
 Dual cap reconciles; the instruction-side cap should be set well above the
 old chunk-sweep optimum, and block-cut spacing (chunk) decouples from the
 region target.
+
+## Scheduler indifference explained (2026-07-03, ADL; within-batch comparisons)
+
+2x2 + grouped-source probes (straight 65536, SLP off; machine drifted between
+batches — compare within batch only):
+- interleaved source: misched default = forced-on = 0.170 ns/op. Forcing the
+  scheduler does NOT undo good order (pressure heuristic acts only on excess;
+  the interleave sits at the 16-xmm limit without crossing it).
+- split c6400: default 0.171 -> forced-on 0.141 (18% better!) — MISched IS
+  disabled by default on x86 (target opt-in); forced on, it engages
+  tractable-size region functions but is inert on the 65k monolith.
+- grouped SOURCE (chains emitted one at a time, no pass involved): 1.321
+  ns/op default, 1.336 forced-on — 7.8x worse than interleaved, and NOTHING
+  in the pipeline repairs it, even forced. Dose-response confirms the
+  mechanism: source-grouped runs of 8192 -> 7.8x; pass-induced runs of
+  ~1400-1600 -> 2.5-3.5x.
+
+Conclusions: "MISched expresses no preference" = it is not running (default
+x86) or not engaging blocks this size (forced, 65k). IR instruction order is
+fully load-bearing for ILP on x86: frontend/source order decides, InstCombine
+may scramble it, and no default pass can recreate it. This is the strongest
+justification yet for the order-preserving-sink upstream patch (lost order is
+unrecoverable), and flags two curiosities: -enable-misched=true won 18% on
+split region functions (a possible cheap knob for split code), and AArch64
+(MISched on by default) may not exhibit the sinking pathology's full cost.
