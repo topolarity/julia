@@ -242,3 +242,67 @@ Interpretation:
   emission) is required for acceptable split-code runtime on call-free code.
 - Optionally run the same sweep under Medium+PIC for the paired curve; the
   delta curve directly prices the CodeModel change per region size.
+
+## RESULTS: sizing-vs-CodeModel (2026-07-03, same Zen 4 box, perf_matrix.sh)
+
+Realized region counts at 256k (verified -julia-split-time on this tree):
+c1600/3200/6400/12800 -> 356/183/93/47 (not the 321/160/80/40 estimates;
+median realized sizes match targets: 1633/3214/6409/12826).
+
+Penalty per iteration vs off (raw in perfout-sizes-large/ and
+perfout-sizes-medium/; off baselines 22.7us (Large) / 24.7us (Medium+PIC),
+within the known cross-process band):
+
+| penalty us/iter (ns/boundary) | c1600 | c3200 | c6400 | c12800 |
+|---|---|---|---|---|
+| Large (stock)      | +53.3 (150) | +24.2 (132) | +6.6 (71) | +4.8 (102) |
+| Medium+PIC (direct)| +14.6 (41)  | +5.3 (29)   | +4.5 (48) | +6.4 (136) |
+
+Decision: **sizing alone suffices under stock Large — no per-entry floor —
+but it needs ~2x larger regions to reach the same plateau** (Large converges
+at c6400-12800 to the same +4.5-6.5us both models bottom out at; Medium+PIC
+is already there at c3200). The Large collapse is predictor-capacity relief,
+visible in the counters: branch-misses/iter 3182 -> 958 -> 159 -> 103 and
+bp_de_redirect/iter 2893 -> 557 -> 100 -> 79 across c1600 -> c12800 — once
+only ~93-47 indirect sites remain, the BTB/indirect predictor holds them
+even under Large, fetch-ahead resumes, and the demand-fill term shrinks
+(ic_cache_fill_sys/iter 25.1k -> 10.4k). Per-boundary cost is NOT constant
+in region size (150 -> 71 -> 102 ns/b), reconfirming that the capacity term
+scales with footprint/predictor pressure, not boundary count; the c12800
+per-boundary upticks in both models are small absolute penalties (+4.8/6.4us)
+divided by very few (47) boundaries.
+
+For the pass: scale the region target with total function size so the
+realized boundary-site count stays O(BTB) — ~100 sites was enough here even
+with fully indirect calls. Medium+PIC (codemodel-medium-pic.patch, verified
+working: direct rel32 calls, movabs count 0, identical results, smoke tests
+pass; Static+Medium is NOT viable — R_X86_64_32S jump-table relocs assume
+low 2GB) remains an independent JIT-wide track: it halves the region size
+needed and would also de-indirect every JIT specsig call, but this pass no
+longer depends on it. Anomaly flagged, not chased: the Medium c12800 EVA
+window measured 87.5k insts/iter (~half of Large's 172.6k at identical IR)
+at consistent cycles/iter — single-window artifact suspected; runtime for
+that cell is PERFDONE-derived and solid.
+
+## RESULTS: software code prefetch — REFUTED (2026-07-03)
+
+-julia-split-prefetch-lines=N (EXPERIMENT flag in the pass, default 0):
+before each region call, prefetcht1 the first N 64B lines of the NEXT
+region's code (lookahead: issued before call k, covering region k+1, so
+region k's execution overlaps the fills; x86 cannot prefetch into L1i, so
+this targets the unified L2). Verified in asm (prefetcht1 [rip+...]).
+On the Medium+PIC build at 256k:
+
+  c400:  N=0 111.8us, N=4 114.5, N=8 114.9, N=16 112.5, N=32 118.6
+  c1600: N=0 34.1us,  N=8 38.7,  N=32 41.3   (13-21% REGRESSION)
+
+The counters (perfout-pf/, c400 N=32 vs N=0) show the prefetches DID land:
+ic_cache_fill_l2/iter 921 -> 21,056 and ic_cache_fill_sys/iter 38,075 ->
+25,571 (a third of from-L3 code fills converted to from-L2), instructions
++41k/iter (exactly the added prefetches) — and cycles/iter unchanged
+(383k -> 392k). Conclusion: where fetch-ahead is broken (BTB overflow at
+c400), the serialization is resteer-restart, not fill-source latency —
+cheaper fills buy nothing; where fetch-ahead works (c1600), hardware
+prefetch already covers it and the extra instructions + pollution are pure
+overhead. Software code prefetch is not a lever for this pass on this
+uarch; the levers remain (in order) region sizing and direct calls.
