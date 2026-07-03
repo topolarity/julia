@@ -243,3 +243,24 @@ iTLB vs BTB.
 - Surviving model: per-boundary = ~10ns marshalling + fetch term monotone in
   total once-through code footprint (~4ns @6.9MB -> ~25ns @8.2MB), boundary
   count only multiplies. PMU task: confirm L1i/L2 vs iTLB at region entries.
+
+## A/C coupling: direct calls restore fetch-ahead (other session, Zen 4, 2026-07-03)
+
+CodeModel::Medium + Reloc::PIC_ on x86-64 makes region calls direct
+`call rel32` (plain Static+Medium fails: jump tables emit R_X86_64_32S
+assuming the low 2GB — presumably why Large was chosen). Bit-identical
+results, 0 movabs. Per-boundary at 256k, Large -> direct:
+- c1600: 170 -> ~37ns; branch-misses 10 -> 0.27; resteers 9.1 -> 0.37;
+  demand L3 code fills 65.6 -> 19.9 (70% of the "residency" term vanished).
+  Per-iter penalty 54.6 -> 11.9us with zero pass changes.
+- c400: 81 -> ~75ns, fills ~unchanged — thousands of sites overflow the BTB;
+  misses become decode-resteers instead of execute-flushes but the fetcher
+  still cannot run ahead. Capacity, not predictability.
+- 64k: c400 20 -> 12ns; c1600 ~7ns unchanged = irreducible marshalling core.
+
+Mechanism: with a statically-known target the decoupled front-end fetches
+across the boundary ahead of execution, so region-entry lines are prefetches
+again; the indirect (Large-model) calls were what demand-exposed the icache
+misses. A ("residency") was largely downstream of C (target opacity), up to
+BTB capacity. New design constraint: keep region count per function within
+predictor capacity (~hundreds, not thousands).
