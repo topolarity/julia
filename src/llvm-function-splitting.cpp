@@ -161,6 +161,12 @@ static cl::opt<unsigned> SplitOutputSpillMin(
              "at least this many (0 = only with the full wide-interface spill). "
              "Contiguous slots let one pointer replace per-output pointer "
              "arguments and keep the marshalling vectorizable"));
+static cl::opt<unsigned> SplitPrefetchLines(
+    "julia-split-prefetch-lines", cl::init(0), cl::Hidden,
+    cl::desc("EXPERIMENT(boundary-tax): before each region call, software-"
+             "prefetch the first N 64-byte lines of the NEXT region's code "
+             "into the unified L2 (x86 cannot prefetch into L1i), so region "
+             "entries hit L2 instead of demand-missing to L3 (0 = off)"));
 
 namespace {
 
@@ -2269,6 +2275,37 @@ static bool splitFunction(Function &F, const JuliaPassContext &ctx) JL_NOTSAFEPO
     return true;
 }
 
+// EXPERIMENT(boundary-tax): while region k executes (hundreds of cycles),
+// prefetch the head of region k+1's code so its entry hits L2 instead of
+// demand-missing to L3. Layout order of a glue function's region calls
+// approximates execution order (the glue CFG is essentially linear with
+// exit branches). locality=2 -> prefetcht1 on x86 (fill L2, not L1d);
+// cache type "data" because x86 drops instruction-type prefetches, and the
+// L2 is unified so code fetch hits lines a data prefetch brought in.
+static void insertRegionPrefetches(Function &F) JL_NOTSAFEPOINT
+{
+    SmallVector<CallInst *, 32> Calls;
+    for (BasicBlock &BB : F)
+        for (Instruction &I : BB)
+            if (auto *CI = dyn_cast<CallInst>(&I))
+                if (Function *Callee = CI->getCalledFunction())
+                    if (!Callee->isDeclaration() && Callee->getName().contains("julia_split"))
+                        Calls.push_back(CI);
+    if (Calls.size() < 2)
+        return;
+    LLVMContext &Ctx = F.getContext();
+    Type *I8 = Type::getInt8Ty(Ctx);
+    for (size_t i = 0; i + 1 < Calls.size(); i++) {
+        Function *Next = Calls[i + 1]->getCalledFunction();
+        IRBuilder<> B(Calls[i]);
+        for (unsigned l = 0; l < SplitPrefetchLines; l++) {
+            Value *P = B.CreateGEP(I8, Next, B.getInt64((uint64_t)l * 64));
+            B.CreateIntrinsic(Intrinsic::prefetch, {P->getType()},
+                              {P, B.getInt32(0), B.getInt32(2), B.getInt32(1)});
+        }
+    }
+}
+
 } // anonymous namespace
 
 PreservedAnalyses FunctionSplittingPass::run(Module &M, ModuleAnalysisManager &AM)
@@ -2285,5 +2322,9 @@ PreservedAnalyses FunctionSplittingPass::run(Module &M, ModuleAnalysisManager &A
     bool Changed = false;
     for (Function *F : Work)
         Changed |= splitFunction(*F, ctx);
+    if (Changed && SplitPrefetchLines)
+        for (Function &F : M)
+            if (!F.isDeclaration())
+                insertRegionPrefetches(F);
     return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
 }

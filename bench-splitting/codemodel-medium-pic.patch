@@ -1,0 +1,42 @@
+diff --git a/src/jitlayers.cpp b/src/jitlayers.cpp
+index 714c0f21d3..5f7135d190 100644
+--- a/src/jitlayers.cpp
++++ b/src/jitlayers.cpp
+@@ -1128,9 +1128,12 @@ namespace {
+         // Allocate a target...
+         std::optional<CodeModel::Model> codemodel =
+ #ifdef _P64
++            // EXPERIMENT(boundary-tax): Medium instead of Large — code uses
++            // direct rel32 calls (predictable at decode) while data stays
++            // 64-bit absolute. See bench-splitting/PERF.md "RESULTS".
+             // Make sure we are using the large code model on 64bit
+             // Let LLVM pick a default suitable for jitting on 32bit
+-            CodeModel::Large;
++            CodeModel::Medium;
+ #else
+             None;
+ #endif
+@@ -1145,6 +1148,11 @@ namespace {
+ #endif
+         // Generate simpler code for JIT
+         Reloc::Model relocmodel = Reloc::Static;
++        // EXPERIMENT(boundary-tax): PIC so jump tables/consts are emitted
++        // PC-relative (Static+Medium assumes them in the low 2GB, which a
++        // JIT cannot guarantee); far data goes through the GOT instead.
++        if (TheTriple.getArch() == Triple::x86_64)
++            relocmodel = Reloc::PIC_;
+         if (TheTriple.isRISCV()) {
+             // until large code model is supported, use PIC for RISC-V
+             // https://github.com/llvm/llvm-project/issues/106203
+@@ -1658,6 +1666,11 @@ void optimizeDLSyms(Module &M) {
+ 
+ void fixupTM(TargetMachine &TM) {
+     auto TheTriple = TM.getTargetTriple();
++    // EXPERIMENT(boundary-tax): with CodeModel::Medium, force ALL data into
++    // large-model (movabs) addressing so RIP+rel32 loads can't target
++    // runtime globals >2GB away; code (calls/branches) stays direct rel32.
++    if (TM.getCodeModel() == CodeModel::Medium)
++        TM.setLargeDataThreshold(0);
+     if (jl_options.opt_level < 2) {
+         // Try GlobalISel on AArch64 - it's the default in LLVM at -O0 and
+         // is apparently generally faster than SelectionDAG while producing good code.

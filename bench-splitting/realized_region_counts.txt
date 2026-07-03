@@ -1,0 +1,4 @@
+CH=1600 julia-function-splitting: julia_bench_f_0: formed 356 regions insts min/med/max=837/1633/1633 cuts(target/clamp)=355/1 growfail(blocks/size/stuck)=0/0/713
+CH=3200 julia-function-splitting: julia_bench_f_0: formed 183 regions insts min/med/max=2697/3214/3214 cuts(target/clamp)=182/1 growfail(blocks/size/stuck)=0/0/367
+CH=6400 julia-function-splitting: julia_bench_f_0: formed 93 regions insts min/med/max=4735/6409/6417 cuts(target/clamp)=92/1 growfail(blocks/size/stuck)=0/0/95
+CH=12800 julia-function-splitting: julia_bench_f_0: formed 47 regions insts min/med/max=4735/12826/12834 cuts(target/clamp)=46/1 growfail(blocks/size/stuck)=0/0/49
