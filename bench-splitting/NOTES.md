@@ -338,3 +338,27 @@ justification yet for the order-preserving-sink upstream patch (lost order is
 unrecoverable), and flags two curiosities: -enable-misched=true won 18% on
 split region functions (a possible cheap knob for split code), and AArch64
 (MISched on by default) may not exhibit the sinking pathology's full cost.
+
+## CORRECTION to the scheduler section above (2026-07-03)
+
+User's physics objection was right: a disabled pass cannot bill 1.9s.
+Replication (3 reps, default/=true/=false in one batch): compile time
+default==true (5.2-6.1s) vs =false (-1.4s) => MISched RUNS BY DEFAULT on
+x86; "disabled by default" is retracted. The "18% -enable-misched=true win"
+is also retracted: runtimes are BIMODAL across all configs (~11.2us vs
+~7.6-9.2us, flag-independent) — almost certainly P-core/E-core scheduling
+lottery on the 12700H under WSL2 (no pinning in gen_axes runs; perf_one.sh
+pins, plain runs do not). This also explains earlier "session drift".
+PROTOCOL FIX: pin benchmark runs (taskset -c <P-core>) from now on.
+The load-bearing-order conclusion SURVIVES and strengthens: MISched runs and
+still preserves grouped order (the 7.8x grouped-source probe had it active).
+
+## DESIGN DECISION (user, 2026-07-03): seams accepted beyond merge limits
+
+Block-merging proceeds up to the size limits our heuristics justify (SLP
+knee: flat to ~3.2k, gentle to ~12.8k, cubic >=25k); seams are allowed to
+appear beyond that. The InstCombine sinking interaction on residual seams is
+accepted as a rare, specific scheduling issue marked for later follow-up —
+the order-preserving-sink upstream patch is the eventual fix, not a blocker.
+Block-size and region-size ceilings remain independent knobs with the seam
+risk consciously accepted.
