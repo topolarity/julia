@@ -264,3 +264,17 @@ again; the indirect (Large-model) calls were what demand-exposed the icache
 misses. A ("residency") was largely downstream of C (target opacity), up to
 BTB capacity. New design constraint: keep region count per function within
 predictor capacity (~hundreds, not thousands).
+
+## Software code-prefetch REFUTED (other session, Zen 4, 2026-07-03)
+
+32-line lookahead prefetch of the next region, measured under the Large
+model: at c400 it converted a third of the from-L3 code fills into from-L2
+fills — counters prove the lines arrived — yet cycles were UNCHANGED: in the
+BTB-overflow regime the front-end is serialized on miss resteers, so the
+fetcher's problem is not fill latency but not knowing where to go; cheaper
+fills do not help. At c1600 it is a 13-21% regression (instruction overhead
+plus pollution where BTB-steered fetch-ahead already works). Not a viable
+lever in either regime. Sharpens the model: in overflow, target resolution
+(control) gates fetch, not data movement — consistent with the A/C coupling.
+Remaining levers: capacity-aware region sizing (deciding sweep pending) and
+direct-call emission (Medium+PIC).
