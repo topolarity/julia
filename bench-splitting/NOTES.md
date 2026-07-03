@@ -362,3 +362,12 @@ accepted as a rare, specific scheduling issue marked for later follow-up —
 the order-preserving-sink upstream patch is the eventual fix, not a blocker.
 Block-size and region-size ceilings remain independent knobs with the seam
 risk consciously accepted.
+
+Pinned follow-up (taskset -c 2, 5 reps): 4x ~11.2-11.3us, 1x 9.26us —
+bimodality persists under virtual pinning. Refined explanation: WSL2
+taskset pins vCPUs; Hyper-V places vCPUs on physical P/E cores beneath the
+VM, so physical placement is uncontrollable from inside. PROTOCOL (final):
+compile times are stable and trustworthy on this box; us-scale runtimes
+carry a discrete ~30-45% placement mode — use >=5 process reps and take the
+per-config minimum (P-core mode), or measure runtime-sensitive numbers on
+the bare-metal Zen box (pinnable, as PERF.md already does).
