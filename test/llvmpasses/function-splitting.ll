@@ -7,6 +7,7 @@
 ; RUN: opt --load-pass-plugin=libjulia-codegen%shlibext -passes='JuliaFunctionSplitting,function(GCInvariantVerifier),verify' -julia-split-function-threshold=50 -julia-split-chunk-size=40 -S %s | FileCheck %s --check-prefix=MULTI
 ; RUN: opt --load-pass-plugin=libjulia-codegen%shlibext -passes='JuliaFunctionSplitting,JuliaFunctionSplitting,verify' -julia-split-function-threshold=50 -julia-split-chunk-size=40 -S %s | FileCheck %s --check-prefix=IDEM
 ; RUN: opt --load-pass-plugin=libjulia-codegen%shlibext -passes='JuliaFunctionSplitting,function(GCInvariantVerifier),verify' -julia-split-block-threshold=30 -julia-split-chunk-size=200 -julia-split-chunk-safepoints=4 -S %s | FileCheck %s --check-prefix=SPCAP
+; RUN: opt --load-pass-plugin=libjulia-codegen%shlibext -passes='JuliaFunctionSplitting,function(GCInvariantVerifier),verify' -julia-split-block-threshold=30 -julia-split-chunk-size=200 -julia-split-chunk-safepoints=4 -julia-split-region-safepoints=8 -S %s | FileCheck %s --check-prefix=RSPCAP
 ; RUN: opt --load-pass-plugin=libjulia-codegen%shlibext -passes='JuliaFunctionSplitting,function(GCInvariantVerifier),verify' -julia-split-block-threshold=30 -julia-split-chunk-size=16 -S %s | FileCheck %s --check-prefix=MIXED
 
 declare ptr @julia.get_pgcstack()
@@ -104,6 +105,12 @@ top:
 ; SPCAP-LABEL: define void @tracked(
 ; SPCAP-COUNT-4: br label
 ; SPCAP: ret void
+
+; The region-level safepoint budget cuts region growth on call-dense code
+; even when the instruction target (200) exceeds the whole function: with 32
+; safepoints and a budget of 8, @tracked must split into multiple regions.
+; RSPCAP: define internal void @tracked.julia_split
+; RSPCAP: define internal void @tracked.julia_split.1
 
 ; A tracked (addrspace 10) value used in every chunk is passed as an argument
 ; (assumed rooted by the caller), and callees containing safepoints

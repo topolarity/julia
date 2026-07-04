@@ -188,6 +188,16 @@ static cl::opt<unsigned> SplitChunkSafepoints(
              "instruction count alone provides; this also keeps any future "
              "region-level safepoint budget realizable from whole blocks. "
              "0 disables"));
+static cl::opt<unsigned> SplitRegionSafepoints(
+    "julia-split-region-safepoints", cl::init(128), cl::Hidden,
+    cl::desc("Cut region growth once a region spans about this many safepoint "
+             "calls, independently of the instruction target. The per-region "
+             "compile cost on call-dense code is superlinear in region size "
+             "(MachineCSE ~S^2.9, GreedyRA ~S^1.5), so call-dense regions must "
+             "stay small even when the instruction target is large; together "
+             "with the instruction target this forms the dual cap that lets "
+             "call-free regions grow (boundary tax ~1/R) while call-dense "
+             "regions stay near the register-allocation optimum. 0 disables"));
 static cl::opt<unsigned> SplitOutputSpillMin(
     "julia-split-output-spill-min", cl::init(2), cl::Hidden,
     cl::desc("Spill region outputs through the aggregate whenever a region has "
@@ -330,25 +340,33 @@ struct Region {
     bool BoundaryDominated = false;
 };
 
-// Lazily computed per-block size and pinnedness (blocks are created during
-// splitting, so this must tolerate new blocks).
+static bool isSafepointCall(const Instruction &I, const JuliaPassContext &ctx) JL_NOTSAFEPOINT;
+
+// Lazily computed per-block size, safepoint count and pinnedness (blocks are
+// created during splitting, so this must tolerate new blocks).
+struct BlockInfo {
+    unsigned Size;
+    unsigned Safepoints;
+    bool Pinned;
+};
 struct BlockInfoCache {
     const JuliaPassContext &ctx;
-    DenseMap<BasicBlock *, std::pair<unsigned, bool>> M;
+    DenseMap<BasicBlock *, BlockInfo> M;
     BlockInfoCache(const JuliaPassContext &ctx) JL_NOTSAFEPOINT : ctx(ctx) {}
-    std::pair<unsigned, bool> get(BasicBlock *BB) JL_NOTSAFEPOINT
+    BlockInfo get(BasicBlock *BB) JL_NOTSAFEPOINT
     {
         auto It = M.find(BB);
         if (It != M.end())
             return It->second;
-        unsigned n = 0;
-        bool pinned = false;
+        BlockInfo BI{0, 0, false};
         for (Instruction &I : *BB) {
-            n++;
-            if (!pinned && isPinned(I, ctx))
-                pinned = true;
+            BI.Size++;
+            if (isSafepointCall(I, ctx))
+                BI.Safepoints++;
+            if (!BI.Pinned && isPinned(I, ctx))
+                BI.Pinned = true;
         }
-        return M[BB] = {n, pinned};
+        return M[BB] = BI;
     }
     void invalidate(BasicBlock *BB) JL_NOTSAFEPOINT { M.erase(BB); }
 
@@ -1092,7 +1110,7 @@ static int64_t PrepRematMs, PrepCEMs, PrepIOMs, PrepSpillMs;
 // Region-growth outcome counters (reset per function; printed under
 // -julia-split-time). "clamp" cuts and growth failures mean the realized
 // region sizes diverge from the requested target — never silently.
-static int64_t GrowCutTarget, GrowCutClamp, GrowFailBlocks, GrowFailSize, GrowFailNoAdd;
+static int64_t GrowCutTarget, GrowCutSafepoint, GrowCutClamp, GrowFailBlocks, GrowFailSize, GrowFailNoAdd;
 // Interface statistics across a function's extractions (reset per function).
 static int64_t IfaceIn, IfaceOut, IfaceInMax, IfaceOutMax, IfaceExits, IfaceCalls;
 
@@ -1717,7 +1735,7 @@ static bool growParent(BasicBlock *Entry, unsigned Target, BlockInfoCache &Info,
         }
         else {
             NewBlocks.push_back(B);
-            Insts += Info.get(B).first;
+            Insts += Info.get(B).Size;
         }
         for (BasicBlock *NB : NewBlocks) {
             PR.Set.insert(NB);
@@ -1747,7 +1765,8 @@ static bool growParent(BasicBlock *Entry, unsigned Target, BlockInfoCache &Info,
     {
         auto It = AtomOf.find(Entry);
         if (It == AtomOf.end()) {
-            auto [ESize, EPinned] = Info.get(Entry);
+            auto [ESize, ESafepoints, EPinned] = Info.get(Entry);
+    (void)ESafepoints;
             if (EPinned || isa<ReturnInst>(Entry->getTerminator()))
                 return false;
         }
@@ -1789,7 +1808,8 @@ static bool growParent(BasicBlock *Entry, unsigned Target, BlockInfoCache &Info,
                     continue; // interior block of a node; only enter via entry
             }
             else {
-                auto [SSize, SPinned] = Info.get(S);
+                auto [SSize, SSafepoints, SPinned] = Info.get(S);
+                (void)SSafepoints;
                 if (SPinned || isa<ReturnInst>(S->getTerminator()))
                     continue;
             }
@@ -1825,7 +1845,8 @@ static bool growParent(BasicBlock *Entry, unsigned Target, BlockInfoCache &Info,
                         Retreating = false;
                 }
                 else {
-                    auto [CSize, CPinned] = Info.get(Cand);
+                    auto [CSize, CSafepoints, CPinned] = Info.get(Cand);
+                    (void)CSafepoints;
                     if (CPinned || isa<ReturnInst>(Cand->getTerminator()))
                         Retreating = false;
                 }
@@ -2283,7 +2304,8 @@ static bool growRegion(BasicBlock *Entry, unsigned Target, BlockInfoCache &Info,
                        const DenseMap<BasicBlock *, unsigned> &RPOIndex,
                        Region &R) JL_NOTSAFEPOINT
 {
-    auto [ESize, EPinned] = Info.get(Entry);
+    auto [ESize, ESafepoints, EPinned] = Info.get(Entry);
+    (void)ESafepoints;
     if (EPinned || isa<ReturnInst>(Entry->getTerminator()))
         return false;
     unsigned MinSize = std::max(16u, Target / 4);
@@ -2293,6 +2315,7 @@ static bool growRegion(BasicBlock *Entry, unsigned Target, BlockInfoCache &Info,
     R.Blocks.push_back(Entry);
     R.Set.insert(Entry);
     unsigned Insts = ESize;
+    unsigned Safepoints = ESafepoints;
     // Escape targets: number of edges into them from inside R, plus their
     // total predecessor edge count.
     DenseMap<BasicBlock *, std::pair<unsigned, unsigned>> Fringe;
@@ -2361,7 +2384,8 @@ static bool growRegion(BasicBlock *Entry, unsigned Target, BlockInfoCache &Info,
             }
             if (!Full)
                 continue; // can't add yet: some predecessors outside the group
-            auto [SSize, SPinned] = Info.get(S);
+            auto [SSize, SSafepoints, SPinned] = Info.get(S);
+                (void)SSafepoints;
             if (SPinned || isa<ReturnInst>(S->getTerminator()))
                 continue; // may act as a boundary, but must stay in the caller
             unsigned Idx = RPOIndex.lookup(S);
@@ -2376,19 +2400,28 @@ static bool growRegion(BasicBlock *Entry, unsigned Target, BlockInfoCache &Info,
         // path below still accepts multi-exit cuts so growth cannot fail more
         // often than before.
         bool WantCut = CanCut && (!SplitSingleExitCuts || NumCand == 1);
-        if (WantCut && Insts >= Target) {
+        // Dual cap: cut at the instruction target OR the safepoint budget,
+        // whichever fills first. Per-region compile cost on call-dense code
+        // is superlinear in the safepoints spanned (MachineCSE, GreedyRA),
+        // so the safepoint axis must bound regions even when the instruction
+        // target is large (the call-free case, where boundaries are the cost
+        // and regions should grow).
+        bool SPFull = SplitRegionSafepoints && Safepoints >= SplitRegionSafepoints;
+        if (WantCut && (Insts >= Target || SPFull)) {
             R.Boundary = Cand;
             R.BoundaryDominated = CandFull;
             R.Insts = Insts;
-            GrowCutTarget++;
+            (SPFull && Insts < Target) ? GrowCutSafepoint++ : GrowCutTarget++;
             return true;
         }
-        if (!Add || Insts >= MaxSize || R.Blocks.size() >= MaxBlocks) {
+        bool SPOver = SplitRegionSafepoints &&
+                      Safepoints >= 4 * SplitRegionSafepoints;
+        if (!Add || Insts >= MaxSize || SPOver || R.Blocks.size() >= MaxBlocks) {
             // When growth stopped against a clamp (rather than getting stuck),
             // any legal cut beats forming no region at all: with MinSize
             // unreachable inside the clamp, insisting on it made oversized
             // targets silently no-op on fine-grained CFGs.
-            bool Clamped = Insts >= MaxSize || R.Blocks.size() >= MaxBlocks;
+            bool Clamped = Insts >= MaxSize || SPOver || R.Blocks.size() >= MaxBlocks;
             if (CanCut && (Insts >= MinSize || Clamped)) {
                 R.Boundary = Cand;
                 R.BoundaryDominated = CandFull;
@@ -2399,9 +2432,10 @@ static bool growRegion(BasicBlock *Entry, unsigned Target, BlockInfoCache &Info,
             // Loop headers can only be entered as debt: admit the candidate
             // when its unabsorbed predecessors are all retreating edges (loop
             // backedges); the debt clears once the loop body is inside.
-            if (Add == nullptr && Cand && Insts < MaxSize &&
+            if (Add == nullptr && Cand && Insts < MaxSize && !SPOver &&
                 R.Blocks.size() < MaxBlocks) {
-                auto [CSize, CPinned] = Info.get(Cand);
+                auto [CSize, CSafepoints, CPinned] = Info.get(Cand);
+                    (void)CSafepoints;
                 bool Retreating = !CPinned && !isa<ReturnInst>(Cand->getTerminator());
                 if (Retreating) {
                     unsigned CandRPO = RPOIndex.lookup(Cand);
@@ -2416,7 +2450,8 @@ static bool growRegion(BasicBlock *Entry, unsigned Target, BlockInfoCache &Info,
                 }
                 if (Retreating) {
                     addBlock(Cand);
-                    Insts += Info.get(Cand).first;
+                    Insts += Info.get(Cand).Size;
+                    Safepoints += Info.get(Cand).Safepoints;
                     continue;
                 }
             }
@@ -2429,7 +2464,8 @@ static bool growRegion(BasicBlock *Entry, unsigned Target, BlockInfoCache &Info,
             return false;
         }
         addBlock(Add);
-        Insts += Info.get(Add).first;
+        Insts += Info.get(Add).Size;
+        Safepoints += Info.get(Add).Safepoints;
     }
 }
 
@@ -2522,7 +2558,7 @@ static bool splitFunction(Function &F, const JuliaPassContext &ctx) JL_NOTSAFEPO
         return std::chrono::duration_cast<std::chrono::milliseconds>(b - a).count();
     };
     auto T0 = now();
-    GrowCutTarget = GrowCutClamp = GrowFailBlocks = GrowFailSize = GrowFailNoAdd = 0;
+    GrowCutTarget = GrowCutSafepoint = GrowCutClamp = GrowFailBlocks = GrowFailSize = GrowFailNoAdd = 0;
     IfaceIn = IfaceOut = IfaceInMax = IfaceOutMax = IfaceExits = IfaceCalls = 0;
     if (BigBlocks) {
         SmallVector<BasicBlock *, 4> Oversized;
@@ -2547,7 +2583,8 @@ static bool splitFunction(Function &F, const JuliaPassContext &ctx) JL_NOTSAFEPO
         if (!Sizes.empty())
             errs() << " insts min/med/max=" << Sizes.front() << "/"
                    << Sizes[Sizes.size() / 2] << "/" << Sizes.back();
-        errs() << " cuts(target/clamp)=" << GrowCutTarget << "/" << GrowCutClamp
+        errs() << " cuts(target/sp/clamp)=" << GrowCutTarget << "/"
+               << GrowCutSafepoint << "/" << GrowCutClamp
                << " growfail(blocks/size/stuck)=" << GrowFailBlocks << "/"
                << GrowFailSize << "/" << GrowFailNoAdd << "\n";
     }

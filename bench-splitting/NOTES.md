@@ -457,3 +457,17 @@ REGION-level safepoint cap's job. The dual cap needs both halves:
 M_block ~128 (RA, merge protection, cut granularity) and M_region ~64-128
 (MachineCSE + RA residual). No regressions: c400 M=128 == M=0, straight
 unchanged (zero safepoints), composite asserts pass, lit 7/7.
+
+## Region-level safepoint cap implemented — dual cap complete (2026-07-04)
+
+-julia-split-region-safepoints (default 128, 0=off): growRegion cuts at the
+instruction target OR the safepoint budget, whichever fills first
+(BlockInfoCache now carries per-block safepoint counts; cuts(target/sp/clamp)
+in the -julia-split-time line). Demonstrated: calls-16384 at C=3200 compiles
+6.22s (cap off) -> 2.28s (cap on) == 2.18s c400 anchor, same batch — the cap
+recovers call-dense compile under a coarse instruction target by bounding
+MachineCSE/RA per region. straight bit-identical cap on/off (no safepoints).
+With both halves (chunk-safepoints for blocks, region-safepoints for
+regions), blocks and regions are now sized independently: the instruction
+target can be raised for call-free code (boundary tax ~1/R) without
+touching call-dense compile. Lit 8/8; composite asserts pass.
