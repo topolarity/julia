@@ -105,10 +105,15 @@ xmm16-31" was checked only on the welded build ($xmm vs %xmm parse bug).
 
 ## Measured (Zen 4 / EPYC 9354, LLVM 21.1.8 base)
 
-    stock   InstCombine: 10433 ns/call   0.816 ns/step
-    patched InstCombine:  1702 ns/call   0.133 ns/step   (6.1x)
+    MN=1600: stock 10433 ns/call vs patched 1702 ns/call   (6.1x)
+    MN=400:  stock  2230 ns/call vs patched  429 ns/call   (5.2x)
 
-Onset vs chain length N (grouped-vs-interleaved, direct generation):
-N=200 no delta (OOO absorbs); N=400 1.8x; N=800 1.9x; N=1600 6.1x.
+MN=400 (3232 FMAs, ~6.5k insts) is the compact upstream repro: it sits
+right at the fragmentation onset and keeps almost the full ratio; the
+same delta reproduces with Ubuntu LLVM 18 opt as the stock compiler
+(long-standing behavior, not a recent regression). Shrinking the chain
+COUNT instead does not work: 4 chains cap at ~2.7x (only 2 serialize),
+2 chains never weld (constants keep stable homes, no head borrowing —
+see mechanism item 5).
 
 Identical output sums in all configurations.
