@@ -388,3 +388,15 @@ unchanged), regenerated. Two bugs found and fixed during validation:
 end()-deref for instructions created after their block was numbered, and
 missing head bit for debug-record-aware insertion (debuginfo_add.ll passes
 UNMODIFIED, so dbg sinking behavior is preserved exactly).
+
+## Re-marshalling fixes revalidated on ADL (2026-07-03)
+
+Merged 02e5c945dc..1daee80dba (phi demotion into spill aggregates, slot
+utilities, split-function provenance marker, lowering contract doc).
+Full ladder green: lit 6/6 configs (incl. new IDEM); composite value
+asserts pass on fixed N=10/20 + stock N=6/10; synthetic smoke all shapes
+incl. W=128; validation suite (65536/4096/400) all ok=true with ratios
+preserved (tracked N=20 4.7x, stock N=10 4.0x, MTK guard no overhead).
+Two phase-1 outliers discriminated as noise via off-controls: stock compile
+bounce (off matched history exactly) and a calls 171us cell (5 reps: on ==
+off == 122-130us; low-rep GC artifact).
