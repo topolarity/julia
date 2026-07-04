@@ -64,7 +64,6 @@
 // zero outputs for such regions, except for the deliberate leftovers:
 //   * regions with fewer than SplitOutputSpillMin outputs (never spilled;
 //     the scalar path is fine at that size),
-//   * escapes via phis of cold exit targets (rare paths, not worth slots),
 //   * escape kinds that cannot be slotted (rejected or rematerialized
 //     before spilling ever runs).
 // Any other value reaching CodeExtractor's output path means the interface
@@ -786,17 +785,22 @@ static void DemotePHIToAggregateSlot(PHINode &PN, MaybeAlign A,
 // by the boundary (e.g. on cold exit paths) which stay ordinary CodeExtractor
 // outputs.
 //
-// Values whose escape is an incoming edge of a boundary-head PHI need special
+// Values whose escape is an incoming edge of an exit-target PHI need special
 // handling: such a use "happens" at the end of the incoming block (inside the
 // region, cf. useBlock), so the use-site rewrite below never sees it, and
 // left alone CodeExtractor would marshal the value a second time through a
 // scalar alloca of its own — on branchy regions that duplicates the entire
-// output interface. Instead the boundary phi itself is demoted into the
-// aggregate (one slot per phi): each incoming value is stored at the end of
-// its incoming block — exactly one of those runs per traversal, so the slot
-// always holds the value of the edge actually taken, on cycles too — and the
-// phi is replaced by a load of the slot.
-static void spillInterface(Function &F, Region &R, const DominatorTree &DT,
+// output interface. Instead the phi itself is demoted into the aggregate
+// (one slot per phi, cf. DemotePHIToAggregateSlot). This applies to every
+// exit target of the region — the designated boundary and any additional
+// exits from reconvergence-failure cuts, which sit on hot paths. Exit
+// targets that also merge paths the region does not own (mixed targets,
+// e.g. shared joins or throw blocks) keep their phis: demotion would plant
+// stores on the foreign edges. Their region-side edges are split instead,
+// which turns the crossing phi uses into ordinary external uses served by
+// a reload in the caller-side edge block — no cost is added to the foreign
+// paths, and nothing is left for CodeExtractor to marshal.
+static void spillInterface(Function &F, Region &R, DominatorTree &DT,
                            const SmallPtrSetImpl<BasicBlock *> &Owned,
                            const SetVector<Value *> &Inputs,
                            const SetVector<Value *> &Outputs) JL_NOTSAFEPOINT
@@ -828,32 +832,85 @@ static void spillInterface(Function &F, Region &R, const DominatorTree &DT,
     SmallVector<PHINode *, 8> TPhis, UPhis;
     SmallPtrSet<PHINode *, 8> DemoteSet;
     if (Boundary && !SplitNoOutputSpill) {
-        for (PHINode &PN : Boundary->phis()) {
+        // Every block outside the region that a region block branches to: the
+        // designated boundary plus any extra exits of multi-exit cuts.
+        SmallSetVector<BasicBlock *, 8> ExitTargets;
+        for (BasicBlock *BB : R.Blocks)
+            for (BasicBlock *S : successors(BB))
+                if (!R.Set.count(S))
+                    ExitTargets.insert(S);
+        for (BasicBlock *T : ExitTargets) {
+            // Does any phi of T carry a region value across a region edge?
             bool Crossing = false;
-            for (Value *IV : PN.incoming_values()) {
-                auto *II = dyn_cast<Instruction>(IV);
-                if (II && R.Set.count(II->getParent())) {
-                    Crossing = true;
-                    break;
+            for (PHINode &PN : T->phis()) {
+                for (unsigned i = 0, e = PN.getNumIncomingValues(); i != e; i++) {
+                    auto *II = dyn_cast<Instruction>(PN.getIncomingValue(i));
+                    if (II && R.Set.count(II->getParent()) &&
+                        R.Set.count(PN.getIncomingBlock(i))) {
+                        Crossing = true;
+                        break;
+                    }
                 }
+                if (Crossing)
+                    break;
             }
             if (!Crossing)
                 continue;
-            switch (classifyType(PN.getType())) {
-            case ValKind::Tracked:
-                TPhis.push_back(&PN);
-                DemoteSet.insert(&PN);
-                break;
-            case ValKind::Untracked:
-                if (PN.getType()->isFirstClassType() && PN.getType()->isSized()) {
-                    UPhis.push_back(&PN);
-                    DemoteSet.insert(&PN);
+            // A phi's incoming block list is its parent's predecessor list,
+            // so "fed entirely from inside the region" is a per-block
+            // property.
+            bool AllInterior = true;
+            for (BasicBlock *P : predecessors(T)) {
+                if (!R.Set.count(P)) {
+                    AllInterior = false;
+                    break;
                 }
-                break;
-            default:
-                // Regions with escapes of other kinds were rejected or
-                // rematerialized before spilling.
-                break;
+            }
+            if (!AllInterior) {
+                // Mixed target: its phis also merge paths the region does not
+                // own, so they must survive, and demoting one would plant
+                // stores on those foreign edges. Normalize instead: split
+                // each region-side edge, so the phis' incoming blocks become
+                // the caller-side edge blocks and the crossing uses turn into
+                // ordinary external uses, which the slot rewrite below serves
+                // with a load in the edge block — executed only when that
+                // edge is taken, and free for every foreign path.
+                SmallSetVector<BasicBlock *, 4> InteriorPreds;
+                for (BasicBlock *P : predecessors(T))
+                    if (R.Set.count(P))
+                        InteriorPreds.insert(P);
+                for (BasicBlock *P : InteriorPreds)
+                    SplitEdge(P, T, &DT, nullptr, nullptr,
+                              P->getName() + ".exit");
+                continue;
+            }
+            for (PHINode &PN : T->phis()) {
+                bool PNCrossing = false;
+                for (Value *IV : PN.incoming_values()) {
+                    auto *II = dyn_cast<Instruction>(IV);
+                    if (II && R.Set.count(II->getParent())) {
+                        PNCrossing = true;
+                        break;
+                    }
+                }
+                if (!PNCrossing)
+                    continue;
+                switch (classifyType(PN.getType())) {
+                case ValKind::Tracked:
+                    TPhis.push_back(&PN);
+                    DemoteSet.insert(&PN);
+                    break;
+                case ValKind::Untracked:
+                    if (PN.getType()->isFirstClassType() && PN.getType()->isSized()) {
+                        UPhis.push_back(&PN);
+                        DemoteSet.insert(&PN);
+                    }
+                    break;
+                default:
+                    // Regions with escapes of other kinds were rejected or
+                    // rematerialized before spilling.
+                    break;
+                }
             }
         }
         // A value whose only escapes are demoted phis needs no slot of its
@@ -1097,7 +1154,7 @@ static void localizeRegionInputs(Region &R,
 }
 
 // Legality check + interface preparation for one region.
-static bool prepareRegion(Function &F, Region &R, const DominatorTree &DT,
+static bool prepareRegion(Function &F, Region &R, DominatorTree &DT,
                           const SmallPtrSetImpl<BasicBlock *> &Owned,
                           DenseMap<Value *, bool> &HighFanout,
                           const JuliaPassContext &ctx) JL_NOTSAFEPOINT

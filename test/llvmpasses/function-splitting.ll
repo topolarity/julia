@@ -6,6 +6,7 @@
 ; RUN: opt --load-pass-plugin=libjulia-codegen%shlibext -passes='JuliaFunctionSplitting,function(GCInvariantVerifier,LateLowerGCFrame),verify' -julia-split-block-threshold=30 -julia-split-chunk-size=16 -S %s | FileCheck %s --check-prefix=LOWER
 ; RUN: opt --load-pass-plugin=libjulia-codegen%shlibext -passes='JuliaFunctionSplitting,function(GCInvariantVerifier),verify' -julia-split-function-threshold=50 -julia-split-chunk-size=40 -S %s | FileCheck %s --check-prefix=MULTI
 ; RUN: opt --load-pass-plugin=libjulia-codegen%shlibext -passes='JuliaFunctionSplitting,JuliaFunctionSplitting,verify' -julia-split-function-threshold=50 -julia-split-chunk-size=40 -S %s | FileCheck %s --check-prefix=IDEM
+; RUN: opt --load-pass-plugin=libjulia-codegen%shlibext -passes='JuliaFunctionSplitting,function(GCInvariantVerifier),verify' -julia-split-block-threshold=30 -julia-split-chunk-size=16 -S %s | FileCheck %s --check-prefix=MIXED
 
 declare ptr @julia.get_pgcstack()
 declare ptr addrspace(10) @jl_box_int64(i64)
@@ -194,7 +195,9 @@ top:
 ; all-tracked alloca, which the caller's GC lowering turns into GC frame
 ; slots, instead of a wide argument list.
 ; SPILL-LABEL: define void @wide_interface(
+; SPILL-NOT: .loc = alloca
 ; SPILL: %gcspill{{.*}} = alloca ptr addrspace(10), i32
+; SPILL-NOT: .loc = alloca
 ; SPILL: call void @wide_interface.julia_split
 ; SPILL: load ptr addrspace(10)
 define void @wide_interface(i64 %n) {
@@ -980,4 +983,78 @@ j30:
   br label %done
 done:
   ret double %v30
+}
+
+; A region with an extra exit into a shared join: the join also merges a path
+; that bypasses the region entirely, so its phis must survive. The escaping
+; values cross through the spill aggregate, the region-side edge is split, and
+; the phis read reloads placed in the new edge block; nothing is left for
+; CodeExtractor's scalar output marshalling. (The first region of this
+; function has a single output, below the output-spill minimum, and shows the
+; deliberate exception: it keeps CodeExtractor's scalar path.)
+; MIXED-LABEL: define double @mixedexit(
+; MIXED: %spill = alloca { double, double }
+; MIXED: call void @mixedexit.julia_split(
+; MIXED: [[EXITBB:[a-z.]+.exit]]:
+; MIXED-DAG: %b39.out = load double
+; MIXED-DAG: %b40.out = load double
+; MIXED: join:
+; MIXED: %p = phi double [ %x, %top ], [ %b40.out, %[[EXITBB]] ]
+; MIXED: %p2 = phi double [ 0.000000e+00, %top ], [ %b39.out, %[[EXITBB]] ]
+define double @mixedexit(double %x, i1 %c, i1 %c2) {
+top:
+  br i1 %c, label %body, label %join
+
+body:
+  %b1 = fadd double %x, 1.000000e+00
+  %b2 = fadd double %b1, 1.000000e+00
+  %b3 = fadd double %b2, 1.000000e+00
+  %b4 = fadd double %b3, 1.000000e+00
+  %b5 = fadd double %b4, 1.000000e+00
+  %b6 = fadd double %b5, 1.000000e+00
+  %b7 = fadd double %b6, 1.000000e+00
+  %b8 = fadd double %b7, 1.000000e+00
+  %b9 = fadd double %b8, 1.000000e+00
+  %b10 = fadd double %b9, 1.000000e+00
+  %b11 = fadd double %b10, 1.000000e+00
+  %b12 = fadd double %b11, 1.000000e+00
+  %b13 = fadd double %b12, 1.000000e+00
+  %b14 = fadd double %b13, 1.000000e+00
+  %b15 = fadd double %b14, 1.000000e+00
+  %b16 = fadd double %b15, 1.000000e+00
+  %b17 = fadd double %b16, 1.000000e+00
+  %b18 = fadd double %b17, 1.000000e+00
+  %b19 = fadd double %b18, 1.000000e+00
+  %b20 = fadd double %b19, 1.000000e+00
+  %b21 = fadd double %b20, 1.000000e+00
+  %b22 = fadd double %b21, 1.000000e+00
+  %b23 = fadd double %b22, 1.000000e+00
+  %b24 = fadd double %b23, 1.000000e+00
+  %b25 = fadd double %b24, 1.000000e+00
+  %b26 = fadd double %b25, 1.000000e+00
+  %b27 = fadd double %b26, 1.000000e+00
+  %b28 = fadd double %b27, 1.000000e+00
+  %b29 = fadd double %b28, 1.000000e+00
+  %b30 = fadd double %b29, 1.000000e+00
+  %b31 = fadd double %b30, 1.000000e+00
+  %b32 = fadd double %b31, 1.000000e+00
+  %b33 = fadd double %b32, 1.000000e+00
+  %b34 = fadd double %b33, 1.000000e+00
+  %b35 = fadd double %b34, 1.000000e+00
+  %b36 = fadd double %b35, 1.000000e+00
+  %b37 = fadd double %b36, 1.000000e+00
+  %b38 = fadd double %b37, 1.000000e+00
+  %b39 = fadd double %b38, 1.000000e+00
+  %b40 = fadd double %b39, 1.000000e+00
+  br i1 %c2, label %cont, label %join
+
+cont:
+  %d = fadd double %b40, 1.000000e+00
+  ret double %d
+
+join:
+  %p = phi double [ %x, %top ], [ %b40, %body ]
+  %p2 = phi double [ 0.000000e+00, %top ], [ %b39, %body ]
+  %s = fadd double %p, %p2
+  ret double %s
 }
