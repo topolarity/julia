@@ -48,6 +48,30 @@
 //     outputs (their output allocas would not be recognized as GC frame slots
 //     by the caller's GC lowering).
 //
+// Interface lowering contract (implemented by spillInterface): this pass,
+// not CodeExtractor, owns how values cross a region boundary, because the
+// data interface carries all the Julia-specific knowledge (GC slot typing,
+// register-vs-memory strategy, vectorizable marshalling). CodeExtractor
+// provides control-flow surgery only: function construction and block
+// moving, input-to-argument remapping, multi-exit lowering to return codes
+// plus the caller-side switch, extraction legality, and debug-info fixup.
+// Once a region's interface has been spilled, the only SSA values still
+// crossing its boundary are direct inputs (which extraction turns into
+// arguments, riding in registers) — every spilled input, every escaping
+// value and every boundary-head phi crosses through the two caller-frame
+// aggregates instead. CodeExtractor's own output marshalling (one scalar
+// alloca, pointer argument and lifetime-marker pair per value) must see
+// zero outputs for such regions, except for the deliberate leftovers:
+//   * regions with fewer than SplitOutputSpillMin outputs (never spilled;
+//     the scalar path is fine at that size),
+//   * escapes via phis of cold exit targets (rare paths, not worth slots),
+//   * escape kinds that cannot be slotted (rejected or rematerialized
+//     before spilling ever runs).
+// Any other value reaching CodeExtractor's output path means the interface
+// was only half-lowered and is being marshalled twice — the boundary-phi
+// hole this contract was written after — and shows up as a nonzero
+// "out avg" for spilled regions in the -julia-split-time statistics.
+//
 // The pass is a no-op unless -julia-split-block-threshold or
 // -julia-split-function-threshold is set nonzero.
 
@@ -751,6 +775,7 @@ static void DemotePHIToAggregateSlot(PHINode &PN, MaybeAlign A,
     PN.eraseFromParent();
 }
 
+// Implementation of the interface lowering contract (see the file header).
 // Reduce an oversized region interface by passing values through two stack
 // aggregates instead of individual arguments: tracked (AS10) values go through
 // an array-of-AS10 alloca (which the caller's LateLowerGCFrame turns into GC
