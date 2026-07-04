@@ -88,9 +88,46 @@ end
 
 @noinline bench_leaf(r::Base.RefValue{Float64}, x::Float64) = Base.RefValue(muladd(r[], 0.99999, x))
 
+# arrays: like straight, but from k >= S/4 the addends come from a Vector
+# fetched once from a const Ref (a runtime tracked value — a const global's
+# data pointer would constant-fold away), with an occasional store into it.
+# EarlyCSE (pre-split) CSEs the element derivation spines (memoryref getfield
+# -> julia.gc_loaded -> GEP) at their first occurrence — mid-block, so past
+# the entry chunk and inside an extracted region — and the stores keep the
+# loads from being CSE'd, so the derived (AS11/AS13) pointers themselves stay
+# live across every later chunk boundary: derived *outputs*, exercising
+# rematerializeDerivedOutputs, which the pure-FP shapes never hit.
+function arrays_expr(S)
+    stmts = Expr[]
+    push!(stmts, :(A = BENCH_REF[]))
+    for i in 1:8
+        push!(stmts, :($(chain(i)) = x + $(float(i))))
+    end
+    for k in 0:S-1
+        i = k % 8 + 1
+        if k < S ÷ 4
+            push!(stmts, :($(chain(i)) = muladd($(chain(i)), 1.0000001, $(float(k % 7)))))
+            continue
+        end
+        if k % 512 == 0
+            push!(stmts, Expr(:macrocall, Symbol("@inbounds"), LineNumberNode(0),
+                              :(A[$(k % 7 + 1)] = 1.0 + $(chain(i)) * 1.0e-9)))
+        end
+        elt = Expr(:macrocall, Symbol("@inbounds"), LineNumberNode(0),
+                   :(A[$(k % 7 + 1)]))
+        push!(stmts, :($(chain(i)) = muladd($(chain(i)), 1.0000001, $elt)))
+    end
+    push!(stmts, :(return $(Expr(:call, :+, (chain(i) for i in 1:8)...))))
+    :(function bench_f(x::Float64)
+        $(Expr(:block, stmts...))
+    end)
+end
+
+GEN == "arrays" && Core.eval(Main, :(const BENCH_REF = Ref{Vector{Float64}}(collect(0.0:6.0))))
 ex = GEN == "straight" ? straight_expr(S) :
      GEN == "blocks"   ? blocks_expr(S, B) :
-     GEN == "calls"    ? calls_expr(S, W, B) : error("unknown GEN=$GEN")
+     GEN == "calls"    ? calls_expr(S, W, B) :
+     GEN == "arrays"   ? arrays_expr(S) : error("unknown GEN=$GEN")
 Core.eval(Main, ex)
 
 llvm_io = open(tempname(), "w+")
