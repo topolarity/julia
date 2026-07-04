@@ -1088,6 +1088,12 @@ static Function *extractRegion(Function &F, Region &R, const JuliaPassContext &c
     NewF->setLinkage(GlobalValue::InternalLinkage);
     NewF->removeFnAttr(Attribute::AlwaysInline);
     NewF->addFnAttr(Attribute::NoInline);
+    // Provenance marker: outlined functions are already at the pass's output
+    // granularity, so a later invocation (the pipeline runs this pass twice)
+    // must not re-split them — doing so cannot reduce their size, it only
+    // wraps the body in a shim and stacks a second marshalling layer onto
+    // the same interface (which also corrupts SLP's store-group seeds).
+    NewF->addFnAttr("julia.split-function");
     for (StringRef AN : {"target-cpu", "target-features", "tune-cpu", "frame-pointer"})
         if (!NewF->hasFnAttribute(AN) && F.hasFnAttribute(AN))
             NewF->addFnAttr(F.getFnAttribute(AN));
@@ -2362,9 +2368,17 @@ PreservedAnalyses FunctionSplittingPass::run(Module &M, ModuleAnalysisManager &A
     JuliaPassContext ctx;
     ctx.initFunctions(M);
     // Snapshot the worklist: extraction adds new (already small) functions.
+    // Functions this pass outlined earlier (same or a previous invocation)
+    // carry "julia.split-function" and are skipped: they are already within the
+    // size contract, so re-splitting them cannot reduce anything (see the
+    // marker in extractRegion). The residual original functions are NOT
+    // skipped — a later invocation runs on cleaner IR (post-mem2reg) and can
+    // extract regions whose growth previously failed, which is genuine
+    // reduction of not-yet-outlined content.
     SmallVector<Function *, 16> Work;
     for (Function &F : M)
-        if (!F.isDeclaration() && !F.hasFnAttribute(Attribute::OptimizeNone))
+        if (!F.isDeclaration() && !F.hasFnAttribute(Attribute::OptimizeNone) &&
+            !F.hasFnAttribute("julia.split-function"))
             Work.push_back(&F);
     bool Changed = false;
     for (Function *F : Work)
