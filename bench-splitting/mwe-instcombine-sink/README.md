@@ -20,13 +20,25 @@ source is, with three structural features:
 - Stock InstCombine sinks the single-use chains across the seam one
   instruction at a time; the cascade reassembles all 8 chains contiguously
   (runs of ~1600 dependent FMAs).
-- The backend CAN usually rescue grouped chains by rescheduling — unless
-  interleaving is blocked by register pressure at the call: the reused
-  coefficients are live across the call (x86-64 has no callee-saved XMM),
-  so interleaving would need 8 accumulators + 8 live-across values > 16
-  XMM registers, and the pressure-aware scheduler keeps the grouped order.
-  (Without ingredient 3 the constants die at the call and llc rescues the
-  grouping completely; without ingredient 2 likewise.)
+- The backend pipeline is order-preserving in both directions at this
+  scale: the pre-RA scheduler neither fixes grouped input nor destroys
+  interleaved input. What decides the outcome is register allocation's
+  response to the input order under pressure. Grouped input + low
+  pressure: each chain's live range gets its own register, and the
+  post-RA scheduler then interleaves freely (the observed "rescue").
+  Grouped input + high pressure (the coefficients are live across the
+  call; x86-64 has no callee-saved XMM): RA assigns every chain's run to
+  the SAME register with spills between runs — locally optimal for the
+  grouped order — and the resulting physical anti-dependencies and
+  spill-slot memory deps hard-block any later reordering. Interleaved
+  input under the same pressure runs at full speed (RA folds the cheap
+  read-only spills), proving the pressure only blocks the CONVERSION of
+  grouped to interleaved, not interleaved execution itself. Exceeding
+  the register file alone does not reproduce the problem (verified with
+  12- and 18-accumulator variants): the grouped order is the essential
+  co-ingredient.
+  Register-level signature: failing build has all runs on %xmm1;
+  rescued build has 8 distinct accumulator registers.
 
 ## Reproduce
 
