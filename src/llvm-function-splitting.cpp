@@ -48,6 +48,30 @@
 //     outputs (their output allocas would not be recognized as GC frame slots
 //     by the caller's GC lowering).
 //
+// Interface lowering contract (implemented by spillInterface): this pass,
+// not CodeExtractor, owns how values cross a region boundary, because the
+// data interface carries all the Julia-specific knowledge (GC slot typing,
+// register-vs-memory strategy, vectorizable marshalling). CodeExtractor
+// provides control-flow surgery only: function construction and block
+// moving, input-to-argument remapping, multi-exit lowering to return codes
+// plus the caller-side switch, extraction legality, and debug-info fixup.
+// Once a region's interface has been spilled, the only SSA values still
+// crossing its boundary are direct inputs (which extraction turns into
+// arguments, riding in registers) — every spilled input, every escaping
+// value and every boundary-head phi crosses through the two caller-frame
+// aggregates instead. CodeExtractor's own output marshalling (one scalar
+// alloca, pointer argument and lifetime-marker pair per value) must see
+// zero outputs for such regions, except for the deliberate leftovers:
+//   * regions with fewer than SplitOutputSpillMin outputs (never spilled;
+//     the scalar path is fine at that size),
+//   * escapes via phis of cold exit targets (rare paths, not worth slots),
+//   * escape kinds that cannot be slotted (rejected or rematerialized
+//     before spilling ever runs).
+// Any other value reaching CodeExtractor's output path means the interface
+// was only half-lowered and is being marshalled twice — the boundary-phi
+// hole this contract was written after — and shows up as a nonzero
+// "out avg" for spilled regions in the -julia-split-time statistics.
+//
 // The pass is a no-op unless -julia-split-block-threshold or
 // -julia-split-function-threshold is set nonzero.
 
@@ -584,7 +608,9 @@ static bool rematerializeDerivedOutputs(Function &F, Region &R, const DominatorT
     LLVMContext &Ctx = F.getContext();
     Type *T_prjlvalue = PointerType::get(Ctx, AddressSpace::Tracked);
     auto R2 = rnow();
-    if (!HoistSpine.empty()) {
+    // (Pred is non-null whenever HoistSpine is non-empty — collectHoistSpine
+    // only runs with a preheader — but spelled out for the static analyzer.)
+    if (Pred && !HoistSpine.empty()) {
         // RF_NoModuleLevelChanges below (and in the site clones): only remap
         // the local operands through the map. Without it the mapper also
         // "remaps" the !dbg attachment, cloning the (distinct)
@@ -685,6 +711,71 @@ static bool rematerializeDerivedOutputs(Function &F, Region &R, const DominatorT
     return true;
 }
 
+// Memory-demotion utilities in the style of llvm::DemoteRegToStack /
+// llvm::DemotePHIToStack, except that the demoted value lives in a
+// caller-provided aggregate slot instead of a fresh alloca. The slot address
+// is materialized at every store/load site via MakeSlot (a single GEP per
+// site; entry-block GEPs would accumulate O(interface) code in the outermost
+// caller).
+
+// Lower an SSA value into its slot: store it right after its definition (the
+// value stays live in SSA until then, so GC lowering keeps it rooted and the
+// slot always holds the most recent def) and replace every use classified by
+// IsExternal with a reload materialized at the use site. Reading back where
+// the value is needed — rather than once at a fixed point such as a region
+// boundary — stays correct when the reader sits on a cycle and can execute
+// before the definition has run.
+static void DemoteRegToAggregateSlot(Instruction &I, MaybeAlign A,
+                                     function_ref<Value *(IRBuilder<> &)> MakeSlot,
+                                     function_ref<bool(Use &)> IsExternal) JL_NOTSAFEPOINT
+{
+    BasicBlock::iterator StoreIP = isa<PHINode>(I)
+                                       ? I.getParent()->getFirstInsertionPt()
+                                       : std::next(I.getIterator());
+    IRBuilder<> SB(I.getParent(), StoreIP);
+    SB.CreateAlignedStore(&I, MakeSlot(SB), A);
+    SmallVector<Use *, 8> ExtUses;
+    for (Use &U : I.uses())
+        if (IsExternal(U))
+            ExtUses.push_back(&U);
+    for (Use *U : ExtUses) {
+        auto *UI = cast<Instruction>(U->getUser());
+        BasicBlock::iterator IP;
+        if (auto *PN = dyn_cast<PHINode>(UI))
+            IP = PN->getIncomingBlock(*U)->getTerminator()->getIterator();
+        else
+            IP = UI->getIterator();
+        IRBuilder<> B(IP->getParent(), IP);
+        auto *L = B.CreateAlignedLoad(I.getType(), MakeSlot(B), A, I.getName() + ".out");
+        U->set(L);
+    }
+}
+
+// Lower a PHI into its slot: store each incoming value at the end of its
+// incoming block — exactly one of those runs per traversal, so the slot
+// always holds the value of the edge actually taken, on cycles too — and
+// replace the PHI with a load of the slot at its own position. Duplicate
+// incoming blocks (switches) carry identical values per LLVM's PHI rules, so
+// one store per predecessor suffices.
+static void DemotePHIToAggregateSlot(PHINode &PN, MaybeAlign A,
+                                     function_ref<Value *(IRBuilder<> &)> MakeSlot) JL_NOTSAFEPOINT
+{
+    SmallPtrSet<BasicBlock *, 8> Stored;
+    for (unsigned i = 0, e = PN.getNumIncomingValues(); i != e; i++) {
+        BasicBlock *In = PN.getIncomingBlock(i);
+        if (!Stored.insert(In).second)
+            continue;
+        IRBuilder<> B(In->getTerminator());
+        B.CreateAlignedStore(PN.getIncomingValue(i), MakeSlot(B), A);
+    }
+    BasicBlock *BB = PN.getParent();
+    IRBuilder<> LB(BB, BB->getFirstInsertionPt());
+    auto *L = LB.CreateAlignedLoad(PN.getType(), MakeSlot(LB), A, PN.getName() + ".phi");
+    PN.replaceAllUsesWith(L);
+    PN.eraseFromParent();
+}
+
+// Implementation of the interface lowering contract (see the file header).
 // Reduce an oversized region interface by passing values through two stack
 // aggregates instead of individual arguments: tracked (AS10) values go through
 // an array-of-AS10 alloca (which the caller's LateLowerGCFrame turns into GC
@@ -694,6 +785,17 @@ static bool rematerializeDerivedOutputs(Function &F, Region &R, const DominatorT
 // Derived and Mixed inputs remain direct arguments, as do uses not dominated
 // by the boundary (e.g. on cold exit paths) which stay ordinary CodeExtractor
 // outputs.
+//
+// Values whose escape is an incoming edge of a boundary-head PHI need special
+// handling: such a use "happens" at the end of the incoming block (inside the
+// region, cf. useBlock), so the use-site rewrite below never sees it, and
+// left alone CodeExtractor would marshal the value a second time through a
+// scalar alloca of its own — on branchy regions that duplicates the entire
+// output interface. Instead the boundary phi itself is demoted into the
+// aggregate (one slot per phi): each incoming value is stored at the end of
+// its incoming block — exactly one of those runs per traversal, so the slot
+// always holds the value of the edge actually taken, on cycles too — and the
+// phi is replaced by a load of the slot.
 static void spillInterface(Function &F, Region &R, const DominatorTree &DT,
                            const SmallPtrSetImpl<BasicBlock *> &Owned,
                            const SetVector<Value *> &Inputs,
@@ -723,9 +825,54 @@ static void spillInterface(Function &F, Region &R, const DominatorTree &DT,
             }
         }
     }
+    SmallVector<PHINode *, 8> TPhis, UPhis;
+    SmallPtrSet<PHINode *, 8> DemoteSet;
     if (Boundary && !SplitNoOutputSpill) {
+        for (PHINode &PN : Boundary->phis()) {
+            bool Crossing = false;
+            for (Value *IV : PN.incoming_values()) {
+                auto *II = dyn_cast<Instruction>(IV);
+                if (II && R.Set.count(II->getParent())) {
+                    Crossing = true;
+                    break;
+                }
+            }
+            if (!Crossing)
+                continue;
+            switch (classifyType(PN.getType())) {
+            case ValKind::Tracked:
+                TPhis.push_back(&PN);
+                DemoteSet.insert(&PN);
+                break;
+            case ValKind::Untracked:
+                if (PN.getType()->isFirstClassType() && PN.getType()->isSized()) {
+                    UPhis.push_back(&PN);
+                    DemoteSet.insert(&PN);
+                }
+                break;
+            default:
+                // Regions with escapes of other kinds were rejected or
+                // rematerialized before spilling.
+                break;
+            }
+        }
+        // A value whose only escapes are demoted phis needs no slot of its
+        // own: the phi slot's edge stores cover it, and the use-site rewrite
+        // below would find nothing to rewrite (leaving a dead store).
+        auto escapesBeyondDemotedPhis = [&](Instruction *I) JL_NOTSAFEPOINT {
+            for (Use &U : I->uses()) {
+                if (auto *PN = dyn_cast<PHINode>(U.getUser());
+                    PN && DemoteSet.count(PN))
+                    continue;
+                if (!R.Set.count(useBlock(U)))
+                    return true;
+            }
+            return false;
+        };
         for (Value *V : Outputs) {
             auto *I = cast<Instruction>(V);
+            if (!escapesBeyondDemotedPhis(I))
+                continue;
             switch (classifyType(I->getType())) {
             case ValKind::Tracked:
                 TOut.push_back(I);
@@ -739,7 +886,8 @@ static void spillInterface(Function &F, Region &R, const DominatorTree &DT,
             }
         }
     }
-    if (TIn.empty() && UIn.empty() && TOut.empty() && UOut.empty())
+    if (TIn.empty() && UIn.empty() && TOut.empty() && UOut.empty() &&
+        TPhis.empty() && UPhis.empty())
         return;
     static int SpillCount = 0;
     if (SplitSpillMax >= 0 && SpillCount >= SplitSpillMax)
@@ -748,26 +896,29 @@ static void spillInterface(Function &F, Region &R, const DominatorTree &DT,
     if (SplitDebug)
         errs() << "julia-function-splitting: spill #" << SpillCount << " at "
                << Entry->getName() << " TIn=" << TIn.size() << " UIn=" << UIn.size()
-               << " TOut=" << TOut.size() << " UOut=" << UOut.size() << "\n";
+               << " TOut=" << TOut.size() << " UOut=" << UOut.size()
+               << " TPhi=" << TPhis.size() << " UPhi=" << UPhis.size() << "\n";
     ++RegionsSpilled;
 
     LLVMContext &Ctx = F.getContext();
     Type *T_prjlvalue = PointerType::get(Ctx, AddressSpace::Tracked);
     IRBuilder<> EB(&F.getEntryBlock(), F.getEntryBlock().begin());
     AllocaInst *TSpill = nullptr;
-    unsigned NT = TIn.size() + TOut.size();
+    unsigned NT = TIn.size() + TOut.size() + TPhis.size();
     if (NT) {
         TSpill = EB.CreateAlloca(T_prjlvalue, EB.getInt32(NT), "gcspill");
         TSpill->setAlignment(Align(sizeof(void *)));
     }
     StructType *UTy = nullptr;
     AllocaInst *USpill = nullptr;
-    if (!UIn.empty() || !UOut.empty()) {
+    if (!UIn.empty() || !UOut.empty() || !UPhis.empty()) {
         SmallVector<Type *, 16> Elts;
         for (Value *V : UIn)
             Elts.push_back(V->getType());
         for (Instruction *I : UOut)
             Elts.push_back(I->getType());
+        for (PHINode *PN : UPhis)
+            Elts.push_back(PN->getType());
         UTy = StructType::get(Ctx, Elts);
         USpill = EB.CreateAlloca(UTy, nullptr, "spill");
     }
@@ -823,60 +974,48 @@ static void spillInterface(Function &F, Region &R, const DominatorTree &DT,
             }
         }
     }
-    if (!TOut.empty() || !UOut.empty()) {
-        // Store each output right after its definition (the value stays live
-        // in SSA until then, so the callee's own GC lowering keeps it rooted;
-        // the slot then always holds the most recent def). Each external use
-        // re-reads the slot right where it needs it: unlike a reload placed at
-        // the boundary, this stays correct when the boundary sits on a cycle
-        // and can execute before the region has run.
-        auto storePoint = [](Instruction *I) JL_NOTSAFEPOINT -> BasicBlock::iterator {
-            if (isa<PHINode>(I))
-                return I->getParent()->getFirstInsertionPt();
-            return std::next(I->getIterator());
-        };
-        auto rewriteOutputUses = [&](Instruction *I, auto MakeGEP) JL_NOTSAFEPOINT {
-            SmallVector<Use *, 8> ExtUses;
-            for (Use &U : I->uses())
-                if (!R.Set.count(useBlock(U)))
-                    ExtUses.push_back(&U);
-            for (Use *U : ExtUses) {
-                auto *UI = cast<Instruction>(U->getUser());
-                BasicBlock::iterator IP;
-                if (auto *PN = dyn_cast<PHINode>(UI))
-                    IP = PN->getIncomingBlock(*U)->getTerminator()->getIterator();
-                else
-                    IP = UI->getIterator();
-                // Materialize the slot address at the use site (a single GEP
-                // per use; entry-block GEPs would accumulate O(outputs) code
-                // in the outermost caller).
-                Value *G = MakeGEP(IP);
-                auto *L = new LoadInst(I->getType(), G, I->getName() + ".out", IP);
-                L->setAlignment(Align(sizeof(void *)));
-                U->set(L);
-            }
-        };
+    // Lower the escaping values and boundary phis into their aggregate slots.
+    // (The aggregate null checks are redundant with the emptiness of the
+    // corresponding lists; spelled out for the static analyzer.)
+    auto isExternalUse = [&](Use &U) JL_NOTSAFEPOINT {
+        return !R.Set.count(useBlock(U));
+    };
+    if (TSpill) {
         for (Instruction *I : TOut) {
-            IRBuilder<> SB(I->getParent(), storePoint(I));
-            SB.CreateAlignedStore(
-                I, SB.CreateConstInBoundsGEP1_32(T_prjlvalue, TSpill, TSlot),
-                Align(sizeof(void *)));
-            unsigned Slot = TSlot;
-            rewriteOutputUses(I, [&, Slot](BasicBlock::iterator IP) JL_NOTSAFEPOINT -> Value * {
-                IRBuilder<> B(IP->getParent(), IP);
-                return B.CreateConstInBoundsGEP1_32(T_prjlvalue, TSpill, Slot);
-            });
-            TSlot++;
+            unsigned Slot = TSlot++;
+            DemoteRegToAggregateSlot(
+                *I, Align(sizeof(void *)),
+                [&, Slot](IRBuilder<> &B) JL_NOTSAFEPOINT -> Value * {
+                    return B.CreateConstInBoundsGEP1_32(T_prjlvalue, TSpill, Slot);
+                },
+                isExternalUse);
         }
+        for (PHINode *PN : TPhis) {
+            unsigned Slot = TSlot++;
+            DemotePHIToAggregateSlot(
+                *PN, Align(sizeof(void *)),
+                [&, Slot](IRBuilder<> &B) JL_NOTSAFEPOINT -> Value * {
+                    return B.CreateConstInBoundsGEP1_32(T_prjlvalue, TSpill, Slot);
+                });
+        }
+    }
+    if (UTy && USpill) {
         for (Instruction *I : UOut) {
-            IRBuilder<> SB(I->getParent(), storePoint(I));
-            SB.CreateStore(I, SB.CreateStructGEP(UTy, USpill, USlot));
-            unsigned Slot = USlot;
-            rewriteOutputUses(I, [&, Slot](BasicBlock::iterator IP) JL_NOTSAFEPOINT -> Value * {
-                IRBuilder<> B(IP->getParent(), IP);
-                return B.CreateStructGEP(UTy, USpill, Slot);
-            });
-            USlot++;
+            unsigned Slot = USlot++;
+            DemoteRegToAggregateSlot(
+                *I, MaybeAlign(),
+                [&, Slot](IRBuilder<> &B) JL_NOTSAFEPOINT -> Value * {
+                    return B.CreateStructGEP(UTy, USpill, Slot);
+                },
+                isExternalUse);
+        }
+        for (PHINode *PN : UPhis) {
+            unsigned Slot = USlot++;
+            DemotePHIToAggregateSlot(
+                *PN, MaybeAlign(),
+                [&, Slot](IRBuilder<> &B) JL_NOTSAFEPOINT -> Value * {
+                    return B.CreateStructGEP(UTy, USpill, Slot);
+                });
         }
     }
 }
@@ -1088,6 +1227,12 @@ static Function *extractRegion(Function &F, Region &R, const JuliaPassContext &c
     NewF->setLinkage(GlobalValue::InternalLinkage);
     NewF->removeFnAttr(Attribute::AlwaysInline);
     NewF->addFnAttr(Attribute::NoInline);
+    // Provenance marker: outlined functions are already at the pass's output
+    // granularity, so a later invocation (the pipeline runs this pass twice)
+    // must not re-split them — doing so cannot reduce their size, it only
+    // wraps the body in a shim and stacks a second marshalling layer onto
+    // the same interface (which also corrupts SLP's store-group seeds).
+    NewF->addFnAttr("julia.split-function");
     for (StringRef AN : {"target-cpu", "target-features", "tune-cpu", "frame-pointer"})
         if (!NewF->hasFnAttribute(AN) && F.hasFnAttribute(AN))
             NewF->addFnAttr(F.getFnAttribute(AN));
@@ -2362,9 +2507,17 @@ PreservedAnalyses FunctionSplittingPass::run(Module &M, ModuleAnalysisManager &A
     JuliaPassContext ctx;
     ctx.initFunctions(M);
     // Snapshot the worklist: extraction adds new (already small) functions.
+    // Functions this pass outlined earlier (same or a previous invocation)
+    // carry "julia.split-function" and are skipped: they are already within the
+    // size contract, so re-splitting them cannot reduce anything (see the
+    // marker in extractRegion). The residual original functions are NOT
+    // skipped — a later invocation runs on cleaner IR (post-mem2reg) and can
+    // extract regions whose growth previously failed, which is genuine
+    // reduction of not-yet-outlined content.
     SmallVector<Function *, 16> Work;
     for (Function &F : M)
-        if (!F.isDeclaration() && !F.hasFnAttribute(Attribute::OptimizeNone))
+        if (!F.isDeclaration() && !F.hasFnAttribute(Attribute::OptimizeNone) &&
+            !F.hasFnAttribute("julia.split-function"))
             Work.push_back(&F);
     bool Changed = false;
     for (Function *F : Work)

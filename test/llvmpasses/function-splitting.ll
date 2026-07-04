@@ -5,6 +5,7 @@
 ; RUN: opt --load-pass-plugin=libjulia-codegen%shlibext -passes='JuliaFunctionSplitting,function(GCInvariantVerifier),verify' -julia-split-block-threshold=30 -julia-split-chunk-size=16 -julia-split-direct-arg-limit=4 -S %s | FileCheck %s --check-prefix=SPILL
 ; RUN: opt --load-pass-plugin=libjulia-codegen%shlibext -passes='JuliaFunctionSplitting,function(GCInvariantVerifier,LateLowerGCFrame),verify' -julia-split-block-threshold=30 -julia-split-chunk-size=16 -S %s | FileCheck %s --check-prefix=LOWER
 ; RUN: opt --load-pass-plugin=libjulia-codegen%shlibext -passes='JuliaFunctionSplitting,function(GCInvariantVerifier),verify' -julia-split-function-threshold=50 -julia-split-chunk-size=40 -S %s | FileCheck %s --check-prefix=MULTI
+; RUN: opt --load-pass-plugin=libjulia-codegen%shlibext -passes='JuliaFunctionSplitting,JuliaFunctionSplitting,verify' -julia-split-function-threshold=50 -julia-split-chunk-size=40 -S %s | FileCheck %s --check-prefix=IDEM
 
 declare ptr @julia.get_pgcstack()
 declare ptr addrspace(10) @jl_box_int64(i64)
@@ -13,6 +14,14 @@ declare void @use2(ptr addrspace(10), ptr addrspace(10))
 declare i32 @sigsetjmp_ish() returns_twice
 declare swiftcc void @callee_with_roots(ptr, ptr)
 declare void @pop_handler_ish(ptr, i32) "julia.eh_state"
+
+; Outlined functions carry the "julia.split-function" provenance marker and are
+; never re-split by a second invocation of the pass (the pipeline runs it
+; twice): the children exceed the 50-instruction function threshold here, so
+; without the marker the second run would wrap each one in a shim.
+; IDEM-NOT: julia_split.julia_split
+; IDEM: define internal {{.*}}julia_split
+; IDEM-NOT: julia_split.julia_split
 
 ; A long straight-line block of untracked arithmetic is chunked and outlined.
 ; CALLER-LABEL: define double @straightline(
@@ -575,9 +584,11 @@ top:
   ret double %d60
 }
 
-; The outlined functions are internal and marked noinline.
+; The outlined functions are internal, marked noinline, and carry the
+; provenance marker that stops later pass invocations from re-splitting them.
 ; CALLEE: attributes #[[SPLIT_ATTRS]] = {
 ; CALLEE-SAME: noinline
+; CALLEE-SAME: "julia.split-function"
 
 ; After LateLowerGCFrame, outlined callees with safepoints get their own GC frame.
 ; LOWER: define internal void @tracked.julia_split
