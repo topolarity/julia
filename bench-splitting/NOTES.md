@@ -371,3 +371,20 @@ compile times are stable and trustworthy on this box; us-scale runtimes
 carry a discrete ~30-45% placement mode — use >=5 process reps and take the
 per-config minimum (P-core mode), or measure runtime-sensitive numbers on
 the bare-metal Zen box (pinnable, as PERF.md already does).
+
+## Upstream patch drafted: order-preserving InstCombine sinking (2026-07-03)
+
+~/repos/llvm-project branch ct/instcombine-sink-preserve-order (1cba5a650342,
+based on upstream/main): tryToSinkInstruction numbers a block's instructions
+on first sink out of it and inserts each sunk instruction at the position
+keeping same-origin instructions sorted by original rank (per-origin hint
+keeps repeated chain sinking linear; late-created instructions get
+neighbor-approximated ranks; insertion sets the dbg-record head bit).
+Validation: new lit test discriminates (unpatched opt emits the grouped
+b1,b2,a1,a2 order and fails); InstCombine suite 1824/1824 green; full
+Transforms differential vs baseline: 9 patch-caused failures out of 11,379,
+all autogen order-churn (23 lines total; vector widths and interleave groups
+unchanged), regenerated. Two bugs found and fixed during validation:
+end()-deref for instructions created after their block was numbered, and
+missing head bit for debug-record-aware insertion (debuginfo_add.ll passes
+UNMODIFIED, so dbg sinking behavior is preserved exactly).
