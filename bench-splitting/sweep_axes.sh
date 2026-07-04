@@ -46,6 +46,12 @@ for c in 250 500 1000 2000 4000 8000 16000 32000; do
   run calls $c 0 8 on $ON
 done
 
+echo "== A2: arrays axis (derived-pointer outputs; single block) =="
+for s in 8000 16000 32000 65536; do
+  run arrays $s 0 8 off
+  run arrays $s 0 8 on $ON
+done
+
 echo "== B: function axis (blocks pinned at ~40) =="
 for s in 4000 16000 64000 128000 256000; do
   run blocks $s 40 8 off
@@ -61,6 +67,7 @@ for ch in 100 200 400 800 1600 3200; do
   F="-julia-split-function-threshold=64 -julia-split-block-threshold=64 -julia-split-chunk-size=$ch"
   run straight 65536 0 8 chunk$ch $F
   run calls 16384 0 8 chunk$ch $F
+  run arrays 65536 0 8 chunk$ch $F
 done
 
 echo "== D: width axis (calls fixed at 16384) =="

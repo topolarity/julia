@@ -400,3 +400,20 @@ preserved (tracked N=20 4.7x, stock N=10 4.0x, MTK guard no overhead).
 Two phase-1 outliers discriminated as noise via off-controls: stock compile
 bounce (off matched history exactly) and a calls 171us cell (5 reps: on ==
 off == 122-130us; low-rep GC artifact).
+
+## Final tuning sweep (post all fixes, mains power, 2026-07-03)
+
+fast_axes.csv (trimmed bracket sweep, all chk=true). Crossovers on the
+final pass: block axis wins from <=2000 on straight AND calls flavors with
+runtime neutral-to-better (no downside band); arrays (derived outputs) 2x
+compile win, runtime better, behaves like straight; function axis: calls
+crosses ~4000 calls (~45k insts, runtime free), branchy between 16k stmts
+(+15%/+44% - do not fire) and 64k stmts (1.4x win); chunk decided by calls
+compile (1.4->4.0s across 200->3200, runtime flat all shapes).
+
+RECOMMENDED DEFAULTS: block-threshold=2048, function-threshold=65536,
+chunk-size=400, group-size=24, output-spill-min=2, max-region-blocks=4096.
+Design refinements for #8: region-target scaling for call-free code (tax at
+c400/64k-branchy is the one runtime cost, known-mitigated by larger realized
+regions), optional safepoint-aware function gate to recover the 4-6k
+call-dense band below the instruction gate.
