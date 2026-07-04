@@ -6,6 +6,7 @@
 ; RUN: opt --load-pass-plugin=libjulia-codegen%shlibext -passes='JuliaFunctionSplitting,function(GCInvariantVerifier,LateLowerGCFrame),verify' -julia-split-block-threshold=30 -julia-split-chunk-size=16 -S %s | FileCheck %s --check-prefix=LOWER
 ; RUN: opt --load-pass-plugin=libjulia-codegen%shlibext -passes='JuliaFunctionSplitting,function(GCInvariantVerifier),verify' -julia-split-function-threshold=50 -julia-split-chunk-size=40 -S %s | FileCheck %s --check-prefix=MULTI
 ; RUN: opt --load-pass-plugin=libjulia-codegen%shlibext -passes='JuliaFunctionSplitting,JuliaFunctionSplitting,verify' -julia-split-function-threshold=50 -julia-split-chunk-size=40 -S %s | FileCheck %s --check-prefix=IDEM
+; RUN: opt --load-pass-plugin=libjulia-codegen%shlibext -passes='JuliaFunctionSplitting,function(GCInvariantVerifier),verify' -julia-split-block-threshold=30 -julia-split-chunk-size=200 -julia-split-chunk-safepoints=4 -S %s | FileCheck %s --check-prefix=SPCAP
 ; RUN: opt --load-pass-plugin=libjulia-codegen%shlibext -passes='JuliaFunctionSplitting,function(GCInvariantVerifier),verify' -julia-split-block-threshold=30 -julia-split-chunk-size=16 -S %s | FileCheck %s --check-prefix=MIXED
 
 declare ptr @julia.get_pgcstack()
@@ -95,6 +96,14 @@ top:
   %v60 = fadd double %v59, 1.000000e+00
   ret double %v60
 }
+
+; The safepoint budget forces cuts on call-dense code even when the
+; instruction spacing alone (chunk-size=200, larger than the whole function)
+; would never cut: @tracked's 32 safepoint calls must be spread over several
+; blocks (each unconditional br below is a surviving cut).
+; SPCAP-LABEL: define void @tracked(
+; SPCAP-COUNT-4: br label
+; SPCAP: ret void
 
 ; A tracked (addrspace 10) value used in every chunk is passed as an argument
 ; (assumed rooted by the caller), and callees containing safepoints

@@ -438,3 +438,22 @@ large) => dual cap needed, constants from fresh data: insts cap 3200-6400
 R scaling with S no longer needed (capacity cliff eliminated). chunk=400
 stands as CUT SPACING + call-dense region size only; the call-free region
 target is the dual cap's instruction side.
+
+## Safepoint block-cutting cap implemented; two-level attribution sharpened (2026-07-04)
+
+-julia-split-chunk-safepoints (default 128, 0=off): weight-based cut spacing
+(inst=1, safepoint=C/M) in chunkBlock via weight prefix sums; either-axis
+qualification for the cut bail; merge-side mirror in mergeStraightSeams
+(4xM budget) so region-body re-merging cannot reassemble call-dense blocks;
+shared isSafepointCall predicate; SPCAP lit config.
+
+-time-passes attribution of the small-block residual: MachineCSE ~S^2.9
+per function (0.93s@16k -> 7.06s@32k calls B=40), GreedyRA ~S^1.5. The
+per-block quadratic is GreedyRA (giant call blocks); the per-REGION
+superlinear is MachineCSE. Consequence, demonstrated by A/B (c3200+M=64 ==
+c3200 alone, ~6.2s vs c400's 2.3s): the block cap does NOT recover
+call-dense compile under a coarse instruction quantum — that is the
+REGION-level safepoint cap's job. The dual cap needs both halves:
+M_block ~128 (RA, merge protection, cut granularity) and M_region ~64-128
+(MachineCSE + RA residual). No regressions: c400 M=128 == M=0, straight
+unchanged (zero safepoints), composite asserts pass, lit 7/7.

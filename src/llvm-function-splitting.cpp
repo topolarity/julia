@@ -178,6 +178,16 @@ static cl::opt<unsigned> SplitMaxRegionBlocks(
              "point instead of the size target; clamp cuts are counted and "
              "reported under -julia-split-time so parameter sweeps see the "
              "realized region sizes rather than the requested target"));
+static cl::opt<unsigned> SplitChunkSafepoints(
+    "julia-split-chunk-safepoints", cl::init(128), cl::Hidden,
+    cl::desc("Cut oversized blocks so that no chunk (and no re-merged block) "
+             "spans more than about this many safepoint calls, independently "
+             "of the instruction spacing. Register allocation cost is "
+             "superlinear in the rooted live ranges crossing the calls of a "
+             "single block, so call-dense code needs a finer cut quantum than "
+             "instruction count alone provides; this also keeps any future "
+             "region-level safepoint budget realizable from whole blocks. "
+             "0 disables"));
 static cl::opt<unsigned> SplitOutputSpillMin(
     "julia-split-output-spill-min", cl::init(2), cl::Hidden,
     cl::desc("Spill region outputs through the aggregate whenever a region has "
@@ -1229,19 +1239,27 @@ static bool prepareRegion(Function &F, Region &R, DominatorTree &DT,
 // Conservatively determine whether an outlined function may reach a safepoint
 // (and hence needs a pgcstack for its GC frame). Over-approximation only
 // wastes one TLS load.
+// A call that may reach a GC safepoint (and clobbers registers): the unit in
+// which register-allocation cost grows within a block, and the unit of any
+// safepoint budget for chunk cutting or region growth.
+static bool isSafepointCall(const Instruction &I, const JuliaPassContext &ctx) JL_NOTSAFEPOINT
+{
+    auto *CI = dyn_cast<CallBase>(&I);
+    if (!CI || isa<IntrinsicInst>(CI))
+        return false;
+    Function *Callee = CI->getCalledFunction();
+    if (Callee && (Callee == ctx.gc_loaded_func || Callee == ctx.typeof_func ||
+                   Callee == ctx.write_barrier_func || Callee == ctx.pointer_from_objref_func ||
+                   Callee == ctx.gcroot_flush_func || Callee == ctx.blackbox_func))
+        return false;
+    return true;
+}
+
 static bool mayReachSafepoint(Function &F, const JuliaPassContext &ctx) JL_NOTSAFEPOINT
 {
-    for (Instruction &I : instructions(F)) {
-        auto *CI = dyn_cast<CallBase>(&I);
-        if (!CI || isa<IntrinsicInst>(CI))
-            continue;
-        Function *Callee = CI->getCalledFunction();
-        if (Callee && (Callee == ctx.gc_loaded_func || Callee == ctx.typeof_func ||
-                       Callee == ctx.write_barrier_func || Callee == ctx.pointer_from_objref_func ||
-                       Callee == ctx.gcroot_flush_func || Callee == ctx.blackbox_func))
-            continue;
-        return true;
-    }
+    for (Instruction &I : instructions(F))
+        if (isSafepointCall(I, ctx))
+            return true;
     return false;
 }
 
@@ -1906,13 +1924,28 @@ static std::vector<HNode> formParents(Function &F, std::vector<HNode> Nodes,
 // unconditional seam has no benefit in the first place, so fold the seams
 // away instead: Cap bounds the resulting block sizes (region bodies stay
 // within the region size ceiling, cf. growRegion's MaxSize).
-static void mergeStraightSeams(Function &F, unsigned Cap) JL_NOTSAFEPOINT
+static void mergeStraightSeams(Function &F, unsigned Cap,
+                               const JuliaPassContext &ctx) JL_NOTSAFEPOINT
 {
+    // Mirror the cut-side safepoint budget (cf. SplitChunkSafepoints in
+    // chunkBlock): without it, folding a region body back together would
+    // reassemble exactly the call-dense block the chunking cut apart. The
+    // 4x slack mirrors Cap's slack relative to the chunk size and stays far
+    // below the measured onset of the per-block register-allocation blowup.
+    unsigned SPCap = SplitChunkSafepoints ? 4 * SplitChunkSafepoints : 0;
+    auto spCount = [&](BasicBlock *BB) JL_NOTSAFEPOINT {
+        unsigned N = 0;
+        for (Instruction &I : *BB)
+            N += isSafepointCall(I, ctx);
+        return N;
+    };
     for (BasicBlock &B : make_early_inc_range(F)) {
         BasicBlock *P = B.getUniquePredecessor();
         if (!P || P->getSingleSuccessor() != &B)
             continue;
         if (P->size() + B.size() > Cap)
+            continue;
+        if (SPCap && spCount(P) + spCount(&B) > SPCap)
             continue;
         MergeBlockIntoPredecessor(&B);
     }
@@ -1994,7 +2027,7 @@ static void processLevel(Function &F, std::vector<HNode> &Items,
                 break;
             }
         }
-        mergeStraightSeams(*NewF, Cap);
+        mergeStraightSeams(*NewF, Cap, ctx);
     }
 }
 
@@ -2008,7 +2041,17 @@ static bool chunkBlock(Function &F, BasicBlock &BB, const JuliaPassContext &ctx)
         Insts.push_back(&I);
     unsigned n = Insts.size();
     unsigned C = std::max(16u, SplitChunkSize.getValue());
-    if (n < 2 * C)
+    // A block qualifies for cutting on either axis: instruction count or
+    // safepoint count (call-dense blocks can be far below the instruction
+    // spacing yet far above the safepoint budget).
+    bool SafepointsQualify = false;
+    if (SplitChunkSafepoints) {
+        unsigned SP = 0;
+        for (Instruction *I : Insts)
+            SP += isSafepointCall(*I, ctx);
+        SafepointsQualify = SP >= 2 * SplitChunkSafepoints;
+    }
+    if (n < 2 * C && !SafepointsQualify)
         return false;
     DenseMap<Instruction *, unsigned> LocalIdx;
     LocalIdx.reserve(n);
@@ -2135,6 +2178,31 @@ static bool chunkBlock(Function &F, BasicBlock &BB, const JuliaPassContext &ctx)
         UntrackedPS[p] = UntrackedPS[p - 1] + UntrackedDiff[p];
         BarrierPS[p] = BarrierPS[p - 1] + BarrierDiff[p];
     }
+    // Composite cut spacing: each instruction weighs 1 and each safepoint
+    // call additionally weighs C/SplitChunkSafepoints, so one chunk's weight
+    // budget C admits at most about SplitChunkSafepoints safepoints. Register
+    // allocation cost grows superlinearly with the safepoints a single block
+    // spans, so call-dense stretches need a finer cut quantum than the
+    // instruction spacing alone provides. Cutting is also the finest
+    // granularity anything downstream can use: blocks and regions may be
+    // sized independently (regions with their own instruction and safepoint
+    // budgets), and any such budget is only realizable from whole blocks if
+    // the cut quantum respects the denser axis.
+    SmallVector<uint64_t, 0> WeightPS(n + 1, 0);
+    {
+        uint64_t SPW = SplitChunkSafepoints
+                           ? std::max<uint64_t>(1, C / SplitChunkSafepoints)
+                           : 0;
+        uint64_t Acc = 0;
+        for (unsigned i = 0; i < n; i++) {
+            Acc += 1 + (SPW && isSafepointCall(*Insts[i], ctx) ? SPW : 0);
+            WeightPS[i + 1] = Acc;
+        }
+    }
+    auto posAtWeight = [&](uint64_t w) JL_NOTSAFEPOINT -> unsigned {
+        return (unsigned)(std::lower_bound(WeightPS.begin(), WeightPS.end(), w) -
+                          WeightPS.begin());
+    };
 
     // Pick cuts: mandatory cuts fencing off runs of pinned instructions, and
     // within each straight-line span, greedy min-live-score cuts about every
@@ -2151,9 +2219,12 @@ static bool chunkBlock(Function &F, BasicBlock &BB, const JuliaPassContext &ctx)
     };
     auto emitSpanCuts = [&](unsigned s, unsigned e) JL_NOTSAFEPOINT {
         unsigned q = s;
-        while (e - q > C + C / 2) {
-            unsigned lo = q + C / 2;
-            unsigned hi = std::min(q + C + C / 2, e - 1);
+        const uint64_t CW = C; // chunk budget in weight units
+        while (WeightPS[e] - WeightPS[q] > CW + CW / 2) {
+            unsigned lo = posAtWeight(WeightPS[q] + CW / 2);
+            unsigned hi = std::min(posAtWeight(WeightPS[q] + CW + CW / 2), e - 1);
+            if (lo > hi)
+                lo = hi;
             int Best = -1;
             for (unsigned p = lo; p <= hi; p++)
                 if (!BarrierPS[p] && !isa<PHINode>(Insts[p]) &&
