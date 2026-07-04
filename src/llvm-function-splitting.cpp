@@ -584,7 +584,9 @@ static bool rematerializeDerivedOutputs(Function &F, Region &R, const DominatorT
     LLVMContext &Ctx = F.getContext();
     Type *T_prjlvalue = PointerType::get(Ctx, AddressSpace::Tracked);
     auto R2 = rnow();
-    if (!HoistSpine.empty()) {
+    // (Pred is non-null whenever HoistSpine is non-empty — collectHoistSpine
+    // only runs with a preheader — but spelled out for the static analyzer.)
+    if (Pred && !HoistSpine.empty()) {
         // RF_NoModuleLevelChanges below (and in the site clones): only remap
         // the local operands through the map. Without it the mapper also
         // "remaps" the !dbg attachment, cloning the (distinct)
@@ -694,6 +696,17 @@ static bool rematerializeDerivedOutputs(Function &F, Region &R, const DominatorT
 // Derived and Mixed inputs remain direct arguments, as do uses not dominated
 // by the boundary (e.g. on cold exit paths) which stay ordinary CodeExtractor
 // outputs.
+//
+// Values whose escape is an incoming edge of a boundary-head PHI need special
+// handling: such a use "happens" at the end of the incoming block (inside the
+// region, cf. useBlock), so the use-site rewrite below never sees it, and
+// left alone CodeExtractor would marshal the value a second time through a
+// scalar alloca of its own — on branchy regions that duplicates the entire
+// output interface. Instead the boundary phi itself is demoted into the
+// aggregate (one slot per phi): each incoming value is stored at the end of
+// its incoming block — exactly one of those runs per traversal, so the slot
+// always holds the value of the edge actually taken, on cycles too — and the
+// phi is replaced by a load of the slot.
 static void spillInterface(Function &F, Region &R, const DominatorTree &DT,
                            const SmallPtrSetImpl<BasicBlock *> &Owned,
                            const SetVector<Value *> &Inputs,
@@ -723,9 +736,54 @@ static void spillInterface(Function &F, Region &R, const DominatorTree &DT,
             }
         }
     }
+    SmallVector<PHINode *, 8> TPhis, UPhis;
+    SmallPtrSet<PHINode *, 8> DemoteSet;
     if (Boundary && !SplitNoOutputSpill) {
+        for (PHINode &PN : Boundary->phis()) {
+            bool Crossing = false;
+            for (Value *IV : PN.incoming_values()) {
+                auto *II = dyn_cast<Instruction>(IV);
+                if (II && R.Set.count(II->getParent())) {
+                    Crossing = true;
+                    break;
+                }
+            }
+            if (!Crossing)
+                continue;
+            switch (classifyType(PN.getType())) {
+            case ValKind::Tracked:
+                TPhis.push_back(&PN);
+                DemoteSet.insert(&PN);
+                break;
+            case ValKind::Untracked:
+                if (PN.getType()->isFirstClassType() && PN.getType()->isSized()) {
+                    UPhis.push_back(&PN);
+                    DemoteSet.insert(&PN);
+                }
+                break;
+            default:
+                // Regions with escapes of other kinds were rejected or
+                // rematerialized before spilling.
+                break;
+            }
+        }
+        // A value whose only escapes are demoted phis needs no slot of its
+        // own: the phi slot's edge stores cover it, and the use-site rewrite
+        // below would find nothing to rewrite (leaving a dead store).
+        auto escapesBeyondDemotedPhis = [&](Instruction *I) JL_NOTSAFEPOINT {
+            for (Use &U : I->uses()) {
+                if (auto *PN = dyn_cast<PHINode>(U.getUser());
+                    PN && DemoteSet.count(PN))
+                    continue;
+                if (!R.Set.count(useBlock(U)))
+                    return true;
+            }
+            return false;
+        };
         for (Value *V : Outputs) {
             auto *I = cast<Instruction>(V);
+            if (!escapesBeyondDemotedPhis(I))
+                continue;
             switch (classifyType(I->getType())) {
             case ValKind::Tracked:
                 TOut.push_back(I);
@@ -739,7 +797,8 @@ static void spillInterface(Function &F, Region &R, const DominatorTree &DT,
             }
         }
     }
-    if (TIn.empty() && UIn.empty() && TOut.empty() && UOut.empty())
+    if (TIn.empty() && UIn.empty() && TOut.empty() && UOut.empty() &&
+        TPhis.empty() && UPhis.empty())
         return;
     static int SpillCount = 0;
     if (SplitSpillMax >= 0 && SpillCount >= SplitSpillMax)
@@ -748,26 +807,29 @@ static void spillInterface(Function &F, Region &R, const DominatorTree &DT,
     if (SplitDebug)
         errs() << "julia-function-splitting: spill #" << SpillCount << " at "
                << Entry->getName() << " TIn=" << TIn.size() << " UIn=" << UIn.size()
-               << " TOut=" << TOut.size() << " UOut=" << UOut.size() << "\n";
+               << " TOut=" << TOut.size() << " UOut=" << UOut.size()
+               << " TPhi=" << TPhis.size() << " UPhi=" << UPhis.size() << "\n";
     ++RegionsSpilled;
 
     LLVMContext &Ctx = F.getContext();
     Type *T_prjlvalue = PointerType::get(Ctx, AddressSpace::Tracked);
     IRBuilder<> EB(&F.getEntryBlock(), F.getEntryBlock().begin());
     AllocaInst *TSpill = nullptr;
-    unsigned NT = TIn.size() + TOut.size();
+    unsigned NT = TIn.size() + TOut.size() + TPhis.size();
     if (NT) {
         TSpill = EB.CreateAlloca(T_prjlvalue, EB.getInt32(NT), "gcspill");
         TSpill->setAlignment(Align(sizeof(void *)));
     }
     StructType *UTy = nullptr;
     AllocaInst *USpill = nullptr;
-    if (!UIn.empty() || !UOut.empty()) {
+    if (!UIn.empty() || !UOut.empty() || !UPhis.empty()) {
         SmallVector<Type *, 16> Elts;
         for (Value *V : UIn)
             Elts.push_back(V->getType());
         for (Instruction *I : UOut)
             Elts.push_back(I->getType());
+        for (PHINode *PN : UPhis)
+            Elts.push_back(PN->getType());
         UTy = StructType::get(Ctx, Elts);
         USpill = EB.CreateAlloca(UTy, nullptr, "spill");
     }
@@ -856,28 +918,70 @@ static void spillInterface(Function &F, Region &R, const DominatorTree &DT,
                 U->set(L);
             }
         };
-        for (Instruction *I : TOut) {
-            IRBuilder<> SB(I->getParent(), storePoint(I));
-            SB.CreateAlignedStore(
-                I, SB.CreateConstInBoundsGEP1_32(T_prjlvalue, TSpill, TSlot),
-                Align(sizeof(void *)));
-            unsigned Slot = TSlot;
-            rewriteOutputUses(I, [&, Slot](BasicBlock::iterator IP) JL_NOTSAFEPOINT -> Value * {
-                IRBuilder<> B(IP->getParent(), IP);
-                return B.CreateConstInBoundsGEP1_32(T_prjlvalue, TSpill, Slot);
-            });
-            TSlot++;
-        }
-        for (Instruction *I : UOut) {
-            IRBuilder<> SB(I->getParent(), storePoint(I));
-            SB.CreateStore(I, SB.CreateStructGEP(UTy, USpill, USlot));
-            unsigned Slot = USlot;
-            rewriteOutputUses(I, [&, Slot](BasicBlock::iterator IP) JL_NOTSAFEPOINT -> Value * {
-                IRBuilder<> B(IP->getParent(), IP);
-                return B.CreateStructGEP(UTy, USpill, Slot);
-            });
-            USlot++;
-        }
+        // The aggregate null checks are redundant with the emptiness of the
+        // corresponding lists (spelled out for the static analyzer).
+        if (TSpill)
+            for (Instruction *I : TOut) {
+                IRBuilder<> SB(I->getParent(), storePoint(I));
+                SB.CreateAlignedStore(
+                    I, SB.CreateConstInBoundsGEP1_32(T_prjlvalue, TSpill, TSlot),
+                    Align(sizeof(void *)));
+                unsigned Slot = TSlot;
+                rewriteOutputUses(I, [&, Slot](BasicBlock::iterator IP) JL_NOTSAFEPOINT -> Value * {
+                    IRBuilder<> B(IP->getParent(), IP);
+                    return B.CreateConstInBoundsGEP1_32(T_prjlvalue, TSpill, Slot);
+                });
+                TSlot++;
+            }
+        if (UTy && USpill)
+            for (Instruction *I : UOut) {
+                IRBuilder<> SB(I->getParent(), storePoint(I));
+                SB.CreateStore(I, SB.CreateStructGEP(UTy, USpill, USlot));
+                unsigned Slot = USlot;
+                rewriteOutputUses(I, [&, Slot](BasicBlock::iterator IP) JL_NOTSAFEPOINT -> Value * {
+                    IRBuilder<> B(IP->getParent(), IP);
+                    return B.CreateStructGEP(UTy, USpill, Slot);
+                });
+                USlot++;
+            }
+    }
+    // (Boundary and the aggregates are non-null whenever the phi lists are
+    // non-empty; spelled out for the static analyzer.)
+    if (Boundary && (!TPhis.empty() || !UPhis.empty())) {
+        // Demote boundary-head phis into the aggregates (see the header
+        // comment): store each incoming value at the end of its incoming
+        // block, replace the phi with a load of the slot. Duplicate incoming
+        // blocks (switches) carry identical values per LLVM's PHI rules, so
+        // one store per predecessor suffices.
+        auto demote = [&](PHINode *PN, auto MakeGEP, MaybeAlign A) JL_NOTSAFEPOINT {
+            SmallPtrSet<BasicBlock *, 8> Stored;
+            for (unsigned i = 0, e = PN->getNumIncomingValues(); i != e; i++) {
+                BasicBlock *In = PN->getIncomingBlock(i);
+                if (!Stored.insert(In).second)
+                    continue;
+                IRBuilder<> B(In->getTerminator());
+                B.CreateAlignedStore(PN->getIncomingValue(i), MakeGEP(B), A);
+            }
+            IRBuilder<> LB(Boundary, Boundary->getFirstInsertionPt());
+            auto *L = LB.CreateAlignedLoad(PN->getType(), MakeGEP(LB), A,
+                                           PN->getName() + ".phi");
+            PN->replaceAllUsesWith(L);
+            PN->eraseFromParent();
+        };
+        if (TSpill)
+            for (PHINode *PN : TPhis) {
+                unsigned Slot = TSlot++;
+                demote(PN, [&, Slot](IRBuilder<> &B) JL_NOTSAFEPOINT -> Value * {
+                    return B.CreateConstInBoundsGEP1_32(T_prjlvalue, TSpill, Slot);
+                }, Align(sizeof(void *)));
+            }
+        if (UTy && USpill)
+            for (PHINode *PN : UPhis) {
+                unsigned Slot = USlot++;
+                demote(PN, [&, Slot](IRBuilder<> &B) JL_NOTSAFEPOINT -> Value * {
+                    return B.CreateStructGEP(UTy, USpill, Slot);
+                }, MaybeAlign());
+            }
     }
 }
 
