@@ -421,3 +421,20 @@ Design refinements for #8: region-target scaling for call-free code (tax at
 c400/64k-branchy is the one runtime cost, known-mitigated by larger realized
 regions), optional safepoint-aware function gate to recover the 4-6k
 call-dense band below the instruction gate.
+
+## Post-fix tax-vs-R curve, grounded (2026-07-04, anchored batch)
+
+Anchors (start/mid/end vs axes_fast refs) caught a mid-batch condition shift
+(+45-50% from mid-rep-3); conclusions from clean reps / within-batch ratios.
+blocks-64k, min of clean reps (off 4.42us stable): tax +37/+18/+10/+5/+2%
+at R=400/800/1600/3200/6400 — the 1/R decline IS real post-fix; compile
+flat-to-improving with R on this shape. blocks-256k in-batch: +36% (c400),
++10% (c1600) — same proportional tax as 64k: the pre-fix capacity cliff
+(3.7x at 256k/c400 SLP-off) is GONE post marshalling/seam fixes.
+
+VERDICT: R has two owners (call-heavy compile: small; branchy runtime:
+large) => dual cap needed, constants from fresh data: insts cap 3200-6400
+(tax <=5%, compile flat), safepoint cap ~64-128 (=R 200-400 on call-dense).
+R scaling with S no longer needed (capacity cliff eliminated). chunk=400
+stands as CUT SPACING + call-dense region size only; the call-free region
+target is the dual cap's instruction side.
