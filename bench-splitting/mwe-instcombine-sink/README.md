@@ -46,19 +46,35 @@ minimal N=200(rescued)/N=400(welded) pair, and causal flag flips.
    run-length 1, 8 distinct regs, 10432 -> 1700 ns/call, exactly the
    patched-InstCombine reference (1702). Cost: llc time 0.71s -> 1.50s
    on this function (the throttle guards quadratic coalescing).
-5. How fragmentation becomes serialization (traced at N=400): the
-   register coalescer commute-merges some addend constants into the
-   post-call tail FMA chains; those merged intervals overlap the call's
-   regmask (no callee-saved XMM => all 32 regs blocked for any interval
-   covering the call slot; greedy log: "1 regmasks in block"), so they
-   fail tryAssign outright and get split repeatedly. Their per-chain-
-   region pieces are first-fit assigned to registers that other chains'
-   pieces use in neighboring regions; each cross-region re-definition of
-   a shared register adds anti/output dependencies chaining region k to
-   region k+1 — which the post-RA scheduler cannot cross (see 3).
-   Whole (unfragmented) chains instead get their distinct hinted arg
-   registers xmm0-7 outright and the post-RA scheduler round-robins them
-   perfectly.
+5. How fragmentation becomes serialization — the exact lock, read off
+   the post-RA scheduler's own dependency DAG (-debug-only=post-RA-sched,
+   d400 welded vs dr400 rescued): the chain FMA bodies are mutually
+   hazard-free in BOTH cases; the weld is carried entirely by the CHAIN
+   HEADS. Constants that lose their whole-range homes (the coalescer
+   commute-merges some addends into the post-call tail chains; those
+   intervals overlap the call's regmask — no callee-saved XMM, so all 32
+   regs are blocked for any call-covering interval — and local-splitting
+   produces short per-region pieces) get first-fit assigned to the
+   LOWEST free register in each region. With sunk chain heads, the
+   lowest free registers during early regions are precisely the LATER
+   chains' accumulator registers (those chains haven't started). The
+   next chain's head — the first redefinition of that register — then
+   carries Anti edges to the previous region's constant reads, which
+   extend to the region's end (e.g. SU(412) chain-6 head Anti<-SU(406)
+   chain-7 tail; the boundary copy $xmm1 = VMOVAPS $xmm6 moving the
+   constant out is visible in the DAG). Head-of-chain-k waits on
+   tail-of-chain-k+1, one link per region: full serialization.
+   In the rescued layout the heads (and constant homes) are all defined
+   at region top, the accumulator registers are occupied by their own
+   chains from cycle 0, constants live stably in xmm8-15, no such edges
+   exist, and the latency-priority queue round-robins all 8 chains.
+   NOTE: fit is not the issue, placement is — in the welded sunk-heads
+   variant with only 6 addends, xmm8-15 has free slots (census 8) and
+   xmm16-31 is always free, yet first-fit still parks constants in the
+   future accumulator registers and the weld persists. Conversely,
+   entry-heads with 8 addends (census 9) also welds. Head placement
+   alone (= whether accumulator regs are exposed to first-fit parking)
+   is the discriminator between the minimal pair.
 6. xmm16-31 non-use, resolved: the FR64X allocation order does contain
    all 32 registers (greedy log). Intervals overlapping the regmask can
    be assigned NO register (mask blocks all 32 equally); mask-free
