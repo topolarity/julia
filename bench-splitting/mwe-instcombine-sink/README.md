@@ -20,23 +20,29 @@ source is, with three structural features:
 - Stock InstCombine sinks the single-use chains across the seam one
   instruction at a time; the cascade reassembles all 8 chains contiguously
   (runs of ~1600 dependent FMAs).
-- The backend pipeline is order-preserving in both directions at this
-  scale: the pre-RA scheduler neither fixes grouped input nor destroys
-  interleaved input. What decides the outcome is register allocation's
-  response to the input order under pressure. Grouped input + low
-  pressure: each chain's live range gets its own register, and the
-  post-RA scheduler then interleaves freely (the observed "rescue").
-  Grouped input + high pressure (the coefficients are live across the
-  call; x86-64 has no callee-saved XMM): RA assigns every chain's run to
-  the SAME register with spills between runs — locally optimal for the
-  grouped order — and the resulting physical anti-dependencies and
-  spill-slot memory deps hard-block any later reordering. Interleaved
-  input under the same pressure runs at full speed (RA folds the cheap
-  read-only spills), proving the pressure only blocks the CONVERSION of
-  grouped to interleaved, not interleaved execution itself. Exceeding
-  the register file alone does not reproduce the problem (verified with
-  12- and 18-accumulator variants): the grouped order is the essential
-  co-ingredient.
+- The decision point is register allocation, not scheduling (verified in
+  MIR): after the pre-RA machine scheduler, welded and rescued cases look
+  the SAME — still grouped, partially chunked into ~355-op runs per
+  virtual register (each chain is one coalesced, re-defined vreg by then).
+  The lock is REGISTER RE-USAGE installed by RA: in the failing case all
+  chain runs are assigned the same physical register (%xmm1) with spills
+  between runs, and the resulting anti/output dependencies plus
+  spill-slot memory deps freeze the order for the post-RA scheduler and
+  everything after. In the rescued case RA hands the chains distinct
+  registers and the post-RA scheduler interleaves freely.
+- What drives RA to share vs spread is the register squeeze from HOT
+  live values: the reused coefficients are touched every step on both
+  sides of the call (and cannot be folded once MachineCSE keeps them in
+  registers), pinning ~8 registers. IDLE pressure does not do this:
+  18 accumulator chains with no hot extras (sink verified grouped,
+  18 runs of 1600) are fully rescued — waiting accumulators cost one
+  spill/reload per entire run and leave head-room. Exceeding the register
+  file alone therefore does NOT reproduce the problem; grouped order x
+  hot cross-boundary values is the necessary pair.
+- Open puzzle for the upstream report: RA welds within xmm0-15 and never
+  touches xmm16-31 even though the ops are EVEX-class (fr64x, 32
+  registers available) — the sharing is a heuristic choice (allocation
+  order / encoding cost), not exhaustion of the architectural file.
   Register-level signature: failing build has all runs on %xmm1;
   rescued build has 8 distinct accumulator registers.
 
