@@ -408,7 +408,11 @@ final pass: block axis wins from <=2000 on straight AND calls flavors with
 runtime neutral-to-better (no downside band); arrays (derived outputs) 2x
 compile win, runtime better, behaves like straight; function axis: calls
 crosses ~4000 calls (~45k insts, runtime free), branchy between 16k stmts
-(+15%/+44% - do not fire) and 64k stmts (1.4x win); chunk decided by calls
+(+15% compile/+44% runtime - do not fire) and 64k stmts (1.4x compile win,
+SAME ~40% runtime tax — the tax is boundary-density-proportional and
+size-independent at fixed chunk; mitigation is region-target scaling
+(realized-size axis: +23%/+6%/+2% at R=1600/6400/25600), which is therefore
+part of the #8 design proper, not optional); chunk decided by calls
 compile (1.4->4.0s across 200->3200, runtime flat all shapes).
 
 RECOMMENDED DEFAULTS: block-threshold=2048, function-threshold=65536,
