@@ -12,7 +12,7 @@ cd "$(dirname "$0")"
 JULIA=../usr/bin/julia
 OUT=${1:-validate.csv}
 shift || true
-CFG=${*:-"-julia-split-function-threshold=8000 -julia-split-block-threshold=1500 -julia-split-chunk-size=400"}
+CFG=${*:-"-julia-split-function-threshold=8000 -julia-split-block-threshold=1500 -julia-split-block-size=400"}
 FIXED=envs/fixed
 STOCK=envs/stock
 : > sweep.err

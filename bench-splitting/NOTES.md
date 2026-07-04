@@ -471,3 +471,16 @@ With both halves (chunk-safepoints for blocks, region-safepoints for
 regions), blocks and regions are now sized independently: the instruction
 target can be raised for call-free code (boundary tax ~1/R) without
 touching call-dense compile. Lit 8/8; composite asserts pass.
+
+## Independent sizing complete; knob surface restructured (2026-07-04)
+
+Final 2x2: -julia-split-block-size / -julia-split-block-safepoints (cut
+spacing) and -julia-split-region-size / -julia-split-region-safepoints
+(growth targets; region-size=0 inherits block-size). RENAME: the old
+-julia-split-chunk-size / -julia-split-chunk-safepoints are now block-size /
+block-safepoints (historical CSVs/logs predating this use the old names).
+All live scripts updated. Validated: region-size=3200 at block-size=400
+shrinks the branchy tax while calls stays at its compile optimum (2.29s)
+via the safepoint budget; region-size inheritance is semantically identical
+to explicit; lit 8/8; composite asserts pass. Pending for #8: confirmation
+tuning sweep on this final knob surface, then defaults + docs + hygiene.

@@ -1,14 +1,14 @@
 ; This file is a part of Julia. License is MIT: https://julialang.org/license
 
-; RUN: opt --load-pass-plugin=libjulia-codegen%shlibext -passes='JuliaFunctionSplitting,function(GCInvariantVerifier),verify' -julia-split-block-threshold=30 -julia-split-chunk-size=16 -S %s | FileCheck %s --check-prefix=CALLER
-; RUN: opt --load-pass-plugin=libjulia-codegen%shlibext -passes='JuliaFunctionSplitting,function(GCInvariantVerifier),verify' -julia-split-block-threshold=30 -julia-split-chunk-size=16 -S %s | FileCheck %s --check-prefix=CALLEE
-; RUN: opt --load-pass-plugin=libjulia-codegen%shlibext -passes='JuliaFunctionSplitting,function(GCInvariantVerifier),verify' -julia-split-block-threshold=30 -julia-split-chunk-size=16 -julia-split-direct-arg-limit=4 -S %s | FileCheck %s --check-prefix=SPILL
-; RUN: opt --load-pass-plugin=libjulia-codegen%shlibext -passes='JuliaFunctionSplitting,function(GCInvariantVerifier,LateLowerGCFrame),verify' -julia-split-block-threshold=30 -julia-split-chunk-size=16 -S %s | FileCheck %s --check-prefix=LOWER
-; RUN: opt --load-pass-plugin=libjulia-codegen%shlibext -passes='JuliaFunctionSplitting,function(GCInvariantVerifier),verify' -julia-split-function-threshold=50 -julia-split-chunk-size=40 -S %s | FileCheck %s --check-prefix=MULTI
-; RUN: opt --load-pass-plugin=libjulia-codegen%shlibext -passes='JuliaFunctionSplitting,JuliaFunctionSplitting,verify' -julia-split-function-threshold=50 -julia-split-chunk-size=40 -S %s | FileCheck %s --check-prefix=IDEM
-; RUN: opt --load-pass-plugin=libjulia-codegen%shlibext -passes='JuliaFunctionSplitting,function(GCInvariantVerifier),verify' -julia-split-block-threshold=30 -julia-split-chunk-size=200 -julia-split-chunk-safepoints=4 -S %s | FileCheck %s --check-prefix=SPCAP
-; RUN: opt --load-pass-plugin=libjulia-codegen%shlibext -passes='JuliaFunctionSplitting,function(GCInvariantVerifier),verify' -julia-split-block-threshold=30 -julia-split-chunk-size=200 -julia-split-chunk-safepoints=4 -julia-split-region-safepoints=8 -S %s | FileCheck %s --check-prefix=RSPCAP
-; RUN: opt --load-pass-plugin=libjulia-codegen%shlibext -passes='JuliaFunctionSplitting,function(GCInvariantVerifier),verify' -julia-split-block-threshold=30 -julia-split-chunk-size=16 -S %s | FileCheck %s --check-prefix=MIXED
+; RUN: opt --load-pass-plugin=libjulia-codegen%shlibext -passes='JuliaFunctionSplitting,function(GCInvariantVerifier),verify' -julia-split-block-threshold=30 -julia-split-block-size=16 -S %s | FileCheck %s --check-prefix=CALLER
+; RUN: opt --load-pass-plugin=libjulia-codegen%shlibext -passes='JuliaFunctionSplitting,function(GCInvariantVerifier),verify' -julia-split-block-threshold=30 -julia-split-block-size=16 -S %s | FileCheck %s --check-prefix=CALLEE
+; RUN: opt --load-pass-plugin=libjulia-codegen%shlibext -passes='JuliaFunctionSplitting,function(GCInvariantVerifier),verify' -julia-split-block-threshold=30 -julia-split-block-size=16 -julia-split-direct-arg-limit=4 -S %s | FileCheck %s --check-prefix=SPILL
+; RUN: opt --load-pass-plugin=libjulia-codegen%shlibext -passes='JuliaFunctionSplitting,function(GCInvariantVerifier,LateLowerGCFrame),verify' -julia-split-block-threshold=30 -julia-split-block-size=16 -S %s | FileCheck %s --check-prefix=LOWER
+; RUN: opt --load-pass-plugin=libjulia-codegen%shlibext -passes='JuliaFunctionSplitting,function(GCInvariantVerifier),verify' -julia-split-function-threshold=50 -julia-split-block-size=40 -S %s | FileCheck %s --check-prefix=MULTI
+; RUN: opt --load-pass-plugin=libjulia-codegen%shlibext -passes='JuliaFunctionSplitting,JuliaFunctionSplitting,verify' -julia-split-function-threshold=50 -julia-split-block-size=40 -S %s | FileCheck %s --check-prefix=IDEM
+; RUN: opt --load-pass-plugin=libjulia-codegen%shlibext -passes='JuliaFunctionSplitting,function(GCInvariantVerifier),verify' -julia-split-block-threshold=30 -julia-split-block-size=200 -julia-split-block-safepoints=4 -S %s | FileCheck %s --check-prefix=SPCAP
+; RUN: opt --load-pass-plugin=libjulia-codegen%shlibext -passes='JuliaFunctionSplitting,function(GCInvariantVerifier),verify' -julia-split-block-threshold=30 -julia-split-block-size=200 -julia-split-block-safepoints=4 -julia-split-region-safepoints=8 -S %s | FileCheck %s --check-prefix=RSPCAP
+; RUN: opt --load-pass-plugin=libjulia-codegen%shlibext -passes='JuliaFunctionSplitting,function(GCInvariantVerifier),verify' -julia-split-block-threshold=30 -julia-split-block-size=16 -S %s | FileCheck %s --check-prefix=MIXED
 
 declare ptr @julia.get_pgcstack()
 declare ptr addrspace(10) @jl_box_int64(i64)
@@ -99,7 +99,7 @@ top:
 }
 
 ; The safepoint budget forces cuts on call-dense code even when the
-; instruction spacing alone (chunk-size=200, larger than the whole function)
+; instruction spacing alone (block-size=200, larger than the whole function)
 ; would never cut: @tracked's 32 safepoint calls must be spread over several
 ; blocks (each unconditional br below is a surviving cut).
 ; SPCAP-LABEL: define void @tracked(

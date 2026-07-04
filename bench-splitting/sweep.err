@@ -1,0 +1,24 @@
+Julia Version 1.14.0-DEV.2467
+Build Info:
+  Commit 1d641c744d* (2026-07-01 19:51 UTC)
+  GC: Built with stock GC
+Platform Info:
+  OS: Linux (x86_64-unknown-linux-gnu)
+  CPU: 20 × 12th Gen Intel(R) Core(TM) i7-12700H (alderlake)
+  WORD_SIZE: 64
+  LLVM: libLLVM-21.1.8 (ORCJIT, alderlake)
+Threads: 1 default, 1 interactive, 1 GC (on 20 virtual cores)
+Environment:
+  JULIA_LLVM_ARGS = 
+Julia Version 1.14.0-DEV.2467
+Build Info:
+  Commit 1d641c744d* (2026-07-01 19:51 UTC)
+  GC: Built with stock GC
+Platform Info:
+  OS: Linux (x86_64-unknown-linux-gnu)
+  CPU: 20 × 12th Gen Intel(R) Core(TM) i7-12700H (alderlake)
+  WORD_SIZE: 64
+  LLVM: libLLVM-21.1.8 (ORCJIT, alderlake)
+Threads: 1 default, 1 interactive, 1 GC (on 20 virtual cores)
+Environment:
+  JULIA_LLVM_ARGS = -julia-split-function-threshold=65536 -julia-split-block-threshold=4096 -julia-split-chunk-size=400

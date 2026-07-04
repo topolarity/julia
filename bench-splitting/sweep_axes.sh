@@ -34,7 +34,7 @@ run() { # gen S B W label flags...
 }
 
 # forced-on: gate always fires; granularity at the working values
-ON="-julia-split-function-threshold=64 -julia-split-block-threshold=64 -julia-split-chunk-size=400"
+ON="-julia-split-function-threshold=64 -julia-split-block-threshold=64 -julia-split-block-size=400"
 
 echo "== A: block axis (single block) =="
 for s in 1000 2000 4000 8000 16000 32000 64000 128000; do
@@ -64,7 +64,7 @@ done
 
 echo "== C: chunk axis (fixed large size) =="
 for ch in 100 200 400 800 1600 3200; do
-  F="-julia-split-function-threshold=64 -julia-split-block-threshold=64 -julia-split-chunk-size=$ch"
+  F="-julia-split-function-threshold=64 -julia-split-block-threshold=64 -julia-split-block-size=$ch"
   run straight 65536 0 8 chunk$ch $F
   run calls 16384 0 8 chunk$ch $F
   run arrays 65536 0 8 chunk$ch $F

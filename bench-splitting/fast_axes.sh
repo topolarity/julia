@@ -15,7 +15,7 @@ run() {
     $JULIA gen_axes.jl >> "$OUT" 2>>axes.err || echo "$gen,$s,$b,$w,$label,,,,,,,FAIL" >> "$OUT"
   tail -1 "$OUT"
 }
-ON="-julia-split-function-threshold=64 -julia-split-block-threshold=64 -julia-split-chunk-size=400 -julia-split-time"
+ON="-julia-split-function-threshold=64 -julia-split-block-threshold=64 -julia-split-block-size=400 -julia-split-time"
 
 echo "== A: block axis"
 for s in 2000 8000 32000; do
@@ -42,7 +42,7 @@ for c in 4000 16000; do
 done
 echo "== C: chunk axis"
 for ch in 200 400 1600 3200; do
-  F="-julia-split-function-threshold=64 -julia-split-block-threshold=64 -julia-split-chunk-size=$ch"
+  F="-julia-split-function-threshold=64 -julia-split-block-threshold=64 -julia-split-block-size=$ch"
   run straight 65536 0 8 chunk$ch $F
   run calls 16384 0 8 chunk$ch $F
   run arrays 65536 0 8 chunk$ch $F

@@ -14,7 +14,7 @@ CORE=${CORE:-2}   # pick a P-core (0-11 on a 12700H; E-cores are 12+)
 if [ "$CH" = off ]; then
   FLAGS="-vectorize-slp=false"
 else
-  FLAGS="-vectorize-slp=false -julia-split-function-threshold=64 -julia-split-block-threshold=64 -julia-split-max-region-blocks=8192 -julia-split-chunk-size=$CH"
+  FLAGS="-vectorize-slp=false -julia-split-function-threshold=64 -julia-split-block-threshold=64 -julia-split-max-region-blocks=8192 -julia-split-block-size=$CH"
 fi
 LOG=$(mktemp)
 PERFMODE=1 LOOPSECS=$SECS GEN=blocks S=$S B=40 W=8 LABEL=perf-$CH \

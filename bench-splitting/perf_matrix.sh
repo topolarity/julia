@@ -19,7 +19,7 @@ SECS=${3:-$((4 * WIN + 10))}
 if [ "$CH" = off ]; then
   FLAGS="-vectorize-slp=false"
 else
-  FLAGS="-vectorize-slp=false -julia-split-function-threshold=64 -julia-split-block-threshold=64 -julia-split-max-region-blocks=8192 -julia-split-chunk-size=$CH"
+  FLAGS="-vectorize-slp=false -julia-split-function-threshold=64 -julia-split-block-threshold=64 -julia-split-max-region-blocks=8192 -julia-split-block-size=$CH"
 fi
 FLAGS="$FLAGS ${EXTRA_FLAGS:-}"
 

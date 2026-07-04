@@ -17,8 +17,8 @@ run() {
 }
 FL="-julia-split-function-threshold=64 -julia-split-block-threshold=64 -julia-split-time"
 anchors() {
-  run straight 65536 0 8 anchor-$1 $FL -julia-split-chunk-size=400
-  run calls 16384 0 8 anchor-$1 $FL -julia-split-chunk-size=400
+  run straight 65536 0 8 anchor-$1 $FL -julia-split-block-size=400
+  run calls 16384 0 8 anchor-$1 $FL -julia-split-block-size=400
   run blocks 64000 40 8 anchor-$1-off
 }
 anchors start
@@ -26,15 +26,15 @@ echo "== tax curve: blocks 64k, 3 reps"
 for rep in 1 2 3; do
   run blocks 64000 40 8 off-r$rep
   for ch in 400 800 1600 3200 6400; do
-    run blocks 64000 40 8 c$ch-r$rep $FL -julia-split-chunk-size=$ch
+    run blocks 64000 40 8 c$ch-r$rep $FL -julia-split-block-size=$ch
   done
 done
 anchors mid
 echo "== high-site-count pair: blocks 256k"
 for rep in 1 2; do
   run blocks 256000 40 8 off256-r$rep
-  run blocks 256000 40 8 c400-256-r$rep $FL -julia-split-chunk-size=400
-  run blocks 256000 40 8 c1600-256-r$rep $FL -julia-split-chunk-size=1600
+  run blocks 256000 40 8 c400-256-r$rep $FL -julia-split-block-size=400
+  run blocks 256000 40 8 c1600-256-r$rep $FL -julia-split-block-size=1600
 done
 anchors end
 echo done

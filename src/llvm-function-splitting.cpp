@@ -121,11 +121,11 @@ static cl::opt<unsigned> SplitBlockThreshold(
 
 static cl::opt<unsigned> SplitFunctionThreshold(
     "julia-split-function-threshold", cl::init(0), cl::Hidden,
-    cl::desc("Outline chunk-sized regions from functions with more instructions "
+    cl::desc("Outline regions from functions with more instructions "
              "than this (0 = disabled)"));
 
-static cl::opt<unsigned> SplitChunkSize(
-    "julia-split-chunk-size", cl::init(1000), cl::Hidden,
+static cl::opt<unsigned> SplitBlockSize(
+    "julia-split-block-size", cl::init(1000), cl::Hidden,
     cl::desc("Target instruction count of outlined regions"));
 
 // Debugging kill-switches for isolating miscompiles.
@@ -178,8 +178,8 @@ static cl::opt<unsigned> SplitMaxRegionBlocks(
              "point instead of the size target; clamp cuts are counted and "
              "reported under -julia-split-time so parameter sweeps see the "
              "realized region sizes rather than the requested target"));
-static cl::opt<unsigned> SplitChunkSafepoints(
-    "julia-split-chunk-safepoints", cl::init(128), cl::Hidden,
+static cl::opt<unsigned> SplitBlockSafepoints(
+    "julia-split-block-safepoints", cl::init(128), cl::Hidden,
     cl::desc("Cut oversized blocks so that no chunk (and no re-merged block) "
              "spans more than about this many safepoint calls, independently "
              "of the instruction spacing. Register allocation cost is "
@@ -188,6 +188,14 @@ static cl::opt<unsigned> SplitChunkSafepoints(
              "instruction count alone provides; this also keeps any future "
              "region-level safepoint budget realizable from whole blocks. "
              "0 disables"));
+static cl::opt<unsigned> SplitRegionSize(
+    "julia-split-region-size", cl::init(0), cl::Hidden,
+    cl::desc("Instruction growth target for regions, decoupled from the block "
+             "cut spacing (-julia-split-block-size). Call-free regions want to "
+             "grow well beyond the block quantum (the boundary runtime tax "
+             "falls as 1/R while compile stays flat to ~25k), and call-dense "
+             "regions are bounded by -julia-split-region-safepoints instead. "
+             "0 inherits -julia-split-block-size"));
 static cl::opt<unsigned> SplitRegionSafepoints(
     "julia-split-region-safepoints", cl::init(128), cl::Hidden,
     cl::desc("Cut region growth once a region spans about this many safepoint "
@@ -198,6 +206,15 @@ static cl::opt<unsigned> SplitRegionSafepoints(
              "with the instruction target this forms the dual cap that lets "
              "call-free regions grow (boundary tax ~1/R) while call-dense "
              "regions stay near the register-allocation optimum. 0 disables"));
+// Effective region instruction target (region sizing is independent of the
+// block cut quantum; the flag inherits the chunk size when unset).
+static unsigned regionSizeTarget() JL_NOTSAFEPOINT
+{
+    unsigned T = SplitRegionSize ? SplitRegionSize.getValue()
+                                 : SplitBlockSize.getValue();
+    return std::max(16u, T);
+}
+
 static cl::opt<unsigned> SplitOutputSpillMin(
     "julia-split-output-spill-min", cl::init(2), cl::Hidden,
     cl::desc("Spill region outputs through the aggregate whenever a region has "
@@ -1948,12 +1965,12 @@ static std::vector<HNode> formParents(Function &F, std::vector<HNode> Nodes,
 static void mergeStraightSeams(Function &F, unsigned Cap,
                                const JuliaPassContext &ctx) JL_NOTSAFEPOINT
 {
-    // Mirror the cut-side safepoint budget (cf. SplitChunkSafepoints in
+    // Mirror the cut-side safepoint budget (cf. SplitBlockSafepoints in
     // chunkBlock): without it, folding a region body back together would
     // reassemble exactly the call-dense block the chunking cut apart. The
     // 4x slack mirrors Cap's slack relative to the chunk size and stays far
     // below the measured onset of the per-block register-allocation blowup.
-    unsigned SPCap = SplitChunkSafepoints ? 4 * SplitChunkSafepoints : 0;
+    unsigned SPCap = SplitBlockSafepoints ? 4 * SplitBlockSafepoints : 0;
     auto spCount = [&](BasicBlock *BB) JL_NOTSAFEPOINT {
         unsigned N = 0;
         for (Instruction &I : *BB)
@@ -2038,7 +2055,7 @@ static void processLevel(Function &F, std::vector<HNode> &Items,
     // stay in the same block as their defs) — remaining residual chunk seams
     // are kept to preserve the block-size bound, and the values crossing
     // them (region output reloads) have no chains behind them to cascade.
-    unsigned Cap = 4 * std::max(16u, SplitChunkSize.getValue());
+    unsigned Cap = 4 * regionSizeTarget();
     for (Function *NewF : Extracted) {
         for (User *U : NewF->users()) {
             auto *CI = dyn_cast<CallBase>(U);
@@ -2061,16 +2078,16 @@ static bool chunkBlock(Function &F, BasicBlock &BB, const JuliaPassContext &ctx)
     for (Instruction &I : BB)
         Insts.push_back(&I);
     unsigned n = Insts.size();
-    unsigned C = std::max(16u, SplitChunkSize.getValue());
+    unsigned C = std::max(16u, SplitBlockSize.getValue());
     // A block qualifies for cutting on either axis: instruction count or
     // safepoint count (call-dense blocks can be far below the instruction
     // spacing yet far above the safepoint budget).
     bool SafepointsQualify = false;
-    if (SplitChunkSafepoints) {
+    if (SplitBlockSafepoints) {
         unsigned SP = 0;
         for (Instruction *I : Insts)
             SP += isSafepointCall(*I, ctx);
-        SafepointsQualify = SP >= 2 * SplitChunkSafepoints;
+        SafepointsQualify = SP >= 2 * SplitBlockSafepoints;
     }
     if (n < 2 * C && !SafepointsQualify)
         return false;
@@ -2200,8 +2217,8 @@ static bool chunkBlock(Function &F, BasicBlock &BB, const JuliaPassContext &ctx)
         BarrierPS[p] = BarrierPS[p - 1] + BarrierDiff[p];
     }
     // Composite cut spacing: each instruction weighs 1 and each safepoint
-    // call additionally weighs C/SplitChunkSafepoints, so one chunk's weight
-    // budget C admits at most about SplitChunkSafepoints safepoints. Register
+    // call additionally weighs C/SplitBlockSafepoints, so one chunk's weight
+    // budget C admits at most about SplitBlockSafepoints safepoints. Register
     // allocation cost grows superlinearly with the safepoints a single block
     // spans, so call-dense stretches need a finer cut quantum than the
     // instruction spacing alone provides. Cutting is also the finest
@@ -2211,8 +2228,8 @@ static bool chunkBlock(Function &F, BasicBlock &BB, const JuliaPassContext &ctx)
     // the cut quantum respects the denser axis.
     SmallVector<uint64_t, 0> WeightPS(n + 1, 0);
     {
-        uint64_t SPW = SplitChunkSafepoints
-                           ? std::max<uint64_t>(1, C / SplitChunkSafepoints)
+        uint64_t SPW = SplitBlockSafepoints
+                           ? std::max<uint64_t>(1, C / SplitBlockSafepoints)
                            : 0;
         uint64_t Acc = 0;
         for (unsigned i = 0; i < n; i++) {
@@ -2227,7 +2244,7 @@ static bool chunkBlock(Function &F, BasicBlock &BB, const JuliaPassContext &ctx)
 
     // Pick cuts: mandatory cuts fencing off runs of pinned instructions, and
     // within each straight-line span, greedy min-live-score cuts about every
-    // SplitChunkSize instructions. Tracked values weigh heavier: they cost GC
+    // SplitBlockSize instructions. Tracked values weigh heavier: they cost GC
     // roots at the new safepoint, not just an argument slot.
     SmallVector<unsigned, 32> Cuts;
     auto pushCut = [&](unsigned p) JL_NOTSAFEPOINT {
@@ -2481,7 +2498,7 @@ static void formRegions(Function &F, BlockInfoCache &Info,
             Order.push_back(BB);
         }
     }
-    unsigned C = std::max(16u, SplitChunkSize.getValue());
+    unsigned C = regionSizeTarget();
     SmallPtrSet<BasicBlock *, 32> Assigned;
     SmallVector<BasicBlock *, 8> StartQ;
     size_t oi = 0;
@@ -2603,7 +2620,7 @@ static bool splitFunction(Function &F, const JuliaPassContext &ctx) JL_NOTSAFEPO
         N.R = std::move(R);
         Level.push_back(std::move(N));
     }
-    unsigned LevelTarget = std::max(16u, SplitChunkSize.getValue());
+    unsigned LevelTarget = regionSizeTarget();
     while (SplitGroupSize && Level.size() > SplitGroupSize) {
         size_t Before = Level.size();
         LevelTarget *= SplitGroupSize;
