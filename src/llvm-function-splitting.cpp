@@ -687,6 +687,70 @@ static bool rematerializeDerivedOutputs(Function &F, Region &R, const DominatorT
     return true;
 }
 
+// Memory-demotion utilities in the style of llvm::DemoteRegToStack /
+// llvm::DemotePHIToStack, except that the demoted value lives in a
+// caller-provided aggregate slot instead of a fresh alloca. The slot address
+// is materialized at every store/load site via MakeSlot (a single GEP per
+// site; entry-block GEPs would accumulate O(interface) code in the outermost
+// caller).
+
+// Lower an SSA value into its slot: store it right after its definition (the
+// value stays live in SSA until then, so GC lowering keeps it rooted and the
+// slot always holds the most recent def) and replace every use classified by
+// IsExternal with a reload materialized at the use site. Reading back where
+// the value is needed — rather than once at a fixed point such as a region
+// boundary — stays correct when the reader sits on a cycle and can execute
+// before the definition has run.
+static void DemoteRegToAggregateSlot(Instruction &I, MaybeAlign A,
+                                     function_ref<Value *(IRBuilder<> &)> MakeSlot,
+                                     function_ref<bool(Use &)> IsExternal) JL_NOTSAFEPOINT
+{
+    BasicBlock::iterator StoreIP = isa<PHINode>(I)
+                                       ? I.getParent()->getFirstInsertionPt()
+                                       : std::next(I.getIterator());
+    IRBuilder<> SB(I.getParent(), StoreIP);
+    SB.CreateAlignedStore(&I, MakeSlot(SB), A);
+    SmallVector<Use *, 8> ExtUses;
+    for (Use &U : I.uses())
+        if (IsExternal(U))
+            ExtUses.push_back(&U);
+    for (Use *U : ExtUses) {
+        auto *UI = cast<Instruction>(U->getUser());
+        BasicBlock::iterator IP;
+        if (auto *PN = dyn_cast<PHINode>(UI))
+            IP = PN->getIncomingBlock(*U)->getTerminator()->getIterator();
+        else
+            IP = UI->getIterator();
+        IRBuilder<> B(IP->getParent(), IP);
+        auto *L = B.CreateAlignedLoad(I.getType(), MakeSlot(B), A, I.getName() + ".out");
+        U->set(L);
+    }
+}
+
+// Lower a PHI into its slot: store each incoming value at the end of its
+// incoming block — exactly one of those runs per traversal, so the slot
+// always holds the value of the edge actually taken, on cycles too — and
+// replace the PHI with a load of the slot at its own position. Duplicate
+// incoming blocks (switches) carry identical values per LLVM's PHI rules, so
+// one store per predecessor suffices.
+static void DemotePHIToAggregateSlot(PHINode &PN, MaybeAlign A,
+                                     function_ref<Value *(IRBuilder<> &)> MakeSlot) JL_NOTSAFEPOINT
+{
+    SmallPtrSet<BasicBlock *, 8> Stored;
+    for (unsigned i = 0, e = PN.getNumIncomingValues(); i != e; i++) {
+        BasicBlock *In = PN.getIncomingBlock(i);
+        if (!Stored.insert(In).second)
+            continue;
+        IRBuilder<> B(In->getTerminator());
+        B.CreateAlignedStore(PN.getIncomingValue(i), MakeSlot(B), A);
+    }
+    BasicBlock *BB = PN.getParent();
+    IRBuilder<> LB(BB, BB->getFirstInsertionPt());
+    auto *L = LB.CreateAlignedLoad(PN.getType(), MakeSlot(LB), A, PN.getName() + ".phi");
+    PN.replaceAllUsesWith(L);
+    PN.eraseFromParent();
+}
+
 // Reduce an oversized region interface by passing values through two stack
 // aggregates instead of individual arguments: tracked (AS10) values go through
 // an array-of-AS10 alloca (which the caller's LateLowerGCFrame turns into GC
@@ -885,103 +949,49 @@ static void spillInterface(Function &F, Region &R, const DominatorTree &DT,
             }
         }
     }
-    if (!TOut.empty() || !UOut.empty()) {
-        // Store each output right after its definition (the value stays live
-        // in SSA until then, so the callee's own GC lowering keeps it rooted;
-        // the slot then always holds the most recent def). Each external use
-        // re-reads the slot right where it needs it: unlike a reload placed at
-        // the boundary, this stays correct when the boundary sits on a cycle
-        // and can execute before the region has run.
-        auto storePoint = [](Instruction *I) JL_NOTSAFEPOINT -> BasicBlock::iterator {
-            if (isa<PHINode>(I))
-                return I->getParent()->getFirstInsertionPt();
-            return std::next(I->getIterator());
-        };
-        auto rewriteOutputUses = [&](Instruction *I, auto MakeGEP) JL_NOTSAFEPOINT {
-            SmallVector<Use *, 8> ExtUses;
-            for (Use &U : I->uses())
-                if (!R.Set.count(useBlock(U)))
-                    ExtUses.push_back(&U);
-            for (Use *U : ExtUses) {
-                auto *UI = cast<Instruction>(U->getUser());
-                BasicBlock::iterator IP;
-                if (auto *PN = dyn_cast<PHINode>(UI))
-                    IP = PN->getIncomingBlock(*U)->getTerminator()->getIterator();
-                else
-                    IP = UI->getIterator();
-                // Materialize the slot address at the use site (a single GEP
-                // per use; entry-block GEPs would accumulate O(outputs) code
-                // in the outermost caller).
-                Value *G = MakeGEP(IP);
-                auto *L = new LoadInst(I->getType(), G, I->getName() + ".out", IP);
-                L->setAlignment(Align(sizeof(void *)));
-                U->set(L);
-            }
-        };
-        // The aggregate null checks are redundant with the emptiness of the
-        // corresponding lists (spelled out for the static analyzer).
-        if (TSpill)
-            for (Instruction *I : TOut) {
-                IRBuilder<> SB(I->getParent(), storePoint(I));
-                SB.CreateAlignedStore(
-                    I, SB.CreateConstInBoundsGEP1_32(T_prjlvalue, TSpill, TSlot),
-                    Align(sizeof(void *)));
-                unsigned Slot = TSlot;
-                rewriteOutputUses(I, [&, Slot](BasicBlock::iterator IP) JL_NOTSAFEPOINT -> Value * {
-                    IRBuilder<> B(IP->getParent(), IP);
+    // Lower the escaping values and boundary phis into their aggregate slots.
+    // (The aggregate null checks are redundant with the emptiness of the
+    // corresponding lists; spelled out for the static analyzer.)
+    auto isExternalUse = [&](Use &U) JL_NOTSAFEPOINT {
+        return !R.Set.count(useBlock(U));
+    };
+    if (TSpill) {
+        for (Instruction *I : TOut) {
+            unsigned Slot = TSlot++;
+            DemoteRegToAggregateSlot(
+                *I, Align(sizeof(void *)),
+                [&, Slot](IRBuilder<> &B) JL_NOTSAFEPOINT -> Value * {
+                    return B.CreateConstInBoundsGEP1_32(T_prjlvalue, TSpill, Slot);
+                },
+                isExternalUse);
+        }
+        for (PHINode *PN : TPhis) {
+            unsigned Slot = TSlot++;
+            DemotePHIToAggregateSlot(
+                *PN, Align(sizeof(void *)),
+                [&, Slot](IRBuilder<> &B) JL_NOTSAFEPOINT -> Value * {
                     return B.CreateConstInBoundsGEP1_32(T_prjlvalue, TSpill, Slot);
                 });
-                TSlot++;
-            }
-        if (UTy && USpill)
-            for (Instruction *I : UOut) {
-                IRBuilder<> SB(I->getParent(), storePoint(I));
-                SB.CreateStore(I, SB.CreateStructGEP(UTy, USpill, USlot));
-                unsigned Slot = USlot;
-                rewriteOutputUses(I, [&, Slot](BasicBlock::iterator IP) JL_NOTSAFEPOINT -> Value * {
-                    IRBuilder<> B(IP->getParent(), IP);
-                    return B.CreateStructGEP(UTy, USpill, Slot);
-                });
-                USlot++;
-            }
+        }
     }
-    // (Boundary and the aggregates are non-null whenever the phi lists are
-    // non-empty; spelled out for the static analyzer.)
-    if (Boundary && (!TPhis.empty() || !UPhis.empty())) {
-        // Demote boundary-head phis into the aggregates (see the header
-        // comment): store each incoming value at the end of its incoming
-        // block, replace the phi with a load of the slot. Duplicate incoming
-        // blocks (switches) carry identical values per LLVM's PHI rules, so
-        // one store per predecessor suffices.
-        auto demote = [&](PHINode *PN, auto MakeGEP, MaybeAlign A) JL_NOTSAFEPOINT {
-            SmallPtrSet<BasicBlock *, 8> Stored;
-            for (unsigned i = 0, e = PN->getNumIncomingValues(); i != e; i++) {
-                BasicBlock *In = PN->getIncomingBlock(i);
-                if (!Stored.insert(In).second)
-                    continue;
-                IRBuilder<> B(In->getTerminator());
-                B.CreateAlignedStore(PN->getIncomingValue(i), MakeGEP(B), A);
-            }
-            IRBuilder<> LB(Boundary, Boundary->getFirstInsertionPt());
-            auto *L = LB.CreateAlignedLoad(PN->getType(), MakeGEP(LB), A,
-                                           PN->getName() + ".phi");
-            PN->replaceAllUsesWith(L);
-            PN->eraseFromParent();
-        };
-        if (TSpill)
-            for (PHINode *PN : TPhis) {
-                unsigned Slot = TSlot++;
-                demote(PN, [&, Slot](IRBuilder<> &B) JL_NOTSAFEPOINT -> Value * {
-                    return B.CreateConstInBoundsGEP1_32(T_prjlvalue, TSpill, Slot);
-                }, Align(sizeof(void *)));
-            }
-        if (UTy && USpill)
-            for (PHINode *PN : UPhis) {
-                unsigned Slot = USlot++;
-                demote(PN, [&, Slot](IRBuilder<> &B) JL_NOTSAFEPOINT -> Value * {
+    if (UTy && USpill) {
+        for (Instruction *I : UOut) {
+            unsigned Slot = USlot++;
+            DemoteRegToAggregateSlot(
+                *I, MaybeAlign(),
+                [&, Slot](IRBuilder<> &B) JL_NOTSAFEPOINT -> Value * {
                     return B.CreateStructGEP(UTy, USpill, Slot);
-                }, MaybeAlign());
-            }
+                },
+                isExternalUse);
+        }
+        for (PHINode *PN : UPhis) {
+            unsigned Slot = USlot++;
+            DemotePHIToAggregateSlot(
+                *PN, MaybeAlign(),
+                [&, Slot](IRBuilder<> &B) JL_NOTSAFEPOINT -> Value * {
+                    return B.CreateStructGEP(UTy, USpill, Slot);
+                });
+        }
     }
 }
 
