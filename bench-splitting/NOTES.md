@@ -484,3 +484,24 @@ shrinks the branchy tax while calls stays at its compile optimum (2.29s)
 via the safepoint budget; region-size inheritance is semantically identical
 to explicit; lit 8/8; composite asserts pass. Pending for #8: confirmation
 tuning sweep on this final knob surface, then defaults + docs + hygiene.
+
+## INDEX: poorly-scaling shapes and super-linear passes (consolidated)
+
+Shapes: (1) giant vectorizable straightline block [SLP ~B^3, ISel ~B^2; ADL
+2x runtime from 2-wide SLP]; (2) giant call block with rooted values
+[GreedyRA ~quadratic in safepoints/block, InstCombine renumbering
+O(calls x B)]; (3) giant derived-pointer/memory block [same family + remat];
+(4) huge branchy call+root-dense CFG [BFI/IRCE/GVN superlinear, backend
+~S^2]; (5) many-small-blocks call-dense [MachineCSE ~S^2.9, RA ~S^1.5];
+(6) self-inflicted pre-fix split shapes [InstCombine sinking chain-grouping;
+BTB/footprint boundary term].
+
+Passes (pre-fix): SLPVectorizer ~B^3; GreedyRA ~safepoints^2 per block +
+S^1.5 residual; MachineCSE ~S^2.9 per call-dense function; InstCombine
+renumbering O(calls x B) and sinking (runtime, unbounded); X86 ISel ~B^2;
+BlockFrequency/IRCE/GVN superlinear on huge CFGs; PropagateJuliaAddrspaces
+(fixed); CodeExtractor findAllocas/emitFunctionBody + freezeOtherUses
+(bypassed); our chunkBlock splice (fixed). LateLowerGCFrame: suspected,
+never dominant. The dual-cap axes map 1:1 onto the offenders: block insts ->
+SLP/ISel; block safepoints -> GreedyRA; region safepoints -> MachineCSE;
+region extent -> CFG analyses.
