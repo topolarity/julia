@@ -1585,7 +1585,9 @@ static void privatizeRootBuffers(Function &F, std::vector<Region> &Leaves) JL_NO
                 C = Orig->clone();
                 C->setName(Orig->getName() + ".priv");
                 C->setOperand(PtrIdx, Base);
-                C->insertBefore(R->Blocks[0]->getFirstInsertionPt());
+                // After the base (already placed), not at the block front, so
+                // the clone stays dominated by its address chain.
+                C->insertAfter(cast<Instruction>(Base));
                 // Address computations only; no metadata worth remapping.
             }
             M[A] = C;
