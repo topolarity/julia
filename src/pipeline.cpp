@@ -343,6 +343,19 @@ namespace {
 
 #define JULIA_PASS(ADD_PASS) if (!options.llvm_only) { ADD_PASS; } else do { } while (0)
 
+// Experimental isolation gates for the splitting-lever study: disable the
+// built-in early (pre-InstCombine) and late (pre-loop-opts) FunctionSplitting
+// invocations so a splitter can be placed at exactly one point of interest.
+// Default true: shipped pipeline unchanged.
+static llvm::cl::opt<bool> SplitBuiltinEarly(
+    "julia-split-builtin-early", llvm::cl::init(true), llvm::cl::Hidden,
+    llvm::cl::desc("Run the built-in FunctionSplitting before early InstCombine "
+                   "(disable for lever-isolation experiments)."));
+static llvm::cl::opt<bool> SplitBuiltinLate(
+    "julia-split-builtin-late", llvm::cl::init(true), llvm::cl::Hidden,
+    llvm::cl::desc("Run the built-in FunctionSplitting before loop optimization "
+                   "(disable for lever-isolation experiments)."));
+
 static void buildEarlySimplificationPipeline(ModulePassManager &MPM, PassBuilder *PB, OptimizationLevel O, const OptimizationOptions &options) JL_NOTSAFEPOINT {
     MPM.addPass(BeforeEarlySimplificationMarkerPass());
 #ifdef JL_VERIFY_PASSES
@@ -375,7 +388,8 @@ static void buildEarlySimplificationPipeline(ModulePassManager &MPM, PassBuilder
           // InstCombine queries (e.g. isKnownNonZero dominance checks) trigger
           // O(block-size) instruction renumbering per query, which is
           // quadratic on the huge basic blocks this pass exists to break up.
-          JULIA_PASS(MPM.addPass(FunctionSplittingPass()));
+          if (SplitBuiltinEarly)
+              JULIA_PASS(MPM.addPass(FunctionSplittingPass()));
           if (O.getSpeedupLevel() >= 1) {
             FunctionPassManager GlobalFPM;
             MPM.addPass(GlobalOptPass());
@@ -541,6 +555,23 @@ static void buildScalarOptimizerPipeline(FunctionPassManager &FPM, PassBuilder *
     FPM.addPass(AfterScalarOptimizationMarkerPass());
 }
 
+static llvm::cl::opt<bool> SplitBBBeforeSLP(
+    "julia-split-bb-before-slp", llvm::cl::init(false), llvm::cl::Hidden,
+    llvm::cl::desc("Experimental: re-split oversized basic blocks immediately "
+                   "before SLP. The function splitter's cuts are merged back "
+                   "by SimplifyCFG before SLP runs, so this restores block-size "
+                   "granularity for it. No-op unless -julia-split-block-threshold "
+                   "is also set."));
+
+static llvm::cl::opt<bool> SplitBBBeforeCodegen(
+    "julia-split-bb-before-codegen", llvm::cl::init(false), llvm::cl::Hidden,
+    llvm::cl::desc("Experimental: re-split oversized basic blocks at the very "
+                   "end of the opt pipeline (after the last SimplifyCFG), so "
+                   "the block cuts survive to instruction selection. Tests "
+                   "whether bounding IR block size reaches the codegen-PM "
+                   "per-block passes (ISel, MachineScheduler). No-op unless "
+                   "-julia-split-block-threshold is set."));
+
 static void buildVectorPipeline(FunctionPassManager &FPM, PassBuilder *PB, OptimizationLevel O, const OptimizationOptions &options) JL_NOTSAFEPOINT {
     FPM.addPass(BeforeVectorizationMarkerPass());
     if (options.enable_vector_pipeline) {
@@ -560,6 +591,14 @@ static void buildVectorPipeline(FunctionPassManager &FPM, PassBuilder *PB, Optim
         FPM.addPass(EarlyCSEPass());
         FPM.addPass(CorrelatedValuePropagationPass());
         FPM.addPass(InstCombinePass());
+        // Re-bound basic-block size immediately before SLP. The function
+        // splitter's cuts upstream have by now been merged back by the CFG
+        // simplifier, so SLP would otherwise see one oversized block; this
+        // restores block-size granularity where SLP can act on it. Gated
+        // (default off) while we evaluate whether it helps; no-op regardless
+        // unless -julia-split-block-threshold is set.
+        if (SplitBBBeforeSLP)
+            JULIA_PASS(FPM.addPass(BasicBlockSplittingPass()));
         FPM.addPass(SLPVectorizerPass());
         FPM.addPass(VectorCombinePass());
         invokeVectorizerCallbacks(FPM, PB, O);
@@ -629,6 +668,10 @@ static void buildCleanupPipeline(ModulePassManager &MPM, PassBuilder *PB, Optimi
             if (O.getSpeedupLevel() >= 2) {
                 FPM.addPass(GVNPass());
             }
+            // Last IR pass before codegen: re-bound block size so the cuts
+            // reach instruction selection (no SimplifyCFG runs after this).
+            if (SplitBBBeforeCodegen)
+                JULIA_PASS(FPM.addPass(BasicBlockSplittingPass()));
             MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM)));
         }
     }
@@ -645,7 +688,8 @@ static void buildPipeline(ModulePassManager &MPM, PassBuilder *PB, OptimizationL
     // LateLowerGCFrame, instruction selection, regalloc). Must run before
     // LateLowerGCFrame so outlined callees get their own GC frames; no-op
     // unless -julia-split-block-threshold is set.
-    JULIA_PASS(MPM.addPass(FunctionSplittingPass()));
+    if (SplitBuiltinLate)
+        JULIA_PASS(MPM.addPass(FunctionSplittingPass()));
     {
         FunctionPassManager FPM;
         buildLoopOptimizerPipeline(FPM, PB, O, options);

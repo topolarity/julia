@@ -2554,6 +2554,29 @@ static void formRegions(Function &F, BlockInfoCache &Info,
     }
 }
 
+// Cut every oversized basic block in F down toward the block-size target.
+// This is the block-splitting half of the pass, factored out from
+// splitFunction so it can also run standalone as BasicBlockSplittingPass.
+// It is purely local (splitBasicBlock inserts unconditional-branch seams;
+// SSA values cross via dominance) — no region growth, no outlining, no
+// interface marshalling — so it is cheap and safe to re-run anywhere in the
+// pipeline. The motivating use is right before a size-sensitive per-block
+// pass (e.g. SLP) whose input the CFG simplifier would otherwise have
+// re-merged back into one oversized block.
+static bool splitOversizedBlocks(Function &F, const JuliaPassContext &ctx) JL_NOTSAFEPOINT
+{
+    if (!SplitBlockThreshold)
+        return false;
+    SmallVector<BasicBlock *, 4> Oversized;
+    for (BasicBlock &BB : F)
+        if (BB.size() > SplitBlockThreshold)
+            Oversized.push_back(&BB);
+    bool Changed = false;
+    for (BasicBlock *BB : Oversized)
+        Changed |= chunkBlock(F, *BB, ctx);
+    return Changed;
+}
+
 static bool splitFunction(Function &F, const JuliaPassContext &ctx) JL_NOTSAFEPOINT
 {
     bool BigBlocks = false;
@@ -2577,14 +2600,8 @@ static bool splitFunction(Function &F, const JuliaPassContext &ctx) JL_NOTSAFEPO
     auto T0 = now();
     GrowCutTarget = GrowCutSafepoint = GrowCutClamp = GrowFailBlocks = GrowFailSize = GrowFailNoAdd = 0;
     IfaceIn = IfaceOut = IfaceInMax = IfaceOutMax = IfaceExits = IfaceCalls = 0;
-    if (BigBlocks) {
-        SmallVector<BasicBlock *, 4> Oversized;
-        for (BasicBlock &BB : F)
-            if (BB.size() > SplitBlockThreshold)
-                Oversized.push_back(&BB);
-        for (BasicBlock *BB : Oversized)
-            Changed |= chunkBlock(F, *BB, ctx);
-    }
+    if (BigBlocks)
+        Changed |= splitOversizedBlocks(F, ctx);
     auto T1 = now();
     BlockInfoCache Info(ctx);
     std::vector<Region> Regions;
@@ -2708,5 +2725,23 @@ PreservedAnalyses FunctionSplittingPass::run(Module &M, ModuleAnalysisManager &A
         for (Function &F : M)
             if (!F.isDeclaration())
                 insertRegionPrefetches(F);
+    return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
+}
+
+// Block-splitting only: cut oversized basic blocks down to the block-size
+// target, without any region outlining. Unlike FunctionSplittingPass this
+// runs on every function (including ones outlined earlier) since the point
+// is to bound basic-block size for a downstream per-block pass, and it is a
+// function pass so it can be scheduled inside a function pass manager
+// immediately before that pass (e.g. SLP), where the CFG simplifier can no
+// longer re-merge the cuts before the consumer sees them.
+PreservedAnalyses BasicBlockSplittingPass::run(Function &F, FunctionAnalysisManager &AM) JL_NOTSAFEPOINT
+{
+    if (SplitBlockThreshold == 0 || F.isDeclaration() ||
+        F.hasFnAttribute(Attribute::OptimizeNone))
+        return PreservedAnalyses::all();
+    JuliaPassContext ctx;
+    ctx.initFunctions(*F.getParent());
+    bool Changed = splitOversizedBlocks(F, ctx);
     return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
 }
