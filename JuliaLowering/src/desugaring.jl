@@ -2658,6 +2658,15 @@ function expand_kw_args(ctx, kws)
     return (kw_decls, kw_names, kw_syms, kw_defaults, restkw_list)
 end
 
+# flisp: vararg-type-expr?  Detect whether the type annotation `t` in a
+# positional argument `x::t` denotes a `Vararg`, i.e. a bare `Vararg`, a
+# `Vararg{T}`/`Vararg{T,N}`, or such wrapped in a `where`.  These forms make the
+# annotated argument a positional vararg that must be splatted when forwarded.
+function is_vararg_type_expr(t)
+    is_same_identifier_like(t, "Vararg") ||
+        (kind(t) in KSet"curly where" && numchildren(t) >= 1 && is_vararg_type_expr(t[1]))
+end
+
 function keywords_method_def_expr(ctx, src, mtable, sparams, argl, body, rett, pos_va)
     kws = argl[end]
     pargl = argl[1:end-1]
@@ -2920,6 +2929,10 @@ function expand_function_def(ctx, src, raw_args, wheres, body, rett)
         pos_va = @stm raw_args[end-1] begin
             [K"kw" [K"..." _] _...] -> true
             [K"..." _] -> true
+            [K"kw" [K"::" _ t] _...] -> is_vararg_type_expr(t)
+            [K"kw" [K"::" t] _...] -> is_vararg_type_expr(t)
+            [K"::" _ t] -> is_vararg_type_expr(t)
+            [K"::" t] -> is_vararg_type_expr(t)
             _ -> false
         end
         keywords_method_def_expr(ctx, src, mtable, sparams, argl, body, rett, pos_va)

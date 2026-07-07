@@ -855,6 +855,120 @@ end
     @test test_mod.f_pos_slurp_with_kws(3, 2, 1; x = 100) === (2,1)
     @test test_mod.f_pos_slurp_with_kws(3, 2, 1) === (2,1)
 
+    # A trailing positional `Vararg{T,N}` written with an explicit `::Vararg`
+    # annotation (rather than `...`) must still be splatted when the keyword
+    # wrappers forward it to the body method.  The zero-keyword path (defaulting
+    # sorter), the explicit-keyword path, and splatted keywords must all work,
+    # and `N` may be referenced in the signature and body.
+    JuliaLowering.include_string(test_mod, """
+    function f_vararg_N_kws(y::Integer, args::Vararg{Integer,N}; kwargs...) where {N}
+        (y, args, N, kwargs)
+    end
+    """)
+    # From PkgEval: CFTime v0.2.10 (145 test errors; Vararg{T,N}+kwargs methods); also SerializedElementArrays, DifferentiationInterface + 2 more
+    @test test_mod.f_vararg_N_kws(1, 2, 3) === (1, (2, 3), 2, Base.pairs(NamedTuple()))
+    let r = test_mod.f_vararg_N_kws(1, 2, 3; foo=1)
+        @test (r[1], r[2], r[3]) === (1, (2, 3), 2)
+        @test r[4][:foo] == 1
+    end
+    let ekw = (a=1, b=2), r = test_mod.f_vararg_N_kws(1, 2; ekw...)
+        @test (r[1], r[2], r[3]) === (1, (2,), 1)
+        @test (r[4][:a], r[4][:b]) == (1, 2)
+    end
+
+    # `N` used as a keyword default (exercises the sorter/body kw forwarding too).
+    JuliaLowering.include_string(test_mod, """
+    function f_vararg_N_kwdefault(y::Integer, args::Vararg{Integer,N}; scale::Int=N) where {N}
+        (y, args, scale)
+    end
+    """)
+    @test test_mod.f_vararg_N_kwdefault(1, 2, 3) === (1, (2, 3), 2)
+    @test test_mod.f_vararg_N_kwdefault(1, 2, 3; scale=10) === (1, (2, 3), 10)
+
+    # `Vararg{T}` with no count, and a bare `Vararg`, plus `Vararg` on an
+    # anonymous (unnamed) positional argument.
+    JuliaLowering.include_string(test_mod, """
+    function f_vararg_T_kws(y, args::Vararg{Integer}; kwargs...)
+        (y, args, kwargs)
+    end
+    """)
+    @test test_mod.f_vararg_T_kws(1, 2, 3) === (1, (2, 3), Base.pairs(NamedTuple()))
+    @test test_mod.f_vararg_T_kws(1, 2, 3; foo=1)[3][:foo] == 1
+
+    JuliaLowering.include_string(test_mod, """
+    function f_vararg_bare_kws(y, args::Vararg; kwargs...)
+        (y, args, kwargs)
+    end
+    """)
+    @test test_mod.f_vararg_bare_kws(1, 2, 3) === (1, (2, 3), Base.pairs(NamedTuple()))
+    @test test_mod.f_vararg_bare_kws(1; z=9)[3][:z] == 9
+
+    JuliaLowering.include_string(test_mod, """
+    function f_vararg_anon_kws(y, ::Vararg{Integer,N}; kwargs...) where {N}
+        (y, N, kwargs)
+    end
+    """)
+    @test test_mod.f_vararg_anon_kws(1, 2, 3) === (1, 2, Base.pairs(NamedTuple()))
+    @test test_mod.f_vararg_anon_kws(1, 2, 3; k=1)[3][:k] == 1
+
+    # Equivalent `args::T...` and plain `args...` forms with kwargs (already
+    # handled, covered here for parity).
+    JuliaLowering.include_string(test_mod, """
+    function f_vararg_dots_typed_kws(y, args::Integer...; kwargs...)
+        (y, args, kwargs)
+    end
+    """)
+    @test test_mod.f_vararg_dots_typed_kws(1, 2, 3) === (1, (2, 3), Base.pairs(NamedTuple()))
+    @test test_mod.f_vararg_dots_typed_kws(1, 2, 3; foo=1)[3][:foo] == 1
+
+    JuliaLowering.include_string(test_mod, """
+    function f_vararg_dots_kws(y, args...; kwargs...)
+        (y, args, kwargs)
+    end
+    """)
+    @test test_mod.f_vararg_dots_kws(1, 2, 3) === (1, (2, 3), Base.pairs(NamedTuple()))
+    @test test_mod.f_vararg_dots_kws(1, 2, 3; foo=1)[3][:foo] == 1
+
+    # Vararg-annotated positional args carrying a default value (`K"kw"`-wrapped
+    # in the AST), both named and anonymous.
+    JuliaLowering.include_string(test_mod, """
+    function f_vararg_default_kws(y, args::Vararg{Int,N}=1; k=1) where {N}
+        (y, args, N, k)
+    end
+    """)
+    @test test_mod.f_vararg_default_kws(1, 2, 3) === (1, (2, 3), 2, 1)
+    @test test_mod.f_vararg_default_kws(1, 2, 3; k=9) === (1, (2, 3), 2, 9)
+
+    JuliaLowering.include_string(test_mod, """
+    function f_vararg_anon_default_kws(y, ::Vararg{Int,N}=1; k=1) where {N}
+        (y, N, k)
+    end
+    """)
+    @test test_mod.f_vararg_anon_default_kws(1, 2, 3) === (1, 2, 1)
+    @test test_mod.f_vararg_anon_default_kws(1, 2, 3; k=9) === (1, 2, 9)
+
+    # `where`-wrapped Vararg annotation.
+    JuliaLowering.include_string(test_mod, """
+    function f_vararg_where_kws(y, args::(Vararg{Int,N} where N); kwargs...)
+        (y, args, kwargs)
+    end
+    """)
+    @test test_mod.f_vararg_where_kws(1, 2, 3) === (1, (2, 3), Base.pairs(NamedTuple()))
+    @test test_mod.f_vararg_where_kws(1, 2, 3; foo=1)[3][:foo] == 1
+
+    # Callable-type method with a trailing Vararg and keywords (shape from
+    # SerializedElementArrays.jl).
+    JuliaLowering.include_string(test_mod, """
+    struct VKS{T,N}
+        dims::NTuple{N,Int}
+    end
+    function (A::Type{VKS{<:Any,N}})(::UndefInitializer, dims::Vararg{Integer,N}; kw=1) where {N}
+        (N, dims, kw)
+    end
+    """)
+    @test test_mod.VKS{<:Any,2}(undef, 3, 4) === (2, (3, 4), 1)
+    @test test_mod.VKS{<:Any,1}(undef, 7; kw=9) === (1, (7,), 9)
+
     # Slurping of keyword args
     JuliaLowering.include_string(test_mod, """
     function f_kw_slurp_all(; kws...)
