@@ -1923,6 +1923,83 @@ end
 
         calls_versioned_macro(Tuple{Int}, Val(1))
     end """; expr_compat_mode) == 1
+
+    @testset "anonymous args promoted by optional/keyword args" begin
+        # A `@generated` method with >=2 anonymous args (`::T` or `_`) whose
+        # placeholder slots get promoted to `#arg#` identifiers because the
+        # method also has an optional positional or keyword arg used to fail at
+        # first call with "function argument name not unique".
+
+        # 2 anonymous optional positional args (mirrors the real SIMD.jl bug)
+        @test JuliaLowering.include_string(test_mod, raw"""
+        begin
+            @generated function g_anon_opt(x, ::Val{A}=Val(false), ::Val{B}=Val(false)) where {A,B}
+                :( (x, A, B) )
+            end
+            g_anon_opt(1)
+        end
+        """; expr_compat_mode) === (1, false, false)
+
+        # calling the same function at two different type instantiations
+        @test JuliaLowering.include_string(test_mod, raw"""
+            (g_anon_opt(1, Val(:a), Val(:b)), g_anon_opt(2.0, Val(3)))
+        """; expr_compat_mode) === ((1, :a, :b), (2.0, 3, false))
+
+        # 2 anonymous required args forced by an unrelated keyword arg
+        @test JuliaLowering.include_string(test_mod, raw"""
+        begin
+            @generated function g_anon_kw(::Val{A}, ::Val{B}; kw=1) where {A,B}
+                :( (A, B, kw) )
+            end
+            g_anon_kw(Val(1), Val(2))
+        end
+        """; expr_compat_mode) === (1, 2, 1)
+        @test JuliaLowering.include_string(test_mod,
+            "g_anon_kw(Val(1), Val(2); kw=5)"; expr_compat_mode) === (1, 2, 5)
+
+        # underscore args (also anonymous), forced by a default
+        @test JuliaLowering.include_string(test_mod, raw"""
+        begin
+            @generated function g_anon_underscore(_, _, z=10)
+                :( z )
+            end
+            g_anon_underscore(:a, :b)
+        end
+        """; expr_compat_mode) === 10
+
+        # named + anonymous mix, with the body reading the named arg while the
+        # generator also uses the where-params
+        @test JuliaLowering.include_string(test_mod, raw"""
+        begin
+            @generated function g_named_anon(a, ::Val{A}, ::Val{B}=Val(0); k=7) where {A,B}
+                :( (a, A, B, k) )
+            end
+            g_named_anon("hi", Val(1))
+        end
+        """; expr_compat_mode) === ("hi", 1, 0, 7)
+
+        # single anonymous arg (no collision possible) still works with a kwarg
+        @test JuliaLowering.include_string(test_mod, raw"""
+        begin
+            @generated function g_one_anon(x, ::Val{A}; k=3) where {A}
+                :( (x, A, k) )
+            end
+            g_one_anon(1, Val(2))
+        end
+        """; expr_compat_mode) === (1, 2, 3)
+
+        # Pathological: a user arg literally named `#arg#` (the promotion name)
+        # must remain a real, body-referenceable slot -- the discriminator is a
+        # metadata tag on promoted anonymous args, not a name match.
+        @test JuliaLowering.include_string(test_mod, raw"""
+        begin
+            @generated function g_user_hasharg(var"#arg#", ::Val{A}=Val(0)) where {A}
+                :( (var"#arg#", A) )
+            end
+            g_user_hasharg(5)
+        end
+        """; expr_compat_mode) === (5, 0)
+    end
 end
 
     genfunc_quote_s = """
