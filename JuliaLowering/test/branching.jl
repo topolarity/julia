@@ -300,6 +300,30 @@ begin
 end
 """) == true
 
+# 0-1 arguments in condition position (`expand_condition`, used by `if`/`while`)
+# have their own desugaring path separate from the value-position case above.
+@test jl_eval(test_mod, Expr(:if, Expr(:&&), 1, 2)) == 1
+@test jl_eval(test_mod, Expr(:if, Expr(:&&, true), 1, 2)) == 1
+@test jl_eval(test_mod, Expr(:if, Expr(:&&, false), 1, 2)) == 2
+@test jl_eval(test_mod, Expr(:if, Expr(:||), 1, 2)) == 2
+@test jl_eval(test_mod, Expr(:if, Expr(:||, true), 1, 2)) == 1
+@test jl_eval(test_mod, Expr(:if, Expr(:||, false), 1, 2)) == 2
+
+# Same, but with the condition inside a block (the `isblock` branch of
+# `expand_condition`)
+@test jl_eval(test_mod, Expr(:if, Expr(:block, Expr(:&&, true)), 1, 2)) == 1
+@test jl_eval(test_mod, Expr(:if, Expr(:block, Expr(:||, false)), 1, 2)) == 2
+@test jl_eval(test_mod, Expr(:if, Expr(:block, Expr(:&&)), 1, 2)) == 1
+
+# Degenerate arities nested inside another `&&`/`||` (flattened away by
+# `expand_cond_children`)
+@test jl_eval(test_mod, Expr(:if, Expr(:&&, Expr(:&&)), 1, 2)) == 1
+@test jl_eval(test_mod, Expr(:if, Expr(:&&, Expr(:&&, false), true), 1, 2)) == 2
+
+# `while` conditions share `expand_condition` with `if`
+@test jl_eval(test_mod, Expr(:while, Expr(:||), 1)) === nothing
+@test jl_eval(test_mod, Expr(:while, Expr(:&&), Expr(:break))) === nothing
+
 end
 
 @testset "symbolic goto/label" begin

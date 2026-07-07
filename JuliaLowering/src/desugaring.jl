@@ -1507,8 +1507,16 @@ function expand_condition(ctx, ex)
         # `||` and `&&` get special lowering so that they compile directly to
         # jumps rather than first computing a bool and then jumping.
         cs = expand_cond_children(ctx, test)
-        @jl_assert length(cs) > 1 ex
-        test = newnode(ctx, test, k, cs)
+        # Degenerate 0- and 1-argument forms can arise from programmatically
+        # constructed ASTs (eg `Expr(:&&)` or `Expr(:&&, x)`); match the
+        # behavior of the value-position case in `expand_forms_2`.
+        test = if isempty(cs)
+            @ast ctx test (k === K"&&")::K"Bool"
+        elseif length(cs) == 1
+            @ast ctx test cs[1]
+        else
+            newnode(ctx, test, k, cs)
+        end
     else
         test = expand_forms_2(ctx, test)
     end
