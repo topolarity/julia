@@ -2501,7 +2501,13 @@ end
 function _expr_arg_sym(a)
     @jl_assert kind(a) === K"::" || kind(a) === K"_typevar" a
     sym = setattr(a[1], :kind, K"Symbol")
-    if kind(a[1]) === K"Placeholder"
+    # Anonymous args are recorded as `#unused#` in the argnames svec baked into
+    # the `@generated` stub.  This covers both un-promoted placeholders and
+    # placeholders promoted to a `#arg#` identifier (via `fix_argname` when the
+    # method has optional or keyword args): the latter must not be reconstructed
+    # as named identifiers by the stub, or two `#arg#` slots sharing one context
+    # collide in scope analysis ("function argument name not unique").
+    if kind(a[1]) === K"Placeholder" || getmeta(a[1], :anon_arg, false)
         setattr!(sym, :name_val, UNUSED)
     end
     sym
@@ -2874,8 +2880,11 @@ end
 fix_argname(ctx, arg, used) = @stm arg begin
     [K"Identifier"] -> arg
     # Lowering should be able to use placeholder args as rvalues internally,
-    # e.g. for kw method dispatch.
-    ([K"Placeholder"], when=used) -> newsym(ctx, arg, "#arg#")
+    # e.g. for kw method dispatch.  Tag the promoted name as `:anon_arg` so that
+    # consumers which only need to *count* the slots (e.g. a `@generated`
+    # stub's argnames) can still treat it as anonymous rather than a real,
+    # potentially-colliding name.
+    ([K"Placeholder"], when=used) -> setmeta!(newsym(ctx, arg, "#arg#"), :anon_arg, true)
     ([K"Placeholder"], when=!used) -> arg
 end
 
