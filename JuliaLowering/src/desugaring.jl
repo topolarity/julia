@@ -673,8 +673,15 @@ function process_indices(sctx::StatementListCtx, arr, idxs)
         is_splat = kind(idx0) == K"..."
         val = replace_beginend(sctx, is_splat ? idx0[1] : idx0,
                                arr, n, splats, n == length(idxs))
-        # TODO: kwarg?
-        idx = !has_splats || is_simple_atom(sctx, val) ? val : emit_assign_tmp(sctx, val)
+        idx = if !has_splats || is_simple_atom(sctx, val)
+            val
+        elseif kind(val) == K"kw"
+            # Only hoist the keyword argument's value to a temporary -- the
+            # `kw` node itself isn't a value and can't be assigned.
+            @ast sctx val [K"kw" val[1] emit_assign_tmp(sctx, val[2])]
+        else
+            emit_assign_tmp(sctx, val)
+        end
         if is_splat
             push!(splats, idx)
         end

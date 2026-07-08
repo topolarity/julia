@@ -514,3 +514,51 @@ a[] = rhs
 2   TestMod.a
 3   (call top.setindex! %₂ %₁)
 4   (return %₁)
+
+########################################
+# kw argument in ref (read)
+a[i, compress=v]
+#---------------------
+1   top.getindex
+2   (call core.tuple :compress)
+3   (call core.apply_type core.NamedTuple %₂)
+4   TestMod.v
+5   (call core.tuple %₄)
+6   (call %₃ %₅)
+7   TestMod.a
+8   TestMod.i
+9   (call core.kwcall %₆ %₁ %₇ %₈)
+10  (return %₉)
+
+########################################
+# kw argument in ref (write)
+a[i, compress=v] = x
+#---------------------
+1   TestMod.x
+2   top.setindex!
+3   (call core.tuple :compress)
+4   (call core.apply_type core.NamedTuple %₃)
+5   TestMod.v
+6   (call core.tuple %₅)
+7   (call %₄ %₆)
+8   TestMod.a
+9   TestMod.i
+10  (call core.kwcall %₇ %₂ %₈ %₁ %₉)
+11  (return %₁)
+
+########################################
+# kw argument in ref, mixed with splat and a non-atomic kw value
+a[xs..., compress=f()]
+#---------------------
+1   TestMod.xs
+2   TestMod.f
+3   (call %₂)
+4   top.getindex
+5   (call core.tuple :compress)
+6   (call core.apply_type core.NamedTuple %₅)
+7   (call core.tuple %₃)
+8   (call %₆ %₇)
+9   TestMod.a
+10  (call core.tuple %₈ %₄ %₉)
+11  (call core._apply_iterate top.iterate core.kwcall %₁₀ %₁)
+12  (return %₁₁)

@@ -9,6 +9,7 @@ function ≅(a, b)
 end
 
 # vect
+# From PkgEval: SOLPS2imas v2.2.5, via IMASdd src/io.jl:949 (kwarg in indexed assignment)
 @test JuliaLowering.include_string(test_mod, """
 [1,2,3]
 """) ≅ [1,2,3]
@@ -156,3 +157,80 @@ let var"end" = [1,2,3], y = [7,8,9]
     y[var"end"[var"end"]]
 end
 """) === 9
+
+# Keyword arguments in indexing position, e.g. `a[i, kw=v]`, desugar to a
+# regular keyword call of getindex/setindex! (matching flisp lowering). Only
+# the comma form is legal syntax; `a[i; kw=v]` is a parse error under both
+# lowerers and is not tested here.
+JuliaLowering.include_string(test_mod, """
+struct KwIndexable
+end
+Base.getindex(::KwIndexable, i; compress=0) = (i, compress)
+Base.getindex(::KwIndexable, i, j; compress=0) = (i, j, compress)
+Base.setindex!(::KwIndexable, v, i; compress=0) = (i, v, compress)
+Base.lastindex(::KwIndexable) = 99
+Base.lastindex(::KwIndexable, d::Int) = 99
+
+struct KwIndexableNum
+end
+Base.getindex(::KwIndexableNum, i; compress=0) = i + compress
+Base.setindex!(::KwIndexableNum, v, i; compress=0) = (i, v, compress)
+""")
+
+# read
+@test JuliaLowering.include_string(test_mod, """
+let a = KwIndexable()
+    a[1, compress=2]
+end
+""") == (1, 2)
+
+# write
+@test JuliaLowering.include_string(test_mod, """
+let a = KwIndexable()
+    a[1, compress=2] = 10
+end
+""") == 10
+
+# update-op through kw indexing
+@test JuliaLowering.include_string(test_mod, """
+let a = KwIndexableNum()
+    a[1, compress=2] += 1
+end
+""") == 4
+
+# `end` inside brackets alongside a keyword argument (counts as an index slot
+# for dimensionality, same as flisp: `lastindex(a, 1)` is called)
+@test JuliaLowering.include_string(test_mod, """
+let a = KwIndexable()
+    a[end, compress=2]
+end
+""") == (99, 2)
+
+# multiple keyword arguments
+@test JuliaLowering.include_string(test_mod, """
+let a = KwIndexable()
+    a[1, 2, compress=3]
+end
+""") == (1, 2, 3)
+
+# keyword argument after a splatted positional argument
+@test JuliaLowering.include_string(test_mod, """
+let a = KwIndexable(), xs = (1, 2)
+    a[xs..., compress=3]
+end
+""") == (1, 2, 3)
+
+# a computed (non-atom) index alongside a keyword argument
+@test JuliaLowering.include_string(test_mod, """
+let a = KwIndexable(), xs = (2,)
+    a[xs..., compress=1+2]
+end
+""") == (2, 3)
+
+# the semicolon form remains rejected under JuliaLowering, same as flisp
+# (it is not valid `ref` syntax at all, regardless of this fix)
+@test_throws JuliaLowering.LoweringError JuliaLowering.include_string(test_mod, """
+let a = KwIndexable()
+    a[1; compress=2]
+end
+""")

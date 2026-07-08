@@ -463,9 +463,9 @@ end
         end
         @testset let ex = Expr(:ref, test_mod.DummyGetIndex(1), kw)
             @test fl_eval(test_mod, ex) == (:semicolon, :b=>2)
-            @test_broken jl_eval(test_mod, ex) == (:semicolon, :b=>2)
+            @test jl_eval(test_mod, ex) == (:semicolon, :b=>2)
             @test fl_eval(test_mod, outer_ab(ex)) == (0, 0)
-            @test_broken jl_eval(test_mod, outer_ab(ex)) == (0, 0)
+            @test jl_eval(test_mod, outer_ab(ex)) == (0, 0)
         end
         @testset let ex = Expr(:ref, test_mod.DummyGetIndex(1), pkw)
             @test_throws "unexpected semicolon" fl_eval(test_mod, ex)
