@@ -781,6 +781,30 @@ begin
 end
 """) == (1,2,Int,Int)
 
+# https://github.com/JuliaLang/JuliaLowering.jl/issues/23
+# A top-level (soft-scope) local function `factory` whose body defines a nested
+# *named* local function `f` redeclaring its own `where {T}` - shadowing
+# `factory`'s static parameter of the same name - with `T` also reused as a
+# top-level local afterwards. `f`'s own signature TypeVar is homed at the
+# top-level thunk, where its lifted method signature is emitted; it must not be
+# captured (and boxed) by `factory`. Otherwise `factory`'s construction reads
+# that box before the signature statements create it, giving a use-before-def
+# (`UndefVarError: T@N`, the internal disambiguated name leaking to the user).
+let (factory, val) = JuliaLowering.include_string(test_mod, """
+    let
+        function factory(x::T) where {T}
+            f(x::T) where {T<:Number} = x + one(T)
+            f(x)
+        end
+        T = Float64
+        (factory, factory(T(1.0)))
+    end
+    """)
+    @test val === 2.0
+    # `factory` must not capture `f`'s static parameter - it has no fields at all
+    @test isempty(fieldnames(typeof(factory)))
+end
+
 # https://github.com/JuliaLang/JuliaLowering.jl/issues/134#issuecomment-3739626003
 JuliaLowering.include_string(test_mod, """
 function f_update_outer_capture()

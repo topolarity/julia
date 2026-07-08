@@ -669,6 +669,10 @@ struct VariableAnalysisContext{Attrs} <: AbstractLoweringContext
     # Collection of information about each closure, principally which methods
     # are part of the closure (and hence captures).
     closure_bindings::Dict{IdTag,ClosureBindings}
+    # True while analyzing the lifted method-signature statements of a
+    # `K"method_defs"` (the non-lambda parts, see `collect_closure_sig_sparams!`
+    # and `find_closure_sig_local`). Reset to false on entering a method lambda.
+    in_closure_sig::Bool
 end
 
 function init_closure_bindings!(ctx, fname)
@@ -738,6 +742,21 @@ function add_assign!(b::BindingInfo)
     b.is_assigned_once = !b.is_assigned
     b.is_assigned = true
 end
+
+# A reference or assignment within a closure's lifted method-signature region
+# (`ctx.in_closure_sig`) to a binding whose home lambda is the top-level thunk
+# needs no capture: closure conversion lifts the signature out to the thunk,
+# co-locating the reference with the binding's home (which `add_lambda_local!`
+# already placed at the thunk for these lifted-scope locals). Without this
+# exemption such a binding - e.g. the closure's own `where`-clause TypeVar
+# temporary from `assign_sparams`, referenced by the signature svec but declared
+# in a `method_defs` nested inside an enclosing method - is spuriously captured
+# (and boxed) by that enclosing method, producing a use-before-def at the
+# enclosing closure's own construction site. This mirrors the `top_scope`
+# exemption in `find_closure_sig_local`, which already accepts exactly these
+# bindings as "lifted with the signature" rather than rejecting them.
+is_lifted_sig_thunk_local(ctx, b::BindingInfo) =
+    ctx.in_closure_sig && b.lambda_id == top_scope(ctx).id
 
 # Record any static parameters of enclosing methods which are referenced by a
 # closure's method signatures - the parts of the closure's `method_defs` which
@@ -868,10 +887,12 @@ function analyze_variables!(ctx, ex)
         # The type of typed locals is invisible in the previous pass,
         # but is filled in here.
         scope = ctx.scopes[ctx.lambda_bindings.scope_id]
-        ensure_captured!(ctx, scope, b)
-        @jl_assert (b.kind === :global ||
-            b.is_ssa ||
-            haskey(ctx.lambda_bindings.locals_capt, b.id)) ex binding_ex(ctx, b.id)
+        if !is_lifted_sig_thunk_local(ctx, b)
+            ensure_captured!(ctx, scope, b)
+            @jl_assert (b.kind === :global ||
+                b.is_ssa ||
+                haskey(ctx.lambda_bindings.locals_capt, b.id)) ex binding_ex(ctx, b.id)
+        end
     elseif k == K"Identifier"
         @jl_assert false ex
     elseif k == K"break" && numchildren(ex) >= 2
@@ -909,7 +930,7 @@ function analyze_variables!(ctx, ex)
             b = get_binding(ctx, lhs)
             add_assign!(b)
             scope = ctx.scopes[ctx.lambda_bindings.scope_id]
-            ensure_captured!(ctx, scope, b)
+            is_lifted_sig_thunk_local(ctx, b) || ensure_captured!(ctx, scope, b)
             if !isnothing(b.type)
                 # Assignments introduce a variable's type later during closure
                 # conversion, but we must model that explicitly here.
@@ -956,7 +977,15 @@ function analyze_variables!(ctx, ex)
                                          Set{ScopeId}(), false)
         end
         push!(ctx.method_def_stack, name)
-        analyze_variables!(ctx, ex[2])
+        # The signature statements (non-lambda parts of ex[2]) are lifted out to
+        # the top-level thunk by closure conversion; analyze them as such so that
+        # references to bindings homed there (the closure's own signature
+        # TypeVar temporaries) are not spuriously captured. Method lambdas reset
+        # this in the K"lambda" case below.
+        ctx_sig = VariableAnalysisContext(
+            ctx.graph, ctx.layer, ctx.bindings, ctx.scopes,
+            ctx.lambda_bindings, ctx.method_def_stack, ctx.closure_bindings, true)
+        analyze_variables!(ctx_sig, ex[2])
         pop!(ctx.method_def_stack)
     elseif k == K"_opaque_closure"
         name = ex[1]
@@ -981,7 +1010,7 @@ function analyze_variables!(ctx, ex)
         end
         ctx2 = VariableAnalysisContext(
             ctx.graph, ctx.layer, ctx.bindings, ctx.scopes,
-            lambda_bindings, ctx.method_def_stack, ctx.closure_bindings)
+            lambda_bindings, ctx.method_def_stack, ctx.closure_bindings, false)
         foreach(e->analyze_variables!(ctx2, e), ex[3:end]) # body & return type
     else
         foreach(e->analyze_variables!(ctx, e), children(ex))
@@ -1032,7 +1061,7 @@ enclosing lambda form and information about variables captured by closures.
     ctx3 = VariableAnalysisContext(graph, ctx2.layer, ctx2.bindings,
                                    ctx2.scopes, ex2.lambda_bindings,
                                    SyntaxList(graph),
-                                   Dict{IdTag,ClosureBindings}())
+                                   Dict{IdTag,ClosureBindings}(), false)
     analyze_variables!(ctx3, ex2)
     analyze_def_and_use!(ctx3, ex2)
     ctx3, ex2
