@@ -61,7 +61,10 @@ end
 # always considered provenance if unquoted, then removed in certain forms.  If
 # `src` is not an linenode, it is assumed to be a better provenance source, so
 # linenodes in `e` are not used for provenance (but still removed).
-function _expr_to_est(graph::SyntaxGraph, @nospecialize(e), src::SourceAttrType)
+# `as_else` is true when `e` occupies the else-slot (3rd child) of a preceding
+# `if`/`elseif`, i.e. it is a genuine chained else-branch.
+function _expr_to_est(graph::SyntaxGraph, @nospecialize(e), src::SourceAttrType,
+                      as_else::Bool=false)
     st = if e isa Symbol
         setattr!(newleaf(graph, src, K"Identifier"), :name_val, String(e))
     elseif e isa QuoteNode
@@ -85,14 +88,22 @@ function _expr_to_est(graph::SyntaxGraph, @nospecialize(e), src::SourceAttrType)
     elseif e isa Expr
         head_s = string(e.head)
         st_k = find_kind(head_s)
+        # flisp lowers `elseif` with the same expander as `if`, so a bare
+        # `Expr(:elseif, ...)` outside an else-slot (e.g. spliced as a block
+        # sibling by a macro) is an independent `if`, not part of a chain.
+        # Inert quoted bare `:elseif` therefore round-trips as `:if`.
+        if e.head === :elseif && !as_else
+            st_k = K"if"
+        end
         src = old_src = src isa LineNumberNode ? _get_inner_lnn(e, src) : src
         cs = NodeId[]
         rm_linenodes = e.head in (:block, :toplevel)
-        for arg in e.args
+        is_if_like = e.head === :if || e.head === :elseif
+        for (i, arg) in enumerate(e.args)
             if rm_linenodes && arg isa LineNumberNode
                 src isa LineNumberNode && (src = arg)
             else
-                cid, src = _expr_to_est(graph, arg, src)
+                cid, src = _expr_to_est(graph, arg, src, is_if_like && i == 3)
                 push!(cs, cid)
             end
         end
