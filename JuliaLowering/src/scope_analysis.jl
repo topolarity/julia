@@ -759,6 +759,56 @@ function collect_closure_sig_sparams!(ctx, sig_sparams, ex)
     nothing
 end
 
+# Search a closure's method-signature statements (the non-lambda parts of a
+# `K"method_defs"` block - see `collect_closure_sig_sparams!`) for a reference
+# to a `:local`/`:argument` binding of an enclosing method. Such bindings are
+# lifted out to top level along with the signature, where they don't exist,
+# so flisp rejects them outright ("local variable ... cannot be used in
+# closure declaration", flisp's `moved-vars`) rather than attempting to
+# capture them - unlike static parameters (`collect_closure_sig_sparams!`)
+# there's no way to recover the value of an arbitrary local at the closure's
+# top-level definition site. Bindings declared as part of the lifted
+# signature block itself (e.g. the closure's own `where`-clause TypeVar
+# temporaries from `assign_sparams`) are fine: their home lambda ends up
+# being the top-level thunk itself (see `add_lambda_local!`), which is
+# exactly where the signature is emitted. `own_name_id` is the closure's own
+# type-table binding (`K"method_defs"`'s first child): it legitimately
+# appears in `function_type` for the `#self#` argument and is not itself an
+# enclosing local (flisp: `(not (eq? name s))` in `moved-vars`).
+#
+# The names of *other* local closures are also fine, even though they are
+# `:local` bindings of an enclosing method: closure conversion rewrites every
+# reference to a local closure name into that closure's type (flisp's `namemap`
+# / `rename-sig-types`), so signature references to them are resolved rather
+# than moved. flisp gates this on `(has? namemap s)`, and `namemap` is built up
+# as cl-convert walks the block in order; `ctx.closure_bindings` is populated
+# the same way as `analyze_variables!` descends, so a reference is legitimate
+# exactly when its binding is already registered there. This covers a closure's
+# generated helper methods (kwarg `#kw_body#`, optional-argument wrappers, extra
+# methods on one name) whose signatures mention the closure's own name from a
+# *sibling* `method_defs`, and it preserves flisp's order sensitivity: a forward
+# reference to a not-yet-defined sibling closure (mutual recursion) is still an
+# error, matching flisp.
+function find_closure_sig_local(ctx, ex, own_name_id)
+    k = kind(ex)
+    if k == K"BindingId"
+        b = get_binding(ctx, ex)
+        if (b.kind === :local || b.kind === :argument) && !b.is_ssa &&
+                b.id != own_name_id && b.lambda_id != top_scope(ctx).id &&
+                !haskey(ctx.closure_bindings, b.id)
+            return ex
+        end
+    elseif k != K"lambda" && !is_leaf(ex) && !is_quoted(ex)
+        for e in children(ex)
+            r = find_closure_sig_local(ctx, e, own_name_id)
+            if !isnothing(r)
+                return r
+            end
+        end
+    end
+    return nothing
+end
+
 # Record any static parameters of enclosing methods which are referenced
 # inside `K"static_eval"` positions (ccall/cfunction return and argument
 # types) within a closure's method bodies. An ordinary body reference reads
@@ -894,6 +944,12 @@ function analyze_variables!(ctx, ex)
     elseif k == K"method_defs"
         name = ex[1]
         if kind(name) == K"BindingId" && get_binding(ctx, name).kind === :local
+            badvar = find_closure_sig_local(ctx, ex[2], name.var_id)
+            if !isnothing(badvar)
+                bname = get_binding(ctx, badvar).name
+                throw(LoweringError(badvar,
+                    "local variable $bname cannot be used in closure declaration"))
+            end
             cb = init_closure_bindings!(ctx, name)
             collect_closure_sig_sparams!(ctx, cb.sig_sparams, ex[2])
             collect_static_eval_sparams!(ctx, cb.sig_sparams, ex[2],

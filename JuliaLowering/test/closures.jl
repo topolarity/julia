@@ -865,3 +865,62 @@ let (g, x) = test_mod.f_arg_reassign_with_label(42)
     @test g() == 1
     @test x == 1
 end
+
+@testset "locals in closure signatures produce a clean error" begin
+    # flisp: "local variable T cannot be used in closure declaration".
+    # These used to trip an internal-looking "unexpected binding of kind local".
+    for src in ["""
+                function f1()
+                    T = Int
+                    g = e::T -> e + 1
+                    g(1)
+                end
+                """,
+                """
+                function f2()
+                    let S = Float64
+                        k = x::S -> 2x
+                        k(1.0)
+                    end
+                end
+                """,
+                """
+                function f3(x)
+                    g = e::typeof(x) -> e
+                    g(x)
+                end
+                """,
+                """
+                function f4(x::T) where {T}
+                    let T = Int8
+                        g = e::T -> e
+                        g(Int8(1))
+                    end
+                end
+                """]
+        err = try
+            JuliaLowering.include_string(test_mod, src)
+            nothing
+        catch e
+            e
+        end
+        @test err isa JuliaLowering.LoweringError
+        @test occursin("cannot be used in closure declaration", sprint(showerror, err))
+    end
+
+    # Still-working neighbors: enclosing sparam (sig_sparams), global type,
+    # closure's own where-param, and a top-level let (flisp accepts it there).
+    JuliaLowering.include_string(test_mod, """
+    function f5(x::T) where {T}
+        g = e::T -> e
+        g(x)
+    end
+    """)
+    @test test_mod.f5(3) == 3
+    @test JuliaLowering.include_string(test_mod, """
+    let TT = Int
+        g = e::TT -> e + 1
+        g(1)
+    end
+    """) == 2
+end
