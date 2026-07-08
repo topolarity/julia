@@ -135,6 +135,44 @@ end
     @test gen.zz == 3
 end
 
+@testset "(AI) unescaped `using`/`import` from a cross-module macro" begin
+    # flisp `unescape`s `using`/`import` (macroexpand.scm), so an unescaped
+    # `using`/`import` spliced into an old-style macro's expansion (e.g.
+    # Distributed's `@everywhere using ...`, which splices raw import Exprs
+    # extracted from the caller) resolves against the macro *call site*, not the
+    # macro's defining module.  Previously JuliaLowering targeted the defining
+    # module -> "Cannot load module X into module <macro home>".
+    host = Module()
+    @eval host import JuliaLowering
+    JuliaLowering.include_string(host, raw"""
+    module Prov
+        export exval
+        exval = 111
+        global other = 222
+    end
+    module Home
+        macro old_use(); Expr(:toplevel, :(using ..Prov)); end
+        macro old_imp(); Expr(:toplevel, :(import ..Prov: other as o)); end
+    end
+    """; expr_compat_mode=true)
+    Core.@latestworld
+    JuliaLowering.include_string(host, raw"""
+    module Caller
+        using ..Home: @old_use, @old_imp
+        @old_use
+        @old_imp
+    end
+    """; expr_compat_mode=true)
+    Core.@latestworld
+    Home = Core.eval(host, :Home)
+    Caller = Core.eval(host, :Caller)
+    # `using`/`import` act on the call site (Caller), not the macro home (Home).
+    @test isdefined(Caller, :exval)
+    @test isdefined(Caller, :o)
+    @test !isdefined(Home, :exval)
+    @test !isdefined(Home, :o)
+end
+
 @testset "(AI) macro-returned `Expr(:module)` keeps hygiene (#22)" begin
     # Contrast with the `@eval module` testset above. A macro that *directly
     # returns* `Expr(:toplevel, Expr(:module, false, esc(name), body))` (EnumX's
@@ -193,14 +231,14 @@ end
     @test isdefined(gen, :evalue)
     @test gen.evalue == 99
     @test !isdefined(Provider, :evalue)
-    # KNOWN RESIDUAL (pre-existing, tracked in bugs/eval-payload-hygiene, first
-    # noted in 592451a539): flisp hygiene-hides an unescaped bare `const` as a
-    # name-mangled global of the NEW module; JuliaLowering instead binds it in
-    # the macro's module. Not part of #22 and intentionally not chased here.
-    @test_broken !isdefined(Provider, :c)
-    # NOTE: flisp hygiene-HIDES the bare const as a name-mangled global of the
-    # new module (e.g. #N#c), so a plain `gen.c` never exists even when fixed;
-    # the assertion above is the flip indicator for the residual.
+    # An unescaped bare `const` in a hygienic expansion is hygiene-hidden as a
+    # name-mangled global of the NEW module (matching flisp), so it never leaks
+    # into the macro's module by its plain name.
+    @test !isdefined(Provider, :c)
+    # flisp (and now JuliaLowering) hygiene-HIDES the bare const as a
+    # name-mangled global of the new module (e.g. #N#c), so a plain `gen.c`
+    # never exists.
+    @test !isdefined(gen, :c)
 end
 
 @testset "Imported macrocalls" for expr_compat_mode in (true, false)

@@ -4244,6 +4244,14 @@ function expand_import_or_using(ctx, ex)
         push!(path_specs, @ast ctx spec [K"inert" path])
     end
     is_using = kind(ex) == K"using"
+    # flisp `unescape`s `using`/`import` (macroexpand.scm), so like `export`/
+    # `public` (see `expand_public`) they act on the module the top-level form
+    # is evaluated into, not the macro's home module.  Relayer flisp-compat
+    # expansions to that eval target; hygienic (new-style) expansions and plain
+    # caller-written code (base layer) keep their own module.
+    sc = ex.context::SyntaxContext
+    target_mod = (is_flisp_compat(sc) && !is_base_layer(sc)) ?
+        base_layer(sc).mod : syntax_module(ex)
     stmts = SyntaxList(ctx)
     if isnothing(from_path)
         for spec in path_specs
@@ -4251,7 +4259,7 @@ function expand_import_or_using(ctx, ex)
                 push!(stmts,
                     @ast ctx spec [K"call"
                         eval_using   ::K"Value"
-                        syntax_module(ex)::K"Value"
+                        target_mod::K"Value"
                         spec
                     ]
                 )
@@ -4260,7 +4268,7 @@ function expand_import_or_using(ctx, ex)
                     @ast ctx spec [K"call"
                         eval_import   ::K"Value"
                         (!is_using)   ::K"Bool"
-                        syntax_module(ex)::K"Value"
+                        target_mod::K"Value"
                         (::K"nothing")
                         spec
                     ]
@@ -4274,7 +4282,7 @@ function expand_import_or_using(ctx, ex)
         push!(stmts, @ast ctx ex [K"call"
             eval_import   ::K"Value"
             (!is_using)   ::K"Bool"
-            syntax_module(ex)::K"Value"
+            target_mod::K"Value"
             from_path
             path_specs...
         ])
