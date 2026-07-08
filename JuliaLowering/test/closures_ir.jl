@@ -1122,3 +1122,64 @@ Expression:
   (call JuliaLowering.eval_closure_type Main.TestMod :##->###3 (call core.svec) (call core.svec))
 Containing expressions:
   (call JuliaLowering.eval_closure_type Main.TestMod :##->###3 (call core.svec) (call core.svec))
+
+########################################
+# Closure using an enclosing method's static parameter in its argument type:
+# the static parameter becomes a leading type parameter of the closure type
+# (applied at closure creation time) and a fresh `TypeVar` static parameter of
+# the closure's method, re-bound from the closure type by dispatch.
+function f_argcapt_sp(x::T) where T
+    g = e::T -> e + one(T)
+    g(x)
+end
+#---------------------
+1   (method TestMod.f_argcapt_sp)
+2   latestworld
+3   (call core.svec :T)
+4   (call core.svec false)
+5   (call core.svec :T)
+6   (call JuliaLowering.eval_closure_type TestMod :#f_argcapt_sp##->###0 %₃ %₄ %₅)
+7   latestworld
+8   (call core.TypeVar :T)
+9   TestMod.#f_argcapt_sp##->###0
+10  (call core.apply_type %₉ %₈)
+11  (call core.svec %₁₀ %₈)
+12  (call core.svec %₈)
+13  SourceLocation::2:9
+14  (call core.svec %₁₁ %₁₂ %₁₃)
+15  --- method core.nothing %₁₄
+    slots: [slot₁/#self#(!read) slot₂/e]
+    1   TestMod.+
+    2   TestMod.one
+    3   (call core.getfield slot₁/#self# :T)
+    4   (call %₂ %₃)
+    5   (call %₁ slot₂/e %₄)
+    6   (return %₅)
+16  latestworld
+17  (= slot₁/T (call core.TypeVar :T))
+18  TestMod.f_argcapt_sp
+19  (call core.TypeEqOf %₁₈)
+20  slot₁/T
+21  (call core.svec %₁₉ %₂₀)
+22  slot₁/T
+23  (call core.svec %₂₂)
+24  SourceLocation::1:10
+25  (call core.svec %₂₁ %₂₃ %₂₄)
+26  --- method TestMod.f_argcapt_sp %₂₅
+    slots: [slot₁/#self#(!read) slot₂/x slot₃/#->#(single_assign) slot₄/g(single_assign,called)]
+    1   TestMod.#f_argcapt_sp##->###0
+    2   static_parameter₁
+    3   static_parameter₁
+    4   (call core._typeof_captured_variable %₃)
+    5   (call core.apply_type %₁ %₂ %₄)
+    6   static_parameter₁
+    7   (new %₅ %₆)
+    8   (= slot₃/#-># %₇)
+    9   slot₃/#->#
+    10  (= slot₄/g %₉)
+    11  slot₄/g
+    12  (call %₁₁ slot₂/x)
+    13  (return %₁₂)
+27  latestworld
+28  TestMod.f_argcapt_sp
+29  (return %₂₈)

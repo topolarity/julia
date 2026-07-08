@@ -615,9 +615,14 @@ end
 struct ClosureBindings
     name_stack::Vector{String}      # Names of functions the closure is nested within
     lambdas::Vector{LambdaBindings} # Bindings for each method of the closure
+    # Static parameters of enclosing methods which are referenced in the
+    # closure's method signatures, in order of first appearance (see
+    # `convert_closure_sig_sparams`)
+    sig_sparams::Vector{IdTag}
 end
 
-ClosureBindings(name_stack) = ClosureBindings(name_stack, Vector{LambdaBindings}())
+ClosureBindings(name_stack) =
+    ClosureBindings(name_stack, Vector{LambdaBindings}(), Vector{IdTag}())
 
 struct VariableAnalysisContext{Attrs} <: AbstractLoweringContext
     graph::SyntaxGraph{Attrs}
@@ -668,6 +673,26 @@ end
 function add_assign!(b::BindingInfo)
     b.is_assigned_once = !b.is_assigned
     b.is_assigned = true
+end
+
+# Record any static parameters of enclosing methods which are referenced by a
+# closure's method signatures - the parts of the closure's `method_defs` which
+# sit outside the method lambdas themselves. These are emitted at top level by
+# closure conversion, where static parameters are inaccessible, so they need
+# special treatment (see `convert_closure_sig_sparams`).
+function collect_closure_sig_sparams!(ctx, sig_sparams, ex)
+    k = kind(ex)
+    if k == K"BindingId"
+        b = get_binding(ctx, ex)
+        if b.kind === :static_parameter && !(b.id in sig_sparams)
+            push!(sig_sparams, b.id)
+        end
+    elseif k != K"lambda" && !is_leaf(ex) && !is_quoted(ex)
+        for e in children(ex)
+            collect_closure_sig_sparams!(ctx, sig_sparams, e)
+        end
+    end
+    nothing
 end
 
 # Update ctx.bindings metadata based on binding usage
@@ -743,7 +768,12 @@ function analyze_variables!(ctx, ex)
         end
         foreach(e->analyze_variables!(ctx, e), children(ex))
     elseif k == K"method_defs"
-        push!(ctx.method_def_stack, ex[1])
+        name = ex[1]
+        if kind(name) == K"BindingId" && get_binding(ctx, name).kind === :local
+            cb = init_closure_bindings!(ctx, name)
+            collect_closure_sig_sparams!(ctx, cb.sig_sparams, ex[2])
+        end
+        push!(ctx.method_def_stack, name)
         analyze_variables!(ctx, ex[2])
         pop!(ctx.method_def_stack)
     elseif k == K"_opaque_closure"

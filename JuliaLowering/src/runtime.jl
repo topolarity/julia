@@ -74,8 +74,12 @@ end
 
 #--------------------------------------------------
 # Functions called by closure conversion
-function eval_closure_type(mod::Module, closure_type_name::Symbol, field_names, field_is_box)
-    type_params = Core.TypeVar[]
+function eval_closure_type(mod::Module, closure_type_name::Symbol, field_names,
+                           field_is_box, sparam_names=())
+    # Leading type parameters for any static parameters of enclosing methods
+    # which are used in the closure's method signatures (see
+    # `convert_closure_sig_sparams`)
+    type_params = Core.TypeVar[Core.TypeVar(Symbol(name)) for name in sparam_names]
     field_types = []
     for (name, isbox) in zip(field_names, field_is_box)
         if !isbox

@@ -640,7 +640,10 @@ begin
 end
 """) == (1, Int)
 
-@test_broken JuliaLowering.include_string(test_mod, """
+# Static parameter of an enclosing method used in a closure's argument type:
+# becomes a type parameter of the closure type, re-bound by dispatch as a
+# static parameter of the closure's methods.
+@test JuliaLowering.include_string(test_mod, """
 begin
     function f_argcapt_sp(x::T) where T
         (inner_x::T)->(x, inner_x, T)
@@ -648,6 +651,121 @@ begin
     f_argcapt_sp(1)(2)
 end
 """) == (1, 2, Int)
+
+# The closure's method signature is specific to each instantiation of the
+# enclosing method
+JuliaLowering.include_string(test_mod, """
+function f_argcapt_sp_inst(x::T) where T
+    (inner_x::T)->(inner_x, T)
+end
+""")
+let g_int = test_mod.f_argcapt_sp_inst(1), g_flt = test_mod.f_argcapt_sp_inst(1.0)
+    @test g_int(2) == (2, Int)
+    @test g_flt(2.5) == (2.5, Float64)
+    @test_throws MethodError g_int(2.5)
+end
+
+# Static parameter inside a `curly` in the closure's argument type
+@test JuliaLowering.include_string(test_mod, """
+begin
+    function f_argcapt_sp_curly(x::T) where {T<:Integer}
+        count(e::Pair{T,T} -> first(e) != last(e), [x=>x+1, x=>x])
+    end
+    f_argcapt_sp_curly(1)
+end
+""") == 1
+
+# Named local function and do-block forms; sparam in arg type only (not body)
+@test JuliaLowering.include_string(test_mod, """
+begin
+    function f_argcapt_sp_named(x::T) where T
+        function g(e::T)
+            e + one(T)
+        end
+        g(x)
+    end
+    f_argcapt_sp_named(41)
+end
+""") == 42
+
+@test JuliaLowering.include_string(test_mod, """
+begin
+    function f_argcapt_sp_do(x::Vector{T}) where T
+        map(x) do e::T
+            e + one(T)
+        end
+    end
+    f_argcapt_sp_do([1, 2])
+end
+""") == [2, 3]
+
+# Two static parameters, both used in the closure signature
+@test JuliaLowering.include_string(test_mod, """
+begin
+    function f_argcapt_sp2(x::S, y::T) where {S,T}
+        g = (a::S, b::T) -> (a, b, S, T)
+        g(x, y)
+    end
+    f_argcapt_sp2(1, 2.0)
+end
+""") == (1, 2.0, Int, Float64)
+
+# Nested closures referencing the outermost method's static parameter, and a
+# mix of enclosing sparams from several nesting levels
+@test JuliaLowering.include_string(test_mod, """
+begin
+    function f_argcapt_sp_nested(x::T) where T
+        function outer(y::S) where S
+            h = (a::T, b::S) -> (a, b)
+            h(x, y)
+        end
+        outer(1.5)
+    end
+    f_argcapt_sp_nested(1)
+end
+""") == (1, 1.5)
+
+# Closure with its own static parameter as well as a captured one in its
+# signature
+@test JuliaLowering.include_string(test_mod, """
+begin
+    function f_argcapt_sp_own(x::T) where T
+        function g(a::T, b::S) where S
+            (a, b, S)
+        end
+        g(x, "hi")
+    end
+    f_argcapt_sp_own(1)
+end
+""") == (1, "hi", String)
+
+# Multiple local methods sharing the closure type, only one of which uses the
+# captured static parameter in its signature
+@test JuliaLowering.include_string(test_mod, """
+begin
+    function f_argcapt_sp_multi(x::T) where T
+        function g(e::T)
+            (e, 1)
+        end
+        function g(e::String)
+            (e, 2)
+        end
+        (g(x), g("s"))
+    end
+    f_argcapt_sp_multi(7)
+end
+""") == ((7, 1), ("s", 2))
+
+# Defining the closure without calling it
+@test JuliaLowering.include_string(test_mod, """
+begin
+    function f_argcapt_sp_nocall(x::T) where T
+        g = e::T -> e
+        nothing
+    end
+    f_argcapt_sp_nocall(1)
+end
+""") === nothing
 
 # Inner method typevar `U` depending on a static parameter `T` so hoisting the
 # method def for `inner` out to top level would require detecting this and

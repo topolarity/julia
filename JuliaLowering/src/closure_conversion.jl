@@ -275,8 +275,12 @@ end
 
 # Return a thunk which creates a new type for a closure with `field_syms` named
 # fields. The new type will be named `name_str` which must be an unassigned
-# name in the module.
-function type_for_closure(ctx::ClosureConversionCtx, srcref, name_str, field_syms, field_is_box)
+# name in the module. `sparam_names` are the names of any static parameters of
+# enclosing methods captured by the closure's method signatures; these become
+# leading type parameters of the closure type (see
+# `convert_closure_sig_sparams`).
+function type_for_closure(ctx::ClosureConversionCtx, srcref, name_str, field_syms,
+                          field_is_box, sparam_names)
     # New closure types always belong to the module we're expanding into - they
     # need to be serialized there during precompile.
     mod = ctx.mod
@@ -288,6 +292,9 @@ function type_for_closure(ctx::ClosureConversionCtx, srcref, name_str, field_sym
         name_str::K"Symbol"
         [K"call" "svec"::K"core" field_syms...]
         [K"call" "svec"::K"core" [f::K"Bool" for f in field_is_box]...]
+        if !isempty(sparam_names)
+            [K"call" "svec"::K"core" [n::K"Symbol" for n in sparam_names]...]
+        end
     ]
     type_ex, type_binding
 end
@@ -310,6 +317,72 @@ end
 # Is captured in the closure's `self` argument
 function is_self_captured(ctx, x)
     get(ctx.lambda_bindings.locals_capt, _binding_id(x), false)
+end
+
+function _rewrite_sig_sparams(ctx, ex, closure_id, sparam_tv_inds, tvs)
+    k = kind(ex)
+    if k == K"BindingId"
+        i = get(sparam_tv_inds, ex.var_id, nothing)
+        isnothing(i) ? ex : tvs[i]
+    elseif k == K"function_type" && kind(ex[1]) == K"BindingId" &&
+            ex[1].var_id == closure_id
+        # The closure type in argument position is constrained by the new
+        # TypeVars, allowing dispatch to re-bind them from the type parameters
+        # applied at closure creation time.
+        @ast ctx ex [K"call" "apply_type"::K"core" ex tvs...]
+    elseif k == K"lambda" || is_leaf(ex) || is_quoted(ex)
+        # References within the closure's method bodies are handled by ordinary
+        # capture conversion, not here.
+        ex
+    elseif k == K"call" && kind(ex[1]) == K"core" && ex[1].name_val == "svec" &&
+            numchildren(ex) == 4 && kind(ex[3]) == K"call" &&
+            kind(ex[4]) == K"SourceLocation"
+        # Method signature metadata `svec(svec(arg_types...), svec(sparams...),
+        # location)` (see `method_def_expr`): append the new TypeVars as
+        # trailing static parameters of the method.
+        @ast ctx ex [K"call"
+            ex[1]
+            _rewrite_sig_sparams(ctx, ex[2], closure_id, sparam_tv_inds, tvs)
+            [K"call"(ex[3]) ex[3][1:end]... tvs...]
+            ex[4]
+        ]
+    else
+        mapchildren(e->_rewrite_sig_sparams(ctx, e, closure_id, sparam_tv_inds, tvs),
+                    ctx, ex)
+    end
+end
+
+# flisp: the `capt-sp` parts of `cl-convert`'s local `method` case
+#
+# A closure's method signatures are emitted at top level where the static
+# parameters of enclosing methods can't be accessed, so each such static
+# parameter referenced by the signatures (recorded in
+# `ClosureBindings.sig_sparams`) is turned into a fresh `TypeVar` which becomes
+#  * a trailing static parameter of each of the closure's methods, substituted
+#    for signature references to the original static parameter, and
+#  * a leading type parameter of the closure type, applied at closure creation
+#    time (see the `K"function_decl"` case of `_convert_closures`).
+#
+# For example, with `T` a static parameter of an enclosing method, the methods
+# of `g = e::T -> e` become methods `(::#Clo{T′})(e::T′) where T′` of the
+# closure type `#Clo`, and the closure itself is created as `new(#Clo{T})` so
+# that dispatch re-binds `T′` per closure instance.
+function convert_closure_sig_sparams(ctx, ex, closure_id, sig_sparams)
+    tvs = SyntaxList(ctx)
+    stmts = SyntaxList(ctx)
+    sparam_tv_inds = Dict{IdTag,Int}()
+    for (i, id) in enumerate(sig_sparams)
+        name = get_binding(ctx, id).name
+        tv = ssavar(ctx, ex, name)
+        push!(stmts, @ast ctx ex [K"=" tv
+            [K"call" "TypeVar"::K"core" name::K"Symbol"]])
+        push!(tvs, tv)
+        sparam_tv_inds[id] = i
+    end
+    @ast ctx ex [K"block"
+        stmts...
+        _rewrite_sig_sparams(ctx, ex, closure_id, sparam_tv_inds, tvs)
+    ]
 end
 
 # Map the children of `ex` through _convert_closures, lifting any toplevel
@@ -419,8 +492,11 @@ function _convert_closures(ctx::ClosureConversionCtx, ex)
                 name_str = reserve_module_binding_i(
                     ctx.mod,
                     string("#", join(closure_binds.name_stack, "#"), "##"))
+                sparam_names = [get_binding(ctx, id).name
+                                for id in closure_binds.sig_sparams]
                 closure_type_def, closure_type_ =
-                    type_for_closure(ctx, ex, name_str, field_syms, field_is_box)
+                    type_for_closure(ctx, ex, name_str, field_syms, field_is_box,
+                                     sparam_names)
                 if !ctx.is_toplevel_seq_point
                     push!(ctx.toplevel_stmts, closure_type_def)
                     push!(ctx.toplevel_stmts, @ast ctx ex (::K"latestworld_if_toplevel"))
@@ -429,6 +505,15 @@ function _convert_closures(ctx::ClosureConversionCtx, ex)
                 closure_info = ClosureInfo(closure_type_, field_syms, field_inds)
                 ctx.closure_infos[func_name_id] = closure_info
                 type_params = SyntaxList(ctx)
+                # Captured static parameters used in the closure's method
+                # signatures become leading type parameters of the closure type
+                for id in closure_binds.sig_sparams
+                    sp_val = binding_ex(ctx, id)
+                    if is_self_captured(ctx, sp_val)
+                        sp_val = captured_var_access(ctx, sp_val)
+                    end
+                    push!(type_params, sp_val)
+                end
                 init_closure_args = SyntaxList(ctx)
                 for (id, boxed) in zip(field_orig_bindings, field_is_box)
                     field_val = binding_ex(ctx, id)
@@ -493,11 +578,19 @@ function _convert_closures(ctx::ClosureConversionCtx, ex)
         name = ex[1]
         is_closure = kind(name) == K"BindingId" && get_binding(ctx, name).kind === :local
         cap_rewrite = is_closure ? ctx.closure_infos[name.var_id] : nothing
+        body_in = ex[2]
+        if is_closure
+            sig_sparams = ctx.closure_bindings[name.var_id].sig_sparams
+            if !isempty(sig_sparams)
+                body_in = convert_closure_sig_sparams(ctx, body_in, name.var_id,
+                                                      sig_sparams)
+            end
+        end
         ctx2 = ClosureConversionCtx(ctx.graph, ctx.bindings, ctx.mod,
                                     ctx.closure_bindings, cap_rewrite, ex.lambda_bindings,
                                     ctx.is_toplevel_seq_point, ctx.toplevel_pure, ctx.toplevel_stmts,
                                     ctx.closure_infos)
-        body = map_cl_convert(ctx2, ex[2], false)
+        body = map_cl_convert(ctx2, body_in, false)
         if is_closure
             if ctx.is_toplevel_seq_point
                 body
