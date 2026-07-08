@@ -220,10 +220,14 @@ vst1(vcx::Validation1Context, st::SyntaxTree)::ValidationResult = @stm st begin
         # TODO: can we restrict xs[2:2:end] to identifier or .identifier?
         all(vst1, vcx, xs[2:2:end]) &
         all(vst1, vcx, xs[1:2:end])
-    [K"<:" x] -> vst1(vcx, x)
-    [K">:" x] -> vst1(vcx, x)
-    [K"<:" x y] -> vst1(vcx, x) & vst1(vcx, y)
-    [K">:" x y] -> vst1(vcx, x) & vst1(vcx, y)
+    # `<:`/`>:` used as a prefix call (`<:(a, b...)` etc) are ordinary calls to
+    # the `<:`/`>:` builtins as far as lowering is concerned (see
+    # `expand_forms_2` in desugaring.jl), so their arguments accept splats
+    # just like any other call.  (2-arg infix `a <: b`/`a >: b` is the common
+    # case, but any arity >= 1 is accepted here; 0-arg `<:()`/`>:()` remains
+    # invalid, matching prior behavior.)
+    [K"<:" xs...] -> minlen(st, xs, 1) & all(vst1_call_arg, vcx, xs)
+    [K">:" xs...] -> minlen(st, xs, 1) & all(vst1_call_arg, vcx, xs)
     [K"-->" xs...] -> all(vst1, vcx, xs)
     [K"::" x y] -> vst1(vcx, x) & vst1(vcx, y)
     # TODO: inner_cond on args[2:end]
