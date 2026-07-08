@@ -1295,6 +1295,20 @@ end
     end
 end
 
+@testset "internal kwarg scratch slot is hidden from kwarg_decl" begin
+    # From PkgEval: QuasiMonteCarlo v0.3.6, src/Sobol.jl:6 (Base.@kwdef @concrete struct SobolSample; ConcreteStructs v0.2.5)
+    # `keywords_method_def_expr` allocates an internal scratch slot for
+    # extracting/typechecking each keyword's value. Its name must contain a `#`
+    # marker so that `Base.kwarg_decl` (which lists every post-nargs slot whose
+    # name lacks `#`) does not leak it into method displays as a bogus keyword.
+    JuliaLowering.include_string(test_mod, """
+    f_kw_decl(a; x::Char='a', y::Bool=true) = (a, x, y)
+    """)
+    kd = Base.kwarg_decl(first(methods(test_mod.f_kw_decl)))
+    @test kd == [:x, :y]
+    @test !any(s -> occursin("kwtmp", string(s)), kd)
+end
+
 @testset "pre-desugared arg::Vararg" begin
     @test JuliaLowering.include_string(test_mod, """
     let
