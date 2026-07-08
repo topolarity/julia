@@ -340,6 +340,47 @@ x --> y
 5   (return %₄)
 
 ########################################
+# Prefix <: with a splatted argument (JuliaLowering.jl#18)
+# From PkgEval: JuliaInterpreter src/builtins.jl:60 (prefix <: with splat); ChunkedCSV v0.2.1 and Semicoroutines v1.0.0 failed via it
+<:(xs...)
+#---------------------
+1   TestMod.<:
+2   TestMod.xs
+3   (call core._apply_iterate top.iterate %₁ %₂)
+4   (return %₃)
+
+########################################
+# Prefix >: with a splatted argument
+>:(xs...)
+#---------------------
+1   TestMod.>:
+2   TestMod.xs
+3   (call core._apply_iterate top.iterate %₁ %₂)
+4   (return %₃)
+
+########################################
+# Prefix <: with a mix of plain and splatted arguments
+<:(a, xs...)
+#---------------------
+1   TestMod.<:
+2   TestMod.a
+3   (call core.tuple %₂)
+4   TestMod.xs
+5   (call core._apply_iterate top.iterate %₁ %₃ %₄)
+6   (return %₅)
+
+########################################
+# Prefix <: with 3 plain arguments
+<:(a, b, c)
+#---------------------
+1   TestMod.<:
+2   TestMod.a
+3   TestMod.b
+4   TestMod.c
+5   (call %₁ %₂ %₃ %₄)
+6   (return %₅)
+
+########################################
 # basic ccall
 ccall(:strlen, Csize_t, (Cstring,), "asdfg")
 #---------------------
