@@ -39,13 +39,22 @@ end
 # current lowering module.  (counterexample: macroexpand in mod A producing
 # escaped :toplevel st, then eval st in mod B, but flisp does the same thing by
 # spamming globalrefs to mod A throughout st).
-function rebase_layers(st, mod::Module, ver::VersionNumber)
+function rebase_layers(st, mod::Module, ver::VersionNumber,
+                       remap_layer::Union{Nothing,ScopeLayer}=nothing)
     out = if !hasattr(st, :context)
         # assert zero context
         sc = SyntaxContext(mod, ver)
         fill_context!(st, sc)
     else
-        base = base_layer(st.context::SyntaxContext)
+        # By default we remap the *base* layer (the module code was written in /
+        # eval'd into) to `mod`. When walking into a `module` block whose body
+        # carries macro-expansion hygiene (e.g. a `module` produced by an
+        # unescaped macro quote and evaluated via `@eval`/`Core.eval`), the
+        # unescaped body scope is the module's *outermost* layer rather than the
+        # base layer, so `remap_layer` lets the caller target that layer instead.
+        # This makes `using`/`import` and plain global references inside such a
+        # module resolve against the freshly-created module, matching flisp.
+        base = isnothing(remap_layer) ? base_layer(st.context::SyntaxContext) : remap_layer
         newbase = ScopeLayer(mod, nothing)
         _rebase_layers(
             st, Dict{ScopeLayer, ScopeLayer}(base=>newbase),
@@ -94,13 +103,18 @@ end
 # We might consider changing at least the second of these choices, depending on
 # how we end up putting this into Base.
 
+# todo entries are (expr, is_module_body, child_idx, module_layer):
+# `module_layer`, when non-nothing, is the outermost hygiene layer of the
+# enclosing `module` block; its statements are rebased against that layer (see
+# `rebase_layers`) so that hygienic macro-generated module bodies resolve
+# against the freshly-created module.
 struct LoweringIterator{Attrs}
     ver::VersionNumber # later stored in module?
-    todo::Vector{Tuple{SyntaxTree{Attrs}, Bool, Int}}
+    todo::Vector{Tuple{SyntaxTree{Attrs}, Bool, Int, Union{Nothing,ScopeLayer}}}
 end
 
 function lower_init(ex::SyntaxTree{T}, ver) where {T}
-    LoweringIterator{T}(ver, [(ex, false, 0)])
+    LoweringIterator{T}(ver, [(ex, false, 0, nothing)])
 end
 
 function lower_step(iter::LoweringIterator, mod::Module, world::UInt;
@@ -109,10 +123,10 @@ function lower_step(iter::LoweringIterator, mod::Module, world::UInt;
         return Core.svec(:done)
     end
 
-    top_ex, is_module_body, child_idx = pop!(iter.todo)
+    top_ex, is_module_body, child_idx, module_layer = pop!(iter.todo)
     if child_idx > 0
         if child_idx <= numchildren(top_ex)
-            push!(iter.todo, (top_ex, is_module_body, child_idx + 1))
+            push!(iter.todo, (top_ex, is_module_body, child_idx + 1, module_layer))
             ex = top_ex[child_idx]
         elseif is_module_body
             return Core.svec(:end_module)
@@ -125,12 +139,12 @@ function lower_step(iter::LoweringIterator, mod::Module, world::UInt;
 
     k = kind(ex)
     if !(k in KSet"toplevel module")
-        ex = rebase_layers(ex, mod, iter.ver)
+        ex = rebase_layers(ex, mod, iter.ver, module_layer)
         ex = expand_forms_1(ex, world, true)
         k = kind(ex)
     end
     if k == K"toplevel"
-        push!(iter.todo, (ex, false, 1))
+        push!(iter.todo, (ex, false, 1, nothing))
         return lower_step(iter, mod, world; soft_scope)
     elseif k == K"module"
         (version, notbare, name, body) = @stm ex begin
@@ -144,7 +158,13 @@ function lower_step(iter::LoweringIterator, mod::Module, world::UInt;
         end
         newmod_name = Symbol(name.name_val)
         loc = source_location(LineNumberNode, ex)
-        push!(iter.todo, (body, true, 1))
+        # The body's unescaped scope is the module node's outermost hygiene layer
+        # (for hygienic macro-generated modules this differs from the base
+        # layer); rebase the body statements against it so they resolve into the
+        # new module. Parsed literal modules carry no context, so fall back to
+        # the default (base-layer) rebasing.
+        body_layer = hasattr(ex, :context) ? ex.context.layer : nothing
+        push!(iter.todo, (body, true, 1, body_layer))
         return Core.svec(:begin_module, version, newmod_name, notbare, loc)
     else
          ctx2, ex2 = expand_forms_2(ex, mod, world)
