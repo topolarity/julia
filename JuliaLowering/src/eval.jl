@@ -132,6 +132,13 @@ function lower_init(ex::SyntaxTree{T}, ver) where {T}
     LoweringIterator{T}(ver, [(ex, false, 0, nothing, false)])
 end
 
+# Positional adapter so `invoke_in_lowerer_world` (which forwards only positional
+# arguments) can dispatch the lowering step at the pinned lowering world.
+function _lower_step_positional(iter::LoweringIterator, mod::Module, world::UInt,
+                                soft_scope::Union{Nothing,Bool})
+    return lower_step(iter, mod, world; soft_scope)
+end
+
 function lower_step(iter::LoweringIterator, mod::Module, world::UInt;
                     soft_scope::Union{Nothing,Bool}=nothing)
     if isempty(iter.todo)
@@ -824,7 +831,17 @@ function _eval(mod::Module, iter::LoweringIterator; soft_scope::Union{Nothing,Bo
     modules = Module[mod]
     result = nothing
     while true
-        thunk = lower_step(iter, modules[end], Base.get_world_counter(); soft_scope)::Core.SimpleVector
+        # `JuliaLowering.eval` is emitted into user code by the `@eval` macro (see
+        # syntax_macros.jl) and therefore runs at the caller's latest world, where
+        # its lowering machinery would be invalidated by every method the
+        # surrounding code defines (e.g. an `@eval`-in-loop that extends Base
+        # operators). Dispatch the lowering step at the pinned lowering world so
+        # those specializations stay valid; the semantic world for the code being
+        # lowered is still passed explicitly (get_world_counter()), so macros and
+        # binding resolution observe the latest method table. The eval of the
+        # resulting thunk below runs at the caller's world, as it must.
+        thunk = invoke_in_lowerer_world(_lower_step_positional, iter, modules[end],
+                                        Base.get_world_counter(), soft_scope)::Core.SimpleVector
         type = thunk[1]::Symbol
         if type == :done
             break

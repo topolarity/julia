@@ -13,6 +13,27 @@ Base.@assume_effects :removable function current_exception()
     @ccall jl_current_exception(current_task()::Any)::Any
 end
 
+# The Julia-side lowerer is dispatched at a fixed "lowering world" (see
+# `jl_lowering_world` and `activate!`), which keeps its own specializations from
+# being invalidated (and re-inferred) by method definitions in the code being
+# lowered. A few lowering runtime helpers are *emitted into user code* (e.g. the
+# quote/interpolation builders) and therefore run at the caller's latest world,
+# where they would be re-invalidated the same way. Re-dispatch such a helper at
+# the pinned lowering world so its compiled code stays valid across the surrounding
+# code's method definitions.
+#
+# This is only safe for helpers that touch JuliaLowering-internal syntax state and
+# never dispatch on user values: interpolated user values are materialized into
+# tuples at the emitted call site (at the caller's world) before the builder runs,
+# so no user iteration/dispatch happens under the pin. It must NOT be used for
+# helpers that resolve bindings or module paths (e.g. `using`/`import`), which must
+# observe the caller's world. Falls back to the caller's world when unpinned (0),
+# e.g. under the flisp lowerer.
+@inline function invoke_in_lowerer_world(f::F, @nospecialize(args...)) where {F}
+    w = unsafe_load(cglobal(:jl_lowering_world, Csize_t))
+    return w == 0 ? f(args...) : Base.invoke_in_world(w, f, args...)
+end
+
 function _interpolate_expr(@nospecialize(ex), depth, @nospecialize(vals::Tuple), val_i)
     if ex isa QuoteNode
         out = _interpolate_expr(Expr(:inert, ex.value), depth, vals, val_i)
@@ -36,7 +57,13 @@ function _interpolate_expr(@nospecialize(ex), depth, @nospecialize(vals::Tuple),
         Expr(ex.head, cs_out...)
     end
 end
+# Emitted into user code by `expand_quote`; runs at eval time. Pinned to the
+# lowering world (see `invoke_in_lowerer_world`) so it is not re-invalidated by
+# methods the surrounding code defines. `values` are already materialized here.
 function interpolate_expr(@nospecialize(ex), @nospecialize(values...))
+    return invoke_in_lowerer_world(_interpolate_expr_toplevel, ex, values)
+end
+function _interpolate_expr_toplevel(@nospecialize(ex), @nospecialize(values::Tuple))
     @jl_assert !Meta.isexpr(ex, :$) (expr_to_est(ex), "expand_quote should handle this")
     _interpolate_expr(ex, 0, values, Ref(0))
 end
@@ -63,7 +90,12 @@ function _interpolate_syntax(st::SyntaxTree, depth, @nospecialize(vals), val_i)
     end
     mknode(st, cs_out)
 end
+# Emitted into user code by `expand_syntaxquote`; runs at eval time. Pinned to the
+# lowering world (see `invoke_in_lowerer_world`); `vals` are already materialized.
 function interpolate_syntax(st::SyntaxTree, @nospecialize(vals...))
+    return invoke_in_lowerer_world(_interpolate_syntax_toplevel, st, vals)
+end
+function _interpolate_syntax_toplevel(st::SyntaxTree, @nospecialize(vals::Tuple))
     st = copy_ast(ensure_macro_attributes!(SyntaxGraph()), st)
     val_i = Ref(0)
     out = _interpolate_syntax((@ast st._graph st [K"None" st]), 0, vals, val_i)
