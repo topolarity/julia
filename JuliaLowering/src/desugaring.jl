@@ -3595,7 +3595,13 @@ function _rewrite_ctor_new_calls(ctx, ex, global_struct_name, ctor_sparams,
         elseif n_type_nonsplat > length(struct_typevars)
             throw(LoweringError(ex[1], "too many type parameters specified in `new{...}`"))
         end
-        @ast ctx ex[1] [K"curly" global_struct_name new_type_params...]
+        if isempty(new_type_params)
+            # flisp's `new-call` special-cases zero type parameters: emit a
+            # bare struct reference, not an empty curly (invalid `apply_type`).
+            global_struct_name
+        else
+            @ast ctx ex[1] [K"curly" global_struct_name new_type_params...]
+        end
     elseif !isnothing(ctor_self)
         # new(...) in constructors
         ctor_self

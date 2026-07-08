@@ -1167,6 +1167,72 @@ struct X{S,T}
 end
 
 ########################################
+# `new{}()` (empty curly, zero syntactic type params) on a non-parametric
+# struct constructs a bare instance of the struct, matching flisp's
+# `new-call`, rather than going through `apply_type` with zero arguments.
+# See https://github.com/JuliaLang/JuliaLowering.jl/issues/27
+struct X
+    x
+    X() = new{}(1)
+end
+#---------------------
+1   (call core.declare_global TestMod :X false)
+2   latestworld
+3   (call core.svec)
+4   (call core.svec :x)
+5   (call core.svec)
+6   (call core._structtype TestMod :X %₃ %₄ %₅ false 1)
+7   (= slot₁/X %₆)
+8   (call core._setsuper! %₆ core.Any)
+9   (call core.isdefinedglobal TestMod :X false)
+10  (gotoifnot %₉ label₁₄)
+11  TestMod.X
+12  (= slot₂/if_val (call core._equiv_typedef %₁₁ %₆))
+13  (goto label₁₅)
+14  (= slot₂/if_val false)
+15  slot₂/if_val
+16  (gotoifnot %₁₅ label₂₀)
+17  TestMod.X
+18  (= slot₃/if_val %₁₇)
+19  (goto label₂₁)
+20  (= slot₃/if_val false)
+21  slot₃/if_val
+22  (gotoifnot %₁₅ label₂₃)
+23  (call core.svec core.Any)
+24  (call core._typebody! %₂₁ %₆ %₂₃)
+25  (call core.declare_const TestMod :X %₂₄)
+26  latestworld
+27  TestMod.X
+28  (call core.apply_type core.Type %₂₇)
+29  (call core.svec %₂₈)
+30  (call core.svec)
+31  SourceLocation::3:5
+32  (call core.svec %₂₉ %₃₀ %₃₁)
+33  --- method core.nothing %₃₂
+    slots: [slot₁/#ctor-self#(!read)]
+    1   TestMod.X
+    2   (new %₁ 1)
+    3   (return %₂)
+34  latestworld
+35  (return core.nothing)
+
+########################################
+# Error: `new{}()` (empty curly) on a PARAMETRIC struct still errors:
+# the empty-curly special case only applies when there are no struct type
+# parameters to satisfy. See https://github.com/JuliaLang/JuliaLowering.jl/issues/27
+struct X{T}
+    x::T
+    X() = new{}(1)
+end
+#---------------------
+LoweringError:
+struct X{T}
+    x::T
+    X() = new{}(1)
+#         └───┘ ── too few type parameters specified in `new{...}`
+end
+
+########################################
 # Error: Struct not at top level
 function f()
     struct X
