@@ -102,12 +102,24 @@ function eval_closure_type(mod::Module, closure_type_name::Symbol, field_names,
     type
 end
 
-# Interpolate captured local variables into the CodeInfo for a global method
+# Interpolate captured local variables into the CodeInfo for a global method.
+# `captured_local` markers may appear either as whole statements or nested
+# inside an expression (e.g. within a ccall/cfunction `static_eval` argument
+# type), so replacement recurses into sub-expressions.
+function _replace_captured_locals!(ex, locals::Core.SimpleVector)
+    ex isa Expr || return ex
+    if Meta.isexpr(ex, :captured_local)
+        return locals[ex.args[1]::Int]
+    end
+    for i in eachindex(ex.args)
+        ex.args[i] = _replace_captured_locals!(ex.args[i], locals)
+    end
+    return ex
+end
+
 function replace_captured_locals!(codeinfo::Core.CodeInfo, locals::Core.SimpleVector)
     for (i, ex) in enumerate(codeinfo.code)
-        if Meta.isexpr(ex, :captured_local)
-            codeinfo.code[i] = locals[ex.args[1]::Int]
-        end
+        codeinfo.code[i] = _replace_captured_locals!(ex, locals)
     end
     codeinfo
 end

@@ -456,8 +456,15 @@ function _convert_closures(ctx::ClosureConversionCtx, ex)
         else
             access
         end
-    elseif is_leaf(ex) || k == K"inert" || k == K"syntaxinert" || k == K"static_eval"
+    elseif is_leaf(ex) || k == K"inert" || k == K"syntaxinert"
         ex
+    elseif k == K"static_eval"
+        # Recurse so that locals captured from an enclosing scope (e.g. a ccall
+        # or cfunction return/argument type referencing an outer `local`) are
+        # rewritten into `captured_local` interpolations and spliced into the
+        # method at definition time.  Globals and static parameters are left
+        # unchanged by the recursion.
+        mapchildren(e->_convert_closures(ctx, e), ctx, ex)
     elseif k == K"="
         convert_assignment(ctx, ex)
     elseif k == K"isdefined"
