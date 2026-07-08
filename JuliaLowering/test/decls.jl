@@ -63,6 +63,98 @@ let
 end
 """) === (1, 20)
 
+@testset "reassigned local with `<:`-bounded declared type" begin
+    # From PkgEval: Toolips src/core.jl:859 and CSV src/context.jl:258 (typed local with <: bound, reassigned); 8+ packages hit this class
+    # A declared type containing a `<:` bound desugars to a `TypeVar(...)`
+    # construction bound to an SSA value.  The declared type is re-evaluated at
+    # each assignment (like flisp), so each emission needs fresh SSA values.
+    @test JuliaLowering.include_string(test_mod, """
+    function f()
+        local x::Type{<:Real} = Int
+        x = Float64
+        x
+    end
+    f()
+    """) === Float64
+
+    # Bare declaration followed by two assignments
+    @test JuliaLowering.include_string(test_mod, """
+    function f()
+        local x::Type{<:Real}
+        x = Int
+        x = Float64
+        x
+    end
+    f()
+    """) === Float64
+
+    # `Vector{<:Real}` variant
+    @test JuliaLowering.include_string(test_mod, """
+    function f()
+        local x::Vector{<:Real} = [1, 2, 3]
+        x = [1.0]
+        x
+    end
+    f()
+    """) == [1.0]
+
+    # Declaration + reassignment inside a `let`
+    @test JuliaLowering.include_string(test_mod, """
+    let
+        local y::Type{<:Real} = Int
+        y = Float64
+        y
+    end
+    """) === Float64
+
+    # Captured typed local: the closure sees the reassigned value
+    @test JuliaLowering.include_string(test_mod, """
+    function f()
+        local x::Type{<:Real} = Int
+        g = () -> x
+        x = Float64
+        g()
+    end
+    f()
+    """) === Float64
+
+    # Three-plus assignments
+    @test JuliaLowering.include_string(test_mod, """
+    function f()
+        local x::Type{<:Real} = Int
+        x = Float32
+        x = Float64
+        x = Int8
+        x
+    end
+    f()
+    """) === Int8
+
+    # The convert/typeassert is still enforced on every assignment
+    @test_throws Exception JuliaLowering.include_string(test_mod, """
+    function f()
+        local x::Type{<:Real} = Int
+        x = String
+        x
+    end
+    f()
+    """)
+
+    # A side-effecting declared-type expression is re-evaluated once per
+    # assignment, exactly as flisp does
+    @test JuliaLowering.include_string(test_mod, """
+    let side = Ref(0)
+        sidetype() = (side[] += 1; Type{<:Real})
+        function f()
+            local x::(sidetype()) = Int
+            x = Float64
+            x
+        end
+        (f(), side[])
+    end
+    """) === (Float64, 2)
+end
+
 @testset "Global const mixes" for (mod, run) in [(Module(), fl_eval),
                                                  (Module(), jl_eval)]
 
