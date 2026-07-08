@@ -273,6 +273,7 @@ end
 """) === (1, 2, (1,2,3,1), 1, 2, (1,2,3,0))
 
 @testset "Optional positional arguments" begin
+    # From PkgEval: Normalization v0.9.3 test/runtests.jl:597, via DimensionalData v0.30.1 src/array/array.jl:83-87 (rebuild defaults dims=dims(A), ...)
     @test JuliaLowering.include_string(test_mod, """
     begin
         function f_def_simple(x=1, y=2, z=x)
@@ -438,6 +439,51 @@ end
         """)
         @test res == (Complex(1), 4)
         @test_broken res == (Complex(1), 1)
+    end
+
+    # A batch of trailing defaults filled together must not let an arg's own
+    # name shadow a same-named global its default calls (regression for the
+    # DimensionalData `rebuild(...; dims=dims(A), refdims=refdims(A), ...)`
+    # UndefVarError -- each default should only see *previously*-bound names
+    # of the batch, as with flisp's per-arg cascading wrapper methods).
+    @test JuliaLowering.include_string(test_mod, """
+    begin
+        # The parameter names must EQUAL the global functions their defaults
+        # call — the DimensionalData `rebuild` shape — or the self-shadow
+        # never triggers.
+        dimsx(x) = "GLOBAL-dims"
+        refdimsx(x) = "GLOBAL-refdims"
+        function f_optarg_self_shadow(x, dimsx=dimsx(x), refdimsx=refdimsx(x))
+            (dimsx, refdimsx)
+        end
+        f_optarg_self_shadow(1)
+    end
+    """) == ("GLOBAL-dims", "GLOBAL-refdims")
+
+    # Self-shadow in the MIDDLE of a 3-default batch.
+    @test JuliaLowering.include_string(test_mod, """
+    let
+        helper1(x) = 100
+        mid_glob(x) = 200
+        helper3(x) = 300
+        f_optarg_mid_shadow(x, firstarg=helper1(x), mid_glob=mid_glob(x), lastarg=helper3(x)) =
+            (firstarg, mid_glob, lastarg)
+        f_optarg_mid_shadow(0)
+    end
+    """) == (100, 200, 300)
+
+    # Batched defaults are still evaluated left-to-right, exactly once each,
+    # and a later default sees the (already-bound) *value* of an earlier one.
+    let res = JuliaLowering.include_string(test_mod, """
+        let order = Int[]
+            function f_optarg_batch_order(x,
+                    a=(push!(order,1); 1), b=(push!(order,2); a+1), c=(push!(order,3); b+1))
+                (a, b, c, order)
+            end
+            f_optarg_batch_order(0)
+        end
+        """)
+        @test res == (1, 2, 3, [1,2,3])
     end
 end
 
