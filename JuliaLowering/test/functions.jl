@@ -2306,3 +2306,44 @@ end
     @test test_mod.f_uscore_nested_where([1, 2]) == 3
     @test hasmethod(test_mod.f_uscore_nested_where, Tuple{Vector{Int}})
 end
+
+@testset "self-shadowing static parameters (leaf-type capture)" begin
+    # #20: a static parameter shadowing a global type whose own bound refers to
+    # that outer global -- the `T <: T` leaf-type-capture idiom, as used by
+    # GeometryBasics.jl `connect(...) where {Point <: Point}`.  This must lower
+    # and *define* without error (previously an UndefVarError at method
+    # definition time), matching flisp: like flisp's `replace-vars`, each
+    # static parameter's name is substituted into *later* bounds and argument
+    # types only, so a self-referential (or forward-referential) bound resolves
+    # its own name lexically outward to the enclosing global.
+    M = Module(:SelfShadowTest)
+    JuliaLowering.include_string(M, """
+        struct Point{N} end
+        struct Box{X} end
+        const T = Integer
+        # leaf-type capture: `Point`'s bound is the outer global `Point`, while
+        # the argument annotation captures the concrete leaf subtype.
+        f1(x::Point) where {Point <: Point} = Point
+        # a later bound referring to an earlier sparam resolves to that sparam.
+        g3(a::Box{T}, b::S) where {T, S <: T} = (T, S)
+        # self-shadow then reuse: `T`'s own bound resolves to the global `T`
+        # (== Integer); `S`'s bound resolves to the sparam `T`.
+        g4(a::Box{T}, b::S) where {T <: T, S <: T} = (T, S)
+    """)
+    # captures the concrete leaf type, constrained to a subtype of global Point
+    @test M.f1(M.Point{2}()) === M.Point{2}
+    # `S`'s bound is the sparam `T`, so `S` may be any subtype of the matched T
+    @test M.g3(M.Box{Float64}(), 3.0) === (Float64, Float64)
+    # `T <: global Integer`: a Float64 leaf is rejected (proves `T`'s own bound
+    # is the outer global, not a fresh unconstrained sparam).
+    @test_throws MethodError M.g4(M.Box{Float64}(), 1.0)
+    @test M.g4(M.Box{Int}(), 3) === (Int, Int)
+    # `S`'s bound is the sparam `T` (== Int here), so a BigInt `b` is rejected
+    # even though BigInt <: Integer (proves `S`'s bound is the sparam, not the
+    # global).
+    @test_throws MethodError M.g4(M.Box{Int}(), big(3))
+    # a lower-bounded self-shadow also *defines* without a definition-time
+    # UndefVarError (the pre-fix bug); the bound resolves to the outer global.
+    JuliaLowering.include_string(M, "f5(x::Point) where {Point >: Point} = Point")
+    @test hasmethod(M.f5, Tuple{M.Point})
+end

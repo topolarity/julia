@@ -2484,55 +2484,69 @@ function pos_opt_args(argl::SyntaxList)
     argl[opt_start:opt_end]
 end
 
-# Substitute unquoted occurrences of write-only ("placeholder", eg `_`) typevar
-# names appearing in `ex` with a reference to their actual (hidden, internal)
-# value.  flisp allows a placeholder-named `where` typevar's *value* to still
-# be read from later parts of the same method signature (subsequent typevar
-# bounds, and the argument types), even though the name itself remains
-# write-only everywhere else (in particular the method body). `aliases` maps
-# each such placeholder's name to the internal identifier holding its value.
-function subst_placeholder_sparams(ctx, ex::SyntaxTree, aliases::Dict{String,SyntaxTree})
+# Substitute unquoted occurrences of `where` typevar names appearing in `ex`
+# with a reference to their (hidden, internal) `TypeVar` value.  This mirrors
+# flisp's `replace-vars`: each static parameter's name is bound to a fresh
+# internal value which is substituted into *later* typevar bounds and the
+# argument types.  A self-referential or forward-referential bound (eg the
+# `T <: T` leaf-type-capture idiom, or `where {S <: T, T}`) therefore still
+# resolves its own name lexically outward -- to the enclosing global -- because
+# that name is not yet in `aliases` when its own bound is processed.  This also
+# makes a write-only placeholder (`_`) typevar's value readable from those same
+# signature positions, even though the name stays write-only everywhere else
+# (in particular the method body).
+#
+# `aliases` pairs each such name (an `Identifier`, or a `_` `Placeholder`) with
+# the internal identifier holding its value.  Matching is by name and scope
+# layer (`is_same_identifier_like`), so hygiene is preserved: a same-named
+# identifier introduced by a different macro layer is left untouched.
+function subst_sparams(ctx, ex::SyntaxTree, aliases)
     if isempty(aliases)
         ex
-    elseif kind(ex) === K"Placeholder"
-        get(aliases, ex.name_val::String, ex)
+    elseif kind(ex) === K"Identifier" || kind(ex) === K"Placeholder"
+        i = findfirst(a->is_same_identifier_like(ex, a.first), aliases)
+        isnothing(i) ? ex : aliases[i].second
     elseif is_quoted(ex) || kind(ex) in KSet"-> function"
         ex
     else
-        mapchildren(e->subst_placeholder_sparams(ctx, e, aliases), ctx, ex)
+        mapchildren(e->subst_sparams(ctx, e, aliases), ctx, ex)
     end
 end
 
-# (_typevar name lb ub) -> (local (= name (call core TypeVar...)))
+# (_typevar name lb ub) -> (= vref (call core TypeVar...))
 #
-# Returns `(stmts, value_refs, aliases)` where `stmts` assign a `TypeVar` to
-# each typevar name (or, for write-only placeholder names, to a hidden
-# internal alias -- see `subst_placeholder_sparams`), `value_refs` holds a
-# readable reference to each typevar's value (in the same order as `tvs`), and
-# `aliases` is the accumulated name=>alias map used to substitute placeholder
-# typevar names in the method's argument types.
+# Returns `(stmts, value_refs, aliases)` where `stmts` assign a `TypeVar` to a
+# fresh internal identifier for each typevar (in the same order as `tvs`),
+# `value_refs` holds a readable reference to each typevar's value, and
+# `aliases` is the accumulated name=>value-ref map used by `subst_sparams` to
+# substitute the typevar names appearing in later bounds and in the method's
+# argument types.  Like flisp, the source name never becomes a local of the
+# method-defining scope, so its use inside its own bound resolves outward to
+# the enclosing global rather than to the (freshly hoisted, unassigned) local.
 function assign_sparams(ctx, tvs)
     out = SyntaxList(ctx.graph)
     refs = SyntaxList(ctx.graph)
-    aliases = Dict{String,SyntaxTree}()
+    aliases = Pair{SyntaxTree,SyntaxTree}[]
     for tv in tvs
         @jl_assert kind(tv) === K"_typevar" tv
         if !isempty(aliases)
             tv = @ast ctx tv [K"_typevar" tv[1]
-                subst_placeholder_sparams(ctx, tv[2], aliases)
-                subst_placeholder_sparams(ctx, tv[3], aliases)]
+                subst_sparams(ctx, tv[2], aliases)
+                subst_sparams(ctx, tv[3], aliases)]
         end
         name = tv[1]
-        push!(out, @ast ctx tv [K"local" name])
         if kind(name) === K"Placeholder"
-            nameval = name.name_val::String
-            haskey(aliases, nameval) && throw(LoweringError(
-                name, "function static parameter name not unique"))
-            vref = newsym(ctx, name, nameval)
-            aliases[nameval] = vref
+            # Placeholders are anonymous, so they can't be disambiguated by the
+            # lambda's static-parameter scope; reject duplicates here instead.
+            any(a->is_same_identifier_like(name, a.first), aliases) && throw(
+                LoweringError(name, "function static parameter name not unique"))
+            push!(out, @ast ctx tv [K"local" name])
+            vref = newsym(ctx, name, name.name_val::String)
         else
-            vref = name
+            @jl_assert kind(name) === K"Identifier" name
+            vref = newsym(ctx, name, name.name_val::String)
         end
+        push!(aliases, name => vref)
         push!(out, @ast ctx tv [K"=" vref bounds_to_typevar(ctx, tv)])
         push!(refs, vref)
     end
@@ -2581,7 +2595,7 @@ function method_def_expr(ctx, src, mtable, sparams, argl, body,
     # resolves them here instead of assigning to locals
     sparam_stmts, sparam_refs, sparam_aliases = assign_sparams(ctx, sparams)
     arg_types = mapsyntax(
-        a->expand_forms_2(ctx, subst_placeholder_sparams(ctx, a[2], sparam_aliases)), argl)
+        a->expand_forms_2(ctx, subst_sparams(ctx, a[2], sparam_aliases)), argl)
     @ast ctx src [K"block"
         sparam_stmts...
         method_metadata := [K"call"(src) "svec"::K"core"

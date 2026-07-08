@@ -144,18 +144,18 @@ end
 #---------------------
 1   (method TestMod.f)
 2   latestworld
-3   (= slot₁/U (call core.TypeVar :U))
-4   (= slot₂/V (call core.TypeVar :V))
-5   (= slot₃/T (call core.TypeVar :T))
+3   (= slot₂/U (call core.TypeVar :U))
+4   (= slot₃/V (call core.TypeVar :V))
+5   (= slot₁/T (call core.TypeVar :T))
 6   TestMod.f
 7   (call core.TypeEqOf %₆)
-8   slot₃/T
-9   slot₁/U
-10  slot₂/V
+8   slot₁/T
+9   slot₂/U
+10  slot₃/V
 11  (call core.svec %₇ %₈ %₉ %₁₀)
-12  slot₁/U
-13  slot₂/V
-14  slot₃/T
+12  slot₂/U
+13  slot₃/V
+14  slot₁/T
 15  (call core.svec %₁₂ %₁₃ %₁₄)
 16  SourceLocation::1:10
 17  (call core.svec %₁₁ %₁₅ %₁₆)
@@ -236,17 +236,17 @@ end
 #---------------------
 1   (method TestMod.f)
 2   latestworld
-3   (= slot₁/T (call core.TypeVar :T))
+3   (= slot₂/T (call core.TypeVar :T))
 4   TestMod.AbstractVector
-5   slot₁/T
+5   slot₂/T
 6   (call core.apply_type %₄ %₅)
-7   (= slot₂/S (call core.TypeVar :S %₆))
+7   (= slot₁/S (call core.TypeVar :S %₆))
 8   TestMod.f
 9   (call core.TypeEqOf %₈)
-10  slot₂/S
+10  slot₁/S
 11  (call core.svec %₉ core.Any %₁₀)
-12  slot₁/T
-13  slot₂/S
+12  slot₂/T
+13  slot₁/S
 14  (call core.svec %₁₂ %₁₃)
 15  SourceLocation::1:10
 16  (call core.svec %₁₁ %₁₄ %₁₅)
@@ -780,12 +780,12 @@ end
 #---------------------
 1   (method TestMod.f)
 2   latestworld
-3   (= slot₁/T (call core.TypeVar :T))
+3   (= slot₃/T (call core.TypeVar :T))
 4   TestMod.f
 5   (call core.TypeEqOf %₄)
-6   slot₁/T
+6   slot₃/T
 7   (call core.svec %₅ %₆)
-8   slot₁/T
+8   slot₃/T
 9   (call core.svec %₈)
 10  SourceLocation::1:10
 11  (call core.svec %₇ %₉ %₁₀)
@@ -796,16 +796,16 @@ end
     3   (call slot₁/#self# slot₂/x %₂ 2)
     4   (return %₃)
 13  latestworld
-14  (= slot₁/T (call core.TypeVar :T))
-15  slot₁/T
-16  (= slot₂/S (call core.TypeVar :S %₁₅))
+14  (= slot₄/T (call core.TypeVar :T))
+15  slot₄/T
+16  (= slot₁/S (call core.TypeVar :S %₁₅))
 17  TestMod.f
 18  (call core.TypeEqOf %₁₇)
-19  slot₁/T
-20  slot₂/S
+19  slot₄/T
+20  slot₁/S
 21  (call core.svec %₁₈ %₁₉ %₂₀)
-22  slot₁/T
-23  slot₂/S
+22  slot₄/T
+23  slot₁/S
 24  (call core.svec %₂₂ %₂₃)
 25  SourceLocation::1:10
 26  (call core.svec %₂₁ %₂₄ %₂₅)
@@ -814,20 +814,20 @@ end
     1   (call slot₁/#self# slot₂/x slot₃/y 2)
     2   (return %₁)
 28  latestworld
-29  (= slot₁/T (call core.TypeVar :T))
-30  slot₁/T
+29  (= slot₅/T (call core.TypeVar :T))
+30  slot₅/T
 31  (= slot₂/S (call core.TypeVar :S %₃₀))
 32  slot₂/S
-33  (= slot₃/U (call core.TypeVar :U %₃₂))
+33  (= slot₆/U (call core.TypeVar :U %₃₂))
 34  TestMod.f
 35  (call core.TypeEqOf %₃₄)
-36  slot₁/T
+36  slot₅/T
 37  slot₂/S
-38  slot₃/U
+38  slot₆/U
 39  (call core.svec %₃₅ %₃₆ %₃₇ %₃₈)
-40  slot₁/T
+40  slot₅/T
 41  slot₂/S
-42  slot₃/U
+42  slot₆/U
 43  (call core.svec %₄₀ %₄₁ %₄₂)
 44  SourceLocation::1:10
 45  (call core.svec %₃₉ %₄₃ %₄₄)
@@ -862,17 +862,17 @@ end
     3   (call slot₁/#self# slot₂/x %₂ 2)
     4   (return %₃)
 10  latestworld
-11  (= slot₁/T (call core.TypeVar :T))
+11  (= slot₃/T (call core.TypeVar :T))
 12  TestMod.AbstractVector
-13  slot₁/T
+13  slot₃/T
 14  (call core.apply_type %₁₂ %₁₃)
-15  (= slot₂/S (call core.TypeVar :S %₁₄))
+15  (= slot₁/S (call core.TypeVar :S %₁₄))
 16  TestMod.f
 17  (call core.TypeEqOf %₁₆)
-18  slot₂/S
+18  slot₁/S
 19  (call core.svec %₁₇ core.Any %₁₈)
-20  slot₁/T
-21  slot₂/S
+20  slot₃/T
+21  slot₁/S
 22  (call core.svec %₂₀ %₂₁)
 23  SourceLocation::1:10
 24  (call core.svec %₁₉ %₂₂ %₂₃)
@@ -881,20 +881,20 @@ end
     1   (call slot₁/#self# slot₂/x slot₃/y 2)
     2   (return %₁)
 26  latestworld
-27  (= slot₁/T (call core.TypeVar :T))
+27  (= slot₄/T (call core.TypeVar :T))
 28  TestMod.AbstractVector
-29  slot₁/T
+29  slot₄/T
 30  (call core.apply_type %₂₈ %₂₉)
 31  (= slot₂/S (call core.TypeVar :S %₃₀))
-32  (= slot₃/U (call core.TypeVar :U))
+32  (= slot₅/U (call core.TypeVar :U))
 33  TestMod.f
 34  (call core.TypeEqOf %₃₃)
 35  slot₂/S
-36  slot₃/U
+36  slot₅/U
 37  (call core.svec %₃₄ core.Any %₃₅ %₃₆)
-38  slot₁/T
+38  slot₄/T
 39  slot₂/S
-40  slot₃/U
+40  slot₅/U
 41  (call core.svec %₃₈ %₃₉ %₄₀)
 42  SourceLocation::1:10
 43  (call core.svec %₃₇ %₄₁ %₄₂)
@@ -1945,18 +1945,18 @@ end
 2   latestworld
 3   (method TestMod.f_kw_sparams)
 4   latestworld
-5   (= slot₁/X (call core.TypeVar :X))
-6   (= slot₂/A (call core.TypeVar :A))
+5   (= slot₂/X (call core.TypeVar :X))
+6   (= slot₁/A (call core.TypeVar :A))
 7   TestMod.#kw_body#f_kw_sparams#0
 8   (call core.TypeEqOf %₇)
-9   slot₂/A
-10  slot₁/X
+9   slot₁/A
+10  slot₂/X
 11  TestMod.f_kw_sparams
 12  (call core.TypeEqOf %₁₁)
-13  slot₁/X
+13  slot₂/X
 14  (call core.svec %₈ %₉ %₁₀ %₁₂ %₁₃)
-15  slot₁/X
-16  slot₂/A
+15  slot₂/X
+16  slot₁/A
 17  (call core.svec %₁₅ %₁₆)
 18  SourceLocation::1:10
 19  (call core.svec %₁₄ %₁₇ %₁₈)
