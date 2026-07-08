@@ -103,18 +103,29 @@ end
 # We might consider changing at least the second of these choices, depending on
 # how we end up putting this into Base.
 
-# todo entries are (expr, is_module_body, child_idx, module_layer):
-# `module_layer`, when non-nothing, is the outermost hygiene layer of the
-# enclosing `module` block; its statements are rebased against that layer (see
-# `rebase_layers`) so that hygienic macro-generated module bodies resolve
-# against the freshly-created module.
+# todo entries are (expr, is_module_body, child_idx, module_layer, reeval):
+# * `module_layer`, when non-nothing, is the outermost hygiene layer of the
+#   enclosing `module` block; its statements are rebased against that layer (see
+#   `rebase_layers`) so that hygienic macro-generated module bodies resolve
+#   against the freshly-created module.
+# * `reeval` marks a subtree that is a *re-evaluated* hygienic payload — a
+#   `module` handed to a fresh `eval()`/`Core.eval` (e.g. `@eval module ...`,
+#   as `@safetestset` does). flisp re-evaluates such payloads through an inert
+#   quote, which strips macro hygiene so every unescaped name binds/resolves in
+#   the freshly-created module. We reproduce that by remapping the outermost
+#   hygiene layer only for `reeval` modules and their nested modules. A `module`
+#   produced *inline* by macro expansion (a macro that directly returns
+#   `Expr(:toplevel, Expr(:module, ...))`, e.g. EnumX's `@enumx`) is not
+#   re-evaluated: flisp keeps its hygiene, so unescaped references resolve back
+#   to the macro's defining module. Such modules are reached as descendants
+#   (`child_idx > 0`) with `reeval` unset and are left un-remapped.
 struct LoweringIterator{Attrs}
     ver::VersionNumber # later stored in module?
-    todo::Vector{Tuple{SyntaxTree{Attrs}, Bool, Int, Union{Nothing,ScopeLayer}}}
+    todo::Vector{Tuple{SyntaxTree{Attrs}, Bool, Int, Union{Nothing,ScopeLayer}, Bool}}
 end
 
 function lower_init(ex::SyntaxTree{T}, ver) where {T}
-    LoweringIterator{T}(ver, [(ex, false, 0, nothing)])
+    LoweringIterator{T}(ver, [(ex, false, 0, nothing, false)])
 end
 
 function lower_step(iter::LoweringIterator, mod::Module, world::UInt;
@@ -123,10 +134,11 @@ function lower_step(iter::LoweringIterator, mod::Module, world::UInt;
         return Core.svec(:done)
     end
 
-    top_ex, is_module_body, child_idx, module_layer = pop!(iter.todo)
+    top_ex, is_module_body, child_idx, module_layer, reeval = pop!(iter.todo)
+    root = child_idx == 0
     if child_idx > 0
         if child_idx <= numchildren(top_ex)
-            push!(iter.todo, (top_ex, is_module_body, child_idx + 1, module_layer))
+            push!(iter.todo, (top_ex, is_module_body, child_idx + 1, module_layer, reeval))
             ex = top_ex[child_idx]
         elseif is_module_body
             return Core.svec(:end_module)
@@ -144,7 +156,7 @@ function lower_step(iter::LoweringIterator, mod::Module, world::UInt;
         k = kind(ex)
     end
     if k == K"toplevel"
-        push!(iter.todo, (ex, false, 1, nothing))
+        push!(iter.todo, (ex, false, 1, nothing, reeval))
         return lower_step(iter, mod, world; soft_scope)
     elseif k == K"module"
         (version, notbare, name, body) = @stm ex begin
@@ -158,13 +170,19 @@ function lower_step(iter::LoweringIterator, mod::Module, world::UInt;
         end
         newmod_name = Symbol(name.name_val)
         loc = source_location(LineNumberNode, ex)
-        # The body's unescaped scope is the module node's outermost hygiene layer
-        # (for hygienic macro-generated modules this differs from the base
-        # layer); rebase the body statements against it so they resolve into the
-        # new module. Parsed literal modules carry no context, so fall back to
-        # the default (base-layer) rebasing.
-        body_layer = hasattr(ex, :context) ? ex.context.layer : nothing
-        push!(iter.todo, (body, true, 1, body_layer))
+        # Remap the body's outermost hygiene layer into the new module only for
+        # re-evaluated payloads: a `module` handed to a fresh `eval()` (reached
+        # as the iterator root, `root`) or nested inside such a payload
+        # (`reeval`). flisp strips hygiene from these (they pass through `@eval`'s
+        # inert quote), so unescaped `using`/`import` targets and global names
+        # bind/resolve in the freshly-created module. A `module` produced inline
+        # by macro expansion (returned directly as `Expr(:module, ...)`) is not
+        # re-evaluated: keeping its hygiene makes unescaped references resolve to
+        # the macro's defining module, matching flisp. Parsed literal modules
+        # carry no context and fall back to default (base-layer) rebasing.
+        module_reeval = reeval || root
+        body_layer = (module_reeval && hasattr(ex, :context)) ? ex.context.layer : nothing
+        push!(iter.todo, (body, true, 1, body_layer, module_reeval))
         return Core.svec(:begin_module, version, newmod_name, notbare, loc)
     else
          ctx2, ex2 = expand_forms_2(ex, world)
