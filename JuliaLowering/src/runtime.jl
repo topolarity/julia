@@ -13,6 +13,19 @@ Base.@assume_effects :removable function current_exception()
     @ccall jl_current_exception(current_task()::Any)::Any
 end
 
+# Re-dispatch `f(args...)` at the pinned lowering world (see `jl_lowering_world`)
+@inline function invoke_in_lowerer_world(f::F, @nospecialize(args...)) where {F}
+    w = unsafe_load(cglobal(:jl_lowering_world, Csize_t))
+    if w == 0
+        # Fallback when the Base lowering hook is not set up
+        #
+        # FIXME: this should probably distinguish the two cases so that setting up
+        # the hook does not change independent JuliaLowering behavior.
+        w = Base.tls_world_age()
+    end
+    return Base.invoke_in_world(w, f, args...)
+end
+
 #--------------------------------------------------
 # Supporting functions for AST interpolation (`quote`)
 struct InterpolationContext{Graph} <: AbstractLoweringContext
@@ -105,7 +118,13 @@ end
 # Produced by expanding K"quote".  Must create a copy of the AST.  Note that
 # wrapping `ex` in an extra node handles the edge case where the root `ex` is
 # `$` (our recursion is one step removed due to forms like `($ a b)`.)
-function interpolate_ast(::Type{SyntaxTree}, ex::SyntaxTree, values...)
+function interpolate_ast(::Type{T}, @nospecialize(ex), values...) where {T}
+    # runs at eval time in user code, so pin it to the lowering world which
+    # is safe since we do not dispatch on user values internally
+    return invoke_in_lowerer_world(_interpolate_ast_toplevel, T, ex, values...)
+end
+
+function _interpolate_ast_toplevel(::Type{SyntaxTree}, ex::SyntaxTree, values...)
     # Construct graph for interpolation context. We inherit this from the macro
     # context where possible by detecting it using __macro_ctx__. This feels
     # hacky though.
@@ -135,7 +154,7 @@ function interpolate_ast(::Type{SyntaxTree}, ex::SyntaxTree, values...)
     return only(children(out))
 end
 
-function interpolate_ast(::Type{Expr}, @nospecialize(ex), values...)
+function _interpolate_ast_toplevel(::Type{Expr}, @nospecialize(ex), values...)
     ctx = ExprInterpolationContext(values, Ref(1))
     if ex isa Expr && ex.head === :$
         @assert length(values) === 1
