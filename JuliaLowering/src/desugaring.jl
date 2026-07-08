@@ -2732,10 +2732,15 @@ function optional_positional_defs(ctx, src, mtable, sparams, argl, body, rett)
         wrapper_body = if all((<)(i), deps[i+1:end])
             # fill-all-defaults case.  note that the final default may be a
             # splat, and doesn't have further args referring to it by name, so
-            # we put it directly in the call (see #50563 for some notes)
-            @ast ctx src [K"block"
-                make_assigns(ctx, opt_names[i:end-1], opt_defaults[i:end-1])...
-                [K"call" mapindex(passed, 1)... opt_names[i:end-1]... opt_defaults[end]]]
+            # we put it directly in the call (see #50563 for some notes).
+            # Nest each default in its own `let` (as with kwarg defaults,
+            # scope_nest) rather than a flat block of assignments, so a
+            # default only sees the *previously* bound names of the batch,
+            # never itself or later ones -- matching flisp's per-argument
+            # cascading-method semantics.
+            scope_nest(ctx, make_assigns(ctx, opt_names[i:end-1], opt_defaults[i:end-1]),
+                @ast ctx src [K"block"
+                    [K"call" mapindex(passed, 1)... opt_names[i:end-1]... opt_defaults[end]]])
         else
             @ast ctx src [K"block"
                 [K"call" mapindex(passed, 1)... opt_defaults[i]]]
