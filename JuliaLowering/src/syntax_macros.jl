@@ -72,11 +72,33 @@ function Base.var"@generated"(__context__::MacroContext, ex)
         kind(ex) === K"=" && is_eventually_call(ex[1]))
         throw(LoweringError(ex, "Expected a function argument to `@generated`"))
     end
+    # Lift any leading `meta` statements out of the body and into the method
+    # prologue, in front of the `if @generated` split.  Such statements are
+    # produced by preceding "prologue" macros that annotate a definition --
+    # e.g. `@inline`/`@noinline` (inlining), `Base.@propagate_inbounds`,
+    # `Base.@constprop`, `Base.@nospecializeinfer` and `Base.@assume_effects`
+    # (purity) -- and, unlike the compiler metadata carried by `Method`, these
+    # are only recorded on the `CodeInfo` of each freshly-lowered specialization.
+    # If they were left inside the generated branch they would merely execute as
+    # no-op statements while the code generator runs and never reach the emitted
+    # specialization, silently dropping the annotation.  Hoisting them here
+    # mirrors flisp's `generated-version`, which quasiquotes the whole body
+    # (prologue meta included) into the generator's output, so the meta lands on
+    # both the generated specializations and the non-generated fallback method.
+    body = ex[2]
+    prologue = SyntaxList(__context__)
+    if kind(body) === K"block"
+        for c in children(body)
+            kind(c) === K"meta" || break
+            push!(prologue, c)
+        end
+    end
     @ast __context__ __context__.macrocall [K"function"
         ex[1]
         [K"block"
+            prologue...
             [K"if" [K"generated"]
-                ex[2]
+                body
                 [K"block"
                     [K"meta" "generated_only"::K"Identifier"]
                     [K"return" nothing::K"Value"]

@@ -2002,6 +2002,50 @@ end
         end
         """; expr_compat_mode) === (5, 0)
     end
+
+    @testset "prologue meta forwarded to specializations" begin
+        # From PkgEval: BitIntegers v0.3.7 (@inline @generated shift_call; @inferred bitrotate degraded to Any)
+        # A "prologue" annotation macro (`@inline`, `@noinline`,
+        # `Base.@propagate_inbounds`, `Base.@constprop`, `Base.@assume_effects`)
+        # in front of an `@generated` function must annotate the `CodeInfo` of
+        # every freshly-lowered specialization, not just execute as a no-op while
+        # the code generator runs.  Losing `@inline` in particular silently
+        # regresses inference: forced inlining is what lets the compiler
+        # constant-propagate a singleton `::Function` argument to a concrete
+        # result instead of falling back to the generic `Any` return type.
+        @test JuliaLowering.include_string(test_mod, raw"""
+        begin
+            @inline @generated function gen_inline(fn::Function, x)
+                quote fn(x) end
+            end
+            @noinline @generated function gen_noinline(fn::Function, x)
+                quote fn(x) end
+            end
+            Base.@propagate_inbounds @generated function gen_propagate(fn::Function, x)
+                quote fn(x) end
+            end
+            Base.@constprop :aggressive @generated function gen_constprop(fn::Function, x)
+                quote fn(x) end
+            end
+            Base.@assume_effects :foldable @generated function gen_effects(fn::Function, x)
+                quote fn(x) end
+            end
+            argt = (typeof(Base.neg_int), Int)
+            ci_inline    = only(code_lowered(gen_inline,    argt))
+            ci_noinline  = only(code_lowered(gen_noinline,  argt))
+            ci_propagate = only(code_lowered(gen_propagate, argt))
+            ci_constprop = only(code_lowered(gen_constprop, argt))
+            ci_effects   = only(code_lowered(gen_effects,   argt))
+            # Inference-visible outcome: constant-propagation through the
+            # abstract `::Function` argument keeps the result concrete.
+            call_inline(x::Int) = gen_inline(Base.neg_int, x)
+            (Int(ci_inline.inlining), Int(ci_noinline.inlining),
+             Int(ci_propagate.inlining), ci_propagate.propagate_inbounds,
+             Int(ci_constprop.constprop), ci_effects.purity != 0,
+             Base.infer_return_type(call_inline, (Int,)))
+        end
+        """; expr_compat_mode) === (1, 2, 1, true, 1, true, Int)
+    end
 end
 
     genfunc_quote_s = """
