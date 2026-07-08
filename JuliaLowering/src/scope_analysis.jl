@@ -274,8 +274,20 @@ function _find_scope_decls!(ctx, scope, ex)
         sc = ex[1].context::SyntaxContext
         if k === K"constdecl" && is_flisp_compat(ex[1]) &&
             is_top_scope(scope) && sc.layer !== ctx.layer
-            # hack: flisp declares a mangled global in expansion; we must not error
-            explicit_declare_in_scope!(ctx, scope, ex[1], :global)
+            # flisp gensym-renames an unescaped top-level `const` target in a
+            # hygienic expansion, binding a hidden (name-mangled) global in the
+            # eval-target module rather than the macro's home.  Mirror that; the
+            # binding is invisible outside the expansion, but later unescaped
+            # references in the same expansion resolve to it (e.g. CBOOCall
+            # reads its `FuncMap` const back in generated methods).
+            nk = NameKey(ex[1])
+            if !haskey(scope.vars, nk)
+                mangled = reserve_module_binding_i(ctx.layer.mod,
+                                                   string("#", nk.name, "#"))
+                b = _new_binding(ctx, ex[1], mangled, :global;
+                                 mod=ctx.layer.mod, is_internal=true)
+                scope.vars[nk] = b.id
+            end
         elseif k1 === K"BindingId"
             b = get_binding(ctx, ex[1])
             get!(scope.binding_assignments, b.id, ex[1]._id)
