@@ -119,6 +119,14 @@ function _expr_to_est(graph::SyntaxGraph, @nospecialize(e), src::SourceAttrType)
     return st._id, src
 end
 
+# A `Base.@__doc__` marker is exactly `(block (meta doc) x)`.  `Base.Docs.finddoc`
+# recognizes it only via `isexpr(def, :block, 2) && isexpr(def.args[1], :meta, 1)`,
+# so its length and the absence of any interleaved `LineNumberNode` are load-bearing.
+_is_meta_doc_block(st) = @stm st begin
+    [K"block" [K"meta" [K"Identifier"]] _] -> st[1][1].name_val::String == "doc"
+    _ -> false
+end
+
 # `suppress_linenodes` is true if `st`'s parent knows `st` is an exception to
 # normal linenode rules.  It only applies to `st`, and not transitively to its
 # children.
@@ -156,7 +164,8 @@ function est_to_expr(st::SyntaxTree, suppress_linenodes=false)
         # Macro authors are responsible for handling any linenodes that follow
         # the rules above (but the presence of optional linenodes can't be
         # counted upon).
-        need_lnns = head in (:block, :toplevel) && !suppress_linenodes
+        need_lnns = head in (:block, :toplevel) && !suppress_linenodes &&
+            !_is_meta_doc_block(st)
         for (i, c) in enumerate(children(st))
             need_lnns && push!(out.args, source_location(LineNumberNode, c))
             let suppress_c = i == 1 && (k == K"for" || k == K"let")
