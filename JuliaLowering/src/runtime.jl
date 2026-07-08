@@ -133,7 +133,11 @@ end
 function replace_captured_locals!(codeinfo::Core.CodeInfo, locals::Core.SimpleVector)
     for (i, ex) in enumerate(codeinfo.code)
         if Meta.isexpr(ex, :captured_local)
-            codeinfo.code[i] = locals[ex.args[1]::Int]
+            # Use Base's own convention for splicing a runtime value into IR
+            # (see `Compiler/src/typeinfer.jl`'s `ReturnNode(quoted(val))`): values
+            # which are themselves AST/IR nodes (Symbol, Expr, ...) must be
+            # QuoteNode-wrapped so they're not misread as syntax.
+            codeinfo.code[i] = Base.quoted(locals[ex.args[1]::Int])
         end
     end
     codeinfo
