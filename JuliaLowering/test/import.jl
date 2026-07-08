@@ -135,6 +135,74 @@ end
     @test gen.zz == 3
 end
 
+@testset "(AI) macro-returned `Expr(:module)` keeps hygiene (#22)" begin
+    # Contrast with the `@eval module` testset above. A macro that *directly
+    # returns* `Expr(:toplevel, Expr(:module, false, esc(name), body))` (EnumX's
+    # `@enumx` pattern) is expanded inline: its body keeps macro-expansion
+    # hygiene, so under flisp unescaped *references* resolve back to the macro's
+    # defining module, while the `@eval module` form (a re-evaluated inert-quote
+    # payload) resolves everything in the freshly-created module. These two
+    # shapes must therefore be lowered differently. Raw-`Expr`-returning macros
+    # require `expr_compat_mode` (the mode packages are lowered in), so this is
+    # pinned in that mode only.
+    host = Module()
+    @eval host import JuliaLowering
+    JuliaLowering.include_string(host, raw"""
+    module Provider
+        abstract type AbstractEnum end
+        provider_func() = :from_provider
+        macro mk(modname)
+            block = quote
+                # unescaped type name -> binds in the NEW module (plain);
+                # unescaped supertype reference -> the MACRO's module (hygiene).
+                primitive type T <: AbstractEnum 32 end
+                # unescaped function/const definitions -> hygiene-hidden.
+                function foo() 1 end
+                const c = 2
+                # a body-level reference to a macro-module global.
+                rf() = provider_func()
+            end
+            # escaped definition (EnumX's enum-instance pattern) -> NEW module.
+            push!(block.args, Expr(:const, Expr(:(=), esc(:evalue), 99)))
+            return Expr(:toplevel, Expr(:module, false, esc(modname), block), nothing)
+        end
+    end
+    """; expr_compat_mode=true)
+    Core.@latestworld
+    JuliaLowering.include_string(host, "using .Provider"; expr_compat_mode=true)
+    Core.@latestworld
+    JuliaLowering.include_string(host, "Provider.@mk Generated"; expr_compat_mode=true)
+    Core.@latestworld
+    gen = Core.eval(host, :Generated)
+    Provider = Core.eval(host, :Provider)
+
+    @test gen isa Module
+    # Unescaped type-declaration name binds (plain) in the new module.
+    @test isdefined(gen, :T)
+    @test !isdefined(Provider, :T)
+    # Unescaped supertype *reference* resolves to the macro's defining module
+    # (this is #22: previously it resolved into the new module -> UndefVarError).
+    @test gen.T <: Provider.AbstractEnum
+    # Unescaped function/const definitions are hygiene-hidden: not visible by
+    # their plain name in the new module, and (correctly) not leaked as a plain
+    # global of the macro's module either.
+    @test !isdefined(gen, :foo)
+    @test !isdefined(Provider, :foo)
+    # Escaped definitions bind (plain) in the new module -- EnumX relies on this
+    # for its enum instances.
+    @test isdefined(gen, :evalue)
+    @test gen.evalue == 99
+    @test !isdefined(Provider, :evalue)
+    # KNOWN RESIDUAL (pre-existing, tracked in bugs/eval-payload-hygiene, first
+    # noted in 592451a539): flisp hygiene-hides an unescaped bare `const` as a
+    # name-mangled global of the NEW module; JuliaLowering instead binds it in
+    # the macro's module. Not part of #22 and intentionally not chased here.
+    @test_broken !isdefined(Provider, :c)
+    # NOTE: flisp hygiene-HIDES the bare const as a name-mangled global of the
+    # new module (e.g. #N#c), so a plain `gen.c` never exists even when fixed;
+    # the assertion above is the flip indicator for the residual.
+end
+
 @testset "Imported macrocalls" for expr_compat_mode in (true, false)
     # Test importing macros by their @-name
     macname_mod = Module()
