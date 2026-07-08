@@ -569,7 +569,7 @@ function _convert_closures(ctx::ClosureConversionCtx, ex)
                 "isdefinedglobal"::K"core"
                 ctx.mod::K"Value"
                 binfo.name::K"Symbol"
-                false::K"Bool"]
+                true::K"Bool"]  # allow_import=true matches flisp
         else
             ex
         end
