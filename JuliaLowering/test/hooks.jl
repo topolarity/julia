@@ -79,4 +79,41 @@
 
         @test jeval("Base.@propagate_inbounds @inline meta_double_quote_issue(x) = x") isa Function
     end
+
+    @testset "error log attachments are truncated" begin
+        # Regression test: `core_lowering_hook`'s `@info` on a caught
+        # exception used to render `code`/`st0`/`st1` unboundedly.  A large
+        # (but not otherwise unusual) input can make that dump many MB in
+        # size, which blows past log size caps used by CI tooling (e.g.
+        # PkgEval's 1MB per-test log limit) and can bury or truncate the
+        # actual exception.  Attachments must be capped to a reasonable size
+        # instead.
+        function deep_binary_expr(n)
+            e = :(1 + 1)
+            for i in 1:n
+                e = :($e + $e)
+            end
+            e
+        end
+        # `Expr(:&, ...)` is invalid syntax outside a `ccall` argument list,
+        # so this deterministically throws a `LoweringError` in
+        # `core_lowering_hook`, with `deep_binary_expr(9)` (~1000s of nodes)
+        # attached as (part of) `code`/`st0`/`st1`.
+        ex = Expr(:block, Expr(:&, deep_binary_expr(9)))
+
+        io = IOBuffer()
+        logger = Base.CoreLogging.SimpleLogger(io)
+        Base.CoreLogging.with_logger(logger) do
+            @test_throws JL.LoweringError JL.core_lowering_hook(ex, test_mod)
+        end
+        logtext = String(take!(io))
+
+        # The triage marker used to grep for these errors must survive.
+        @test occursin("JuliaLowering threw given input", logtext)
+        # Each oversized attachment should show a truncation marker...
+        @test occursin("truncated", logtext)
+        # ...and the overall log must stay small, regardless of how deep the
+        # input expression is.
+        @test sizeof(logtext) < 64_000
+    end
 end

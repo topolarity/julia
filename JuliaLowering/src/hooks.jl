@@ -1,6 +1,47 @@
 # TODO: Allow `soft_scope::Union{Nothing,Bool}` to be passed through `jl_lower` C API
 
 """
+    TruncatedForLog(x, maxbytes=10_000)
+
+Wraps `x` for logging so that its `text/plain` rendering is capped at
+`maxbytes` bytes, with a `… truncated (N of M bytes) …` marker appended when
+the full rendering would have been longer.
+
+This is used for attachments (ASTs, etc) in [`core_lowering_hook`](@ref)'s
+error log, where a pathologically large `Expr`/`SyntaxTree` could otherwise
+render as many megabytes of text and blow past log size caps used by CI
+tooling (e.g. PkgEval), burying or truncating the actual exception.
+
+The wrapped value `x` itself is never modified — only mutated at render
+(`show`) time, and only the text produced by `show` is truncated.
+"""
+struct TruncatedForLog
+    x::Any
+    maxbytes::Int
+end
+TruncatedForLog(@nospecialize(x)) = TruncatedForLog(x, 10_000)
+
+function Base.show(io::IO, ::MIME"text/plain", t::TruncatedForLog)
+    s = try
+        sprint(show, MIME("text/plain"), t.x)
+    catch e
+        # We're already on an error-reporting path -- don't let a broken
+        # `show` method for `x` hide the original exception.
+        return print(io, "<error while rendering for log: ",
+                     sprint(showerror, e), ">")
+    end
+    n = sizeof(s)
+    if n <= t.maxbytes
+        print(io, s)
+    else
+        i = thisind(s, min(t.maxbytes, lastindex(s)))
+        print(io, SubString(s, 1, i))
+        print(io, "\n… truncated (", i, " of ", n, " bytes) …")
+    end
+end
+Base.show(io::IO, t::TruncatedForLog) = show(io, MIME("text/plain"), t)
+
+"""
 Becomes `Core._lower()` upon activating JuliaLowering.
 
 Returns an svec with the lowered code (usually expr) as its first element, and
@@ -35,7 +76,9 @@ function core_lowering_hook(@nospecialize(code), mod::Module, file::Union{String
         ex = to_lowered_expr(st5)
         return Core.svec(ex, st5, ctx5)
     catch exc
-        @info("JuliaLowering threw given input:", code=code, st0=st0, st1=st1, file=file, line=line, mod=mod)
+        @info("JuliaLowering threw given input:",
+              code=TruncatedForLog(code), st0=TruncatedForLog(st0), st1=TruncatedForLog(st1),
+              file=file, line=line, mod=mod)
         rethrow(exc)
 
         # TODO: Re-enable flisp fallback once we're done collecting errors
