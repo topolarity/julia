@@ -526,6 +526,10 @@ extern JL_DLLEXPORT size_t jl_hugepage_size;
 extern JL_DLLEXPORT jl_value_t *jl_typeinf_func JL_GLOBALLY_ROOTED;
 extern JL_DLLEXPORT jl_value_t *jl_compile_and_emit_func JL_GLOBALLY_ROOTED;
 extern JL_DLLEXPORT size_t jl_typeinf_world;
+// Fixed world age at which the Julia-side lowerer (`Core._lower`) is dispatched,
+// analogous to `jl_typeinf_world`; keeps the lowerer's specializations valid across
+// method definitions in the code being lowered. 0 means dispatch at the latest world.
+extern JL_DLLEXPORT size_t jl_lowering_world;
 extern JL_DLLEXPORT jl_value_t *jl_libdl_dlopen_func JL_GLOBALLY_ROOTED;
 extern _Atomic(jl_typemap_entry_t*) call_cache[N_CALL_CACHE] JL_GLOBALLY_ROOTED;
 
