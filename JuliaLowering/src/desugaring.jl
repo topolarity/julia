@@ -2794,7 +2794,8 @@ function is_vararg_type_expr(t)
         (kind(t) in KSet"curly where" && numchildren(t) >= 1 && is_vararg_type_expr(t[1]))
 end
 
-function keywords_method_def_expr(ctx, src, mtable, sparams, argl, body, rett, pos_va)
+function keywords_method_def_expr(ctx, src, mtable, sparams, argl, body, rett,
+                                  pos_va, overlay=false)
     kws = argl[end]
     pargl = argl[1:end-1]
     @jl_assert kind(kws) === K"parameters" src
@@ -2816,11 +2817,14 @@ function keywords_method_def_expr(ctx, src, mtable, sparams, argl, body, rett, p
     ordered_defaults = any(val->contains_identifier(val, kw_names), kw_defaults)
     positional_sparams = used_typevars(pargl, sparams)
 
-    m1_name = let n = kind(mtable) === K"nothing" ? "_" : mtable.name_val,
+    # For an overlay, `mtable` is a value temporary (no `name_val`) and is not a
+    # function name, so derive the hidden kw-body function name generically.
+    m1_name = let ref = (overlay || kind(mtable) === K"nothing") ? src : mtable,
+        n = (overlay || kind(mtable) === K"nothing") ? "_" : mtable.name_val,
         mangled = string(startswith(n, '#') ? "" : "#kw_body#", n, "#")
         # probably not desirable, but fixes eval-into-closed-module
-        a1 = setattr(mtable, :context,
-                     escape_layer(mtable.context::SyntaxContext, true))
+        a1 = setattr(ref, :context,
+                     escape_layer(ref.context::SyntaxContext, true))
         newsym(ctx, a1, reserve_module_binding_i(syntax_module(a1), mangled))
     end
     # (1) Body method.  This contains the actual function body, and requires
@@ -2939,12 +2943,16 @@ function keywords_method_def_expr(ctx, src, mtable, sparams, argl, body, rett, p
                 SyntaxList(arg1, arg2, pargl...), kwcall_body)
         end
     end
+    # The kw-body function is ordinary (non-overlaid); the nokw and `kwcall`
+    # methods land in the overlay table, so pass `nothing` as their
+    # `method_defs` id and emit no `function_decl` for the table value.
+    mdefs23_id = overlay ? nothing_(ctx, src) : mtable
     @ast ctx src [K"block"
         [K"function_decl" m1_name]
-        kind(mtable) === K"nothing" ? nothing : [K"function_decl" mtable]
+        (overlay || kind(mtable) === K"nothing") ? nothing : [K"function_decl" mtable]
         [K"method_defs" m1_name mdefs1]
-        [K"method_defs" mtable mdefs2]
-        [K"method_defs" mtable mdefs3]
+        [K"method_defs" mdefs23_id mdefs2]
+        [K"method_defs" mdefs23_id mdefs3]
         mtable
     ]
 end
@@ -3043,6 +3051,14 @@ function expand_function_def(ctx, src, raw_args, wheres, body, rett)
         end
     end
     (overlay, mtable, a1) = expand_function_arg1(ctx, raw_args[1])
+    # The `@overlay` method table may be any expression yielding a MethodTable
+    # (flisp: `sym-ref-or-overlay?`); evaluate it to a temporary so the method
+    # slots below only carry a simple value reference.
+    overlay_prelude = SyntaxList(ctx)
+    if overlay
+        mtable = emit_assign_tmp(overlay_prelude, ctx,
+                                 expand_forms_2(ctx, mtable), "overlay_mt")
+    end
     argl = SyntaxList(a1)
     has_kws = kind(raw_args[end]) === K"parameters" && numchildren(raw_args[end]) > 0
     let force_used = length(pos_opt_args(raw_args)) > 0 || has_kws
@@ -3065,11 +3081,17 @@ function expand_function_def(ctx, src, raw_args, wheres, body, rett)
             [K"::" t] -> is_vararg_type_expr(t)
             _ -> false
         end
-        keywords_method_def_expr(ctx, src, mtable, sparams, argl, body, rett, pos_va)
+        result = keywords_method_def_expr(ctx, src, mtable, sparams, argl, body,
+                                          rett, pos_va, overlay)
+        overlay ? @ast(ctx, src, [K"block" overlay_prelude... result]) : result
     else
+        # The table temporary is a value, not a function binding: no
+        # `function_decl`, and `nothing` as the `method_defs` id.
+        mdefs_id = overlay ? nothing_(ctx, src) : mtable
         @ast ctx src [K"block"
+            overlay_prelude...
             (overlay || kind(mtable) === K"nothing") ? nothing : [K"function_decl" mtable]
-            [K"method_defs" mtable [K"block"
+            [K"method_defs" mdefs_id [K"block"
                 method_def_expr(ctx, src, mtable, sparams, argl, body, rett)]]
                 # TODO: overlay should return the method
                 [K"removable" mtable]]

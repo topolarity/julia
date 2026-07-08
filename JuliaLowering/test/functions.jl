@@ -2284,6 +2284,64 @@ end
 
 end
 
+@testset "method table overlays: non-identifier tables" begin
+    # flisp accepts any `sym-ref-or-overlay?` method-table expression, not just a
+    # bare identifier: a dotted module path, a pre-evaluated `Core.MethodTable`
+    # spliced in as a literal (the shape CUDA/CUDACore emit), etc.  Each such
+    # method must land in the overlay table, not the global one.
+    world() = Base.get_world_counter()
+    in_overlay(T, tbl) =
+        length(Base._methods_by_ftype(T, tbl, 1, world())) == 1 &&
+        isempty(Base._methods_by_ftype(T, nothing, 1, world()))
+
+    # (b) dotted/qualified method table: `M.mt` (pre-split CUDA shape)
+    MtHome = Module()
+    @eval MtHome Base.Experimental.@MethodTable mt
+    UserB = Module()
+    @eval UserB const MtHome = $MtHome
+    JL.include_string(UserB, "function gb end")
+    JL.include_string(UserB, "Base.Experimental.@overlay MtHome.mt gb(x::Int) = x + 1")
+    @test in_overlay(Tuple{typeof(UserB.gb), Int}, MtHome.mt)
+
+    # (c) interpolated, pre-evaluated `Core.MethodTable` value (current CUDACore
+    # shape: `@overlay $(CUDACore.method_table) def` arriving as a K"Value").
+    # A macro whose expansion embeds the method-table value as a literal in the
+    # returned `Expr` reproduces that shape (the table reaches lowering as a
+    # K"Value" node rather than a name).
+    UserC = Module()
+    JL.include_string(UserC, "function gc end")
+    @eval UserC macro ov(def)
+        esc(Expr(:macrocall, GlobalRef(Base.Experimental, Symbol("@overlay")),
+                 LineNumberNode(@__LINE__), $(MtHome.mt), def))
+    end
+    JL.include_string(UserC, "@ov gc(x::Int) = x + 1")
+    @test in_overlay(Tuple{typeof(UserC.gc), Int}, MtHome.mt)
+
+    # (d) `where` params (exercises sparam handling in the overlay slot)
+    UserD = Module()
+    @eval UserD const MtHome = $MtHome
+    JL.include_string(UserD, "function gd end")
+    JL.include_string(UserD,
+        "Base.Experimental.@overlay MtHome.mt gd(x::T, y::T) where {T<:Number} = (x + y)::T")
+    @test in_overlay(Tuple{typeof(UserD.gd), Int, Int}, MtHome.mt)
+
+    # (e) keyword arguments against a dotted table (previously mis-declared the
+    # table as a function / leaked the method to the global table)
+    UserE = Module()
+    @eval UserE const MtHome = $MtHome
+    JL.include_string(UserE, "function ge end")
+    JL.include_string(UserE, "Base.Experimental.@overlay MtHome.mt ge(x::Int; k=1) = x + k")
+    @test in_overlay(Tuple{typeof(UserE.ge), Int}, MtHome.mt)
+
+    # `@consistent_overlay` shares the same method-table slot machinery
+    UserF = Module()
+    @eval UserF const MtHome = $MtHome
+    JL.include_string(UserF, "function gf end")
+    JL.include_string(UserF,
+        "Base.Experimental.@consistent_overlay MtHome.mt gf(x::Int) = x + 1")
+    @test in_overlay(Tuple{typeof(UserF.gf), Int}, MtHome.mt)
+end
+
 @testset "underscore static parameters: fragility guards" begin
     # Local function with its own placeholder `where` interacting with the
     # enclosing method's sparam (exercises skip-but-consume sparam indices
