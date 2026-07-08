@@ -109,7 +109,11 @@ end
 function _replace_captured_locals!(ex, locals::Core.SimpleVector)
     ex isa Expr || return ex
     if Meta.isexpr(ex, :captured_local)
-        return locals[ex.args[1]::Int]
+        # Use Base's own convention for splicing a runtime value into IR
+        # (see `Compiler/src/typeinfer.jl`'s `ReturnNode(quoted(val))`): values
+        # which are themselves AST/IR nodes (Symbol, Expr, ...) must be
+        # QuoteNode-wrapped so they're not misread as syntax.
+        return Base.quoted(locals[ex.args[1]::Int])
     end
     for i in eachindex(ex.args)
         ex.args[i] = _replace_captured_locals!(ex.args[i], locals)

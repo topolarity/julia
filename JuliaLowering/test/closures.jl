@@ -890,6 +890,35 @@ let (g, x) = test_mod.f_arg_reassign_with_label(42)
     @test x == 1
 end
 
+# A top-level global method captures a single-assignment `let` local whose
+# *value* happens to be AST/IR-node-like (a `Symbol` or `Expr`). Captured
+# values for such methods are spliced directly into the method's `CodeInfo`
+# (`JuliaLowering.replace_captured_locals!`), so they must be `QuoteNode`-wrapped
+# before splicing: a raw `Symbol` reads as an unresolved identifier reference
+# (and `jl_method_def` rejects it), while a raw `Expr` reads as executable
+# code and would silently run instead of being returned as data.
+@test JuliaLowering.include_string(test_mod, """
+module M_capture_symbol_value
+    f(x) = nothing
+end
+let name = Symbol("hello")
+    M_capture_symbol_value.f(x::Int) = name
+end
+M_capture_symbol_value.f(1)
+""") === :hello
+
+# Inside @test so a regression (raw Expr executing/throwing) reports as a
+# failure instead of aborting the file.
+@test JuliaLowering.include_string(test_mod, """
+    module M_capture_expr_value
+        f(x) = nothing
+    end
+    let e = :(1 + 2)
+        M_capture_expr_value.f(x::Int) = e
+    end
+    M_capture_expr_value.f(1)
+    """) == :(1 + 2)
+
 @testset "locals in closure signatures produce a clean error" begin
     # flisp: "local variable T cannot be used in closure declaration".
     # These used to trip an internal-looking "unexpected binding of kind local".
