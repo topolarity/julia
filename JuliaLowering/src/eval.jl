@@ -807,28 +807,40 @@ end
 
 #-------------------------------------------------------------------------------
 # Our version of eval - should be upstreamed though?
-@fzone "JL: eval" function eval(mod::Module, ex::SyntaxTree;
+@fzone "JL: eval" function eval(mod::Module, @nospecialize(ex);
                                 soft_scope::Union{Nothing,Bool}=nothing,
                                 expr_compat_mode::Bool=false)
+    # The `eval` driver is dispatched at the pinned lowering world. Operations
+    # with user-visible world semantics (e.g. dispatching on user types / code)
+    # are required to dispatch back to the latest world inside `_eval`.
+    #
+    # (this provides invalidation protection for the JuliaLowering pieces)
     ver = expr_compat_mode ? JL_OLD_SYNTAX_VERSION : JL_NEW_SYNTAX_VERSION
-    iter = lower_init(ex, ver)
-    _eval(mod, iter; soft_scope)
+    return invoke_in_lowerer_world(_lower_and_eval, mod, ex, soft_scope, ver)
 end
 
-# Version of eval() taking `Expr` (or Expr tree leaves of any type)
-function eval(mod::Module, @nospecialize(ex); opts...)
-    eval(mod, expr_to_est(ex); opts...)
+# `ex` may be a `SyntaxTree` or an `Expr` (or `Expr` tree leaves of any type).
+function _lower_and_eval(mod::Module, @nospecialize(ex),
+                         soft_scope::Union{Nothing,Bool}, ver)
+    st = ex isa SyntaxTree ? ex : expr_to_est(ex)
+    iter = lower_init(st, ver)
+    return _eval(mod, iter; soft_scope)
 end
 
 function _eval(mod::Module, iter::LoweringIterator; soft_scope::Union{Nothing,Bool}=nothing)
     modules = Module[mod]
     result = nothing
     while true
+        # Re-read the semantic world each step so that macros and binding
+        # resolution observe methods defined by the previous forms.
         thunk = lower_step(iter, modules[end], Base.get_world_counter(); soft_scope)::Core.SimpleVector
         type = thunk[1]::Symbol
         if type == :done
             break
         elseif type == :begin_module
+            # The Julia callbacks under module begin/end (`Base._setup_module!`,
+            # `Base.register_root_module`, deferred `__init__`s) are invoked at
+            # an explicitly-chosen (latest) world by the C runtime.
             filename = something(thunk[5].file, :none)
             mod = @ccall jl_begin_new_module(
                 modules[end]::Any, thunk[3]::Symbol, thunk[2]::Any, thunk[4]::Cint,
@@ -839,7 +851,8 @@ function _eval(mod::Module, iter::LoweringIterator; soft_scope::Union{Nothing,Bo
             result = pop!(modules)
         else
             @assert type == :thunk
-            result = Core.eval(modules[end], thunk[2])
+            # Evaluate the thunk at the latest world, as flisp does
+            result = Base.invokelatest(Core.eval, modules[end], thunk[2])
         end
     end
     @assert length(modules) === 1
