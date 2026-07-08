@@ -1956,3 +1956,105 @@ end
         test_mod, "@def_ctx_global(ctxf7jl2); ctxf7jl2(41)";
         expr_compat_mode=false) == 999
 end
+
+# Reverse of the escaped-parameter alias above: an old-style macro emits a
+# keyword-argument *name* bare (its own layer) while esc'd defaults or the body
+# reference it from the caller's (ancestor) layer.  flisp exempts keyword-arg
+# names from hygiene renaming (macroexpand.scm `safe-llist-keyword-args`), so the
+# esc'd reference binds to the kwarg; JuliaLowering must match this for
+# flisp-compatible expansions.  This is the `Base.@kwdef` pattern (a field
+# default `Expr(:kw, name, esc(defval))` referencing an earlier bare field).
+fl_eval(test_mod, :(macro def_kw_body(fname)
+    Expr(:function,
+         Expr(:call, esc(fname), Expr(:parameters, :__kw__)),
+         Expr(:block, esc(:(__kw__ + 1))))   # esc'd body binds to the kwarg
+end))
+fl_eval(test_mod, :(macro def_kw_closure(fname)
+    Expr(:function,
+         Expr(:call, esc(fname), Expr(:parameters, Expr(:kw, :__kw__, esc(4)))),
+         Expr(:block, esc(:(inner() = __kw__ + 1)), esc(:(inner()))))
+end))
+fl_eval(test_mod, :(macro def_kw_default(fname)
+    # esc'd default of `__kb__` references the earlier bare kwarg `__ka__`.
+    Expr(:function,
+         Expr(:call, esc(fname),
+              Expr(:parameters, Expr(:kw, :__ka__, esc(2)),
+                   Expr(:kw, :__kb__, esc(:(__ka__ * 10))))),
+         Expr(:block, esc(:(__ka__ + __kb__))))
+end))
+fl_eval(test_mod, :(macro def_kw_shadow(fname)
+    # kwarg name co-spelled with a caller-module global: the parameter wins.
+    Expr(:function,
+         Expr(:call, esc(fname), Expr(:parameters, Expr(:kw, :__kwsh__, esc(1)))),
+         Expr(:block, esc(:__kwsh__)))
+end))
+fl_eval(test_mod, :(macro def_kw_assign(fname)
+    # esc'd assignment to the kwarg name: read-only alias => fresh hygienic local
+    # (see divergence testset), so the RHS read of the old value is undef.
+    Expr(:function,
+         Expr(:call, esc(fname), Expr(:parameters, Expr(:kw, :__kw__, esc(10)))),
+         Expr(:block, esc(:(__kw__ = __kw__ + 5)), esc(:__kw__)))
+end))
+Base.eval(test_mod, :(global __kwsh__ = 999))
+Core.@latestworld
+
+@testset "(AI) keyword-argument name, escaped reference (flisp compat)" for run in [
+    (x::String)->fl_eval(test_mod, JuliaSyntax.parsestmt(Expr, "#=FLISP SANITY-CHECK=# "*x)),
+    (x::String)->JuliaLowering.include_string(
+        test_mod, "#=JL COMPAT=# "*x; expr_compat_mode=true),
+    (x::String)->JuliaLowering.include_string(
+        test_mod, "#=JL=# "*x; expr_compat_mode=false)]
+
+    # esc'd body / inner-closure reference binds to the bare kwarg name.
+    @test run("@def_kw_body(kwf1); kwf1(__kw__=41)") == 42
+    @test run("@def_kw_closure(kwf2); kwf2(__kw__=41)") == 42
+    @test run("@def_kw_closure(kwf2b); kwf2b()") == 5
+    # esc'd default referencing an earlier kwarg (the @kwdef shape).
+    @test run("@def_kw_default(kwf3); kwf3()") == 22
+    @test run("@def_kw_default(kwf3b); kwf3b(__ka__=3)") == 33
+    # kwarg parameter wins over a same-named caller global for reads.
+    @test run("@def_kw_shadow(kwf4); kwf4()") == 1
+    @test run("@def_kw_shadow(kwf4b); kwf4b(__kwsh__=7)") == 7
+end
+
+@testset "(AI) escaped assignment to a keyword-argument name (known divergence)" begin
+    # flisp does not rename an *escaped* assigned name, so it mutates the kwarg
+    # (reads the old value 10, stores 15); JuliaLowering keeps the alias
+    # read-only (matching the escaped-parameter fix), so the assignment target is
+    # a fresh hygienic local read before assignment -> UndefVarError.
+    @test fl_eval(test_mod, JuliaSyntax.parsestmt(
+        Expr, "@def_kw_assign(kwf5fl); kwf5fl()")) == 15
+    @test_throws UndefVarError JuliaLowering.include_string(
+        test_mod, "@def_kw_assign(kwf5jl); kwf5jl()"; expr_compat_mode=true)
+    @test_throws UndefVarError JuliaLowering.include_string(
+        test_mod, "@def_kw_assign(kwf5jl2); kwf5jl2()"; expr_compat_mode=false)
+end
+
+@testset "(AI) Base.@kwdef cross-referencing field default (flisp compat)" begin
+    # `Base.@kwdef` emits `Expr(:kw, fieldname, esc(defval))`: bare field name,
+    # esc'd default.  A default referencing an earlier field must resolve to it
+    # (real-world: MadNLP `MadNLPOptions`).  Covers a plain and a parametric
+    # struct; compares JuliaLowering (both syntax modes) against flisp.
+    src = """
+        module M
+            Base.@kwdef struct Plain
+                base::Int = 2
+                derived::Int = base * 10
+            end
+            Base.@kwdef struct Param{T}
+                a::T
+                b::T = a + one(T)
+            end
+            results() = (Plain().derived, Plain(base=5).derived,
+                         Param{Int}(a=3).b, Param{Float64}(a=1.5).b)
+        end
+    """
+    mfl = Module(); Base.include_string(mfl, src); Core.@latestworld
+    mjl = Module(); JuliaLowering.include_string(mjl, src; expr_compat_mode=true)
+    Core.@latestworld
+    mjl2 = Module(); JuliaLowering.include_string(mjl2, src; expr_compat_mode=false)
+    Core.@latestworld
+    @test mfl.M.results() == (20, 50, 4, 2.5)
+    @test mjl.M.results() == mfl.M.results()
+    @test mjl2.M.results() == mfl.M.results()
+end

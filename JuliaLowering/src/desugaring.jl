@@ -2754,6 +2754,30 @@ function optional_positional_defs(ctx, src, mtable, sparams, argl, body, rett)
     @ast ctx src [K"block" methods...]
 end
 
+# Tag a keyword argument's name so scope analysis can register the flisp-compat
+# read-only alias making the (macro-layer) kwarg name visible to esc'd
+# (ancestor-layer) defaults and body references.  See `register_kwarg_aliases!`.
+tag_keyword_name(n) =
+    kind(n) === K"Identifier" ? setmeta(n, :is_keyword_arg, true) : n
+
+# True if a keyword default `ex` references any keyword name in `kw_names`.  Like
+# flisp, whose kwarg names are identity-mapped by macroexpand so a reference (be
+# it bare from the same expansion or esc'd from the caller) matches the name
+# literally, a flisp-compat reference on the kwarg's own or an ancestor layer
+# counts.  New-style hygiene keeps the strict name+layer match.
+function references_kwarg(ex, kw_names)
+    contains_unquoted(ex) do e
+        kind(e) === K"Identifier" || return false
+        any(kw_names) do kn
+            kind(kn) === K"Identifier" && e.name_val == kn.name_val &&
+                (NameKey(e) == NameKey(kn) ||
+                 (is_flisp_compat(e) && is_strict_ancestor_layer(
+                     (e.context::SyntaxContext).layer,
+                     (kn.context::SyntaxContext).layer)))
+        end
+    end
+end
+
 function expand_kw_args(ctx, kws)
     kargl, restkw = @stm kws begin
         [K"parameters" xs... [K"..." va]] -> (xs, va)
@@ -2766,13 +2790,13 @@ function expand_kw_args(ctx, kws)
         a = expand_function_arg(ctx, raw_a, false)
         @stm a begin
             [K"kw" [K"::" n t] v] -> begin
-                push!(kw_decls, a[1])
+                push!(kw_decls, @ast ctx a[1] [K"::" tag_keyword_name(n) t])
                 push!(kw_defaults, v)
             end
             [K"::" n t] -> begin
-                push!(kw_decls, a)
+                push!(kw_decls, @ast ctx a [K"::" tag_keyword_name(n) t])
                 push!(kw_defaults, @ast ctx a [K"call" "throw"::K"core"
-                    [K"call" "UndefKeywordError"::K"core" a[1]=>K"Symbol"]])
+                    [K"call" "UndefKeywordError"::K"core" n=>K"Symbol"]])
             end
         end
     end
@@ -2814,7 +2838,7 @@ function keywords_method_def_expr(ctx, src, mtable, sparams, argl, body, rett,
         l
     end
     (kw_decls, kw_names, kw_syms, kw_defaults, restkw) = expand_kw_args(ctx, kws)
-    ordered_defaults = any(val->contains_identifier(val, kw_names), kw_defaults)
+    ordered_defaults = any(val->references_kwarg(val, kw_names), kw_defaults)
     positional_sparams = used_typevars(pargl, sparams)
 
     # For an overlay, `mtable` is a value temporary (no `name_val`) and is not a

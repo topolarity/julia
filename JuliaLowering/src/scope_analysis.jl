@@ -47,11 +47,11 @@ struct ScopeInfo
     # Variables captured from an outer scope are not included.  The top-level
     # scope also contains all globals for resolution to fall back to.
     vars::Dict{NameKey,IdTag}
-    # flisp-compat read-only aliases for escaped lambda parameter names (see
-    # `enter_scope!`): consulted by `resolve_name` when `vars` misses, but
-    # invisible to assignment targets and explicit declarations, which get
-    # fresh hygienic locals as under flisp.  Nothing if not a lambda scope.
-    arg_aliases::Union{Nothing, Dict{NameKey,IdTag}}
+    # flisp-compat read-only aliases for cross-layer argument name references
+    # (see `enter_scope!` and `register_kwarg_aliases!`): consulted by
+    # `resolve_name` when `vars` misses, but invisible to assignment targets and
+    # explicit declarations, which get fresh hygienic locals as under flisp.
+    arg_aliases::Dict{NameKey,IdTag}
     # See `LambdaBindings`. Nothing if not a lambda scope.  This is the final
     # collecting place for locals going in to closure conversion.
     locals_capt::Union{Nothing, Dict{IdTag,Bool}}
@@ -75,7 +75,7 @@ function ScopeInfo(ctx, parent_id, ex::SyntaxTree)
     s = ScopeInfo(
         id, parent_id, lambda_id, ex._id, is_permeable, is_lifted,
         Dict{IdTag, NodeId}(), Dict{NameKey, NodeId}(), Dict{NameKey,IdTag}(),
-        kind(ex) === K"lambda" ? Dict{NameKey,IdTag}() : nothing,
+        Dict{NameKey,IdTag}(),
         kind(ex) === K"lambda" ? Dict{IdTag,Bool}() : nothing)
     push!(ctx.scopes, s)
     return s
@@ -137,7 +137,7 @@ function explicit_declare_in_scope!(ctx, scope::ScopeInfo, ex, new_k::Symbol)
     end
     bid = get(scope.vars, NameKey(ex), nothing)
     old_k = isnothing(bid) ? nothing : get_binding(ctx, bid).kind
-    if isnothing(old_k)
+    result_bid = if isnothing(old_k)
         if new_k === :argument
             declare_in_scope!(ctx, scope, ex, :argument;
                               is_nospecialize=getmeta(ex, :nospecialize, false))
@@ -146,8 +146,11 @@ function explicit_declare_in_scope!(ctx, scope::ScopeInfo, ex, new_k::Symbol)
             declare_in_scope!(ctx, scope, ex, real_k)
         end
     elseif old_k === new_k
-        (new_k === :global || new_k === :local) && return bid
-        throw(LoweringError(ex, "function $(_var_str(new_k)) name not unique"))
+        if new_k === :global || new_k === :local
+            bid
+        else
+            throw(LoweringError(ex, "function $(_var_str(new_k)) name not unique"))
+        end
     # See note in test/scopes.jl: "globals may overlap args or sparams"
     # elseif new_k === :global && old_k in (:argument, :static_parameter)
     #     declare_in_scope!(ctx, scope, ex, :global)
@@ -156,6 +159,33 @@ function explicit_declare_in_scope!(ctx, scope::ScopeInfo, ex, new_k::Symbol)
         $(_var_str(new_k)) name `$(NameKey(ex).name)` conflicts with an \
         existing $(_var_str(old_k)) from the same scope"""))
     end
+    register_kwarg_aliases!(scope, ex, result_bid)
+    return result_bid
+end
+
+# flisp compat, the reverse of the escaped-parameter `arg_aliases` registered in
+# `enter_scope!`: an old-style macro emits a keyword-argument *name* bare (its
+# own layer) while esc'd defaults or the body reference it from an ancestor
+# (caller) layer.  flisp exempts keyword-arg names from hygiene renaming
+# (macroexpand.scm `safe-llist-keyword-args`), so those references bind to the
+# kwarg.  Desugaring tags kwarg-derived binding sites `:is_keyword_arg`; register
+# a read-only alias at each ancestor layer of the kwarg's own layer pointing back
+# to its binding.  As with the forward direction the alias is read-only, so a
+# bare name that is assigned or explicitly declared still gets a fresh hygienic
+# local (matching flisp's gensym renaming), and unrelated nested expansions,
+# whose layers are not on this ancestry, keep their hygiene.
+function register_kwarg_aliases!(scope::ScopeInfo, ex, bid)
+    (isnothing(bid) || kind(ex) !== K"Identifier") && return
+    getmeta(ex, :is_keyword_arg, false) || return
+    sc = ex.context::SyntaxContext
+    is_flisp_compat(sc) || return
+    aliases = scope.arg_aliases
+    l = sc.layer.escaped
+    while l !== nothing
+        get!(aliases, NameKey(ex.name_val, l), bid)
+        l = l.escaped
+    end
+    return
 end
 
 # globals are added to both `scope` and the top scope (mainly so we can get the
@@ -224,7 +254,7 @@ function resolve_name(ctx, ex; exclude_toplevel_globals=false,
     for sid in Iterators.reverse(ctx.scope_stack)
         scope = ctx.scopes[sid]
         bid = get(scope.vars, nk, nothing)
-        if isnothing(bid) && include_arg_aliases && !isnothing(scope.arg_aliases)
+        if isnothing(bid) && include_arg_aliases
             bid = get(scope.arg_aliases, nk, nothing)
         end
         isnothing(bid) && continue
