@@ -1876,3 +1876,181 @@ end
     @test !isdefined(test_mod, :a)
     @test !isdefined(macro_mod, :a)
 end
+
+@testset "(AI) single-arg @eval targets the dynamic module (#17)" for expr_compat_mode in (true, false)
+    # flisp passes `__module__` = the module the code is currently being
+    # expanded/evaluated into (`jl_expand_macros`'s `inmodule`) to every macro,
+    # at any nesting depth inside other macros' expansions; only macro *name*
+    # resolution uses the hygiene context. Single-arg `@eval` (and `@__MODULE__`
+    # in re-evaluated quoted payloads) must therefore act on the dynamic
+    # evaluation module, not on `syntax_module(macrocall)` (the macro-defining
+    # module for a macro-generated `@eval`). This is what SafeTestsets'
+    # `@safetestset` relies on: `@eval module $mod; using Test; ... end` must
+    # create the module under the *caller*, where Test is loadable.
+    root = Module(gensym(:eval_dynmod))
+    @eval root import JuliaLowering
+    JuliaLowering.include_string(root, raw"""
+    module MacB
+        import JuliaLowering.@legacy_quote_to_syntax
+        macro do_eval()
+            @legacy_quote_to_syntax quote
+                @eval (@__MODULE__)
+            end
+        end
+    end
+    module MacA
+        import JuliaLowering.@legacy_quote_to_syntax
+        import ..MacB
+        macro wrap()
+            @legacy_quote_to_syntax quote
+                @eval (@__MODULE__)
+            end
+        end
+        macro via_b()
+            @legacy_quote_to_syntax quote
+                MacB.@do_eval()
+            end
+        end
+        macro wrap_ee()
+            @legacy_quote_to_syntax quote
+                @eval @eval (@__MODULE__)
+            end
+        end
+        macro wrap_two_arg()
+            # two-arg control: explicit target module; the payload's
+            # `@__MODULE__` must still see the *target* module
+            @legacy_quote_to_syntax quote
+                @eval MacB (@__MODULE__)
+            end
+        end
+        macro wrap_arg(ex)
+            # caller-provided payload (caller's hygiene layer)
+            @legacy_quote_to_syntax quote
+                @eval $ex
+            end
+        end
+        macro wrap_fn()
+            # `@eval` captures the module current when the enclosing function
+            # *definition* is expanded, like flisp
+            @legacy_quote_to_syntax quote
+                () -> @eval (@__MODULE__)
+            end
+        end
+        macro mkmod()
+            mod = gensym("EvalMod")
+            @legacy_quote_to_syntax quote
+                @eval module $mod
+                    const inside = (@__MODULE__)
+                end
+            end
+        end
+        macro mkmod_payload(ex)
+            mod = gensym("EvalMod2")
+            @legacy_quote_to_syntax quote
+                @eval module $mod
+                    $ex
+                end
+            end
+        end
+    end
+    module Sub
+        import ..MacA
+    end
+    """; expr_compat_mode)
+    Core.@latestworld
+
+    run(str) = JuliaLowering.include_string(root, str; expr_compat_mode)
+
+    # Lexical (non-macro-generated) cases: unchanged behavior
+    @test run("@eval (@__MODULE__)") === root
+    @test run("(() -> @eval (@__MODULE__))()") === root
+    @test run("@eval @eval (@__MODULE__)") === root
+
+    # `@eval` inside another macro's unescaped expansion evaluates in the
+    # caller's module, not the macro's
+    @test run("MacA.@wrap()") === root
+    # ... even when the `@eval`-ing macro is called by another macro's expansion
+    # (flisp: still the dynamic module, not either macro's module)
+    @test run("MacA.@via_b()") === root
+    # `@eval` nested in `@eval` re-expands against the outer target
+    @test run("MacA.@wrap_ee()") === root
+    # two-arg control: explicit module wins; payload `@__MODULE__` follows it
+    @test run("MacA.@wrap_two_arg()") === root.MacB
+    # macro-generated closure: `@eval` binds the definition-time module
+    @test Base.invokelatest(run("MacA.@wrap_fn()")) === root
+    # the same macro evaluated into a different module follows the live module
+    @test JuliaLowering.include_string(
+        root.Sub, "MacA.@wrap()"; expr_compat_mode) === root.Sub
+
+    # Caller-provided payloads evaluate in the caller's module
+    @test run("MacA.@wrap_arg(arg_marker = (@__MODULE__))") === root
+    if !expr_compat_mode
+        # With SyntaxTree-passed arguments the payload keeps the caller's
+        # hygiene: the global lands in `root` and is visible there. (In
+        # expr_compat_mode the old-style Expr round-trip re-layers the payload
+        # with the macro's hygiene and the assignment becomes a hygienic
+        # toplevel local -- a pre-existing divergence from flisp tracked by
+        # the "hygienic toplevel assignments" TODO in scope_analysis.jl.)
+        @test Base.invokelatest(isdefined, root, :arg_marker)
+        @test Base.invokelatest(getfield, root, :arg_marker) === root
+    end
+
+    # The SafeTestsets shape: a macro-generated `@eval module $mod ... end`
+    # creates the module under the dynamic (caller) module
+    m = run("MacA.@mkmod()")
+    @test m isa Module
+    @test parentmodule(m) === root
+    @test Base.invokelatest(getfield, m, :inside) === m
+    # ... and user payload interpolated into the module body sees the fresh
+    # module as its dynamic module (a user's own `@eval` inside a
+    # `@safetestset` acts on the anonymous test module)
+    m2 = run("MacA.@mkmod_payload(@eval user_marker = (@__MODULE__))")
+    @test m2 isa Module
+    @test parentmodule(m2) === root
+    @test Base.invokelatest(getfield, m2, :user_marker) === m2
+
+    if expr_compat_mode
+        # Escaped expansions (old-style macros only): same dynamic target
+        JuliaLowering.include_string(root, raw"""
+        module MacEsc
+            macro wrap_esc()
+                esc(quote
+                    @eval esc_marker = (@__MODULE__)
+                end)
+            end
+        end
+        """; expr_compat_mode)
+        Core.@latestworld
+        @test run("MacEsc.@wrap_esc()") === root
+        @test Base.invokelatest(isdefined, root, :esc_marker)
+        @test Base.invokelatest(getfield, root, :esc_marker) === root
+    end
+
+    # An old-style (flisp-defined and -lowered) macro whose expansion calls
+    # `@eval` gets the same treatment when invoked under JuliaLowering
+    fl_eval(root, :(module MacFl
+        macro flwrap()
+            quote
+                @eval (@__MODULE__)
+            end
+        end
+    end))
+    Core.@latestworld
+    @test run("MacFl.@flwrap()") === root
+end
+
+@testset "(AI) @eval payload-hygiene residual (known divergence)" begin
+    # Bare `const` (and method-definition) payloads in macro-generated @eval
+    # resolve their binding via the payload's hygiene module rather than the
+    # (correctly threaded) eval-target module — a separate pre-existing
+    # divergence from flisp, tracked as eval-payload-hygiene. The dynamic
+    # module threading (#17) fixes the module/global payload shapes.
+    m = Module()
+    Core.eval(m, :(module MacHome2
+        macro make_const()
+            :( @eval const CMARKER = 42 )
+        end
+    end))
+    Core.eval(m, :(MacHome2.@make_const()))
+    @test_broken isdefined(m, :CMARKER)
+end
