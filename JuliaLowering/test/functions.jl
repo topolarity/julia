@@ -1293,6 +1293,19 @@ end
     end
 end
 
+@testset "internal kwarg scratch slot is hidden from kwarg_decl" begin
+    # `keywords_method_def_expr` allocates an internal scratch slot for
+    # extracting/typechecking each keyword's value. Its name must contain a `#`
+    # marker so that `Base.kwarg_decl` (which lists every post-nargs slot whose
+    # name lacks `#`) does not leak it into method displays as a bogus keyword.
+    JuliaLowering.include_string(test_mod, """
+    f_kw_decl(a; x::Char='a', y::Bool=true) = (a, x, y)
+    """)
+    kd = Base.kwarg_decl(first(methods(test_mod.f_kw_decl)))
+    @test kd == [:x, :y]
+    @test !any(s -> occursin("kwtmp", string(s)), kd)
+end
+
 @testset "Keyword call evaluation order" begin
     # Keyword calls must evaluate the receiver and their arguments in source
     # (left-to-right) program order, exactly like ordinary positional calls and

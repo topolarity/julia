@@ -227,6 +227,37 @@ let s = test_mod.S3(42, "hi")
     @test s.y == "hi"
 end
 
+@testset "empty block in struct body doesn't suppress default ctors" begin
+    # A trailing empty `begin end` block in a struct body flattens to a
+    # synthetic `nothing` node; it must be treated as effect-free rather than
+    # as a user-defined inner constructor, otherwise the auto-generated
+    # positional constructor is silently dropped (e.g. ConcreteStructs.@concrete
+    # appends such a placeholder block, which broke QuasiMonteCarlo under JL).
+    @test JuliaLowering.include_string(test_mod, """
+    struct STrailingEmptyBlock
+        x::Int
+        begin end
+    end
+    """) === nothing
+    @test length(methods(test_mod.STrailingEmptyBlock)) == 2
+    let s = test_mod.STrailingEmptyBlock(1)
+        @test s.x === 1
+    end
+
+    # Control: an empty block that is NOT the last body statement was never
+    # affected, but confirm it still gets the default constructor too.
+    @test JuliaLowering.include_string(test_mod, """
+    struct SLeadingEmptyBlock
+        begin end
+        x::Int
+    end
+    """) === nothing
+    @test length(methods(test_mod.SLeadingEmptyBlock)) == 2
+    let s = test_mod.SLeadingEmptyBlock(2)
+        @test s.x === 2
+    end
+end
+
 # Inner constructors: All fields Any; dynamically tested against whatever
 # S4_Field resolves to
 @test JuliaLowering.include_string(test_mod, """
