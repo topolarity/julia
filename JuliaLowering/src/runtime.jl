@@ -13,6 +13,19 @@ Base.@assume_effects :removable function current_exception()
     @ccall jl_current_exception(current_task()::Any)::Any
 end
 
+# Re-dispatch `f(args...)` at the pinned lowering world (see `jl_lowering_world`)
+@inline function invoke_in_lowerer_world(f::F, @nospecialize(args...)) where {F}
+    w = unsafe_load(cglobal(:jl_lowering_world, Csize_t))
+    if w == 0
+        # Fallback when the Base lowering hook is not set up
+        #
+        # FIXME: this should probably distinguish the two cases so that setting up
+        # the hook does not change independent JuliaLowering behavior.
+        w = Base.tls_world_age()
+    end
+    return Base.invoke_in_world(w, f, args...)
+end
+
 function _interpolate_expr(@nospecialize(ex), depth, @nospecialize(vals::Tuple), val_i)
     if ex isa QuoteNode
         out = _interpolate_expr(Expr(:inert, ex.value), depth, vals, val_i)
@@ -37,6 +50,12 @@ function _interpolate_expr(@nospecialize(ex), depth, @nospecialize(vals::Tuple),
     end
 end
 function interpolate_expr(@nospecialize(ex), @nospecialize(values...))
+    # runs at eval time in user code, so pin it to the lowering world which
+    # is safe since we do not dispatch on user values internally
+    return invoke_in_lowerer_world(_interpolate_expr_toplevel, ex, values...)
+end
+
+function _interpolate_expr_toplevel(@nospecialize(ex), @nospecialize(values...))
     @jl_assert !Meta.isexpr(ex, :$) (expr_to_est(ex), "expand_quote should handle this")
     _interpolate_expr(ex, 0, values, Ref(0))
 end
@@ -64,6 +83,12 @@ function _interpolate_syntax(st::SyntaxTree, depth, @nospecialize(vals), val_i)
     mknode(st, cs_out)
 end
 function interpolate_syntax(st::SyntaxTree, @nospecialize(vals...))
+    # runs at eval time in user code, so pin it to the lowering world which
+    # is safe since we do not dispatch on user values internally
+    return invoke_in_lowerer_world(_interpolate_syntax_toplevel, st, vals...)
+end
+
+function _interpolate_syntax_toplevel(st::SyntaxTree, @nospecialize(vals...))
     st = copy_ast(ensure_macro_attributes!(SyntaxGraph()), st)
     val_i = Ref(0)
     out = _interpolate_syntax((@ast st._graph st [K"None" st]), 0, vals, val_i)
