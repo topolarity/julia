@@ -6,7 +6,7 @@ function lower(mod::Module, ex_in::SyntaxTree; expr_compat_mode::Bool=false,
     ver = expr_compat_mode ? JL_OLD_SYNTAX_VERSION : JL_NEW_SYNTAX_VERSION
     ex0 = rebase_layers(ex_in, mod, ver)
     world = Base.get_world_counter()
-    ex1 = expand_forms_1(ex0, world, true)
+    ex1 = expand_forms_1(ex0, mod, world, true)
     ctx2, ex2 = expand_forms_2(ex1, mod, world)
     ctx3, ex3 = resolve_scopes(ctx2, ex2; soft_scope)
     ctx4, ex4 = convert_closures(ctx3, ex3)
@@ -20,13 +20,17 @@ function macroexpand(mod::Module, ex_in::SyntaxTree;
                          JL_OLD_SYNTAX_VERSION : JL_NEW_SYNTAX_VERSION,
                      recursive::Bool=true)
     ex0 = rebase_layers(ex_in, mod, ver)
-    expand_forms_1(ex0, Base.get_world_counter(), recursive)
+    expand_forms_1(ex0, mod, Base.get_world_counter(), recursive)
 end
 
 "May be used in macros or from any module"
 function macroexpand(st::SyntaxTree)
     DEBUG && assert_expandable(st)
-    ctx = MacroExpansionContext(st, Base.get_world_counter(), true)
+    # No evaluation module is available here; the layer-chain root is the
+    # closest analogue (it is the module the enclosing expansion is
+    # lowering into, for syntax originating from the current pass).
+    ctx = MacroExpansionContext(st, base_layer(st.context::SyntaxContext).mod,
+                                Base.get_world_counter(), true)
     expand_forms_1(ctx, st)
 end
 
@@ -140,7 +144,7 @@ function lower_step(iter::LoweringIterator, mod::Module, world::UInt;
     k = kind(ex)
     if !(k in KSet"toplevel module")
         ex = rebase_layers(ex, mod, iter.ver, module_layer)
-        ex = expand_forms_1(ex, world, true)
+        ex = expand_forms_1(ex, mod, world, true)
         k = kind(ex)
     end
     if k == K"toplevel"

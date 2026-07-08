@@ -2,15 +2,20 @@
 struct MacroExpansionContext{Attrs} <: AbstractLoweringContext
     graph::SyntaxGraph{Attrs}
     syntax_context::SyntaxContext
+    # The module this code is being lowered into: the dynamic analogue of
+    # flisp's `inmodule`/`__module__`, as opposed to the (static) hygiene
+    # module of any given piece of syntax. Callers which lower for evaluation
+    # pass the live evaluation module here.
+    mod::Module
     known_layers::Dict{ScopeLayer, Bool}
     world::UInt
     recursive::Bool
 end
 
-function MacroExpansionContext(st, world, recursive)
+function MacroExpansionContext(st, mod::Module, world, recursive)
     sc = st.context::SyntaxContext
     MacroExpansionContext(
-        st._graph, sc, Dict{ScopeLayer, Bool}(base_layer(sc)=>true),
+        st._graph, sc, mod, Dict{ScopeLayer, Bool}(base_layer(sc)=>true),
         world, recursive)
 end
 
@@ -87,6 +92,12 @@ end
 struct MacroContext <: AbstractLoweringContext
     graph::SyntaxGraph
     macrocall::Union{SyntaxTree,LineNumberNode,SourceRef}
+    # The module the enclosing code is being lowered into (see
+    # `MacroExpansionContext.mod`). This is the equivalent of `__module__` in
+    # old-style macros: use it (not `syntax_module(macrocall)`, which is the
+    # macrocall's hygiene module) when expansion must refer to the module the
+    # generated code will be evaluated in, e.g. `@eval`'s implicit target.
+    mod::Module
 end
 
 struct MacroExpansionError <: Exception
@@ -219,7 +230,7 @@ function expand_macro(ctx::MacroExpansionContext, st::SyntaxTree)
         st, "`macrocall` requires a macro name and source location"))
     sc_in = st.context::SyntaxContext
     macname = st[1]
-    mctx = MacroContext(ctx.graph, st)
+    mctx = MacroContext(ctx.graph, st, ctx.mod)
     macfunc = eval_macro_name(ctx, mctx, macname)
     raw_args = st[3:end]
 
@@ -248,7 +259,9 @@ function expand_macro(ctx::MacroExpansionContext, st::SyntaxTree)
         end
     else
         macro_loc = _macrocall_expr_location(st)
-        macro_args = Any[macro_loc, ctx.syntax_context.layer.mod]
+        # Old-style macros receive `__module__` = the module the code is being
+        # lowered into (flisp's `inmodule`), not any hygiene-derived module.
+        macro_args = Any[macro_loc, ctx.mod]
         for arg in raw_args
             @jl_assert kind(arg) !== K"VERSION" arg # handled in EST conversion
             push!(macro_args, est_to_expr(arg))
@@ -405,12 +418,12 @@ function assert_expandable(st, l=base_layer(st.context::SyntaxContext))
 end
 
 @fzone "JL: macroexpand" function expand_forms_1(
-    st::SyntaxTree, world::UInt, recursive::Bool)
+    st::SyntaxTree, mod::Module, world::UInt, recursive::Bool)
 
     graph = ensure_macro_attributes!(copy_attrs(syntax_graph(st)))
     st = reparent(graph, st)
     DEBUG && assert_expandable(st)
-    ctx = MacroExpansionContext(st, world, recursive)
+    ctx = MacroExpansionContext(st, mod, world, recursive)
     st_out = expand_forms_1(ctx, st)
     return st_out
 end

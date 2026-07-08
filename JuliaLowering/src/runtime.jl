@@ -280,7 +280,7 @@ function (g::GeneratedFunctionStub)(world::UInt, source::Method, @nospecialize a
     # Note that we expand in `tls_world_age()` (see Core.GeneratedFunctionStub)
     world = Base.tls_world_age()
     ex0 = JuliaSyntax.fill_context!(ex0, sc)
-    ctx1 = MacroExpansionContext(ex0, world, true)
+    ctx1 = MacroExpansionContext(ex0, __module__, world, true)
     ex1 = expand_forms_1(ctx1, ex0)
     # Desugaring
     ctx2, ex2 = expand_forms_2(ex1, base_layer(sc).mod, world)

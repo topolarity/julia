@@ -278,7 +278,10 @@ function Base.var"@eval"(__context__::MacroContext, ex)
                 val
                 [K"call"
                     JuliaLowering.eval::K"Value"
-                    syntax_module(__context__.macrocall)::K"Value"
+                    # flisp binds single-arg `@eval`'s target to `__module__`:
+                    # the module the generated code is evaluated in, NOT the
+                    # macrocall's (hygiene) module. See #17.
+                    __context__.mod::K"Value"
                     q
                 ]
             ]
