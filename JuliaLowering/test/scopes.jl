@@ -1117,3 +1117,15 @@ end
         Base.delete_binding(test_mod, :old_hyg_struct_tv_G)
     end
 end
+
+@testset "(AI) @isdefined sees imported globals (#31)" begin
+    # From PkgEval: StableTasks v0.1.7, src/internals.jl (@isdefined feature detection silently took the fallback branch)
+    # allow_import=true matches flisp: implicit Core/Base visibility and
+    # `using`-provided names count as defined at module scope.
+    m = Module(:IsdefM)
+    @test JuliaLowering.include_string(m, "@isdefined Core") === true
+    @test JuliaLowering.include_string(m, "@isdefined Base") === true
+    @test JuliaLowering.include_string(m, "@isdefined sin") === true
+    @test JuliaLowering.include_string(m, "@isdefined not_a_thing_anywhere") === false
+    @test JuliaLowering.include_string(m, "f() = @isdefined(Core); f()") === true
+end

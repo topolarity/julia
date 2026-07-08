@@ -389,7 +389,7 @@ end
 #---------------------
 1   1
 2   (= slot₁/x %₁)
-3   (call core.isdefinedglobal TestMod :y false)
+3   (call core.isdefinedglobal TestMod :y true)
 4   (return %₃)
 
 ########################################
