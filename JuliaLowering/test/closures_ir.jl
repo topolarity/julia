@@ -482,31 +482,31 @@ f(x; a=1) do y
 end
 #---------------------
 1   TestMod.f
-2   (call core.tuple :a)
-3   (call core.apply_type core.NamedTuple %₂)
-4   (call core.tuple 1)
-5   (call %₃ %₄)
-6   (call core.svec)
-7   (call core.svec)
-8   (call JuliaLowering.eval_closure_type TestMod :##->###1 %₆ %₇)
-9   latestworld
-10  TestMod.##->###1
-11  (call core.svec %₁₀ core.Any)
-12  (call core.svec)
-13  SourceLocation::1:13
-14  (call core.svec %₁₁ %₁₂ %₁₃)
-15  --- method core.nothing %₁₄
+2   (call core.svec)
+3   (call core.svec)
+4   (call JuliaLowering.eval_closure_type TestMod :##->###1 %₂ %₃)
+5   latestworld
+6   TestMod.##->###1
+7   (new %₆)
+8   (= slot₁/#-># %₇)
+9   TestMod.##->###1
+10  (call core.svec %₉ core.Any)
+11  (call core.svec)
+12  SourceLocation::1:13
+13  (call core.svec %₁₀ %₁₁ %₁₂)
+14  --- method core.nothing %₁₃
     slots: [slot₁/#self#(!read) slot₂/y]
     1   TestMod.+
     2   (call %₁ slot₂/y 2)
     3   (return %₂)
-16  latestworld
-17  TestMod.##->###1
-18  (new %₁₇)
-19  (= slot₁/#-># %₁₈)
-20  slot₁/#->#
+15  latestworld
+16  slot₁/#->#
+17  (call core.tuple :a)
+18  (call core.apply_type core.NamedTuple %₁₇)
+19  (call core.tuple 1)
+20  (call %₁₈ %₁₉)
 21  TestMod.x
-22  (call core.kwcall %₅ %₁ %₂₀ %₂₁)
+22  (call core.kwcall %₂₀ %₁ %₁₆ %₂₁)
 23  (return %₂₂)
 
 ########################################
