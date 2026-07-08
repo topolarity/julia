@@ -242,6 +242,11 @@ function expand_macro(ctx::MacroExpansionContext, st::SyntaxTree)
 
     if has_new_macro
         macro_args = [mctx, raw_args...]
+        # Resolve the invoked method *before* running the body: a nested
+        # `require`/precompile inside the macro can perturb method-table
+        # visibility at `ctx.world`, so re-resolving afterward may fail. This
+        # matches flisp's single lookup in `jl_invoke_julia_macro`.
+        macro_mi = lookup_method_instance(macfunc, macro_args, ctx.world)
         expanded = try
             Base.invoke_in_world(ctx.world, macfunc, macro_args...)
         catch exc
@@ -266,6 +271,10 @@ function expand_macro(ctx::MacroExpansionContext, st::SyntaxTree)
             @jl_assert kind(arg) !== K"VERSION" arg # handled in EST conversion
             push!(macro_args, est_to_expr(arg))
         end
+        # Resolve the invoked method before running the body (see the
+        # new-style branch above): the body may `require` a package which
+        # perturbs `ctx.world` method visibility for a later re-lookup.
+        macro_mi = lookup_method_instance(macfunc, macro_args, ctx.world)
         st_out = try
             Base.invoke_in_world(ctx.world, macfunc, macro_args...)
         catch exc
@@ -282,8 +291,13 @@ function expand_macro(ctx::MacroExpansionContext, st::SyntaxTree)
         st_out = expr_to_est(st._graph, st_out, macro_lnn)
     end
     # Module scope for the returned AST is the module where this particular
-    # method was defined (may be different from `parentmodule(macfunc)`)
-    mod_for_ast = lookup_method_instance(macfunc, macro_args, ctx.world).def.module
+    # method was defined (may be different from `parentmodule(macfunc)`). Use
+    # the method instance resolved before invocation; fall back to the macro's
+    # parent module if it somehow couldn't be resolved (a clean answer instead
+    # of dereferencing `nothing`).
+    # The fallback is unreachable in practice: a lookup miss implies the
+    # invocation below throws the same MethodError. Defense-in-depth only.
+    mod_for_ast = macro_mi !== nothing ? macro_mi.def.module : parentmodule(macfunc)
     sc2 = SyntaxContext(
         ScopeLayer(mod_for_ast, sc_in.layer), st,
         (has_new_macro ? JL_NEW_SYNTAX_VERSION : JL_OLD_SYNTAX_VERSION), false)

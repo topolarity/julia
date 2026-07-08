@@ -1296,6 +1296,30 @@ code = JuliaLowering.include_string(test_mod, """Mod1.@indirect_MODULE()""")
     end
 end
 
+@testset "(AI) old macro attribution survives a nested eval in its body (#32)" begin
+    # Shape test: pins module attribution for the crash-adjacent construct. The
+    # original crash needs incremental-precompile pkgimage loading (see
+    # pkgeval bugs/expand-macro-nothing-def), which in-process tests can't drive.
+    # Regression for macro_expansion.jl:286 crashing with `nothing.def`. An
+    # old-style macro whose body calls `__module__.eval(...)` used to be
+    # re-looked-up *after* invocation to determine the module for its output
+    # AST; a nested `require` during the body could make that second lookup
+    # return `nothing`. We now resolve the method instance before invoking, so
+    # the returned AST is still attributed to the macro's defining module.
+    Base.eval(test_mod, :(module MacDefMod
+        const secret = 99
+        macro getsecret()
+            __module__.eval(:(nested_eval_side_effect = 1 + 1))
+            return :(secret)   # bare name -> resolves in the defining module
+        end
+    end))
+    Core.@latestworld
+    # `secret` must resolve in MacDefMod (== mod_for_ast), matching flisp.
+    @test JuliaLowering.include_string(test_mod, "MacDefMod.@getsecret()") == 99
+    @test test_mod.nested_eval_side_effect == 2
+    @test fl_eval(test_mod, :(MacDefMod.@getsecret())) == 99
+end
+
 @testset "macros defining macros" begin
     @eval test_mod macro make_and_use_macro_toplevel()
         Expr(:toplevel,
