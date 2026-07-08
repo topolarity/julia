@@ -248,7 +248,7 @@ function expand_macro(ctx::MacroExpansionContext, st::SyntaxTree)
         # `require`/precompile inside the macro can perturb method-table
         # visibility at `ctx.world`, so re-resolving afterward may fail. This
         # matches flisp's single lookup in `jl_invoke_julia_macro`.
-        macro_mi = lookup_method_instance(macfunc, macro_args, ctx.world)
+        macro_mi = lookup_method_instance(macfunc, macro_args, macro_world)
         expanded = try
             Base.invoke_in_world(ctx.world, macfunc, macro_args...)
         catch exc
@@ -276,7 +276,7 @@ function expand_macro(ctx::MacroExpansionContext, st::SyntaxTree)
         # Resolve the invoked method before running the body (see the
         # new-style branch above): the body may `require` a package which
         # perturbs `ctx.world` method visibility for a later re-lookup.
-        macro_mi = lookup_method_instance(macfunc, macro_args, ctx.world)
+        macro_mi = lookup_method_instance(macfunc, macro_args, macro_world)
         st_out = try
             Base.invoke_in_world(ctx.world, macfunc, macro_args...)
         catch exc
