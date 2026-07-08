@@ -593,6 +593,10 @@ function est_to_dst(st::SyntaxTree)
         [K"core" x] -> setattr!(mkleaf(st), :name_val, x.name_val)
         [K"top" x] -> setattr!(mkleaf(st), :name_val, x.name_val)
         [K"static_parameter" x] -> setattr!(mkleaf(st), :var_id, x.value::IdTag)
+        # Raw `Expr(:lambda, ...)` argnames are referenced positionally via
+        # `Core.Argument` (e.g. `Base._defaultctors`'s underscore field names),
+        # so they must stay real bindings, never `Placeholder`s.
+        [K"lambda" args sps body] -> mknode(st, [args._id, sps._id, rec(body)._id])
         [K"copyast" [K"inert" ex]] -> @ast g st [K"call"
             interpolate_expr::K"Value"
             [K"inert"(st[1]) ex]
