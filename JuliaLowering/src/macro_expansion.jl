@@ -234,11 +234,13 @@ function expand_macro(ctx::MacroExpansionContext, st::SyntaxTree)
     macfunc = eval_macro_name(ctx, mctx, macname)
     raw_args = st[3:end]
 
-    # TODO: hasmethod always returns false for our `typemax(UInt)` meaning
-    # "latest world," which we shouldn't be using.
-    has_new_macro = ctx.world === typemax(UInt) ?
-        hasmethod(macfunc, Tuple{typeof(mctx), typeof.(raw_args)...}) :
-        hasmethod(macfunc, Tuple{typeof(mctx), typeof.(raw_args)...}; world=ctx.world)
+    # We use a specific well defined world age for the next checks and macro
+    # expansion invocations. This avoids inconsistencies if the latest world
+    # age changes concurrently.
+    #
+    # TODO: Allow this to be passed in
+    macro_world = ctx.world === typemax(UInt) ? Base.get_world_counter() : ctx.world
+    has_new_macro = hasmethod(macfunc, Tuple{typeof(mctx), typeof.(raw_args)...}; world=macro_world)
 
     if has_new_macro
         macro_args = [mctx, raw_args...]

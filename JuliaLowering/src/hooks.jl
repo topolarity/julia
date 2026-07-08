@@ -54,6 +54,14 @@ function core_lowering_hook(@nospecialize(code), mod::Module, file::Union{String
         return Core.svec(code)
     end
 
+    # Refuse to run as `Core._lower` without a pinned world: installing this
+    # hook by hand rather than via `activate!` silently reintroduces per-form
+    # re-inference of the lowering pipeline.
+    if _has_v1_13_hooks && Core._lower === core_lowering_hook &&
+            unsafe_load(cglobal(:jl_lowering_world, Csize_t)) == 0
+        error("`Core._lower` was set without pinning the lowering world; use `JuliaLowering.activate!()`")
+    end
+
     # TODO: fix in base
     file = file isa Ptr{UInt8} ? unsafe_string(file) : file
     line = !(line isa Int) ? Int(line) : line
@@ -102,7 +110,12 @@ function activate!(enable=true)
 
     if enable
         Core._setlowerer!(core_lowering_hook)
+        # Pin lowering dispatch to a fixed world age (like `jl_typeinf_world`) so
+        # methods defined by the code being lowered don't invalidate JuliaLowering
+        ccall(:jl_set_lowering_world, Cvoid, (Csize_t,), Base.get_world_counter())
     else
         Core._setlowerer!(Base.fl_lower)
+        # unpinned: `jl_lower` dispatches the flisp wrapper at the latest world
+        ccall(:jl_set_lowering_world, Cvoid, (Csize_t,), 0)
     end
 end
