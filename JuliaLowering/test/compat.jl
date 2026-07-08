@@ -567,3 +567,59 @@ end
     out = JL.core_lowering_hook(lambda, test_mod)
     @test out isa Core.SimpleVector && out[1] isa Core.CodeInfo
 end
+
+@testset "bare `elseif` Expr == independent `if` (flisp parity)" begin
+    # flisp maps `elseif` to the same `expand-if` handler as `if`, so an
+    # `Expr(:elseif, ...)` that is NOT nested in the else-slot of a preceding
+    # `if`/`elseif` (e.g. spliced as a sibling statement in a `block`, as
+    # DynamicSumTypes' `@sumtype` macro does via a flat `Vector{Expr}`) is
+    # accepted and behaves exactly like a standalone `if` -- its own condition,
+    # its own body, evaluated in sequence and NOT chained to any earlier `if`.
+
+    # A bare `elseif` becomes `K"if"`; a nested else-slot `elseif` stays `K"elseif"`.
+    @test kind(JuliaLowering.expr_to_est(Expr(:elseif, :c, :t))) === K"if"
+    let st = JuliaLowering.expr_to_est(Expr(:if, :c1, :t1, Expr(:elseif, :c2, :t2)))
+        @test kind(st) === K"if"
+        @test kind(st[3]) === K"elseif"          # chain preserved byte-identically
+    end
+    # An `elseif` in a block sibling position is bare, even at arg 3 of the block.
+    let st = JuliaLowering.expr_to_est(Expr(:block, :s1, :s2, Expr(:elseif, :c, :t)))
+        @test kind(st[3]) === K"if"
+    end
+    # Chained `elseif` inside a bare (block-sibling) `elseif` stays a chain.
+    let st = JuliaLowering.expr_to_est(
+                Expr(:block, Expr(:elseif, :c1, :t1, Expr(:elseif, :c2, :t2))))
+        @test kind(st[1]) === K"if"
+        @test kind(st[1][3]) === K"elseif"
+    end
+
+    # End-to-end: the exact flat/sibling shape DynamicSumTypes.jl builds --
+    # `[Expr(:if,...), Expr(:elseif,...), ...]` spliced as block siblings.
+    branches = Any[
+        Expr(:if,     :(v isa Int),     :(return 1)),
+        Expr(:elseif, :(v isa Float64), :(return 2)),
+        Expr(:elseif, :(v isa String),  :(return 3)),
+    ]
+    fdef = Expr(:function, :(f_bare_elseif(v)),
+                Expr(:block, branches..., :(error("unreachable"))))
+    jl_eval(test_mod, fdef)
+    f = getfield(test_mod, :f_bare_elseif)
+    @test Base.invokelatest(f, 1) == 1
+    @test Base.invokelatest(f, 1.0) == 2
+    @test Base.invokelatest(f, "x") == 3
+
+    # flisp parity: each bare `elseif` is INDEPENDENT, not chained.  With an
+    # intervening statement between the `if` and a following `elseif` sibling,
+    # both branches run on their own conditions (proving no real if/elseif
+    # dispatch -- see notes) rather than only one being selected.
+    gdef = Expr(:function, :(g_bare_elseif(v)),
+                Expr(:block,
+                    Expr(:if, :(v == 1), :(push!(log, :a))),
+                    :(push!(log, :mid)),
+                    Expr(:elseif, :(v == 1), :(push!(log, :b))),
+                    :(return log)))
+    jl_eval(test_mod, :(log = Symbol[]))
+    jl_eval(test_mod, gdef)
+    g = getfield(test_mod, :g_bare_elseif)
+    @test Base.invokelatest(g, 1) == [:a, :mid, :b]
+end
