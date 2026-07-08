@@ -854,14 +854,14 @@ end
 vst1_typevar_decl(vcx, st) = @stm st begin
     [K"Identifier"] -> vst1_ident(vcx, st; lhs=true)
     [K"<:" t old] ->
-        vst1_ident(vcx, t; lhs=true) & vst1(vcx, old)
+        vst1_ident(vcx, t; lhs=true) & vst1(with(vcx; readable_underscore=true), old)
     [K">:" t old] ->
-        vst1_ident(vcx, t; lhs=true) & vst1(vcx, old)
+        vst1_ident(vcx, t; lhs=true) & vst1(with(vcx; readable_underscore=true), old)
     ([K"comparison" val_l [K"Identifier"] t [K"Identifier"] val_r],
      when=(st[2].name_val===st[4].name_val && st[2].name_val in ("<:", ">:"))) ->
-         vst1(vcx, val_l) &
+         vst1(with(vcx; readable_underscore=true), val_l) &
          vst1_ident(vcx, t; lhs=true) &
-         vst1(vcx, val_r)
+         vst1(with(vcx; readable_underscore=true), val_r)
     [K"<:" x _] ->
         @fail(x, "expected type name")
     [K">:" x _] ->

@@ -1231,6 +1231,13 @@ function compile_lambda(outer_ctx, ex)
         end
     end
     for (i,arg) in enumerate(children(static_parameters))
+        # Write-only ("placeholder", eg `_`) static parameter names are never
+        # bound to a BindingId (see `explicit_declare_in_scope!`), since their
+        # value cannot be read from the method body. Their position `i` is
+        # still meaningful (it must line up with the corresponding entry in
+        # the method's static parameter value svec), so we still need to
+        # consume it here; there's just nothing to register.
+        kind(arg) == K"Placeholder" && continue
         @jl_assert kind(arg) == K"BindingId" arg
         id = arg.var_id
         info = get_binding(ctx.bindings, id)

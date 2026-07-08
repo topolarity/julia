@@ -2175,3 +2175,26 @@ end
     end
 
 end
+
+@testset "underscore static parameters: fragility guards" begin
+    # Local function with its own placeholder `where` interacting with the
+    # enclosing method's sparam (exercises skip-but-consume sparam indices
+    # combined with closure sig_sparams TypeVar appending).
+    JuliaLowering.include_string(test_mod, """
+    function f_uscore_closure_guard(x::T) where T
+        g(y::Vector{_}, z::T) where {_} = (y, z)
+        g([1], x)
+    end
+    """)
+    @test test_mod.f_uscore_closure_guard(5) == ([1], 5)
+
+    # Pin the (deliberate, flisp-rejected-anyway) acceptance of a nested
+    # `where _` inside an argtype under an outer `_` sparam: substitution is
+    # binder-blind like flisp's replace-vars; this test makes any future
+    # stop-set drift visible.
+    JuliaLowering.include_string(test_mod, """
+    f_uscore_nested_where(x::(Vector{_} where _)) where {_} = sum(x)
+    """)
+    @test test_mod.f_uscore_nested_where([1, 2]) == 3
+    @test hasmethod(test_mod.f_uscore_nested_where, Tuple{Vector{Int}})
+end

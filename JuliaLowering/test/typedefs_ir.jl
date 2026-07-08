@@ -56,6 +56,16 @@ A where {X, Y<:X}
 8   (return %₇)
 
 ########################################
+# Error: All-underscore typevar name in a value-level `where` expression is
+# write-only, unlike a `where` clause in a method signature (there's no
+# corresponding argument-type/svec substitution for this construct)
+A where {_, X<:_}
+#---------------------
+LoweringError:
+A where {_, X<:_}
+#        ╙ ── all-underscore identifiers are write-only and their values cannot be used in expressions
+
+########################################
 # Equivalent nested where expression without braces
 A where Y<:X where X
 #---------------------
@@ -557,6 +567,18 @@ end
 29  (call top._defaultctors %₂₇ %₂₈)
 30  latestworld
 31  (return core.nothing)
+
+########################################
+# Error: All-underscore type parameter name on a struct is write-only, unlike
+# an all-underscore static parameter in a method `where` clause (structs have
+# no argument-type/svec substitution to make the name's value readable)
+struct X{_}
+end
+#---------------------
+LoweringError:
+struct X{_}
+#        ╙ ── all-underscore identifiers are write-only and their values cannot be used in expressions
+end
 
 ########################################
 # Documented struct

@@ -261,6 +261,117 @@ end
 20  (return %₁₉)
 
 ########################################
+# Static parameter with an all-underscore ("placeholder") name used in an
+# argument type: flisp allows this even though the name itself remains
+# write-only (eg in the function body).
+function f(::A{_,N}, x) where {_,N}
+    N
+end
+#---------------------
+1   (method TestMod.f)
+2   latestworld
+3   (= slot₂/_ (call core.TypeVar :_))
+4   (= slot₁/N (call core.TypeVar :N))
+5   TestMod.f
+6   (call core.TypeEqOf %₅)
+7   TestMod.A
+8   slot₂/_
+9   slot₁/N
+10  (call core.apply_type %₇ %₈ %₉)
+11  (call core.svec %₆ %₁₀ core.Any)
+12  slot₂/_
+13  slot₁/N
+14  (call core.svec %₁₂ %₁₃)
+15  SourceLocation::1:10
+16  (call core.svec %₁₁ %₁₄ %₁₅)
+17  --- method TestMod.f %₁₆
+    slots: [slot₁/#self#(!read) slot₂/#unused#(!read) slot₃/x(!read)]
+    1   static_parameter₂
+    2   (return %₁)
+18  latestworld
+19  TestMod.f
+20  (return %₁₉)
+
+########################################
+# Static parameter with an all-underscore name, unused in the argument types
+# (still needs to appear in the static parameter value svec)
+function f(x) where {_}
+    x
+end
+#---------------------
+1   (method TestMod.f)
+2   latestworld
+3   (= slot₁/_ (call core.TypeVar :_))
+4   TestMod.f
+5   (call core.TypeEqOf %₄)
+6   (call core.svec %₅ core.Any)
+7   slot₁/_
+8   (call core.svec %₇)
+9   SourceLocation::1:10
+10  (call core.svec %₆ %₈ %₉)
+11  --- method TestMod.f %₁₀
+    slots: [slot₁/#self#(!read) slot₂/x]
+    1   slot₂/x
+    2   (return %₁)
+12  latestworld
+13  TestMod.f
+14  (return %₁₃)
+
+########################################
+# Static parameter bound referencing an earlier all-underscore static
+# parameter
+function f(x::T) where {_, T<:_}
+    T
+end
+#---------------------
+1   (method TestMod.f)
+2   latestworld
+3   (= slot₂/_ (call core.TypeVar :_))
+4   slot₂/_
+5   (= slot₁/T (call core.TypeVar :T %₄))
+6   TestMod.f
+7   (call core.TypeEqOf %₆)
+8   slot₁/T
+9   (call core.svec %₇ %₈)
+10  slot₂/_
+11  slot₁/T
+12  (call core.svec %₁₀ %₁₁)
+13  SourceLocation::1:10
+14  (call core.svec %₉ %₁₂ %₁₃)
+15  --- method TestMod.f %₁₄
+    slots: [slot₁/#self#(!read) slot₂/x(!read)]
+    1   static_parameter₂
+    2   (return %₁)
+16  latestworld
+17  TestMod.f
+18  (return %₁₇)
+
+########################################
+# Error: All-underscore static parameter name is still write-only in the
+# function body
+function f(::A{_,N}) where {_,N}
+    _
+end
+#---------------------
+LoweringError:
+function f(::A{_,N}) where {_,N}
+    _
+#   ╙ ── all-underscore identifiers are write-only and their values cannot be used in expressions
+end
+
+########################################
+# Error: Duplicate all-underscore static parameter names
+function f(x) where {_,_}
+    x
+end
+#---------------------
+LoweringError:
+function f(x) where {_,_}
+#                      ╙ ── function static parameter name not unique
+    x
+end
+
+########################################
 # Return types
 function f(x)::Int
     if x

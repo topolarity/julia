@@ -20,8 +20,17 @@ end
 
 # Return true when `x` and `y` are "the same identifier", but also works with
 # bindings (and hence ssa vars). See also `is_identifier_like()`
+#
+# All-underscore ("placeholder", eg `_`) names are write-only and so are
+# represented as K"Placeholder" rather than K"Identifier" (see
+# `is_writeonly_est_name`); they never get a NameKey-resolvable binding, but we
+# still want two occurrences of eg a `where`-declared `_` typevar (its
+# declaration and a use in an argument type or later typevar bound) to compare
+# equal here, so match them by name and scope layer directly.
 function is_same_identifier_like(ex::SyntaxTree, y::SyntaxTree)
     return (kind(ex) == K"Identifier" && kind(y) == K"Identifier" && NameKey(ex) == NameKey(y)) ||
+           (kind(ex) == K"Placeholder" && kind(y) == K"Placeholder" &&
+               ex.name_val == y.name_val && ex.context.layer == y.context.layer) ||
            (kind(ex) == K"BindingId"  && kind(y) == K"BindingId"  && ex.var_id   == y.var_id)
 end
 
@@ -2422,15 +2431,59 @@ function pos_opt_args(argl::SyntaxList)
     argl[opt_start:opt_end]
 end
 
+# Substitute unquoted occurrences of write-only ("placeholder", eg `_`) typevar
+# names appearing in `ex` with a reference to their actual (hidden, internal)
+# value.  flisp allows a placeholder-named `where` typevar's *value* to still
+# be read from later parts of the same method signature (subsequent typevar
+# bounds, and the argument types), even though the name itself remains
+# write-only everywhere else (in particular the method body). `aliases` maps
+# each such placeholder's name to the internal identifier holding its value.
+function subst_placeholder_sparams(ctx, ex::SyntaxTree, aliases::Dict{String,SyntaxTree})
+    if isempty(aliases)
+        ex
+    elseif kind(ex) === K"Placeholder"
+        get(aliases, ex.name_val::String, ex)
+    elseif is_quoted(ex) || kind(ex) in KSet"-> function"
+        ex
+    else
+        mapchildren(e->subst_placeholder_sparams(ctx, e, aliases), ctx, ex)
+    end
+end
+
 # (_typevar name lb ub) -> (local (= name (call core TypeVar...)))
+#
+# Returns `(stmts, value_refs, aliases)` where `stmts` assign a `TypeVar` to
+# each typevar name (or, for write-only placeholder names, to a hidden
+# internal alias -- see `subst_placeholder_sparams`), `value_refs` holds a
+# readable reference to each typevar's value (in the same order as `tvs`), and
+# `aliases` is the accumulated name=>alias map used to substitute placeholder
+# typevar names in the method's argument types.
 function assign_sparams(ctx, tvs)
     out = SyntaxList(ctx.graph)
+    refs = SyntaxList(ctx.graph)
+    aliases = Dict{String,SyntaxTree}()
     for tv in tvs
         @jl_assert kind(tv) === K"_typevar" tv
-        push!(out, @ast ctx tv [K"local" tv[1]])
-        push!(out, @ast ctx tv [K"=" tv[1] bounds_to_typevar(ctx, tv)])
+        if !isempty(aliases)
+            tv = @ast ctx tv [K"_typevar" tv[1]
+                subst_placeholder_sparams(ctx, tv[2], aliases)
+                subst_placeholder_sparams(ctx, tv[3], aliases)]
+        end
+        name = tv[1]
+        push!(out, @ast ctx tv [K"local" name])
+        if kind(name) === K"Placeholder"
+            nameval = name.name_val::String
+            haskey(aliases, nameval) && throw(LoweringError(
+                name, "function static parameter name not unique"))
+            vref = newsym(ctx, name, nameval)
+            aliases[nameval] = vref
+        else
+            vref = name
+        end
+        push!(out, @ast ctx tv [K"=" vref bounds_to_typevar(ctx, tv)])
+        push!(refs, vref)
     end
-    out
+    out, refs, aliases
 end
 
 # Hack: Normally just (block ex body), but needs special handling due to
@@ -2471,14 +2524,16 @@ function method_def_expr(ctx, src, mtable, sparams, argl, body,
             ctx, src, mtable, sparams, argl, body, rett)
     end
     # Needs to be done per method, not per function (may create ssavalues)
-    arg_types = mapsyntax(a->expand_forms_2(ctx, a[2]), argl)
+    # possible TODO: flisp assigns typevars to ssavalues and manually
+    # resolves them here instead of assigning to locals
+    sparam_stmts, sparam_refs, sparam_aliases = assign_sparams(ctx, sparams)
+    arg_types = mapsyntax(
+        a->expand_forms_2(ctx, subst_placeholder_sparams(ctx, a[2], sparam_aliases)), argl)
     @ast ctx src [K"block"
-        # possible TODO: flisp assigns typevars to ssavalues and manually
-        # resolves them here instead of assigning to locals
-        assign_sparams(ctx, sparams)...
+        sparam_stmts...
         method_metadata := [K"call"(src) "svec"::K"core"
             [K"call" "svec"::K"core" arg_types...]
-            [K"call" "svec"::K"core" mapindex(sparams, 1)...]
+            [K"call" "svec"::K"core" sparam_refs...]
             ::K"SourceLocation"(src[1])]
         [K"method"
             mtable
