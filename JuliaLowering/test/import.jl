@@ -100,6 +100,41 @@ import .H.I, .I.J
     @test !isdefined(macrocall_mod, :other)  # imported only under the name `o`
 end
 
+@testset "(AI) using/import inside macro-generated `@eval module`" for expr_compat_mode in (true, false)
+    # A `module` produced by an unescaped macro quote and evaluated via `@eval`
+    # (as SafeTestsets' `@safetestset` does) must resolve `using`/`import` (and
+    # plain global references) against the freshly-created module, matching
+    # flisp -- not against the macro's defining module. Previously the static
+    # macro-expansion hygiene pinned them to the macro module, so `import
+    # .Inner: y` targeted the wrong module and `y`/`zz` were left undefined.
+    gen_mod = Module()
+    @eval gen_mod import JuliaLowering, JuliaLowering.@legacy_quote_to_syntax
+    JuliaLowering.include_string(gen_mod, raw"""
+    module Def
+        import JuliaLowering.@legacy_quote_to_syntax
+        macro mkmod()
+            mod = gensym("TestMod")
+            @legacy_quote_to_syntax quote
+                @eval module $mod
+                    module Inner
+                        y = 2
+                    end
+                    import .Inner: y   # relative import -> the fresh module
+                    zz = y + 1         # plain global resolves in the fresh module
+                end
+            end
+        end
+    end
+    """; expr_compat_mode)
+    Core.@latestworld
+    gen = JuliaLowering.include_string(gen_mod, "Def.@mkmod"; expr_compat_mode)
+    Core.@latestworld
+    @test gen isa Module
+    @test startswith(String(nameof(gen)), "##TestMod")
+    @test gen.y == 2
+    @test gen.zz == 3
+end
+
 @testset "Imported macrocalls" for expr_compat_mode in (true, false)
     # Test importing macros by their @-name
     macname_mod = Module()
