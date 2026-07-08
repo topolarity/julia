@@ -51,6 +51,7 @@ Base.eval(test_mod, :(struct XX{S,T,U,W} end))
     end
 end
 
+# From PkgEval: DynamicSumTypes v3.7.5 (@sumtype emits new{} on non-parametric structs)
 @test JuliaLowering.include_string(test_mod, """
 XX{Int, <:Integer, Float64, >:AbstractChar}
 """) == (test_mod.XX{Int, T, Float64, S} where {T <: Integer, S >: AbstractChar})
@@ -623,6 +624,30 @@ end
 """)
 @test test_mod.make_s131b() isa test_mod.S131b{Int}
 @test test_mod.make_s131b().x == 100
+
+# `new{}()` (empty curly, zero syntactic type params) on a non-parametric
+# struct should construct a bare instance, not throw in `apply_type`.
+# See https://github.com/JuliaLang/JuliaLowering.jl/issues/27
+@test JuliaLowering.include_string(test_mod, """
+struct S27
+    x::Int
+    S27() = new{}(5)
+end
+""") === nothing
+let s = test_mod.S27()
+    @test s isa test_mod.S27
+    @test s.x === 5
+end
+
+# `new{}()` on a PARAMETRIC struct must still error: the empty-curly
+# special case above only applies when there are no struct type
+# parameters left to satisfy.
+@test_throws LoweringError JuliaLowering.include_string(test_mod, """
+struct S27Param{T}
+    x::T
+    S27Param() = new{}(5)
+end
+""")
 
 # Inner constructor with local variable shadowing type parameter
 # See https://github.com/aviatesk/JETLS.jl/issues/508
