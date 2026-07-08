@@ -1792,11 +1792,17 @@ end
     # divergence from flisp, tracked as eval-payload-hygiene. The dynamic
     # module threading (#17) fixes the module/global payload shapes.
     m = Module()
-    Core.eval(m, :(module MacHome2
-        macro make_const()
-            :( @eval const CMARKER = 42 )
+    @test_broken try
+        JuliaLowering.include_string(m, """
+        module MacHome2
+            macro make_const()
+                :( @eval const CMARKER = 42 )
+            end
         end
-    end))
-    Core.eval(m, :(MacHome2.@make_const()))
-    @test_broken isdefined(m, :CMARKER)
+        MacHome2.@make_const()
+        """)
+        isdefined(m, :CMARKER)
+    catch
+        false   # currently throws/misbinds under JL; see bugs/eval-payload-hygiene
+    end
 end
