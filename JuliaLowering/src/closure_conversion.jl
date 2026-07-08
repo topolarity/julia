@@ -175,6 +175,45 @@ function convert_global_assignment(ctx, ex, var, rhs0)
     ]
 end
 
+# A typed local's declared type expression is stored once (on the binding) and
+# re-emitted at every assignment to that variable, because flisp re-evaluates
+# the declared type at each assignment (see the note in `expand_let`). When the
+# declared type contains a `<:` bound it desugars to a `TypeVar(...)`
+# construction assigned to an SSA value (see `expand_curly`); re-emitting the
+# shared subtree verbatim would assign that same SSA value more than once, which
+# is invalid IR. Mint a fresh SSA binding for each SSA value assigned within the
+# type expression (leaving all other references untouched) so each emission is
+# self-contained, matching flisp's fresh-ssavalue-per-evaluation behaviour.
+function renumber_assigned_ssavalues(ctx, ex)
+    ssa_map = Dict{IdTag,IdTag}()
+    _collect_assigned_ssavalues!(ctx, ssa_map, ex)
+    isempty(ssa_map) && return ex
+    _rename_ssavalues(ctx, ssa_map, ex)
+end
+
+function _collect_assigned_ssavalues!(ctx, ssa_map, ex)
+    if kind(ex) == K"=" && is_ssa(ctx, ex[1])
+        id = _binding_id(ex[1])
+        get!(ssa_map, id) do
+            _binding_id(ssavar(ctx, ex[1], get_binding(ctx, id).name))
+        end
+    end
+    if !is_leaf(ex)
+        for e in children(ex)
+            _collect_assigned_ssavalues!(ctx, ssa_map, e)
+        end
+    end
+    nothing
+end
+
+function _rename_ssavalues(ctx, ssa_map, ex)
+    if kind(ex) == K"BindingId"
+        newid = get(ssa_map, _binding_id(ex), nothing)
+        return isnothing(newid) ? ex : binding_ex(ctx, newid)
+    end
+    mapchildren(e->_rename_ssavalues(ctx, ssa_map, e), ctx, ex)
+end
+
 # Convert assignment to a closed variable to a `setfield!` call and generate
 # `convert` calls for variables with declared types.
 #
@@ -201,7 +240,8 @@ function convert_assignment(ctx, ex)
             rhs = isnothing(binfo.type) ? tmp_rhs0 :
                 convert_for_type_decl(
                     ctx, ex, tmp_rhs0,
-                    _convert_closures(ctx, binding_type_ex(ctx, binfo)),
+                    _convert_closures(ctx, renumber_assigned_ssavalues(
+                        ctx, binding_type_ex(ctx, binfo))),
                     true)
             assignment = if boxed
                 @ast ctx ex [K"call"
