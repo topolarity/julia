@@ -1267,7 +1267,14 @@ JL_DLLEXPORT jl_value_t *jl_lower(jl_value_t *expr, jl_module_t *inmodule,
     args[6] = warn ? jl_true : jl_false;
     jl_task_t *ct = jl_current_task;
     size_t last_age = ct->world_age;
-    ct->world_age = jl_atomic_load_acquire(&jl_world_counter);
+    // Dispatch the lowerer at a fixed "lowering world" when one is pinned (see
+    // jl_lowering_world). This keeps the lowerer's own specializations valid
+    // across method definitions in the code being lowered, avoiding a storm of
+    // invalidation + re-inference of the lowerer itself. The semantic world for
+    // the code being lowered is passed explicitly as `world` (args[5]); it is
+    // unaffected by this and continues to observe the latest method table.
+    size_t lowering_world = jl_lowering_world;
+    ct->world_age = lowering_world != 0 ? lowering_world : jl_atomic_load_acquire(&jl_world_counter);
     jl_value_t *result = jl_apply(args, 7);
     ct->world_age = last_age;
     args[0] = result; // root during error check below

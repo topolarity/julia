@@ -102,7 +102,17 @@ function activate!(enable=true)
 
     if enable
         Core._setlowerer!(core_lowering_hook)
+        # Pin lowering to a fixed world age (analogous to `jl_typeinf_world`) so
+        # that JuliaLowering's own specializations are not invalidated (and then
+        # re-inferred) every time the code being lowered defines a method. We
+        # capture the current world here; reinstalling an updated lowerer (e.g.
+        # under Revise) re-captures a fresh world. The semantic world for the
+        # code being lowered is threaded separately (see `core_lowering_hook`).
+        ccall(:jl_set_lowering_world, Cvoid, (Csize_t,), Base.get_world_counter())
     else
         Core._setlowerer!(Base.fl_lower)
+        # The flisp lowerer is a C interpreter and is not subject to method
+        # invalidation, so unpin (dispatch at the latest world as before).
+        ccall(:jl_set_lowering_world, Cvoid, (Csize_t,), 0)
     end
 end

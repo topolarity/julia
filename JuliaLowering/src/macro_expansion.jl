@@ -234,11 +234,14 @@ function expand_macro(ctx::MacroExpansionContext, st::SyntaxTree)
     macfunc = eval_macro_name(ctx, mctx, macname)
     raw_args = st[3:end]
 
-    # TODO: hasmethod always returns false for our `typemax(UInt)` meaning
-    # "latest world," which we shouldn't be using.
-    has_new_macro = ctx.world === typemax(UInt) ?
-        hasmethod(macfunc, Tuple{typeof(mctx), typeof.(raw_args)...}) :
-        hasmethod(macfunc, Tuple{typeof(mctx), typeof.(raw_args)...}; world=ctx.world)
+    # `ctx.world === typemax(UInt)` is our sentinel for "latest world". Resolve
+    # it against the global world counter explicitly rather than letting the
+    # two-argument `hasmethod` fall back to the ambient (task-local) world: since
+    # lowering is dispatched at a fixed, pinned world (see `jl_lowering_world`),
+    # the ambient world would not see macros defined earlier in the same lowering
+    # pass (e.g. a macro defined in one top-level form and used in a later one).
+    macro_world = ctx.world === typemax(UInt) ? Base.get_world_counter() : ctx.world
+    has_new_macro = hasmethod(macfunc, Tuple{typeof(mctx), typeof.(raw_args)...}; world=macro_world)
 
     if has_new_macro
         macro_args = [mctx, raw_args...]
