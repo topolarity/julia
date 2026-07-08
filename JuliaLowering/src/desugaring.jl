@@ -1724,9 +1724,51 @@ end
 #-------------------------------------------------------------------------------
 # Call expansion
 
-function expand_kw_call(ctx, srcref, farg, args, kws)
+# `all_args` are the arguments of the call as written (`ex[2:end]`): an optional
+# leading `parameters` block (the keyword arguments written after `;`) followed
+# by the remaining arguments (positional arguments and any `kw` nodes written
+# before `;`) in source order.
+#
+# Keyword calls must evaluate their arguments in program (left-to-right) order,
+# just like ordinary positional calls. To achieve this we hoist the side effects
+# of the receiver and the pre-`;` arguments to temporaries in source order --
+# mirroring flisp's use of `remove-argument-side-effects` in `lower-kw-call` --
+# before constructing the keyword `NamedTuple` and emitting the `kwcall`. The
+# `parameters` block always comes last in the source and is evaluated as part of
+# the `NamedTuple` construction, so it does not need pre-hoisting.
+function expand_kw_call(ctx, srcref, farg, all_args)
+    para = SyntaxList(ctx)
+    pre_semi = SyntaxList(ctx)
+    for arg in all_args
+        if kind(arg) == K"parameters"
+            append!(para, children(arg))
+        else
+            push!(pre_semi, arg)
+        end
+    end
+    # Hoist side effects in source order. `_arg_to_temp` leaves effect-free
+    # arguments (literals, identifiers, ...) in place so that simple calls don't
+    # gain gratuitous temporaries.
+    stmts = SyntaxList(ctx)
+    hoisted = SyntaxList(ctx)
+    for arg in pre_semi
+        push!(hoisted, _arg_to_temp(ctx, stmts, arg))
+    end
+    # Now that evaluation order is fixed by the hoisting above, separate the
+    # (temporary-valued) keyword arguments from the positional arguments.
+    kws = SyntaxList(ctx)
+    args = SyntaxList(ctx)
+    for arg in hoisted
+        if kind(arg) == K"kw"
+            push!(kws, arg)
+        else
+            push!(args, arg)
+        end
+    end
+    append!(kws, para)
     @ast ctx srcref [K"block"
         func := farg
+        stmts...
         kw_container := expand_named_tuple(ctx, srcref, kws;
                                            field_name="keyword argument",
                                            element_name="keyword argument")
@@ -1961,9 +2003,13 @@ function expand_call(ctx, ex)
         return expand_cglobal(ctx, ex)
     end
     args = copy(ex[2:end])
+    # `remove_kw_args!` both detects keyword arguments and validates the call
+    # (e.g. rejecting multiple `;`-separated keyword groups). `expand_kw_call`
+    # re-derives the keyword/positional split from the original argument list so
+    # that it can preserve source evaluation order.
     kws = remove_kw_args!(ctx, args)
     if !isnothing(kws)
-        return expand_forms_2(ctx, expand_kw_call(ctx, ex, farg, args, kws))
+        return expand_forms_2(ctx, expand_kw_call(ctx, ex, farg, ex[2:end]))
     end
     if any(kind(arg) == K"..." for arg in args)
         # Splatting, eg, `f(a, xs..., b)`

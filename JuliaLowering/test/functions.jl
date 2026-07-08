@@ -1171,6 +1171,69 @@ end
     @test isempty(setdiff(Set(kwbodies(OwnerB)), b_before))
     @test !isempty(kwbodies(ExtB))
     @test OwnerB.sample(:s; y=7) == 7
+@testset "Keyword call evaluation order" begin
+    # Keyword calls must evaluate the receiver and their arguments in source
+    # (left-to-right) program order, exactly like ordinary positional calls and
+    # matching the reference (flisp) lowering. Regression test for keyword
+    # argument values being evaluated before positional arguments.
+    JuliaLowering.include_string(test_mod, """
+    const _ko_order = Symbol[]
+    _ko_mark(s) = (push!(_ko_order, s); nothing)
+    ko_g(x; kw=0, a=0, b=0) = nothing
+    ko_g2(x, y; kw=0, a=0, b=0) = nothing
+    ko_g3(x; k1=0, k2=0) = nothing
+    ko_fdo(cb, x; kw=0) = (_ko_mark(:body); cb(); kw)
+    ko_getg() = (_ko_mark(:recv); ko_g)
+    ko_getg2() = (_ko_mark(:recv); ko_g2)
+    ko_pos()   = (_ko_mark(:pos);   1)
+    ko_pos2()  = (_ko_mark(:pos2);  2)
+    ko_kw()    = (_ko_mark(:kw);    10)
+    ko_kw2()   = (_ko_mark(:kw2);   20)
+    ko_mk()    = (_ko_mark(:mk);    (a=1, b=2))
+    ko_mk2()   = (_ko_mark(:mk2);   (b=99,))
+    ko_mkpos() = (_ko_mark(:mkpos); (1, 2))
+    struct KOArr end
+    Base.getindex(::KOArr, i; kw=0) = (_ko_mark(:getindex); nothing)
+    const ko_arr = KOArr()
+    ko_idx() = (_ko_mark(:idx); 1)
+    """)
+    # Evaluate `code` (lowered by JuliaLowering) and return the observed order.
+    ko_order(code) = (empty!(test_mod._ko_order);
+                      JuliaLowering.include_string(test_mod, code);
+                      copy(test_mod._ko_order))
+
+    # keyword after positional
+    @test ko_order("ko_g(ko_pos(), kw=ko_kw())") == [:pos, :kw]
+    # keyword written before positional (interleaved source order preserved)
+    @test ko_order("ko_g(kw=ko_kw(), ko_pos())") == [:kw, :pos]
+    # multiple keywords keep their own source order, after the positionals
+    @test ko_order("ko_g2(ko_pos(), ko_pos2(), b=ko_kw2(), a=ko_kw())") ==
+        [:pos, :pos2, :kw2, :kw]
+    # splatted keywords
+    @test ko_order("ko_g(ko_pos(); ko_mk()...)") == [:pos, :mk]
+    # explicit keyword mixed with a keyword splat
+    @test ko_order("ko_g2(ko_pos(), ko_pos2(); a=ko_kw(), ko_mk2()...)") ==
+        [:pos, :pos2, :kw, :mk2]
+    # splatted positionals followed by a keyword
+    @test ko_order("ko_g2(ko_mkpos()...; a=ko_kw())") == [:mkpos, :kw]
+    # the receiver expression is evaluated first
+    @test ko_order("ko_getg()(ko_pos(), kw=ko_kw())") == [:recv, :pos, :kw]
+    @test ko_order("ko_getg()(ko_pos(); ko_mk()...)") == [:recv, :pos, :mk]
+    # keyword after `;`
+    @test ko_order("ko_g(ko_pos(); kw=ko_kw())") == [:pos, :kw]
+    @test ko_order("ko_g2(ko_pos(), ko_pos2(); b=ko_kw2(), a=ko_kw())") ==
+        [:pos, :pos2, :kw2, :kw]
+    # keyword before `;` interleaved with a keyword after `;`
+    @test ko_order("ko_g3(ko_pos(), k1=ko_kw(); k2=ko_kw2())") == [:pos, :kw, :kw2]
+    # do-block call: the do closure is the first positional argument
+    @test ko_order("ko_fdo(ko_pos(); kw=ko_kw()) do; _ko_mark(:doblock); end") ==
+        [:pos, :kw, :body, :doblock]
+    # indexing lowers to a keyword `getindex` call and inherits the same order
+    @test ko_order("ko_arr[ko_idx(), kw=ko_kw()]") == [:idx, :kw, :getindex]
+
+    # Simple keyword calls must not gain gratuitous temporaries or evaluate
+    # anything: a call with only effect-free arguments produces no marks.
+    @test ko_order("ko_g(1; kw=2)") == Symbol[]
 end
 
 @testset "pre-desugared arg::Vararg" begin
