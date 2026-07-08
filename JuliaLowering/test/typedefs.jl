@@ -822,3 +822,23 @@ end
           end
           (struct_eq_assigns_test(5).x, struct_eq_assigns_test().x)
       end)) == (5, 1)
+
+@testset "(AI) struct fields named with underscores (#30)" begin
+    # Default ctors are raw Expr lambdas whose arg names include `_` verbatim;
+    # those are binding positions, not write-only reads.
+    m = Module()
+    JuliaLowering.include_string(m, """
+        struct TextItem
+            _::String
+        end
+        struct TwoScores
+            _::Int
+            __::Int
+        end
+    """)
+    @test JuliaLowering.include_string(m, """TextItem("hi")._""") == "hi"
+    t = JuliaLowering.include_string(m, "TwoScores(1, 2)")
+    @test (t._, t.__) == (1, 2)
+    # Genuine reads of `_` stay rejected.
+    @test_throws JuliaLowering.LoweringError JuliaLowering.include_string(m, "_ = 4; _ + 1")
+end
