@@ -1806,3 +1806,129 @@ end
         false   # currently throws/misbinds under JL; see bugs/eval-payload-hygiene
     end
 end
+
+# Old-style macros that build a function whose parameter *name* is escaped
+# (`esc(:__ctx__)`) but whose body refers to that same symbol bare/unescaped.
+# flisp binds the two by plain name (escaped argument names get an identity
+# mapping in the expansion environment); JuliaLowering must match this for
+# flisp-compatible expansions.  This is the ZygoteRules `@adjoint`/`gradm`
+# pattern (`ZygoteRules.jl/src/adjoint.jl`).
+fl_eval(test_mod, :(macro def_ctx_fn(fname)
+    ctxparam = :($(esc(:__ctx__))::Any)
+    quote
+        function $(esc(fname))($ctxparam)
+            return __ctx__ + 1     # bare ref must bind to the escaped parameter
+        end
+    end
+end))
+fl_eval(test_mod, :(macro def_ctx_closure(fname)
+    ctxparam = :($(esc(:__ctx__))::Any)
+    quote
+        function $(esc(fname))($ctxparam)
+            g() = __ctx__ + 1      # inner closure captures the escaped parameter
+            return g()
+        end
+    end
+end))
+fl_eval(test_mod, :(macro def_ctx_multi(fname)
+    a = :($(esc(:__a__))::Any)
+    b = :($(esc(:__b__))::Any)
+    quote
+        function $(esc(fname))($a, $b)
+            return __a__ + __b__
+        end
+    end
+end))
+# Hygiene must be preserved: a *nested* macro that emits a bare same-named
+# reference belongs to a different expansion and must NOT bind to the outer
+# escaped parameter (it stays an ordinary, here-undefined, global).
+fl_eval(test_mod, :(macro hyg_inner(); quote __hyg__ + 100 end; end))
+fl_eval(test_mod, :(macro def_ctx_hygiene(fname)
+    hygparam = :($(esc(:__hyg__))::Any)
+    quote
+        function $(esc(fname))($hygparam)
+            return @hyg_inner()    # must resolve to (undefined) global __hyg__
+        end
+    end
+end))
+# The alias is READ-only: flisp's identity mapping for escaped argument names
+# is shadowed by the gensym-renaming of names *assigned* in the expansion, so
+# an assigned bare name is a fresh hygienic local (here read-before-assigned),
+# NOT the escaped parameter.
+fl_eval(test_mod, :(macro def_ctx_assign(fname)
+    ctxparam = :($(esc(:__ctx__))::Any)
+    quote
+        function $(esc(fname))($ctxparam)
+            __ctx__ = __ctx__ + 5  # renamed: fresh local, used before assignment
+            return __ctx__
+        end
+    end
+end))
+# Explicit `local` declarations must also be alias-blind: the bare name is
+# declared as a fresh hygienic local (flisp gensym-renames it), not rejected
+# as conflicting with the escaped parameter.
+fl_eval(test_mod, :(macro def_ctx_local(fname)
+    ctxparam = :($(esc(:__ctx__))::Any)
+    quote
+        function $(esc(fname))($ctxparam)
+            local __ctx__ = 5      # fresh local, not the parameter
+            return __ctx__
+        end
+    end
+end))
+# `global` declarations overlapping the escaped parameter: flisp reads the
+# module global; under JuliaLowering this is the pre-existing (alias-blind,
+# fix-independent) "globals may overlap args or sparams" divergence - see the
+# `@test_broken` coverage in test/scopes.jl - because the relayered global
+# collides with the escaped parameter's caller-layer binding.
+fl_eval(test_mod, :(macro def_ctx_global(fname)
+    ctxparam = :($(esc(:__ctx__))::Any)
+    quote
+        function $(esc(fname))($ctxparam)
+            global __ctx__
+            return __ctx__         # module global (999), not the parameter
+        end
+    end
+end))
+# A global of the same name exists in the macro-definition module: the escaped
+# parameter must still win over it (flisp identity mapping shadows the global).
+Base.eval(test_mod, :(global __ctx__ = 999))
+Base.eval(test_mod, :(global __a__ = 999))
+Base.eval(test_mod, :(global __b__ = 999))
+Core.@latestworld
+
+@testset "(AI) escaped parameter name, bare body reference (flisp compat)" for run in [
+    (x::String)->fl_eval(test_mod, JuliaSyntax.parsestmt(Expr, "#=FLISP SANITY-CHECK=# "*x)),
+    (x::String)->JuliaLowering.include_string(
+        test_mod, "#=JL COMPAT=# "*x; expr_compat_mode=true),
+    (x::String)->JuliaLowering.include_string(
+        test_mod, "#=JL=# "*x; expr_compat_mode=false)]
+
+    # Bare body reference binds to the escaped parameter (not the same-named
+    # global), for a plain function, an inner closure, and multiple parameters.
+    @test run("@def_ctx_fn(ctxf1); ctxf1(41)") == 42
+    @test run("@def_ctx_closure(ctxf2); ctxf2(41)") == 42
+    @test run("@def_ctx_multi(ctxf3); ctxf3(40, 2)") == 42
+    # Hygiene of a nested macro's identically-named reference is preserved.
+    @test_throws UndefVarError run("@def_ctx_hygiene(ctxf4); ctxf4(41)")
+    # READ-only: an assigned bare name is a fresh hygienic local, not the
+    # escaped parameter; reading it before assignment throws.
+    @test_throws UndefVarError run("@def_ctx_assign(ctxf5); ctxf5(41)")
+    # READ-only: an explicit `local` declaration introduces a fresh local
+    # rather than conflicting with (or resolving to) the escaped parameter.
+    @test run("@def_ctx_local(ctxf6); ctxf6(41)") == 5
+end
+
+@testset "(AI) escaped parameter overlapped by `global` decl (known divergence)" begin
+    # flisp resolves the bare name to the module global; JL errors on the
+    # arg/global overlap (pre-existing divergence independent of the escaped-
+    # parameter read alias, cf. "globals may overlap args" in test/scopes.jl).
+    @test fl_eval(test_mod, JuliaSyntax.parsestmt(
+        Expr, "@def_ctx_global(ctxf7fl); ctxf7fl(41)")) == 999
+    @test_broken JuliaLowering.include_string(
+        test_mod, "@def_ctx_global(ctxf7jl); ctxf7jl(41)";
+        expr_compat_mode=true) == 999
+    @test_broken JuliaLowering.include_string(
+        test_mod, "@def_ctx_global(ctxf7jl2); ctxf7jl2(41)";
+        expr_compat_mode=false) == 999
+end

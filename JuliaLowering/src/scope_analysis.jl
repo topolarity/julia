@@ -13,6 +13,17 @@ function NameKey(ex::SyntaxTree)
     NameKey(ex.name_val, ex.context.layer)
 end
 
+# True if `anc` is a strict ancestor of `layer` on the `escaped` chain, i.e.
+# `layer` was produced by a macro expansion nested (via `esc`) inside `anc`.
+function is_strict_ancestor_layer(anc::ScopeLayer, layer::ScopeLayer)
+    l = layer.escaped
+    while l !== nothing
+        l === anc && return true
+        l = l.escaped
+    end
+    return false
+end
+
 struct ScopeInfo
     # index into ctx.scopes
     id::ScopeId
@@ -36,6 +47,11 @@ struct ScopeInfo
     # Variables captured from an outer scope are not included.  The top-level
     # scope also contains all globals for resolution to fall back to.
     vars::Dict{NameKey,IdTag}
+    # flisp-compat read-only aliases for escaped lambda parameter names (see
+    # `enter_scope!`): consulted by `resolve_name` when `vars` misses, but
+    # invisible to assignment targets and explicit declarations, which get
+    # fresh hygienic locals as under flisp.  Nothing if not a lambda scope.
+    arg_aliases::Union{Nothing, Dict{NameKey,IdTag}}
     # See `LambdaBindings`. Nothing if not a lambda scope.  This is the final
     # collecting place for locals going in to closure conversion.
     locals_capt::Union{Nothing, Dict{IdTag,Bool}}
@@ -59,6 +75,7 @@ function ScopeInfo(ctx, parent_id, ex::SyntaxTree)
     s = ScopeInfo(
         id, parent_id, lambda_id, ex._id, is_permeable, is_lifted,
         Dict{IdTag, NodeId}(), Dict{NameKey, NodeId}(), Dict{NameKey,IdTag}(),
+        kind(ex) === K"lambda" ? Dict{NameKey,IdTag}() : nothing,
         kind(ex) === K"lambda" ? Dict{IdTag,Bool}() : nothing)
     push!(ctx.scopes, s)
     return s
@@ -196,11 +213,20 @@ function needs_resolution(ex)
         !is_leaf(ex) && !is_quoted(ex) && !(kind(ex) in KSet"toplevel module")
 end
 
-function resolve_name(ctx, ex; exclude_toplevel_globals=false)
+# `include_arg_aliases=false` is used for assignment-target resolution, where
+# an `arg_aliases` entry must be invisible so that assigning a bare name
+# co-spelled with an escaped parameter introduces a fresh hygienic local
+# (matching flisp's gensym-renaming) instead of mutating the parameter.
+function resolve_name(ctx, ex; exclude_toplevel_globals=false,
+                      include_arg_aliases=true)
     # TODO: probably want to cache these lookups
     nk = NameKey(ex)
     for sid in Iterators.reverse(ctx.scope_stack)
-        bid = get(ctx.scopes[sid].vars, nk, nothing)
+        scope = ctx.scopes[sid]
+        bid = get(scope.vars, nk, nothing)
+        if isnothing(bid) && include_arg_aliases && !isnothing(scope.arg_aliases)
+            bid = get(scope.arg_aliases, nk, nothing)
+        end
         isnothing(bid) && continue
         b = get_binding(ctx, bid)
         if !exclude_toplevel_globals || sid !== top_scope(ctx).id || b.kind !== :global
@@ -303,9 +329,26 @@ function enter_scope!(ctx, ex)
     #---------------------------------------------------------------------------
     # Find explicit decls that may influence assignment assignment resolution
     if kind(ex) === K"lambda"
+        lam_layer = (ex.context::SyntaxContext).layer
         for c in children(ex[1])
             @jl_assert kind(c) in KSet"Identifier BindingId Placeholder" c
-            explicit_declare_in_scope!(ctx, scope, c, :argument)
+            bid = explicit_declare_in_scope!(ctx, scope, c, :argument)
+            # flisp compat: an old-style macro may escape a parameter name
+            # (`esc(:x)`) while the body refers to the same symbol bare.  flisp
+            # identity-maps escaped argument names in the expansion environment
+            # (macroexpand.scm `keywords-introduced-by`), so bare references
+            # resolve to the parameter; here the two occurrences carry different
+            # layers, so register a read-only alias at exactly the lambda's
+            # layer.  Deeper nested expansions keep their hygiene, and
+            # assignments/declarations don't see the alias (see `arg_aliases`).
+            if !isnothing(bid) && kind(c) === K"Identifier"
+                sc_c = c.context::SyntaxContext
+                if is_flisp_compat(sc_c) &&
+                        is_strict_ancestor_layer(sc_c.layer, lam_layer)
+                    get!(scope.arg_aliases::Dict{NameKey,IdTag},
+                         NameKey(c.name_val, lam_layer), bid)
+                end
+            end
         end
         for c in children(ex[2])
             @jl_assert kind(c) in KSet"Identifier BindingId Placeholder" c
@@ -332,7 +375,7 @@ function enter_scope!(ctx, ex)
     for (vk, node_id) in sort!(collect(scope.assignments);
                                by=x->let nk=x[1]; (nk.name, ctx.layer_ids[nk.layer]); end)
         local ex = SyntaxTree(ctx.graph, node_id)
-        b = resolve_name(ctx, ex)
+        b = resolve_name(ctx, ex; include_arg_aliases=false)
         if b === nothing
             sc = ex.context::SyntaxContext
             # Top-level assignments are locals in hygienic expansions.  We may
@@ -359,7 +402,8 @@ function enter_scope!(ctx, ex)
             if is_toplevel_thunk
                 # assign-existing and make visible to soft scope
                 push!(ctx.soft_assignable_globals, vk)
-            elseif !isnothing(resolve_name(ctx, ex; exclude_toplevel_globals=true)) ||
+            elseif !isnothing(resolve_name(ctx, ex; exclude_toplevel_globals=true,
+                                           include_arg_aliases=false)) ||
                 (ctx.enable_soft_scopes && scope.is_permeable &&
                 vk in ctx.soft_assignable_globals)
                 # assign-existing-global if this is an explicit global that
