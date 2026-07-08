@@ -264,6 +264,37 @@ end
     @testset "bulk parsed code, no linenodes" begin
         test_each_in_path(roundtrip_eq, JL_DIR)
     end
+
+    @testset "Base.@__doc__ marker block shape" begin
+        # `Base.@__doc__` expands to `(block (meta doc) x)`, which
+        # `Base.Docs.finddoc` recognizes only via `isexpr(def, :block, 2) &&
+        # isexpr(def.args[1], :meta, 1)`.  `est_to_expr` must therefore not
+        # synthesize provenance `LineNumberNode`s into this block, or the
+        # length-2 match breaks and documenting a macrocall whose expansion
+        # nests another `@__doc__` fails with "cannot document ...".
+        marker = Expr(:block, Expr(:meta, :doc), :(const global z = 1))
+        is_marker(e) = Base.isexpr(e, :block, 2) &&
+            Base.isexpr(e.args[1], :meta, 1) && e.args[1].args[1] === :doc
+
+        @test is_marker(roundtrip(marker))
+        # Idempotent across repeated round trips (nested @__doc__ resolution
+        # re-converts the same subtree multiple times).
+        @test is_marker(roundtrip(roundtrip(roundtrip(marker))))
+        # The marker keeps its shape when embedded behind other structure, as
+        # produced by an outer `@__doc__` wrapping a macrocall (finddoc
+        # tolerates the extra line nodes on the ancestor blocks, but the marker
+        # itself must stay exactly length 2).
+        for wrap in (x->Expr(:block, x),
+                     x->Expr(:escape, Expr(:block, x)),
+                     x->Expr(:block, :(y = 2), x))
+            e = roundtrip(wrap(marker))
+            found = Ref(false)
+            find_marker(x) = x isa Expr &&
+                (is_marker(x) ? (found[] = true) : foreach(find_marker, x.args))
+            find_marker(e)
+            @test found[]
+        end
+    end
 end
 
 # taken from JuliaSyntax expr.jl
