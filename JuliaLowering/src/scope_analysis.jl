@@ -649,7 +649,8 @@ struct ClosureBindings
     name_stack::Vector{String}      # Names of functions the closure is nested within
     lambdas::Vector{LambdaBindings} # Bindings for each method of the closure
     # Static parameters of enclosing methods which are referenced in the
-    # closure's method signatures, in order of first appearance (see
+    # closure's method signatures, or in `K"static_eval"` positions within the
+    # closure's method bodies, in order of first appearance (see
     # `convert_closure_sig_sparams`)
     sig_sparams::Vector{IdTag}
 end
@@ -758,6 +759,56 @@ function collect_closure_sig_sparams!(ctx, sig_sparams, ex)
     nothing
 end
 
+# Record any static parameters of enclosing methods which are referenced
+# inside `K"static_eval"` positions (ccall/cfunction return and argument
+# types) within a closure's method bodies. An ordinary body reference reads
+# the static parameter's value from a closure field at runtime, but a
+# static_eval expression is evaluated by codegen's static evaluator, which
+# cannot read closure fields (or local slots). Instead, such static parameters
+# get the same treatment as signature references (see
+# `convert_closure_sig_sparams`): they become trailing static parameters of
+# each of the closure's methods, re-bound by dispatch from leading type
+# parameters of the closure type, and the static_eval references are
+# rewritten to them (see `convert_lambda_static_eval_sparams`). This is how
+# flisp handles *all* closed-over static parameter references (`capt-sp`).
+function collect_static_eval_sparams!(ctx, sig_sparams, ex, own_lambda_ids,
+                                      in_static_eval)
+    k = kind(ex)
+    if k == K"BindingId"
+        in_static_eval || return
+        b = get_binding(ctx, ex)
+        if b.kind === :static_parameter && !(b.lambda_id in own_lambda_ids)
+            if !(b.id in sig_sparams)
+                push!(sig_sparams, b.id)
+            end
+            # The closure creation site - in the current lambda, where this
+            # method_defs sits - reads the static parameter's value to apply
+            # it as a type parameter of the closure type, so any intermediate
+            # closures must capture it. (No-op when the current lambda is the
+            # static parameter's own method.)
+            ensure_captured!(ctx, ctx.scopes[ctx.lambda_bindings.scope_id], b)
+        end
+    elseif k == K"method_defs" || k == K"_opaque_closure"
+        # Nested closures get their own treatment when analyze_variables!
+        # reaches them.
+        return
+    elseif !is_leaf(ex) && !is_quoted(ex)
+        if k == K"lambda"
+            # Record the closure's own lambdas; their own static parameters
+            # are directly usable in static_eval positions and need no
+            # rewriting.
+            push!(own_lambda_ids, (ex.lambda_bindings::LambdaBindings).scope_id)
+        elseif k == K"static_eval"
+            in_static_eval = true
+        end
+        for e in children(ex)
+            collect_static_eval_sparams!(ctx, sig_sparams, e, own_lambda_ids,
+                                         in_static_eval)
+        end
+    end
+    nothing
+end
+
 # Update ctx.bindings metadata based on binding usage
 function analyze_variables!(ctx, ex)
     k = kind(ex)
@@ -845,6 +896,8 @@ function analyze_variables!(ctx, ex)
         if kind(name) == K"BindingId" && get_binding(ctx, name).kind === :local
             cb = init_closure_bindings!(ctx, name)
             collect_closure_sig_sparams!(ctx, cb.sig_sparams, ex[2])
+            collect_static_eval_sparams!(ctx, cb.sig_sparams, ex[2],
+                                         Set{ScopeId}(), false)
         end
         push!(ctx.method_def_stack, name)
         analyze_variables!(ctx, ex[2])

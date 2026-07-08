@@ -543,6 +543,120 @@ end
 @test test_mod.ccall_with_sparams(Int) === 1
 @test test_mod.ccall_with_sparams(Float64) === 1.0
 
+@testset "ccall types referencing captured static parameters in closures" begin
+    # An enclosing method's static parameter, captured by a closure and used in
+    # ccall argument/return types inside the closure body (NCDatasets
+    # `@with_lock`/`nc_vlen_t{T}` pattern). Unlike a captured local, the value
+    # is unknown when the closure's method is defined at top level; it becomes
+    # a leading type parameter of the closure type, re-bound by dispatch as a
+    # trailing static parameter of the closure's method (flisp's `capt-sp`).
+    JuliaLowering.include_string(test_mod, """
+        function ccb_sparam_closure_roundtrip(dst::Vector{T}, src::Vector{T}) where {T}
+            f = () -> ccall(:memcpy, Ptr{T}, (Ptr{T}, Ptr{T}, Csize_t),
+                            dst, src, length(src) * sizeof(T))
+            return f()
+        end
+    """)
+    Core.@latestworld
+    let a = [1.5, 2.5], b = zeros(2)
+        p = GC.@preserve a b test_mod.ccb_sparam_closure_roundtrip(b, a)
+        @test b == [1.5, 2.5]
+        @test p isa Ptr{Float64}
+    end
+    let a = Int32[7, 8], b = zeros(Int32, 2)  # second instantiation
+        p = GC.@preserve a b test_mod.ccb_sparam_closure_roundtrip(b, a)
+        @test b == Int32[7, 8]
+        @test p isa Ptr{Int32}
+    end
+
+    # NCDatasets shape: do-block closure over a lock, Ptr{Struct{T}} argtype
+    JuliaLowering.include_string(test_mod, """
+        struct CcbVlen{T}
+            len::Csize_t
+            p::Ptr{T}
+        end
+        const ccb_lock = ReentrantLock()
+        function ccb_with_lock(vl::Vector{CcbVlen{T}}) where {T}
+            lock(ccb_lock) do
+                ccall(:memset, Ptr{Cvoid}, (Ptr{CcbVlen{T}}, Cint, Csize_t),
+                      vl, 0, sizeof(CcbVlen{T}))
+            end
+        end
+    """)
+    Core.@latestworld
+    for T in (Float64, Int16)
+        vl = [test_mod.CcbVlen{T}(42, Ptr{T}(1234))]
+        GC.@preserve vl test_mod.ccb_with_lock(vl)
+        @test vl[1].len == 0 && vl[1].p == Ptr{T}(0)
+    end
+
+    # Captured sparam in the return type only (no runtime reference at all)
+    JuliaLowering.include_string(test_mod, """
+        function ccb_sparam_rettype(v::Vector{T}) where {T}
+            f = () -> ccall(:memset, Ptr{T}, (Ptr{Cvoid}, Cint, Csize_t), v, 0, 0)
+            return f()
+        end
+    """)
+    Core.@latestworld
+    let v = [1.0]
+        @test (GC.@preserve v test_mod.ccb_sparam_rettype(v)) isa Ptr{Float64}
+    end
+
+    # Two captured sparams; also used in the closure's signature
+    JuliaLowering.include_string(test_mod, """
+        function ccb_two_sparams(dst::Vector{S}, src::Vector{T}) where {S, T}
+            f = (n::Int) -> ccall(:memcpy, Ptr{S}, (Ptr{S}, Ptr{T}, Csize_t),
+                                  dst, src, n * sizeof(T))
+            return f(length(src))
+        end
+    """)
+    Core.@latestworld
+    let a = UInt32[0x12345678], b = UInt32[0]
+        GC.@preserve a b test_mod.ccb_two_sparams(b, a)
+        @test b == [0x12345678]
+    end
+
+    # Nested closures: the ccall sits two lambdas below the sparam's method
+    JuliaLowering.include_string(test_mod, """
+        function ccb_sparam_nested(v::Vector{T}) where {T}
+            outer = () -> begin
+                inner = () -> ccall(:memset, Ptr{Cvoid}, (Ptr{T}, Cint, Csize_t),
+                                    v, 0, length(v) * sizeof(T))
+                inner()
+            end
+            return outer()
+        end
+    """)
+    Core.@latestworld
+    let v = UInt64[9, 9]
+        GC.@preserve v test_mod.ccb_sparam_nested(v)
+        @test all(iszero, v)
+    end
+
+    # A cfunction with a captured sparam in its types is rejected by the
+    # runtime at method definition time ("expected Type, got a value of type
+    # TypeVar"), exactly as under flisp lowering.
+    @test_throws TypeError JuliaLowering.include_string(test_mod, """
+        ccb_cfun_callee(x::Float64) = 2x
+        function ccb_cfun(::Type{T}) where {T}
+            f = () -> @cfunction(ccb_cfun_callee, T, (T,))
+            return f()
+        end
+    """)
+
+    # A captured sparam in the ccall function-name position is not a
+    # static-eval position; it's evaluated as a runtime function-pointer
+    # expression and rejected by codegen, exactly as under flisp lowering.
+    JuliaLowering.include_string(test_mod, """
+        function ccb_sparam_name_pos(v::Vector{T}) where {T}
+            f = () -> ccall(T, Cvoid, ())
+            return f()
+        end
+    """)
+    Core.@latestworld
+    @test_throws TypeError test_mod.ccb_sparam_name_pos(Symbol[])
+end
+
 # Test that ccall can be passed static parameters in the function name
 # Note that this only works with `@generated` functions from 1.13 onwards,
 # where the function name can be evaluated at code generation time.
@@ -882,4 +996,21 @@ end
     @test f(1, 'a') == (1, 'a', Int, Char)
     @test (f = jl_eval(test_mod, ex; expr_compat_mode=false)) isa Function
     @test f(1, 'a') == (1, 'a', Int, Char)
+end
+
+@testset "ccall sparam alignment: own where-params + captured sparam" begin
+    # Swap-detectable through the static_eval path: cconvert(Ptr{T}, v) succeeds
+    # only for the correct T, so an appended-sparam index misalignment (S/T swap)
+    # throws instead of silently reordering.
+    JuliaLowering.include_string(test_mod, """
+    function ccb_own_plus_captured(v::Vector{T}) where {T}
+        function inner(w::Vector{S}) where {S}
+            ccall(:memcpy, Ptr{Cvoid}, (Ptr{T}, Ptr{S}, Csize_t), v, w, 0)
+            (sizeof(S), sizeof(T))
+        end
+        inner(Int8[0])
+    end
+    """)
+    @test test_mod.ccb_own_plus_captured(UInt64[1]) === (1, 8)
+    @test test_mod.ccb_own_plus_captured(UInt16[1]) === (1, 2)
 end

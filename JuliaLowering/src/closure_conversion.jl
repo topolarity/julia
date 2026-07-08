@@ -359,7 +359,7 @@ function is_self_captured(ctx, x)
     get(ctx.lambda_bindings.locals_capt, _binding_id(x), false)
 end
 
-function _rewrite_sig_sparams(ctx, ex, closure_id, sparam_tv_inds, tvs)
+function _rewrite_sig_sparams(ctx, ex, closure_id, sig_sparams, sparam_tv_inds, tvs)
     k = kind(ex)
     if k == K"BindingId"
         i = get(sparam_tv_inds, ex.var_id, nothing)
@@ -370,9 +370,14 @@ function _rewrite_sig_sparams(ctx, ex, closure_id, sparam_tv_inds, tvs)
         # TypeVars, allowing dispatch to re-bind them from the type parameters
         # applied at closure creation time.
         @ast ctx ex [K"call" "apply_type"::K"core" ex tvs...]
-    elseif k == K"lambda" || is_leaf(ex) || is_quoted(ex)
-        # References within the closure's method bodies are handled by ordinary
-        # capture conversion, not here.
+    elseif k == K"lambda"
+        # Ordinary references within the closure's method bodies are handled
+        # by field capture, not here - but references in `K"static_eval"`
+        # positions must remain statically evaluable by codegen, which cannot
+        # read closure fields, so they're rewritten to trailing static
+        # parameters of the method itself.
+        convert_lambda_static_eval_sparams(ctx, ex, sig_sparams, sparam_tv_inds)
+    elseif is_leaf(ex) || is_quoted(ex)
         ex
     elseif k == K"call" && kind(ex[1]) == K"core" && ex[1].name_val == "svec" &&
             numchildren(ex) == 4 && kind(ex[3]) == K"call" &&
@@ -382,24 +387,101 @@ function _rewrite_sig_sparams(ctx, ex, closure_id, sparam_tv_inds, tvs)
         # trailing static parameters of the method.
         @ast ctx ex [K"call"
             ex[1]
-            _rewrite_sig_sparams(ctx, ex[2], closure_id, sparam_tv_inds, tvs)
+            _rewrite_sig_sparams(ctx, ex[2], closure_id, sig_sparams, sparam_tv_inds, tvs)
             [K"call"(ex[3]) ex[3][1:end]... tvs...]
             ex[4]
         ]
     else
-        mapchildren(e->_rewrite_sig_sparams(ctx, e, closure_id, sparam_tv_inds, tvs),
+        mapchildren(e->_rewrite_sig_sparams(ctx, e, closure_id, sig_sparams, sparam_tv_inds, tvs),
                     ctx, ex)
     end
+end
+
+# Does `ex` reference one of the closure's `sig_sparams` inside a
+# `K"static_eval"` position? (Not descending into nested closures, which
+# handle their own static_eval references.)
+function _has_static_eval_sparam_ref(ex, sparam_tv_inds, in_static_eval)
+    k = kind(ex)
+    if k == K"BindingId"
+        return in_static_eval && haskey(sparam_tv_inds, ex.var_id)
+    elseif k == K"method_defs" || k == K"_opaque_closure" || k == K"lambda" ||
+            is_leaf(ex) || is_quoted(ex)
+        return false
+    end
+    in_se = in_static_eval || k == K"static_eval"
+    return any(e->_has_static_eval_sparam_ref(e, sparam_tv_inds, in_se),
+               children(ex))
+end
+
+function _rewrite_static_eval_sparam_refs(ctx, ex, sparam_map, in_static_eval)
+    k = kind(ex)
+    if k == K"BindingId"
+        if in_static_eval
+            new_sp = get(sparam_map, ex.var_id, nothing)
+            isnothing(new_sp) || return new_sp
+        end
+        return ex
+    elseif k == K"method_defs" || k == K"_opaque_closure" || k == K"lambda" ||
+            is_leaf(ex) || is_quoted(ex)
+        # Nested closures handle their own static_eval references (see
+        # `collect_static_eval_sparams!`).
+        return ex
+    end
+    in_se = in_static_eval || k == K"static_eval"
+    mapchildren(e->_rewrite_static_eval_sparam_refs(ctx, e, sparam_map, in_se),
+                ctx, ex)
+end
+
+# Rewrite references to enclosing methods' static parameters occurring in
+# `K"static_eval"` positions (ccall/cfunction return and argument types)
+# within one method body of a closure. Ordinary body references read the
+# captured value from a closure field at runtime, but a static_eval
+# expression is evaluated by codegen's static evaluator, which cannot read
+# closure fields. Instead, append a fresh static parameter to this method for
+# each of the closure's `sig_sparams` - lining up positionally with the
+# TypeVars appended trailing to the method signature by
+# `_rewrite_sig_sparams` - and rewrite the static_eval references to it.
+# Dispatch re-binds these static parameters from the closure's leading type
+# parameters, and codegen's static evaluator handles them natively; this
+# matches the shape flisp produces for such code.
+function convert_lambda_static_eval_sparams(ctx, ex, sig_sparams, sparam_tv_inds)
+    @jl_assert kind(ex) == K"lambda" ex
+    any(e->_has_static_eval_sparam_ref(e, sparam_tv_inds, false), ex[3:end]) ||
+        return ex
+    sparam_map = Dict{IdTag,typeof(ex)}()
+    own_sparams = ex[2]
+    new_sparam_list = SyntaxList(ctx)
+    append!(new_sparam_list, own_sparams[1:end])
+    for id in sig_sparams
+        name = get_binding(ctx, id).name
+        nameref = newleaf(ctx, binding_ex(ctx, id), K"Identifier", name)
+        b = _new_binding(ctx, nameref, name, :static_parameter; is_internal=true)
+        sp = binding_ex(ctx, b)
+        push!(new_sparam_list, sp)
+        sparam_map[id] = sp
+    end
+    lambda_children = SyntaxList(ctx)
+    push!(lambda_children, ex[1])
+    push!(lambda_children, mknode(own_sparams, new_sparam_list))
+    for e in ex[3:end]
+        push!(lambda_children,
+              _rewrite_static_eval_sparam_refs(ctx, e, sparam_map, false))
+    end
+    mknode(ex, lambda_children)
 end
 
 # flisp: the `capt-sp` parts of `cl-convert`'s local `method` case
 #
 # A closure's method signatures are emitted at top level where the static
 # parameters of enclosing methods can't be accessed, so each such static
-# parameter referenced by the signatures (recorded in
-# `ClosureBindings.sig_sparams`) is turned into a fresh `TypeVar` which becomes
+# parameter referenced by the signatures - or by `K"static_eval"` positions
+# within the method bodies, which codegen must evaluate without access to
+# closure fields - (recorded in `ClosureBindings.sig_sparams`) is turned into
+# a fresh `TypeVar` which becomes
 #  * a trailing static parameter of each of the closure's methods, substituted
-#    for signature references to the original static parameter, and
+#    for signature references to the original static parameter (and mirrored
+#    inside the method bodies for static_eval references, see
+#    `convert_lambda_static_eval_sparams`), and
 #  * a leading type parameter of the closure type, applied at closure creation
 #    time (see the `K"function_decl"` case of `_convert_closures`).
 #
@@ -421,7 +503,7 @@ function convert_closure_sig_sparams(ctx, ex, closure_id, sig_sparams)
     end
     @ast ctx ex [K"block"
         stmts...
-        _rewrite_sig_sparams(ctx, ex, closure_id, sparam_tv_inds, tvs)
+        _rewrite_sig_sparams(ctx, ex, closure_id, sig_sparams, sparam_tv_inds, tvs)
     ]
 end
 

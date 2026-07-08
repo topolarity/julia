@@ -510,6 +510,81 @@ end
 17  (return %₁₆)
 
 ########################################
+# ccall argument/return types inside a closure may reference an enclosing
+# method's static parameter. Unlike a captured local, its value is unknown at
+# (top-level) method definition time, so it can't be spliced; instead it gets
+# the `capt-sp` treatment (see `convert_closure_sig_sparams`): a leading type
+# parameter of the closure type, re-bound by dispatch as a trailing static
+# parameter of the closure method, referenced as `static_parameter` in the
+# static_eval positions - which codegen's static evaluator handles natively.
+function ccall_sparam_closure(v::Vector{T}) where {T}
+    f = () -> ccall(:memset, Ptr{T}, (Ptr{T}, Cint, Csize_t), v, 0, 0)
+    f()
+end
+#---------------------
+1   (method TestMod.ccall_sparam_closure)
+2   latestworld
+3   (call core.svec :T :v)
+4   (call core.svec false false)
+5   (call core.svec :T)
+6   (call JuliaLowering.eval_closure_type TestMod :#ccall_sparam_closure##->###0 %₃ %₄ %₅)
+7   latestworld
+8   (call core.TypeVar :T)
+9   TestMod.#ccall_sparam_closure##->###0
+10  (call core.apply_type %₉ %₈)
+11  (call core.svec %₁₀)
+12  (call core.svec %₈)
+13  SourceLocation::2:9
+14  (call core.svec %₁₁ %₁₂ %₁₃)
+15  --- method core.nothing %₁₄
+    slots: [slot₁/#self#(!read)]
+    1   TestMod.Ptr
+    2   (call core.getfield slot₁/#self# :T)
+    3   (call core.apply_type %₁ %₂)
+    4   TestMod.Cint
+    5   TestMod.Csize_t
+    6   (call core.getfield slot₁/#self# :v)
+    7   (call top.cconvert %₃ %₆)
+    8   (call top.cconvert %₄ 0)
+    9   (call top.cconvert %₅ 0)
+    10  (call top.unsafe_convert %₃ %₇)
+    11  (call top.unsafe_convert %₄ %₈)
+    12  (call top.unsafe_convert %₅ %₉)
+    13  (foreigncall :memset (static_eval (call core.apply_type TestMod.Ptr static_parameter₁)) (static_eval (call core.svec (call core.apply_type TestMod.Ptr static_parameter₁) TestMod.Cint TestMod.Csize_t)) 0 :ccall %₁₀ %₁₁ %₁₂ %₇ %₈ %₉)
+    14  (return %₁₃)
+16  latestworld
+17  (= slot₁/T (call core.TypeVar :T))
+18  TestMod.ccall_sparam_closure
+19  (call core.TypeEqOf %₁₈)
+20  TestMod.Vector
+21  slot₁/T
+22  (call core.apply_type %₂₀ %₂₁)
+23  (call core.svec %₁₉ %₂₂)
+24  slot₁/T
+25  (call core.svec %₂₄)
+26  SourceLocation::1:10
+27  (call core.svec %₂₃ %₂₅ %₂₆)
+28  --- method TestMod.ccall_sparam_closure %₂₇
+    slots: [slot₁/#self#(!read) slot₂/v slot₃/#->#(single_assign) slot₄/f(single_assign,called)]
+    1   TestMod.#ccall_sparam_closure##->###0
+    2   static_parameter₁
+    3   static_parameter₁
+    4   (call core._typeof_captured_variable %₃)
+    5   (call core._typeof_captured_variable slot₂/v)
+    6   (call core.apply_type %₁ %₂ %₄ %₅)
+    7   static_parameter₁
+    8   (new %₆ %₇ slot₂/v)
+    9   (= slot₃/#-># %₈)
+    10  slot₃/#->#
+    11  (= slot₄/f %₁₀)
+    12  slot₄/f
+    13  (call %₁₂)
+    14  (return %₁₃)
+29  latestworld
+30  TestMod.ccall_sparam_closure
+31  (return %₃₀)
+
+########################################
 # Error: ccall with too few arguments
 ccall(:strlen, Csize_t, (Cstring,))
 #---------------------
