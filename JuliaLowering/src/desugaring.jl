@@ -2796,12 +2796,22 @@ function keywords_method_def_expr(ctx, src, mtable, sparams, argl, body, rett, p
         # bundle and forward excess if there's a restkw, else throw kwerr
         handle_excess = if !isempty(restkw)
             excess_kw = ssavar(ctx, arg2_name, "excess_kw")
-            @ast ctx src [K"="
-                excess_kw
-                [K"call" "pairs"::K"top"
-                   isempty(kw_names) ? arg2_name :
-                   [K"call" "structdiff"::K"top" arg2_name
-                       [K"curly" "NamedTuple"::K"core" [K"tuple" kw_syms...]]]]]
+            # flisp names the excess-kwargs bundle as a real local `<restkw>...`
+            # (julia-syntax.scm, `keyword-method-def-expr`), which surfaces via
+            # `Base.kwarg_decl`'s trailing-"..." slot-name scan.  We keep the
+            # bundle an SSA value for codegen efficiency and, exactly like the
+            # named kw_temps above, emit a reflection-only `local` stub carrying
+            # that name so `kwarg_decl`/method-show still report the catch-all.
+            restkw_name = restkw[1][1]
+            restkw_refl = setattr(restkw_name, :name_val, restkw_name.name_val * "...")
+            @ast ctx src [K"block"
+                [K"local" setmeta(restkw_refl, :is_internal, true)]
+                [K"="
+                    excess_kw
+                    [K"call" "pairs"::K"top"
+                       isempty(kw_names) ? arg2_name :
+                       [K"call" "structdiff"::K"top" arg2_name
+                           [K"curly" "NamedTuple"::K"core" [K"tuple" kw_syms...]]]]]]
         else
             @ast ctx src [K"if"
                 [K"call" "isempty"::K"top"
