@@ -166,8 +166,13 @@
         # `eval_flisp_compat` (the `@eval` path) wraps in `LoadError`...
         err = try; JL.eval_flisp_compat(mac_mod, bad); catch e; e; end
         @test err isa LoadError
-        # ...preserving the rich `MacroExpansionError` as the wrapped cause.
-        @test err.error isa JL.MacroExpansionError
+        # ...wrapping the macro body's *original* thrown exception directly, as
+        # flisp's `jl_invoke_julia_macro` does (`LoadError.error` is the raw
+        # cause, not JuliaLowering's `MacroExpansionError` wrapper), so packages
+        # that assert the type/message/fields of `ex.error` keep working (found
+        # via Match.jl in PkgEval; refines `0fb6078059`).
+        @test err.error isa ErrorException
+        @test err.error.msg == "bad x"
 
         # The programmatic API keeps raising the raw `MacroExpansionError`
         # (`JuliaLowering.macroexpand` introspection likewise -- both bypass
@@ -186,9 +191,28 @@
                 nothing
             catch e; e; end
             @test hookerr isa LoadError
-            @test hookerr.error isa JL.MacroExpansionError
+            @test hookerr.error isa ErrorException
+            @test hookerr.error.msg == "bad x"
         end
         @test !occursin("JuliaLowering threw given input", String(take!(io)))
+
+        # The wrapped error matches flisp's shape exactly (inner type + message),
+        # for both a plain macro-body error and a *nested* macro-in-macro error
+        # (a macro whose expansion produces another macro that throws) -- flisp
+        # yields a single `LoadError` holding the innermost original exception in
+        # both cases (oracle: `usr/bin/julia` default lowering).
+        Core.eval(mac_mod, :(macro typed(); throw(ArgumentError("typed bad")); end))
+        terr = try; JL.eval_flisp_compat(mac_mod, parsestmt(JL.SyntaxTree, "@typed()")); catch e; e; end
+        @test terr isa LoadError
+        @test terr.error isa ArgumentError
+        @test terr.error.msg == "typed bad"
+
+        Core.eval(mac_mod, :(macro inner(); error("inner boom"); end))
+        Core.eval(mac_mod, :(macro outer(); :(@inner()); end))
+        nerr = try; JL.eval_flisp_compat(mac_mod, parsestmt(JL.SyntaxTree, "@outer()")); catch e; e; end
+        @test nerr isa LoadError
+        @test nerr.error isa ErrorException      # innermost cause, not a nested MacroExpansionError
+        @test nerr.error.msg == "inner boom"
 
         # End-to-end `@eval @boom(0)` under an active lowerer -> LoadError.
         Core.eval(test_mod, :(macro boom(x); x == 0 && error("bad x"); :(nothing); end))

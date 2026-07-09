@@ -915,14 +915,26 @@ end
 # `LoadError`, matching flisp: `jl_invoke_julia_macro` wraps any exception from
 # a macro body in `LoadError(file, line, err)` on the real top-level-lowering
 # path (its `throw_load_error` flag; `src/ast.c`). Packages assert this via the
-# standard `@test_throws LoadError @eval @somemacro(bad)` idiom. We keep the
-# rich `MacroExpansionError` as the `LoadError`'s wrapped error (it already
-# carries the raw cause under "Caused by:"), so `isa LoadError` holds while the
-# macro-expansion diagnostics are preserved.
+# standard `@test_throws LoadError @eval @somemacro(bad)` idiom.
+#
+# flisp wraps the macro body's *original* thrown value directly (`LoadError`'s
+# `.error` is whatever the macro threw -- an `ErrorException`, `ArgumentError`,
+# a bare non-`Exception` value, even a `LoadError` the macro itself threw), with
+# no wrapper type of its own. `MacroExpansionError` is JuliaLowering's richer
+# *introspection*-facing representation, but on this flisp-compat boundary we
+# must reproduce flisp's observable exactly, so packages that assert the type,
+# message, or fields of `ex.error` keep working (found via Match.jl in PkgEval).
+# Unwrap down to that original value, descending through nested
+# `MacroExpansionError`s (a macro whose body expands another failing macro) to
+# the innermost recorded cause. `JuliaLowering.macroexpand`'s introspection path
+# does not go through here and keeps the raw `MacroExpansionError`.
 function _macroexpansion_loaderror(exc::MacroExpansionError,
                                    fallback::LineNumberNode=LineNumberNode(0, :none))
     lnn = fallback
     try
+        # Location comes from the (outermost) erroring macrocall, as flisp takes
+        # it from that macrocall's `LineNumberNode` -- not from the innermost
+        # cause, which may originate in an unrelated file.
         l = source_location(LineNumberNode, exc.ex)
         if l isa LineNumberNode && l.line != 0
             lnn = l
@@ -930,7 +942,14 @@ function _macroexpansion_loaderror(exc::MacroExpansionError,
     catch
     end
     file = lnn.file === nothing ? "none" : String(lnn.file)
-    return LoadError(file, lnn.line, exc)
+    # Unwrap to the innermost cause, as flisp wraps the macro's original
+    # exception. A user-thrown MacroExpansionError carrying its own `err` is
+    # indistinguishable from machinery wrapping and is unwrapped too.
+    inner = exc
+    while inner isa MacroExpansionError && inner.err !== nothing
+        inner = inner.err
+    end
+    return LoadError(file, lnn.line, inner)
 end
 
 # flisp-compatible `eval` used by the `@eval` macro. Behaves like `eval`, but
