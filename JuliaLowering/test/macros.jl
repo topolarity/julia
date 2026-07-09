@@ -2039,6 +2039,47 @@ end
     @test run("MacFl.@flwrap()") === root
 end
 
+@testset "(AI) @generated function generator stub binds in eval target" begin
+    # An old-style macro (home module `GenHome`) that expands to an unescaped
+    # `@generated function $GenHome.thefun(...)` extends a *qualified* function,
+    # but the `@generated` form's internal generator-stub global
+    # (`#_@generator#N` and its closure type) is fresh, invisible machinery.
+    # flisp mangles that stub as a gensym'd anonymous function of the module
+    # the top-level form is evaluated into (the call site), never the macro's
+    # home; a downstream package precompiling such a macro from a *closed*
+    # dependency would otherwise fail with "Creating a new global in closed
+    # module".  This is the Adapt `@adapt_structure` shape (ClimaComms,
+    # DiffusionGarnet, SliceSampling); regression from dedc5dd37d, which bound
+    # the stub via `syntax_module(src)` (the macro home) instead of the eval
+    # target.
+    m = Module()
+    Core.eval(m, :(import JuliaLowering))
+    JuliaLowering.include_string(m, raw"""
+    module GenHome
+        thefun(x) = error("fallback should never run")
+        macro mkgen(T)
+            quote
+                @generated function $GenHome.thefun(x::$(esc(T)))
+                    :(1)
+                end
+            end
+        end
+    end
+    module GenCall
+        using ..GenHome: @mkgen
+        struct S end
+        @mkgen S
+    end
+    """; expr_compat_mode=true)
+    Core.@latestworld
+    gen(mod) = filter(n -> occursin("generator", string(n)), names(mod; all=true))
+    # The generator stub landed in the call site, not the macro's home.
+    @test isempty(gen(m.GenHome))
+    @test !isempty(gen(m.GenCall))
+    # ... and the generated method still fires and reads the stub correctly.
+    @test Base.invokelatest(m.GenHome.thefun, Base.invokelatest(m.GenCall.S)) == 1
+end
+
 @testset "(AI) @eval payload-hygiene residual (known divergence)" begin
     # Bare `const` (and method-definition) payloads in macro-generated @eval
     # resolve their binding via the payload's hygiene module rather than the
