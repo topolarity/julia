@@ -409,14 +409,77 @@ const LINENODE_SPAN_END = Int32(-5)
 const _has_byte_precise_debuginfo =
     hasmethod(Core.DebugInfo, Tuple{Symbol, String, Core.SimpleVector, String})
 
-function _di_pos(st::SyntaxTree)
-    src = JuliaSyntax.unexpanded_sourceref(st)
-    pos = if src isa SourceRef
-        (Int32(first_byte(src)), Int32(last_byte(src)))
-    elseif src isa LineNumberNode
-        (Int32(src.line), LINENODE_SPAN_END)
+# Byte span (first, last) of the `line`th line within `sf`, or `nothing` if
+# `line` is outside `sf`'s range.  Used to synthesize a positive, byte-precise
+# span for statements whose only provenance is a bare `LineNumberNode` (e.g. a
+# macro's `__source__`), so that they participate in byte-precise `DebugInfo`
+# and land on their own textual line (matching flisp).
+function _line_byte_span(sf::SourceFile, line::Integer)
+    lineidx = Int(line) - sf.first_line + 1
+    nls = length(sf.line_starts)
+    (lineidx < 1 || lineidx > nls) && return nothing
+    b1 = sf.line_starts[lineidx] + sf.byte_offset
+    b2 = (lineidx < nls ? sf.line_starts[lineidx + 1] - 1 :
+                          ncodeunits(sf.code)) + sf.byte_offset
+    return (Int32(b1), Int32(max(b1, b2)))
+end
+
+# `true` when the source ref `x` (a `SourceRef` or `LineNumberNode`) points
+# into `top_sf`, so `_di_pos` can express it as a position there.
+function _ref_in_top_sf(x, top_sf)
+    if top_sf isa SourceFile
+        x isa SourceRef ? x.file[]::SourceFile === top_sf :
+            (x.file === Symbol(JuliaSyntax.filename(top_sf)) &&
+             _line_byte_span(top_sf, x.line) !== nothing)
+    else # top_sf::Symbol: line-based debuginfo, match by filename
+        x isa SourceRef ? Symbol(JuliaSyntax.filename(x.file[]::SourceFile)) === top_sf :
+            x.file === top_sf
+    end
+end
+
+# The source ref used for `st`'s debuginfo: `st`'s *own* provenance (nearest
+# embedded line node — matching flisp's backtrace-line attribution for
+# macro-generated code) when it points into `top_sf`; otherwise the nearest
+# enclosing macrocall (climbing the macro-provenance chain outward) that does.
+# Returns `nothing` if no ref along the chain points into `top_sf`.
+#
+# The single-file `DebugInfo` model can only express positions in `top_sf`, so
+# content whose own provenance names a *foreign* file (e.g. a macro body
+# defined in another file) is deliberately attributed to its macrocall site in
+# `top_sf`; this keeps byte-precise debuginfo intact for such CodeInfos.
+function _di_srcref(st::SyntaxTree, top_sf)
+    x = JuliaSyntax.sourceref(st)
+    _ref_in_top_sf(x, top_sf) && return x
+    mp = JuliaSyntax.macro_prov(st)
+    while !isnothing(mp)
+        x = JuliaSyntax.sourceref(mp)
+        _ref_in_top_sf(x, top_sf) && return x
+        mp = JuliaSyntax.macro_prov(mp)
+    end
+    return nothing
+end
+
+function _di_pos(st::SyntaxTree, top_sf)
+    src = _di_srcref(st, top_sf)
+    # Fall back to the outermost macrocall for anomalous provenance (chain
+    # entirely outside `top_sf`); callers with a better fallback (the parent
+    # CodeInfo's position) check `_di_srcref` themselves first.
+    src = src !== nothing ? src : JuliaSyntax.unexpanded_sourceref(st)
+    @jl_assert (src isa SourceRef || src isa LineNumberNode) st
+    if top_sf isa SourceFile
+        if src isa SourceRef
+            (Int32(first_byte(src)), Int32(last_byte(src)))
+        else
+            # Synthesize the line's byte span so `__source__`-style provenance
+            # participates in byte-precise debuginfo.
+            span = _ref_in_top_sf(src, top_sf) ?
+                _line_byte_span(top_sf, src.line) : nothing
+            span !== nothing ? span : (Int32(src.line), LINENODE_SPAN_END)
+        end
     else
-        @jl_assert false st
+        # Line-based debuginfo: degrade any byte-precise ref to its line
+        line = src isa SourceRef ? JuliaSyntax.source_line(src) : src.line
+        (Int32(line), LINENODE_SPAN_END)
     end
 end
 
@@ -434,15 +497,18 @@ function collect_locs!(node_sources, codeinfos, top_sf, st)
     if kind(st) === K"code_info"
         push!(codeinfos, st)
         # TODO: macro_source is ignored for now
-        get!(node_sources, st._id, _di_pos(st))
+        get!(node_sources, st._id, _di_pos(st, top_sf))
         for c in children(st[1])
             node_sources[c._id] =
-                if _di_sourcefile(c) !== top_sf
+                if _di_srcref(c, top_sf) === nothing
+                    # No provenance along `c`'s macro chain points into
+                    # `top_sf` (not even its macrocall): genuinely
+                    # inconsistent; attribute to the parent CodeInfo.
                     top_sf isa SourceFile &&
                         @warn "inconsistent provenance for child" c st
                     node_sources[st._id]
                 else
-                    _di_pos(c)
+                    _di_pos(c, top_sf)
                 end
             collect_locs!(node_sources, codeinfos, top_sf, c)
         end
@@ -494,6 +560,7 @@ function add_debuginfo!(st::SyntaxTree)
         # so the line-based path below emits valid `DebugInfo` (same shape as the
         # `LineNumberNode` case).
         for id in collect(keys(node_sources))
+            node_sources[id][2] == LINENODE_SPAN_END && continue
             line = Int32(JuliaSyntax.source_line(top_sf, node_sources[id][1]))
             node_sources[id] = (line, LINENODE_SPAN_END)
         end

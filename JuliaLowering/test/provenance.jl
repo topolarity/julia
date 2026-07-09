@@ -66,3 +66,77 @@ end
     # TODO: line field may disappear
     @test frames[myframe_i].line == 200
 end
+
+@testset "backtrace line matches own provenance in macro-generated code" begin
+    # The innermost backtrace frame of an exception thrown from macro-generated
+    # code must report the throwing statement's *own* (nearest embedded line
+    # node) location, matching flisp — not the outermost enclosing macrocall.
+    # (Exception: the deeply-nested cell below, a documented flisp divergence.)
+    # See `_di_srcref`/`_di_pos` in eval.jl. The expected line is the
+    # 1-based line of the throwing statement within `usage`.
+    #
+    # `defs` are evaluated normally (compiled functions, as a package's macros
+    # would be); `usage` is lowered byte-precisely by `JuliaLowering.include_string`
+    # and stores the caught backtrace line into the module global `gl`.
+    function caught_line(defs, usage)
+        m = Module(:BtMod)
+        Core.eval(m, :(using Base))
+        for d in defs
+            Core.eval(m, d)
+        end
+        JuliaLowering.include_string(m, usage, "usage.jl")
+        return Core.eval(m, :gl)::Int
+    end
+
+    wrap    = :(macro wrap(body);  quote; $body; end; end)
+    escwrap = :(macro wrap(body);  quote; $(esc(body)); end; end)
+    boom    = :(macro boom(); Expr(:block, __source__, :(throw(ErrorException("boom")))); end)
+    w1 = :(macro wrap1(body); quote; $body; end; end)
+    w2 = :(macro wrap2(body); quote; $body; end; end)
+    w3 = :(macro wrap3(body); quote; $body; end; end)
+    catcher = "catch e\n    global gl = stacktrace(catch_backtrace())[1].line\nend\n"
+
+    # V1: throw via inner `@boom` (`__source__`) nested inside `@wrap`'s body
+    @test caught_line([boom, wrap], "gl = 0\n@wrap try\n    @boom()\n$catcher") == 3
+    # V2: plain `throw` inside `@wrap`'s body (no inner macro)
+    @test caught_line([wrap], "gl = 0\n@wrap try\n    throw(ErrorException(\"x\"))\n$catcher") == 3
+    # V3: multi-statement `@wrap` body, throw on a later line
+    @test caught_line([wrap], "gl = 0\n@wrap try\n    a = 1\n    b = 2\n    throw(ErrorException(\"x\"))\n$catcher") == 5
+    # Deeply nested: three wrapping macros around an inner `@boom`.
+    # NOTE deliberate flisp divergence: because the wrap macros are defined
+    # outside the `usage` "file", flisp emits a multi-frame "macro expansion"
+    # chain here whose innermost frame points into the macro-*definition*
+    # context (its line is a harness-dependent artifact), and whose usage-file
+    # chain entry is line 3.  JL's single-file debuginfo cannot emit that
+    # chain; it reports one frame at the nearest usage-file provenance —
+    # line 3, agreeing with flisp's usage-file entry (and with flisp's
+    # innermost frame when the macros are defined in the *same* file).
+    @test caught_line([boom, w1, w2, w3], "gl = 0\n@wrap1 @wrap2 @wrap3 try\n    @boom()\n$catcher") == 3
+    # esc'd body: escaping the interpolated body does not change line attribution
+    @test caught_line([escwrap], "gl = 0\n@wrap try\n    throw(ErrorException(\"x\"))\n$catcher") == 3
+    # Control: a plain (non-macro) function reports its own throw line, unchanged
+    @test caught_line([], "gl = 0\nf() = throw(ErrorException(\"x\"))\ntry\n    f()\n$catcher") == 2
+end
+
+@testset "cross-file macro content keeps byte-precise debuginfo" begin
+    # Statements whose own provenance names a *foreign* file (a macro body
+    # defined in another file/context) are attributed to their macrocall site
+    # in the lowered file: silently (no "inconsistent provenance" warnings)
+    # and without degrading the CodeInfo to line-based debuginfo.
+    m = Module(:XFMod)
+    Core.eval(m, :(using Base))
+    # The quoted macro body's line nodes point at *this* file, foreign to the
+    # "usage.jl" text lowered below.
+    Core.eval(m, :(macro deffn()
+        esc(quote
+            function genfn_xf(x)
+                x + 1
+            end
+        end)
+    end))
+    f = @test_logs JuliaLowering.include_string(m, "@deffn()\ngenfn_xf", "usage.jl")
+    @test f(1) == 2
+    if JuliaLowering._has_byte_precise_debuginfo
+        @test methods(f)[1].debuginfo.linetable isa String
+    end
+end
