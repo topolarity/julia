@@ -1216,6 +1216,34 @@ end
     @test isempty(setdiff(Set(kwbodies(OwnerB)), b_before))
     @test !isempty(kwbodies(ExtB))
     @test OwnerB.sample(:s; y=7) == 7
+end
+
+@testset "(AI) kwarg_decl reports the kwargs... catch-all" begin
+    # `Base.kwarg_decl` detects a method's "accepts arbitrary extra keywords"
+    # marker purely by finding a Core.kwcall slot whose name ends in "..."
+    # (base/methodshow.jl). flisp binds the excess-kwargs bundle to a real local
+    # named `Symbol(<restkw>, "...")`; JuliaLowering keeps that bundle an SSA
+    # value but emits a matching reflection-only `local` stub so the catch-all
+    # still surfaces (like the named kw_temps).  Regression: the restkw entry was
+    # silently dropped.
+    JuliaLowering.include_string(test_mod, """
+    f_restkw_only(a; kwargs...) = (a, kwargs)
+    f_restkw_named(a; x=1, kwargs...) = (a, x, kwargs)
+    f_restkw_defaults(a; x=1, y=2, z=3, kwargs...) = (a, x, y, z, kwargs)
+    f_restkw_undef(a; x, y=2, extras...) = (a, x, y, extras)
+    """)
+    kd(f) = Base.kwarg_decl(first(methods(f)))
+    @test kd(test_mod.f_restkw_only) == [Symbol("kwargs...")]
+    @test kd(test_mod.f_restkw_named) == [:x, Symbol("kwargs...")]
+    @test kd(test_mod.f_restkw_defaults) == [:x, :y, :z, Symbol("kwargs...")]
+    # The catch-all slot name derives from the restkw parameter's own name, and
+    # is always reported last (kwarg_decl reorders it), even with a leading
+    # UndefKeyword-only kwarg.
+    @test kd(test_mod.f_restkw_undef) == [:x, :y, Symbol("extras...")]
+    # No `#`-mangled internal slot leaks alongside the catch-all.
+    @test !any(s -> occursin('#', string(s)), kd(test_mod.f_restkw_defaults))
+end
+
 @testset "Keyword call evaluation order" begin
     # Keyword calls must evaluate the receiver and their arguments in source
     # (left-to-right) program order, exactly like ordinary positional calls and

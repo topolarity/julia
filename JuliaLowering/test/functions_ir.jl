@@ -1649,11 +1649,12 @@ end
 29  SourceLocation::1:1
 30  (call core.svec %₂₇ %₂₈ %₂₉)
 31  --- method TestMod.f_kw_slurp_simple %₃₀
-    slots: [slot₁/#unused#(!read) slot₂/kws slot₃/#self#]
-    1   (call top.pairs slot₂/kws)
-    2   TestMod.#kw_body#f_kw_slurp_simple#0
-    3   (call %₂ %₁ slot₃/#self#)
-    4   (return %₃)
+    slots: [slot₁/#unused#(!read) slot₂/kws slot₃/#self# slot₄/all_kws...(!read)]
+    1   (newvar slot₄/all_kws...)
+    2   (call top.pairs slot₂/kws)
+    3   TestMod.#kw_body#f_kw_slurp_simple#0
+    4   (call %₃ %₂ slot₃/#self#)
+    5   (return %₄)
 32  latestworld
 33  TestMod.f_kw_slurp_simple
 34  (return %₃₃)
@@ -1706,23 +1707,24 @@ end
 29  SourceLocation::1:1
 30  (call core.svec %₂₇ %₂₈ %₂₉)
 31  --- method TestMod.f_kw_slurp %₃₀
-    slots: [slot₁/#unused#(!read) slot₂/kws slot₃/#self# slot₄/x(!read) slot₅/#kwtmp#]
+    slots: [slot₁/#unused#(!read) slot₂/kws slot₃/#self# slot₄/x(!read) slot₅/non_x_kws...(!read) slot₆/#kwtmp#]
     1   (newvar slot₄/x)
-    2   (newvar slot₅/#kwtmp#)
-    3   (call core.isdefined slot₂/kws :x)
-    4   (gotoifnot %₃ label₇)
-    5   (= slot₅/#kwtmp# (call core.getfield slot₂/kws :x))
-    6   (goto label₉)
-    7   TestMod.x_default
-    8   (= slot₅/#kwtmp# %₇)
-    9   slot₅/#kwtmp#
-    10  (call core.tuple :x)
-    11  (call core.apply_type core.NamedTuple %₁₀)
-    12  (call top.structdiff slot₂/kws %₁₁)
-    13  (call top.pairs %₁₂)
-    14  TestMod.#kw_body#f_kw_slurp#0
-    15  (call %₁₄ %₉ %₁₃ slot₃/#self#)
-    16  (return %₁₅)
+    2   (newvar slot₅/non_x_kws...)
+    3   (newvar slot₆/#kwtmp#)
+    4   (call core.isdefined slot₂/kws :x)
+    5   (gotoifnot %₄ label₈)
+    6   (= slot₆/#kwtmp# (call core.getfield slot₂/kws :x))
+    7   (goto label₁₀)
+    8   TestMod.x_default
+    9   (= slot₆/#kwtmp# %₈)
+    10  slot₆/#kwtmp#
+    11  (call core.tuple :x)
+    12  (call core.apply_type core.NamedTuple %₁₁)
+    13  (call top.structdiff slot₂/kws %₁₂)
+    14  (call top.pairs %₁₃)
+    15  TestMod.#kw_body#f_kw_slurp#0
+    16  (call %₁₅ %₁₀ %₁₄ slot₃/#self#)
+    17  (return %₁₆)
 32  latestworld
 33  TestMod.f_kw_slurp
 34  (return %₃₃)
@@ -1781,7 +1783,7 @@ end
 29  SourceLocation::1:1
 30  (call core.svec %₂₇ %₂₈ %₂₉)
 31  --- method TestMod.f_kw_slurp_dep %₃₀
-    slots: [slot₁/#unused#(!read) slot₂/kws slot₃/#self# slot₄/#kwtmp# slot₅/a(single_assign) slot₆/b(single_assign)]
+    slots: [slot₁/#unused#(!read) slot₂/kws slot₃/#self# slot₄/#kwtmp# slot₅/a(single_assign) slot₆/b(single_assign) slot₇/kws...(!read)]
     1   (newvar slot₄/#kwtmp#)
     2   (call core.isdefined slot₂/kws :a)
     3   (gotoifnot %₂ label₆)
@@ -1797,14 +1799,15 @@ end
     13  slot₅/a
     14  (= slot₄/#kwtmp# %₁₃)
     15  slot₄/#kwtmp#
-    16  (= slot₆/b %₁₅)
-    17  (call core.tuple :a :b)
-    18  (call core.apply_type core.NamedTuple %₁₇)
-    19  (call top.structdiff slot₂/kws %₁₈)
-    20  (call top.pairs %₁₉)
-    21  TestMod.#kw_body#f_kw_slurp_dep#0
-    22  (call %₂₁ slot₅/a slot₆/b %₂₀ slot₃/#self#)
-    23  (return %₂₂)
+    16  (newvar slot₇/kws...)
+    17  (= slot₆/b %₁₅)
+    18  (call core.tuple :a :b)
+    19  (call core.apply_type core.NamedTuple %₁₈)
+    20  (call top.structdiff slot₂/kws %₁₉)
+    21  (call top.pairs %₂₀)
+    22  TestMod.#kw_body#f_kw_slurp_dep#0
+    23  (call %₂₂ slot₅/a slot₆/b %₂₁ slot₃/#self#)
+    24  (return %₂₃)
 32  latestworld
 33  TestMod.f_kw_slurp_dep
 34  (return %₃₃)
@@ -1955,31 +1958,32 @@ end
 29  SourceLocation::1:1
 30  (call core.svec %₂₇ %₂₈ %₂₉)
 31  --- method TestMod.f_kw_slurp %₃₀
-    slots: [slot₁/#unused#(!read) slot₂/kws slot₃/#self# slot₄/a(nospecialize) slot₅/kw1(!read) slot₆/kw2(!read) slot₇/#kwtmp#]
+    slots: [slot₁/#unused#(!read) slot₂/kws slot₃/#self# slot₄/a(nospecialize) slot₅/kw1(!read) slot₆/kw2(!read) slot₇/restkw...(!read) slot₈/#kwtmp#]
     1   (meta :nospecialize slot₄/a)
     2   (newvar slot₅/kw1)
     3   (newvar slot₆/kw2)
-    4   (newvar slot₇/#kwtmp#)
-    5   (call core.isdefined slot₂/kws :kw1)
-    6   (gotoifnot %₅ label₉)
-    7   (= slot₇/#kwtmp# (call core.getfield slot₂/kws :kw1))
-    8   (goto label₁₁)
-    9   (call core.UndefKeywordError :kw1)
-    10  (= slot₇/#kwtmp# (call core.throw %₉))
-    11  slot₇/#kwtmp#
-    12  (call core.isdefined slot₂/kws :kw2)
-    13  (gotoifnot %₁₂ label₁₆)
-    14  (= slot₇/#kwtmp# (call core.getfield slot₂/kws :kw2))
-    15  (goto label₁₇)
-    16  (= slot₇/#kwtmp# 2)
-    17  slot₇/#kwtmp#
-    18  (call core.tuple :kw1 :kw2)
-    19  (call core.apply_type core.NamedTuple %₁₈)
-    20  (call top.structdiff slot₂/kws %₁₉)
-    21  (call top.pairs %₂₀)
-    22  TestMod.#kw_body#f_kw_slurp#1
-    23  (call %₂₂ %₁₁ %₁₇ %₂₁ slot₃/#self# slot₄/a)
-    24  (return %₂₃)
+    4   (newvar slot₇/restkw...)
+    5   (newvar slot₈/#kwtmp#)
+    6   (call core.isdefined slot₂/kws :kw1)
+    7   (gotoifnot %₆ label₁₀)
+    8   (= slot₈/#kwtmp# (call core.getfield slot₂/kws :kw1))
+    9   (goto label₁₂)
+    10  (call core.UndefKeywordError :kw1)
+    11  (= slot₈/#kwtmp# (call core.throw %₁₀))
+    12  slot₈/#kwtmp#
+    13  (call core.isdefined slot₂/kws :kw2)
+    14  (gotoifnot %₁₃ label₁₇)
+    15  (= slot₈/#kwtmp# (call core.getfield slot₂/kws :kw2))
+    16  (goto label₁₈)
+    17  (= slot₈/#kwtmp# 2)
+    18  slot₈/#kwtmp#
+    19  (call core.tuple :kw1 :kw2)
+    20  (call core.apply_type core.NamedTuple %₁₉)
+    21  (call top.structdiff slot₂/kws %₂₀)
+    22  (call top.pairs %₂₁)
+    23  TestMod.#kw_body#f_kw_slurp#1
+    24  (call %₂₃ %₁₂ %₁₈ %₂₂ slot₃/#self# slot₄/a)
+    25  (return %₂₄)
 32  latestworld
 33  TestMod.f_kw_slurp
 34  (return %₃₃)
