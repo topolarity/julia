@@ -260,11 +260,25 @@ function _find_scope_decls!(ctx, scope, ex)
                 ex, "allow local BindingId as function name?")
             get!(scope.binding_assignments, b.id, ex[1]._id)
         elseif k1 === K"Identifier"
-            hasattr(ex[1], :mod) &&
-                explicit_declare_in_scope!(ctx, scope, ex[1], :global)
-            get!(scope.assignments, NameKey(ex[1]), ex[1]._id)
-            get!(ctx.layer_ids, (ex[1].context::SyntaxContext).layer,
-                 length(ctx.layer_ids)+1)
+            sc = ex[1].context::SyntaxContext
+            if !hasattr(ex[1], :mod) && is_flisp_compat(sc) && !is_base_layer(sc) &&
+                sc.layer !== ctx.layer &&
+                getmeta(ex[1], :expansion_root_method, false)
+                # flisp resolves an unescaped method-def name at the root of a
+                # hygienic expansion as a plain global of the macro's home module
+                # (the layer's module), defining or extending that module's
+                # function rather than binding a mangled local.  A nested (e.g.
+                # block- or quote-wrapped) def keeps its hygienic renaming.
+                nk = NameKey(ex[1])
+                haskey(scope.vars, nk) ||
+                    (scope.vars[nk] = _new_binding(ctx, ex[1], nk.name, :global;
+                                                   mod=sc.layer.mod).id)
+            else
+                hasattr(ex[1], :mod) && explicit_declare_in_scope!(ctx, scope, ex[1], :global)
+                get!(scope.assignments, NameKey(ex[1]), ex[1]._id)
+                get!(ctx.layer_ids, (ex[1].context::SyntaxContext).layer,
+                     length(ctx.layer_ids)+1)
+            end
         else
             @jl_assert false (ex, "unknown kind in assignment")
         end

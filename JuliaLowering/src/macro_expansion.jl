@@ -275,7 +275,32 @@ function expand_macro(ctx::MacroExpansionContext, st::SyntaxTree)
         ScopeLayer(mod_for_ast, sc_in.layer), st,
         (has_new_macro ? JL_NEW_SYNTAX_VERSION : JL_OLD_SYNTAX_VERSION), false)
     st_out2 = apply_expansion_layer(ctx, st_out, sc2, true, 0, 0)
-    !ctx.recursive ? st_out2 : expand_forms_1(ctx, st_out2)
+    st_res = !ctx.recursive ? st_out2 : expand_forms_1(ctx, st_out2)
+    mark_expansion_root_method!(st_res)
+    st_res
+end
+
+# flisp resolves an unescaped method-def name that is the *root* of a macro
+# expansion as a plain global of the macro's home module, unlike a nested (e.g.
+# block- or quote-wrapped) def, which stays hygienically renamed.  Mark the root
+# def name so scope analysis can reproduce that rule (see `_find_scope_decls!`).
+function mark_expansion_root_method!(st)
+    k = kind(st)
+    if k === K"function" && numchildren(st) == 1
+        name = st[1] # `function f end` forward declaration
+    elseif k === K"function" || (k === K"=" && is_eventually_call(st[1]))
+        sig = st[1]
+        while kind(sig) === K"where"; sig = sig[1]; end
+        kind(sig) === K"::" && numchildren(sig) == 2 && (sig = sig[1])
+        kind(sig) === K"call" || return
+        name = sig[1]
+        kind(name) === K"curly" && (name = name[1])
+    else
+        return
+    end
+    kind(name) === K"Identifier" && !hasattr(name, :mod) &&
+        setmeta!(name, :expansion_root_method, true)
+    nothing
 end
 
 function known_layer(ctx, sl::Union{Nothing, ScopeLayer})

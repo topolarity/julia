@@ -2060,3 +2060,40 @@ end
         false   # currently throws/misbinds under JL; see bugs/eval-payload-hygiene
     end
 end
+
+@testset "(AI) old-style macro method-def name -> macro-home global (flisp compat)" begin
+    # An unescaped method-def *name* at the root of an old-style macro's
+    # expansion binds a plain global of the *macro's* module (defining or
+    # extending it), matching flisp -- not a mangled hygienic local.  A def
+    # nested inside a block/quote keeps its hygienic renaming.  (Real-world:
+    # Plots `@attributes`, RecipesBase `@recipe`.)  Compares JuliaLowering's
+    # Expr-compat mode (the flisp round-trip path) against flisp.
+    src = """
+        module Mac
+            macro identity_def(ex); ex; end
+            existing(x) = "base"
+        end
+        module User
+            using ..Mac
+            Mac.@identity_def newf() = 1                    # (1) define in Mac
+            Mac.@identity_def existing(x::Int) = "int"      # (2) extend Mac fn
+            Mac.@identity_def begin blockf() = 2 end        # (3) nested -> local
+        end
+        results() = (Mac.newf(), Mac.existing(3), Mac.existing("s"),
+                     isdefined(Mac, :blockf), isdefined(User, :blockf),
+                     isdefined(User, :newf))
+    """
+    mfl = Module(); Base.include_string(mfl, src); Core.@latestworld
+    mjl = Module(); JuliaLowering.include_string(mjl, src; expr_compat_mode=true)
+    Core.@latestworld
+    @test mfl.results() == (1, "int", "base", false, false, false)
+    @test mjl.results() == mfl.results()
+
+    # A method def emitted inside a function body is a global of the macro's
+    # module, so (like flisp) it raises the top-level-only error rather than
+    # silently becoming a local.
+    @test_throws JuliaLowering.LoweringError JuliaLowering.include_string(
+        Module(),
+        "module M2; macro d(ex); ex; end; f() = @d(g()=1); end";
+        expr_compat_mode=true)
+end

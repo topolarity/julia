@@ -567,8 +567,12 @@ end
         macro mesc(x); esc(x); end
     end
 
+    # An unescaped method-def *name* from an old-style macro is the exception to
+    # hygienic renaming: it resolves to a plain global of the macro's module
+    # (flisp compat), defining `macro_mod.f_local_1` rather than a mangled local.
     JuliaLowering.include_string(test_mod, "macro_mod.@m function f_local_1(); 1; end")
-    @test !isdefined(test_mod.macro_mod, :f_local_1)
+    @test isdefined(test_mod.macro_mod, :f_local_1)
+    @test !isdefined(test_mod, :f_local_1)
     JuliaLowering.include_string(test_mod, "macro_mod.@mesc function f_nonlocal_2(); 1; end")
     @test isdefined(test_mod, :f_nonlocal_2)
     # An unescaped const should not error coming from an old-style macro
