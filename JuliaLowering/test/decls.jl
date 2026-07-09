@@ -352,7 +352,11 @@ end
         end
     end
 
-    # setproperty form: decl is ignored (this is misleading, syntax TODO)
+    # setproperty form: the dotted decl `<declkind> sym.a = 2` declares nothing
+    # (a qualified/dotted LHS isn't a new binding), matching flisp's `lhs-decls`
+    # fallthrough.  The plain `sym = (;a=1)` assignment still runs first, then the
+    # setproperty on the immutable NamedTuple raises (a world-age UndefVarError or
+    # a MethodError depending on binding visibility) -- flisp behaves identically.
     @gensym sym
     @testset let ex =
         Expr(:let, Expr(:block),
@@ -362,7 +366,9 @@ end
                   Expr(:tuple, sym)))
         @test_broken jl_eval(test_mod, ex) == ((;a=2),)
         Core.@latestworld
-        @test !isdefined(test_mod, sym)
+        # `global sym = (;a=1)` establishes the module binding before the error;
+        # `local` keeps it out of the module.  (flisp behaves identically here.)
+        @test isdefined(test_mod, sym) == (declkind === :global)
     end
 
     # ref form: decl is ignored, but assignment works (syntax TODO)
@@ -1211,4 +1217,39 @@ end
         end
         """) isa Function
     @test !isdefined(m, :no_method_f)
+@testset "(AI) global/local method def on a qualified name" begin
+    # `global Mod.f(::Int) = 1` (extend another module's method from a local
+    # scope) routes its LHS through `make_lhs_decls`, which recurses into the
+    # call callee -- a dotted `K"."` node.  A qualified name isn't a new binding
+    # here, so there's nothing to declare; flisp's `lhs-decls` returns `'()` for
+    # this shape.  Regression: `make_lhs_decls` had no `K"."` case and threw
+    # "No match found".
+    m = Module()
+    Core.eval(m, :(import JuliaLowering))
+    JuliaLowering.include_string(m, """
+    module Mod
+        f(x) = 0
+        module Sub
+            g(x) = 0
+        end
+    end
+    let
+        global Mod.f(::Int) = 1
+    end
+    let
+        local Mod.Sub.g(::Int) = 2
+    end
+    """)
+    Core.@latestworld
+    @test Base.invokelatest(m.Mod.f, 1) == 1
+    @test Base.invokelatest(m.Mod.f, 1.0) == 0   # original method intact
+    @test Base.invokelatest(m.Mod.Sub.g, 1) == 2
+
+    # Genuinely invalid decl shapes must still error (flisp rejects these before
+    # reaching `lhs-decls`; we keep `make_lhs_decls`'s dispatch non-total rather
+    # than blanket-accepting).
+    @test_throws JuliaLowering.LoweringError JuliaLowering.include_string(
+        Module(), "let; global 1+1; end")
+    @test_throws JuliaLowering.LoweringError JuliaLowering.include_string(
+        Module(), "let; global no_such_fn(); end")
 end

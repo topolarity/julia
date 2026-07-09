@@ -2269,6 +2269,11 @@ function make_lhs_decls(ctx, stmts, declkind, declmeta, ex, type_decls=true)
         end
         [K"..." x] -> nothing # from recursion above
         [K"ref" _ _...] -> nothing # decl is ignored; syntax TODO
+        # A dotted/qualified name (e.g. `global Mod.f(::Int) = 1`) extends an
+        # existing binding in another module rather than introducing a new
+        # local/global here, so there's nothing to declare.  Matches flisp's
+        # `lhs-decls` fallthrough `(else '())` (julia-syntax.scm) for this shape.
+        [K"." _ _] -> nothing
     end
 
     if !isnothing(declname)
