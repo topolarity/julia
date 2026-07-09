@@ -82,6 +82,17 @@ function core_lowering_hook(@nospecialize(code), mod::Module, file::Union{String
         ex = to_lowered_expr(st5)
         return Core.svec(ex, st5, ctx5)
     catch exc
+        if exc isa MacroExpansionError
+            # A macro threw while being expanded. flisp wraps this in `LoadError`
+            # on the real top-level-lowering path (`jl_invoke_julia_macro`'s
+            # `throw_load_error`), so `@test_throws LoadError` on an invalid
+            # macro invocation via `eval`/`Core.eval`/`include` keeps working.
+            # (`JuliaLowering.macroexpand` introspection bypasses this hook and
+            # keeps the raw `MacroExpansionError`, matching flisp's
+            # `throw_load_error=0` for `jl_macroexpand`.) These are user/package
+            # errors, not JuliaLowering bugs, so they skip the triage log below.
+            throw(_macroexpansion_loaderror(exc, LineNumberNode(line, Symbol(file))))
+        end
         @info("JuliaLowering threw given input:",
               code=TruncatedForLog(code), st0=TruncatedForLog(st0), st1=TruncatedForLog(st1),
               file=file, line=line, mod=mod)

@@ -116,4 +116,88 @@
         # input expression is.
         @test sizeof(logtext) < 64_000
     end
+
+    @testset "flisp-compat lowering errors (`@eval` path)" begin
+        # A user-facing lowering error (here: reading all-underscore `_`) must
+        # surface as an ordinary `ErrorException` through the `@eval` path --
+        # matching flisp, where `@eval` is `Core.eval` and lowering errors are
+        # `ErrorException`. `LoweringError <: Exception` but not `<:
+        # ErrorException`, which silently breaks the ubiquitous
+        # `@test_throws ErrorException @eval(bad)` idiom (found via DataPipes).
+        bad = parsestmt(JL.SyntaxTree, "_.values")
+
+        # `eval_flisp_compat` (what `@eval` expands to) converts to ErrorException
+        @test_throws ErrorException JL.eval_flisp_compat(test_mod, bad)
+        @test_throws "all-underscore" JL.eval_flisp_compat(test_mod, bad)
+
+        # ...but the programmatic API keeps raising the richer `LoweringError`,
+        # as the rest of this suite relies on.
+        @test_throws JL.LoweringError JL.eval(test_mod, bad)
+        @test_throws JL.LoweringError JL.include_string(test_mod, "_.values")
+
+        # Valid code is unaffected (value returned, no conversion).
+        @test JL.eval_flisp_compat(test_mod, parsestmt(JL.SyntaxTree, "1 + 2")) == 3
+
+        # Non-`LoweringError` exceptions (e.g. ordinary runtime errors) pass
+        # through unchanged -- only user-facing lowering errors are converted.
+        @test_throws DomainError JL.eval_flisp_compat(test_mod, parsestmt(JL.SyntaxTree, "sqrt(-1.0)"))
+
+        # End-to-end through the actual `@eval` macro under an active lowerer.
+        prog = parseall(Expr, "try; @eval(_.values); false; catch e; e isa ErrorException; end")
+        try
+            JL.activate!()
+            @test Core.eval(test_mod, prog) === true
+        finally
+            JL.activate!(false)
+        end
+    end
+
+    @testset "flisp-compat macro-expansion errors (`LoadError`)" begin
+        # A macro that throws while being *expanded* must surface as a
+        # `LoadError` through the top-level-eval boundary, matching flisp
+        # (`jl_invoke_julia_macro`'s `throw_load_error`). `LoweringError`/
+        # `MacroExpansionError` are `<: Exception` but not `<: LoadError`, so
+        # the standard `@test_throws LoadError @eval @somemacro(bad)` idiom
+        # silently stops matching (found via StationXML / StrLiterals).
+        mac_mod = Module(:MacTM)
+        Core.eval(mac_mod, :(macro boom(x); x == 0 && error("bad x"); :(nothing); end))
+        bad = parsestmt(JL.SyntaxTree, "@boom(0)")
+
+        # `eval_flisp_compat` (the `@eval` path) wraps in `LoadError`...
+        err = try; JL.eval_flisp_compat(mac_mod, bad); catch e; e; end
+        @test err isa LoadError
+        # ...preserving the rich `MacroExpansionError` as the wrapped cause.
+        @test err.error isa JL.MacroExpansionError
+
+        # The programmatic API keeps raising the raw `MacroExpansionError`
+        # (`JuliaLowering.macroexpand` introspection likewise -- both bypass
+        # the flisp-compat boundary, matching flisp's `throw_load_error=0`).
+        @test_throws JL.MacroExpansionError JL.eval(mac_mod, bad)
+        @test_throws JL.MacroExpansionError JL.include_string(mac_mod, "@boom(0)")
+        @test_throws JL.MacroExpansionError JL.macroexpand(mac_mod, bad)
+
+        # `core_lowering_hook` (the `Core.eval`/`include` path) wraps too, and
+        # does *not* emit the triage log for these user/package errors.
+        io = IOBuffer()
+        Base.CoreLogging.with_logger(Base.CoreLogging.SimpleLogger(io)) do
+            hookerr = try
+                JL.core_lowering_hook(Expr(:macrocall, GlobalRef(mac_mod, Symbol("@boom")),
+                                           LineNumberNode(1, :none), 0), mac_mod)
+                nothing
+            catch e; e; end
+            @test hookerr isa LoadError
+            @test hookerr.error isa JL.MacroExpansionError
+        end
+        @test !occursin("JuliaLowering threw given input", String(take!(io)))
+
+        # End-to-end `@eval @boom(0)` under an active lowerer -> LoadError.
+        Core.eval(test_mod, :(macro boom(x); x == 0 && error("bad x"); :(nothing); end))
+        prog = parseall(Expr, "try; @eval(@boom(0)); false; catch e; e isa LoadError; end")
+        try
+            JL.activate!()
+            @test Core.eval(test_mod, prog) === true
+        finally
+            JL.activate!(false)
+        end
+    end
 end

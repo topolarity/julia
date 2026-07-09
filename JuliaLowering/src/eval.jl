@@ -821,6 +821,86 @@ end
     return invoke_in_lowering_world(_lower_and_eval, mod, ex, ver, soft_scope)
 end
 
+# Render an `internal=false` `LoweringError` (bad user code -- the JuliaLowering
+# analogue of flisp's `Expr(:error, msg)` sentinel; see the `LoweringError`
+# docstring) into a plain message string, mirroring flisp's lowering-error
+# message. Source location is appended in flisp's `format-loc` style
+# (" around file:line") when available.
+function _lowering_error_message(exc::LoweringError)
+    io = IOBuffer()
+    for i in eachindex(exc.msgs)
+        i > 1 && print(io, '\n')
+        print(io, exc.msgs[i])
+        lnn = try
+            source_location(LineNumberNode, exc.sts[i])
+        catch
+            nothing
+        end
+        if lnn isa LineNumberNode && lnn.line != 0 &&
+                lnn.file !== :none && lnn.file !== nothing
+            print(io, " around ", lnn.file, ":", lnn.line)
+        end
+    end
+    return String(take!(io))
+end
+
+# Wrap a `MacroExpansionError` (a macro that threw while being expanded) in a
+# `LoadError`, matching flisp: `jl_invoke_julia_macro` wraps any exception from
+# a macro body in `LoadError(file, line, err)` on the real top-level-lowering
+# path (its `throw_load_error` flag; `src/ast.c`). Packages assert this via the
+# standard `@test_throws LoadError @eval @somemacro(bad)` idiom. We keep the
+# rich `MacroExpansionError` as the `LoadError`'s wrapped error (it already
+# carries the raw cause under "Caused by:"), so `isa LoadError` holds while the
+# macro-expansion diagnostics are preserved.
+function _macroexpansion_loaderror(exc::MacroExpansionError,
+                                   fallback::LineNumberNode=LineNumberNode(0, :none))
+    lnn = fallback
+    try
+        l = source_location(LineNumberNode, exc.ex)
+        if l isa LineNumberNode && l.line != 0
+            lnn = l
+        end
+    catch
+    end
+    file = lnn.file === nothing ? "none" : String(lnn.file)
+    return LoadError(file, lnn.line, exc)
+end
+
+# flisp-compatible `eval` used by the `@eval` macro. Behaves like `eval`, but
+# restores flisp's user-facing error contract at the top-level-eval boundary
+# (there `@eval` expands to `Core.eval`):
+#
+# * a user-facing (`internal=false`) `LoweringError` surfaces as an ordinary
+#   `ErrorException` (`LoweringError` is `<: Exception` but not `<:
+#   ErrorException`, silently breaking `@test_throws ErrorException @eval(bad)`
+#   for syntax/lowering errors -- found via DataPipes); and
+# * a `MacroExpansionError` (a macro erroring during expansion) is wrapped in
+#   `LoadError`, as flisp's macro-invocation path does (breaking
+#   `@test_throws LoadError @eval @somemacro(bad)` -- found via StationXML /
+#   StrLiterals).
+#
+# The conversions live here, on the `@eval` path (and, for the
+# `MacroExpansionError` case, in `core_lowering_hook`, the `Core.eval`/`include`
+# path), rather than in `eval` itself: `eval`/`include_string`/`lower` are
+# JuliaLowering's programmatic API and its own test suite asserts the richer
+# `LoweringError`/`MacroExpansionError` through them, so they must keep raising
+# them (mirroring flisp's introspection-only `macroexpand`, which does not
+# wrap). `internal` (assertion-class) `LoweringError`s stay loud everywhere.
+function eval_flisp_compat(mod::Module, @nospecialize(ex);
+                           soft_scope::Union{Nothing,Bool}=nothing,
+                           expr_compat_mode::Bool=false)
+    try
+        return eval(mod, ex; soft_scope, expr_compat_mode)
+    catch exc
+        if exc isa MacroExpansionError
+            throw(_macroexpansion_loaderror(exc))
+        elseif exc isa LoweringError && !exc.internal
+            throw(ErrorException(_lowering_error_message(exc)))
+        end
+        rethrow()
+    end
+end
+
 # `ex` may be a `SyntaxTree` or an `Expr` (or `Expr` tree leaves of any type).
 function _lower_and_eval(mod::Module, @nospecialize(ex), ver::VersionNumber,
                          soft_scope::Union{Nothing,Bool})

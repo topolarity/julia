@@ -278,7 +278,11 @@ function _at_eval_code(mc::MacroContext, mod_st::SyntaxTree, ex)
         [K"local"
             [K"="
                 val
-                [K"call" JuliaLowering.eval::K"Value"
+                [K"call"
+                    # `eval_flisp_compat` mirrors flisp's `@eval` == `Core.eval`:
+                    # a user-facing lowering error surfaces as an `ErrorException`
+                    # rather than a raw `LoweringError`. See its definition.
+                    JuliaLowering.eval_flisp_compat::K"Value"
                     mod_st
                     [K"call" JuliaSyntax.fill_context::K"Value" q new_sc::K"Value"]
                 ]
