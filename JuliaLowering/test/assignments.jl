@@ -15,6 +15,7 @@ MyVector{T} = Array{1,T}
 @test test_mod.MyVector{Int} == Array{1,Int}
 
 # Chained assignment
+# From PkgEval: Gadfly v1.4.1 / SGCRNAs v1.1.0, via Compose src/svg.jl:990 (x, y += ... tuple update)
 @test JuliaLowering.include_string(test_mod, """
 let
     a = b = 42
@@ -99,6 +100,28 @@ let x = [1 2; 3 4]
     x
 end
 """) == [0 1 ; 3 4]
+
+# Tuple-destructuring updating assignment `x, y += a, b` (JuliaLang/julia#30062
+# path). `+` is defined on tuples of a test-owned type (as Measures.jl does for
+# Compose.jl), so the non-error branch of `contains_ssa_binding` executes.
+@test JuliaLowering.include_string(test_mod, """
+struct Vec1; v::Int; end
+Base.:+(a::Tuple{Vec1,Vec1}, b::Tuple{Vec1,Vec1}) = (Vec1(a[1].v+b[1].v), Vec1(a[2].v+b[2].v))
+let x = Vec1(1), y = Vec1(2)
+    x, y += Vec1(3), Vec1(4)
+    (x.v, y.v)
+end
+""") == (4, 6)
+
+# A tuple destructuring update whose left hand side contains a non-assignable
+# element gets hoisted into an ssavalue by remove_argument_side_effects and is
+# rejected (`contains_ssa_binding` true branch).
+@test_throws LoweringError JuliaLowering.include_string(test_mod, """
+let x = 1
+    f() = 3
+    f(), x += 10, 20
+end
+""")
 
 @testset "lhs forms" begin
     @test JuliaLowering.include_string(test_mod, """

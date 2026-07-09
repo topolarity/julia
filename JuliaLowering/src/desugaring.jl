@@ -43,6 +43,12 @@ function contains_identifier(ex::SyntaxTree, idents...)
     end
 end
 
+function contains_ssa_binding(ctx, ex)
+    contains_unquoted(ex) do e
+        kind(e) == K"BindingId" && get_binding(ctx, e).is_ssa
+    end
+end
+
 # Return true if `f(e)` is true for any unquoted child of `ex`, recursively.
 function contains_unquoted(f::Function, ex::SyntaxTree)
     if f(ex)

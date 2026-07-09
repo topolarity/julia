@@ -367,3 +367,36 @@ f() += y
 LoweringError:
 (if false end, b) += 2
 #└──────────┘ ── invalid syntax in left-hand side of assignment
+
+########################################
+# Updating assignment with tuple destructuring on left hand side
+begin
+    local x, y
+    x, y += a, b
+end
+#---------------------
+1   TestMod.+
+2   slot₂/x
+3   slot₃/y
+4   (call core.tuple %₂ %₃)
+5   TestMod.a
+6   TestMod.b
+7   (call core.tuple %₅ %₆)
+8   (call %₁ %₄ %₇)
+9   (call top.indexed_iterate %₈ 1)
+10  (= slot₂/x (call core.getfield %₉ 1))
+11  (= slot₁/iterstate (call core.getfield %₉ 2))
+12  slot₁/iterstate
+13  (call top.indexed_iterate %₈ 2 %₁₂)
+14  (= slot₃/y (call core.getfield %₁₃ 1))
+15  (return %₈)
+
+########################################
+# Error: Updating assignment where tuple destructuring contains an ssavalue
+# location (a non-assignable element hoisted by remove_argument_side_effects,
+# JuliaLang/julia#30062)
+f(), x += 10, 20
+#---------------------
+LoweringError:
+f(), x += 10, 20
+└────┘ ── invalid multiple assignment location
