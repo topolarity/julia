@@ -2138,3 +2138,32 @@ end
         "module M2; macro d(ex); ex; end; f() = @d(g()=1); end";
         expr_compat_mode=true)
 end
+
+@testset "(AI) @eval'd method-def payload extends eval-target global (flisp compat)" begin
+    # A macro that relays its own argument to a nested `@eval` -- PETSc.jl's
+    # `@for_libpetsc begin ... end` idiom, which generates per-scalar-type methods
+    # for a type from a runtime list -- hands a block of method defs to a fresh
+    # `eval()`.  flisp evaluates such a payload through an inert quote, stripping
+    # the relaying macro's hygiene, so both a curly-form def (`T{S}(...)`, which
+    # references the global type `T`) and a plain-form def (`T(...)`, an outer
+    # constructor) in the same block extend the eval-target module's global `T`.
+    # Previously the plain-form name became a spurious hygienic local, which the
+    # curly-form def then read undefined: `UndefVarError: T@1 not defined in
+    # local scope` (found via SafePETSc -> PETSc.jl in PkgEval).
+    src = """
+        macro relay(expr); quote; @eval \$expr; end; end
+        mutable struct PCr{T}; ptr::Int; end
+        @relay begin
+            PCr{Float64}(comm::Bool) = PCr{Float64}(0)
+            PCr(x::Vector{Float64}) = PCr{Float64}(0)
+        end
+        results() = (PCr{Float64}(true).ptr, PCr(Float64[1.0]).ptr)
+    """
+    # Compares JuliaLowering's Expr-compat mode (the flisp round-trip path, which
+    # the old-style `@relay`/`@eval` expansion uses) against flisp.
+    mfl = Module(); Base.include_string(mfl, src); Core.@latestworld
+    mjl = Module(); JuliaLowering.include_string(mjl, src; expr_compat_mode=true)
+    Core.@latestworld
+    @test mfl.results() == (0, 0)
+    @test mjl.results() == mfl.results()
+end
