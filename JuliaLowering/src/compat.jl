@@ -71,14 +71,32 @@ function _expr_to_est(graph::SyntaxGraph, @nospecialize(e), src::SourceAttrType)
         cid, _ = _expr_to_est(graph, e.value, src)
         newnode(graph, src, K"inert", NodeId[cid])
     elseif e isa Expr && e.head === :lambda && length(e.args) == 2
-        argnames = e.args[1]::Vector{Any}
+        # flisp accepts any iterable of Symbols for the argnames slot (e.g.
+        # Tricks.jl's `create_codeinfo_with_returnvalue`, used by ValSplit,
+        # hands it a `Vector{Symbol}`); the per-name `::Symbol` assert below
+        # carries the real contract, so don't over-constrain the container type.
+        # The former `::Vector{Any}` spuriously rejected the common
+        # `Vector{Symbol}` case with a `TypeError`.
+        argnames = e.args[1]
         arg_cs = NodeId[]
         for name in argnames
             id = newleaf(graph, src, K"Identifier")
             setattr!(id, :name_val, String(name::Symbol))
             push!(arg_cs, id._id)
         end
-        body_id, src = _expr_to_est(graph, e.args[2], src)
+        # flisp spells an already-lowered lambda body as `(scope-block body)`;
+        # that scope-block just delimits the lambda's own scope, which the
+        # `K"lambda"` node below already provides. It is a lowering-internal form
+        # (not valid surface input to the pipeline this hook re-runs in full), so
+        # unwrap it to the inner body, matching the plain-`block` body shape the
+        # pipeline can desugar. Tricks.jl's `create_codeinfo_with_returnvalue`
+        # (used by ValSplit) builds exactly this `(lambda args (scope-block ...))`.
+        lam_body = e.args[2]
+        if lam_body isa Expr && lam_body.head === Symbol("scope-block") &&
+                length(lam_body.args) == 1
+            lam_body = lam_body.args[1]
+        end
+        body_id, src = _expr_to_est(graph, lam_body, src)
         args_block = newnode(graph, src, K"block", arg_cs)
         tvars_block = newnode(graph, src, K"block", NodeId[])
         st = newnode(graph, src, K"lambda",

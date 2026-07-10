@@ -110,9 +110,19 @@ function core_lowering_hook(@nospecialize(code), mod::Module, file::Union{String
             # errors, not JuliaLowering bugs, so they skip the triage log below.
             throw(_macroexpansion_loaderror(exc, LineNumberNode(line, Symbol(file))))
         end
-        @info("JuliaLowering threw given input:",
-              code=TruncatedForLog(code), st0=TruncatedForLog(st0), st1=TruncatedForLog(st1),
-              file=file, line=line, mod=mod)
+        # Diagnostic triage log for JuliaLowering failures (collected during
+        # PkgEval etc). Skip it when lowering runs inside a `@generated`
+        # function's staging (or any other pure callback): the logger performs a
+        # blocking write, but task switching is forbidden there, so a write that
+        # can't complete synchronously crashes with "task switch not allowed from
+        # inside staged nor pure functions" -- masking `exc`, the real catchable
+        # lowering error, with an opaque one. The `rethrow` below runs either way,
+        # so `exc` always propagates unchanged.
+        if ccall(:jl_is_in_pure_context, Int8, ()) == 0
+            @info("JuliaLowering threw given input:",
+                  code=TruncatedForLog(code), st0=TruncatedForLog(st0), st1=TruncatedForLog(st1),
+                  file=file, line=line, mod=mod)
+        end
         rethrow(exc)
 
         # TODO: Re-enable flisp fallback once we're done collecting errors

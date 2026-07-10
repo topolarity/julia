@@ -1,3 +1,21 @@
+# Scaffolding for the pure/staged-context test below: a `@generated` function
+# must be defined at module scope. Its generator deliberately fails lowering
+# (an unlabeled `break` outside any loop) while the runtime holds
+# `in_pure_callback == 1` (staging), and invokes the hook under a captured
+# logger so the test can assert the triage `@info` is suppressed there.
+const _pure_ctx_log = IOBuffer()
+@generated function _staged_lowering_probe(::Val{N}) where {N}
+    bad = Expr(:lambda, Any[Symbol("#self#"), :x],
+               Expr(:block, Expr(:break), Expr(:return, 1)))
+    Base.CoreLogging.with_logger(Base.CoreLogging.SimpleLogger(_pure_ctx_log)) do
+        try
+            JuliaLowering.core_lowering_hook(bad, @__MODULE__)
+        catch
+        end
+    end
+    return :(nothing)
+end
+
 @testset "hooks" begin
     test_mod = Module()
 
@@ -177,6 +195,21 @@
         # ...and the overall log must stay small, regardless of how deep the
         # input expression is.
         @test sizeof(logtext) < 64_000
+    end
+
+    @testset "triage `@info` is suppressed inside pure/staged lowering" begin
+        # When lowering fails inside a `@generated` function's staging (or any
+        # pure callback), `core_lowering_hook`'s diagnostic `@info` must NOT
+        # run: its blocking write would hit "task switch not allowed from inside
+        # staged nor pure functions" under log-pipe backpressure (seen via
+        # PlanningDomains -> PDDL -> ValSplit), masking the real, catchable
+        # lowering error. Here `_staged_lowering_probe`'s generator fails
+        # lowering while `in_pure_callback == 1`; the captured logger must stay
+        # free of the triage marker. (The non-pure path above still logs it.)
+        take!(_pure_ctx_log)
+        _staged_lowering_probe(Val(1))
+        @test !occursin("JuliaLowering threw given input",
+                        String(take!(_pure_ctx_log)))
     end
 
     @testset "flisp-compat lowering errors (`@eval` path)" begin
