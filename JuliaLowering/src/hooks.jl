@@ -75,6 +75,23 @@ function core_lowering_hook(@nospecialize(code), mod::Module, file::Union{String
         end
         st0 = rebase_layers(st0, mod, JL_OLD_SYNTAX_VERSION)
         st1 = expand_forms_1(st0, world, true)
+        # Re-check the kind after macro/hygiene expansion, mirroring the
+        # pre-expansion early-out on `st0` above. `expand_forms_1` can turn a
+        # `hygienic-scope`-wrapped form into a bare top-level `module`: a macro
+        # returning `Expr(:toplevel, Expr(:module, ...))` (the "macro defines a
+        # module" idiom, e.g. EnumX/SuperEnum) that is `@macroexpand`ed and then
+        # `eval`ed separately reaches us as the `hygienic-scope`-wrapped `module`
+        # child alone -- the C toplevel driver (`jl_eval_toplevel_stmts`) peels
+        # the enclosing `:toplevel` and re-lowers each child, and only the
+        # `module` child needs lowering. Such a `module` is genuinely top-level,
+        # but `expand_forms_2` unconditionally rejects any `module` it sees (at
+        # that point one can only be illegally nested). Wrap it in a `toplevel`
+        # so it reuses the existing `K"toplevel"` handling, which defers module
+        # creation to a fresh `eval` (preserving the body's macro hygiene), just
+        # as happens when the same macro is expanded and evaluated in one step.
+        if kind(st1) === K"module"
+            st1 = @ast st1._graph st1 [K"toplevel" st1]
+        end
         ctx2, st2 = expand_forms_2(st1, world)
         ctx3, st3 = resolve_scopes(ctx2, st2)
         ctx4, st4 = convert_closures(ctx3, st3)

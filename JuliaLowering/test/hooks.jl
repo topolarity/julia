@@ -80,6 +80,68 @@
         @test jeval("Base.@propagate_inbounds @inline meta_double_quote_issue(x) = x") isa Function
     end
 
+    @testset "macroexpand-then-eval of a macro-generated `module`" begin
+        # A macro returning `Expr(:toplevel, Expr(:module, ...))` (the "macro
+        # defines a module" idiom -- EnumX's `@enumx`, SuperEnum's `@superenum`)
+        # that is `@macroexpand`ed into a captured value and then `eval`ed
+        # *separately* (SuperEnum's own test idiom). `@macroexpand` uses the
+        # flisp macro expander, which serializes the module through a
+        # `hygienic-scope` wrapper; the C toplevel driver peels the enclosing
+        # `:toplevel` and hands that wrapper to `core_lowering_hook` alone, so
+        # after macro/hygiene expansion the form surfaces as a bare top-level
+        # `module`. It must still be recognized as top-level -- this used to fail
+        # with "`module` is only allowed at top level" (evaluating the same macro
+        # call inline always worked; only the macroexpand-then-eval path broke).
+        out = jeval("""
+            module MkModHome
+                const SECRET = 41
+                macro mkmod(name)
+                    blk = quote
+                        module \$(esc(name))
+                            const \$(esc(:got)) = SECRET + 1  # RHS unescaped -> macro home
+                        end
+                        const \$(esc(:trailing)) = 7          # trailing toplevel stmt
+                    end
+                    blk.head = :toplevel
+                    return blk
+                end
+            end
+            expr = @macroexpand MkModHome.@mkmod EnumMod
+            @assert expr.head == :toplevel
+            Core.eval(@__MODULE__, expr)
+            (EnumMod.got, trailing)
+        """)
+        # module created, its body evaluated (escaped `got` binds in `EnumMod`),
+        # unescaped `SECRET` resolves back to the macro's home module
+        # (`MkModHome`, giving 42, i.e. hygiene preserved), and the toplevel
+        # statement trailing the module also runs.
+        @test out == (42, 7)
+        @test isdefined(test_mod, :EnumMod)
+        @test isdefined(test_mod.EnumMod, :got)
+
+        # The same captured expression `eval`ed a second time re-runs cleanly
+        # (no template-mutation hazard from the first lowering).
+        out2 = jeval("""
+            module MkModHome2
+                macro mkmod(name)
+                    blk = quote
+                        module \$(esc(name))
+                            const \$(esc(:w)) = 7
+                        end
+                    end
+                    blk.head = :toplevel
+                    return blk
+                end
+            end
+            expr = @macroexpand MkModHome2.@mkmod TwiceMod
+            Core.eval(@__MODULE__, expr)
+            r1 = TwiceMod.w
+            Core.eval(@__MODULE__, expr)
+            (r1, TwiceMod.w)
+        """)
+        @test out2 == (7, 7)
+    end
+
     @testset "error log attachments are truncated" begin
         # Regression test: `core_lowering_hook`'s `@info` on a caught
         # exception used to render `code`/`st0`/`st1` unboundedly.  A large
