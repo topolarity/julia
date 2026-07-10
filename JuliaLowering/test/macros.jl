@@ -2893,3 +2893,72 @@ end
     @test mfl.results() == (42, 43, true, false, true, false)
     @test mjl.results() == mfl.results()
 end
+
+@testset "eval-free macro-name resolution (generated-function staging)" begin
+    # A @generated generator can return a deferred macrocall whose name is a
+    # dotted expression headed by an *interpolated value* (e.g. Unrolled.jl's
+    # recursive `$Mod.@mac`). Such names must resolve without `eval`, since
+    # generator bodies are lowered inside a "pure" callback where `eval` is
+    # forbidden. flisp resolves every identifier/value dot-chain eval-free (via
+    # the C `a.b` fast path) and rejects only names needing arbitrary evaluation
+    # with "eval cannot be used in a generated function"; JuliaLowering must
+    # match. Full oracle: bugs/macro-eval-in-generated/notes.md.
+    macname_mod = Module(:MacnameHost)
+    Core.eval(macname_mod, :(import JuliaLowering))
+    Core.eval(macname_mod, :(module Mod
+            macro double(ex); esc(:(2 * ($ex))); end
+            module Sub
+                macro triple(ex); esc(:(3 * ($ex))); end
+            end
+        end))
+    Core.eval(macname_mod, :(struct Holder end))
+    Core.eval(macname_mod, :(Base.getproperty(::Holder, s::Symbol) =
+        s === Symbol("@double") ? Mod.var"@double" : getfield(Holder(), s)))
+    Core.@latestworld
+    Mod = macname_mod.Mod
+    Holder = macname_mod.Holder
+    dbl = Mod.var"@double"
+    trp = Mod.Sub.var"@triple"
+
+    # Build the macro-name SyntaxTree exactly as `eval_macro_name` sees it:
+    # convert the deferred `Expr` (raw value spliced in) and expand its head.
+    function macname_st(nameexpr)
+        ex = Expr(:macrocall, nameexpr, LineNumberNode(0, :test), 3)
+        JuliaLowering.macroexpand(macname_mod, JuliaLowering.expr_to_est(ex)[1])
+    end
+    world = Base.get_world_counter()
+    resolve(nameexpr) = JuliaLowering._eval_dot(world, macname_mod, macname_st(nameexpr))
+
+    # These calls take the eval-free path directly (no `jl_toplevel_eval`), so a
+    # correct return proves resolution without eval - the property staging needs.
+    # Accepted, eval-free shapes (flisp: all OK):
+    @test resolve(Expr(:., Mod, QuoteNode(Symbol("@double")))) === dbl          # $Mod.@mac
+    @test resolve(Expr(:., Expr(:., Mod, QuoteNode(:Sub)),
+                       QuoteNode(Symbol("@triple")))) === trp                    # $Mod.Sub.@mac
+    @test resolve(Expr(:., Holder(), QuoteNode(Symbol("@double")))) === dbl      # $value.@mac (getproperty)
+    @test resolve(Expr(:., :Mod, QuoteNode(Symbol("@double")))) === dbl          # Mod.@mac
+    @test resolve(Expr(:., Expr(:., :Mod, QuoteNode(:Sub)),
+                       QuoteNode(Symbol("@triple")))) === trp                    # Mod.Sub.@mac
+    # A name needing arbitrary evaluation falls through to the catch-all (flisp:
+    # rejected in pure context with "eval cannot be used in a generated function"):
+    @test resolve(Expr(:., Expr(:call, :identity, :Mod),
+                       QuoteNode(Symbol("@double")))) isa JuliaLowering.NotAName
+
+    # End-to-end @generated staging is only exercised when this JuliaLowering is
+    # the one baked into the running sysimage - staging always dispatches to
+    # `Base.JuliaLowering`, so otherwise this would run stale code. Gated exactly
+    # like the may_invoke_generator parity test in functions.jl.
+    if isdefined(Base, :JuliaLowering) && Base.JuliaLowering === JuliaLowering
+        stage_mod = Module(:MacnameStage)
+        JuliaLowering.include_string(stage_mod, """
+            module Inner
+                macro double(ex); esc(:(2 * (\$ex))); end
+            end
+            @generated function fgen(x)
+                :(\$(Inner).@double(x))
+            end
+            """)
+        Core.@latestworld
+        @test JuliaLowering.include_string(stage_mod, "fgen(3)") == 6
+    end
+end

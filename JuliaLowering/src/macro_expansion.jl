@@ -146,17 +146,34 @@ function Base.showerror(io::IO, exc::MacroExpansionError)
     end
 end
 
+# Sentinel returned by `_eval_dot` when a name isn't a plain identifier/value or
+# a qualified `.`-chain of them, so `eval_macro_name` can fall back to eval.
+struct NotAName end
+
+# Resolve a macro-name expression to its value *without* calling `eval`,
+# mirroring the C `jl_eval_dot_expr` fast path that lets qualified names resolve
+# even inside a generated-function ("pure") context. Handles identifiers,
+# interpolated `Value` leaves (e.g. a `Module` spliced into the name, as in
+# `$Mod.@mac`), and `.`-chains of them (`A.B.@mac`, `$Mod.Sub.@mac`); the
+# leftmost identifier is looked up in `mod`. `getproperty` covers both module
+# and non-module qualifiers, matching flisp. Returns `NotAName()` for anything
+# that would require arbitrary evaluation.
 function _eval_dot(world::UInt, mod, ex::SyntaxTree)
-    if kind(ex) === K"."
-        mod = _eval_dot(world, mod, ex[1])
-        ex = ex[2]
+    k = kind(ex)
+    if k === K"Value"
+        return ex.value
+    elseif k === K"Identifier"
+        return _invoke_in_world(world, getproperty, mod, Symbol(ex.name_val))
+    elseif k === K"." && numchildren(ex) == 2
+        lhs = _eval_dot(world, mod, ex[1])
+        lhs isa NotAName && return lhs
+        rhs = ex[2]
+        kind(rhs) === K"inert" && (rhs = rhs[1])
+        kind(rhs) in KSet"Identifier Symbol" || return NotAName()
+        return _invoke_in_world(world, getproperty, lhs, Symbol(rhs.name_val))
+    else
+        return NotAName()
     end
-    if kind(ex) === K"inert"
-        ex = ex[1]
-    end
-    kind(ex) in KSet"Identifier Symbol" && mod isa Module ?
-        _invoke_in_world(world, getproperty, mod, Symbol(ex.name_val)) :
-        nothing
 end
 
 # If macroexpand(ex[1]) is an identifier or dot-expression, we can simply grab
@@ -175,15 +192,25 @@ function eval_macro_name(ctx, mctx::MacroContext, st0::SyntaxTree)
                              syntax_module(st), Symbol(st.name_val))
         elseif kind(st) === K"." &&
                 # TODO: correct mod?
-                (ed = _eval_dot(ctx.world, mod, st); !isnothing(ed))
+                (ed = _eval_dot(ctx.world, mod, st); !(ed isa NotAName))
             ed
         else
-            # `ex` might contain a nontrivial mix of scopes so we can't just
+            # The name isn't a plain identifier/value or a qualified `.`-chain
+            # of them, so resolving it requires arbitrary evaluation. Inside a
+            # generated-function ("pure") context flisp forbids exactly this (its
+            # `jl_toplevel_eval` of the name hits the pure-callback guard once the
+            # name is no longer an `a.b` fast path), so raise the same error here
+            # rather than attempt a lowering that can only fail. At true top level
+            # we evaluate, matching flisp.
+            if ccall(:jl_is_in_pure_context, Int8, ()) != 0
+                error("eval cannot be used in a generated function")
+            end
+            # `st` might contain a nontrivial mix of scopes so we can't just
             # `eval()` it, as it's already been partially lowered by this point.
             # Instead, we repeat the latter parts of `lower()` here.
-             ctx2, st2 = expand_forms_2(st, ctx.world)
-             ctx3, st3 = resolve_scopes(ctx2, st2)
-             ctx4, st4 = convert_closures(ctx3, st3)
+            ctx2, st2 = expand_forms_2(st, ctx.world)
+            ctx3, st3 = resolve_scopes(ctx2, st2)
+            ctx4, st4 = convert_closures(ctx3, st3)
             _ctx5, st5 = linearize_ir(ctx4, st4)
             expr_form  = to_lowered_expr(st5)
             ccall(:jl_toplevel_eval, Any, (Any, Any), mod, expr_form)
