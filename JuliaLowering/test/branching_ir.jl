@@ -265,3 +265,81 @@ end
 9   (= slot₁/loop-exit_result core.nothing)
 10  slot₁/loop-exit_result
 11  (return %₁₀)
+
+########################################
+# Diverging `&&` condition term: trailing `return` (the PSSFSS `&& return` idiom)
+function f(a, b)
+    if a && return b
+    end
+    99
+end
+#---------------------
+1   (method TestMod.f)
+2   latestworld
+3   TestMod.f
+4   (call core.TypeEqOf %₃)
+5   (call core.svec %₄ core.Any core.Any)
+6   (call core.svec)
+7   SourceLocation::1:10
+8   (call core.svec %₅ %₆ %₇)
+9   --- method TestMod.f %₈
+    slots: [slot₁/#self#(!read) slot₂/a slot₃/b]
+    1   (gotoifnot slot₂/a label₄)
+    2   slot₃/b
+    3   (return %₂)
+    4   (return 99)
+10  latestworld
+11  TestMod.f
+12  (return %₁₁)
+
+########################################
+# Diverging `||` condition term: trailing `return`
+function g(a, b)
+    if a || return b
+    end
+    99
+end
+#---------------------
+1   (method TestMod.g)
+2   latestworld
+3   TestMod.g
+4   (call core.TypeEqOf %₃)
+5   (call core.svec %₄ core.Any core.Any)
+6   (call core.svec)
+7   SourceLocation::1:10
+8   (call core.svec %₅ %₆ %₇)
+9   --- method TestMod.g %₈
+    slots: [slot₁/#self#(!read) slot₂/a slot₃/b]
+    1   (gotoifnot slot₂/a label₃)
+    2   (goto label₅)
+    3   slot₃/b
+    4   (return %₃)
+    5   (return 99)
+10  latestworld
+11  TestMod.g
+12  (return %₁₁)
+
+########################################
+# Diverging `&&` condition term in a non-final position (parens flatten `[a, return, b]`)
+function h(a, b)
+    if (a && return 1) && b
+    end
+    99
+end
+#---------------------
+1   (method TestMod.h)
+2   latestworld
+3   TestMod.h
+4   (call core.TypeEqOf %₃)
+5   (call core.svec %₄ core.Any core.Any)
+6   (call core.svec)
+7   SourceLocation::1:10
+8   (call core.svec %₅ %₆ %₇)
+9   --- method TestMod.h %₈
+    slots: [slot₁/#self#(!read) slot₂/a slot₃/b]
+    1   (gotoifnot slot₂/a label₃)
+    2   (return 1)
+    3   (return 99)
+10  latestworld
+11  TestMod.h
+12  (return %₁₁)

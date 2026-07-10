@@ -415,6 +415,12 @@ end
 
 function compile_condition_term(ctx, ex)
     cond = compile(ctx, ex, true, false)
+    # A term whose evaluation diverges (eg an embedded `return`/`break`/
+    # `continue`) compiles to `nothing`, JuliaLowering's marker for "no
+    # reachable value here". Signal this to `compile_conditional` by returning
+    # `nothing` rather than passing it on to `is_valid_body_ir_argument`, which
+    # would crash trying to take its `kind`.
+    isnothing(cond) && return nothing
     if !is_valid_body_ir_argument(ctx, cond)
         cond = emit_assign_tmp(ctx, cond)
     end
@@ -436,6 +442,10 @@ function compile_conditional(ctx, ex, false_label)
         true_label = make_label(ctx, test)
         for (i,e) in enumerate(children(test))
             c = compile_condition_term(ctx, e)
+            # A diverging term (eg `a || return x`) already emitted its control
+            # flow; the remaining terms and the short-circuit target are
+            # unreachable, so stop emitting gates for this chain.
+            isnothing(c) && break
             if i < numchildren(test)
                 next_term_label = make_label(ctx, test)
                 # Jump over short circuit
@@ -451,11 +461,15 @@ function compile_conditional(ctx, ex, false_label)
     elseif k == K"&&"
         for e in children(test)
             c = compile_condition_term(ctx, e)
+            # A diverging term (eg `a && return x`) already emitted its control
+            # flow; the remaining terms and the true branch are unreachable.
+            isnothing(c) && break
             emit(ctx, @ast ctx e [K"gotoifnot" c false_label])
         end
     else
         c = compile_condition_term(ctx, test)
-        emit(ctx, @ast ctx test [K"gotoifnot" c false_label])
+        # A bare diverging test (eg `if return x; ...; end`) needs no gate.
+        isnothing(c) || emit(ctx, @ast ctx test [K"gotoifnot" c false_label])
     end
 end
 
