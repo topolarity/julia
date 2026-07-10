@@ -119,8 +119,12 @@ end
 function _relayer_global_if_unhygienic(done::SyntaxList, st::SyntaxTree, sc::SyntaxContext)
     k = kind(st)
     if k === K"Identifier" && is_flisp_compat(st) && st.context::SyntaxContext !== sc
+        # collect (original, relayered) pairs, consumed by the
+        # K"relayered_global" markers emitted at the call sites
+        st2 = setattr(st, :context, sc)
         push!(done, st)
-        setattr(st, :context, sc)
+        push!(done, st2)
+        st2
     elseif k === K"::" || k === K"kw"
         n_done = length(done)
         lhs = _relayer_global_if_unhygienic(done, st[1], sc)
@@ -2325,8 +2329,9 @@ function expand_decls(ctx, ex)
             elseif simple
                 (c, relayered) = relayer_global_if_unhygienic(ctx, c);
             end
-            @isdefined(relayered) && for x in relayered
-                push!(stmts, @ast ctx x [K"relayered_global" x])
+            @isdefined(relayered) && for i in 1:2:length(relayered)
+                push!(stmts, @ast ctx relayered[i] [
+                    K"relayered_global" relayered[i] relayered[i+1]])
             end
         end
         lhs = @stm c begin
@@ -2377,8 +2382,9 @@ function expand_const_decl(ctx, ex)
             (lhs, relayered) = relayer_global_if_unhygienic(ctx, x[1])
             make_lhs_decls(
                 ctx, decls, K"global", get(ex[1], :meta, nothing), lhs, false)
-            for x in relayered
-                push!(decls, @ast ctx x [K"relayered_global" x])
+            for i in 1:2:length(relayered)
+                push!(decls, @ast ctx relayered[i] [
+                    K"relayered_global" relayered[i] relayered[i+1]])
             end
             x2 = @ast ctx x [K"=" lhs x[2]]
             @ast ctx ex [K"block" decls... expand_assignment(ctx, x2, true)]

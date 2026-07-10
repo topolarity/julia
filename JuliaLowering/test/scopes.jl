@@ -962,7 +962,8 @@ end
                             end))
         run(:(import ..test_mod.@old_hyg_g_rescope_conflict_new2))
         Core.@latestworld
-        @test_throws "unhygienic global" run(:(@old_hyg_g_rescope_conflict_new2())) context=ctx
+        # the `global` comes first, so the `local` is what conflicts
+        @test_throws "conflicts with an existing global variable" run(:(@old_hyg_g_rescope_conflict_new2())) context=ctx
 
         fl_eval(test_mod, :(macro old_hyg_g_rescope_conflict_new3();
                                 :(let
@@ -982,13 +983,14 @@ end
                             end))
         run(:(import ..test_mod.@old_hyg_g_rescope_conflict_new4))
         Core.@latestworld
-        @test_throws "conflicts with an existing local variable" run(:(@old_hyg_g_rescope_conflict_new4())) context=ctx
+        # the `global` comes first, so the `local` is what conflicts
+        @test_throws "conflicts with an existing global variable" run(:(@old_hyg_g_rescope_conflict_new4())) context=ctx
     end
 
-    # A reference in the same scope as the declaration: flisp keeps the
-    # reference hygienic (hitting the undefined macro-module global), but
-    # JuliaLowering deliberately resolves it to the global the declaration just
-    # created in the calling module, which is more consistent.
+    # A reference in the same scope as the declaration: both lowerers keep the
+    # reference hygienic, hitting the (undefined) macro-home-module global —
+    # consistent with the home-module exemption for co-emitted defs/assignments
+    # (all data rows assert ref_resolves=false).
     @testset "references in the declaring scope" for (ctx, mod, run, ref_resolves) in [
         ("flisp reference (delete if fail)", fl_mod, x->fl_eval(fl_mod, x), false),
         ("jl expr_compat_mode=true", jl_mod, x->jl_eval(jl_mod, x; expr_compat_mode=true), false),
@@ -1151,6 +1153,129 @@ end
 @testset "@isdefined sees imported globals" begin
     # implicit Core/Base visibility and `using`-provided names count as defined
     # at module scope
+# An unhygienic `global` declaration exempts its name from hygiene renaming in
+# flisp: sibling bare occurrences of the same raw symbol classify as global in
+# the declaring scope and resolve in the macro's *home* module (while the
+# declaration itself, and any initialization with it, target the *calling*
+# module).  This is the Clang.jl lazy-dlsym wrapper idiom
+# (`let cache = C_NULL; global f; f() = ...; end`); JuliaLowering used to
+# reject it as an "unhygienic global" conflict with the def's hygienic local.
+@testset "(AI) compat: unhygienic global gives sibling occurrences global reach" for (ctx, mod, run) in [
+    ("flisp reference (delete if fail)", fl_mod, x->fl_eval(fl_mod, x)),
+    ("jl expr_compat_mode=true", jl_mod, x->jl_eval(jl_mod, x; expr_compat_mode=true)),
+    ("jl expr_compat_mode=false", jl_mod, x->jl_eval(jl_mod, x; expr_compat_mode=false))]
+
+    # the lazy-cache idiom: same-scope method def targets the home module; the
+    # declaration leaves the caller's global declared but unassigned
+    fl_eval(test_mod, :(macro old_hyg_gsib_cached();
+                            quote
+                                let ptr = 0
+                                    global old_hyg_gsib_cached_G
+                                    old_hyg_gsib_cached_G() =
+                                        (ptr == 0 ? (ptr = 42) : ptr)
+                                end
+                            end
+                        end))
+    run(:(import ..test_mod.@old_hyg_gsib_cached))
+    Core.@latestworld
+    run(:(@old_hyg_gsib_cached))
+    Core.@latestworld
+    @test getglobal(test_mod, :old_hyg_gsib_cached_G)() == 42 context=ctx
+    @test !Base.isdefinedglobal(mod, :old_hyg_gsib_cached_G) context=ctx
+    Base.delete_binding(mod, :old_hyg_gsib_cached_G)
+    Base.delete_binding(test_mod, :old_hyg_gsib_cached_G)
+
+    # multiple defs and a same-scope call, without the let
+    fl_eval(test_mod, :(macro old_hyg_gsib_defs();
+                            quote
+                                global old_hyg_gsib_defs_G
+                                old_hyg_gsib_defs_G() = 1
+                                old_hyg_gsib_defs_G(a) = a + 1
+                                old_hyg_gsib_defs_G() + old_hyg_gsib_defs_G(4)
+                            end
+                        end))
+    run(:(import ..test_mod.@old_hyg_gsib_defs))
+    Core.@latestworld
+    @test run(:(@old_hyg_gsib_defs)) == 6 context=ctx
+    Core.@latestworld
+    @test getglobal(test_mod, :old_hyg_gsib_defs_G)(41) == 42 context=ctx
+    @test !Base.isdefinedglobal(mod, :old_hyg_gsib_defs_G) context=ctx
+    Base.delete_binding(mod, :old_hyg_gsib_defs_G)
+    Base.delete_binding(test_mod, :old_hyg_gsib_defs_G)
+
+    # the def may precede the declaration; kwargs are fine
+    fl_eval(test_mod, :(macro old_hyg_gsib_kwdef();
+                            quote
+                                old_hyg_gsib_kwdef_G(; k = 1) = k
+                                global old_hyg_gsib_kwdef_G
+                            end
+                        end))
+    run(:(import ..test_mod.@old_hyg_gsib_kwdef))
+    Core.@latestworld
+    run(:(@old_hyg_gsib_kwdef))
+    Core.@latestworld
+    @test getglobal(test_mod, :old_hyg_gsib_kwdef_G)(k = 5) == 5 context=ctx
+    @test !Base.isdefinedglobal(mod, :old_hyg_gsib_kwdef_G) context=ctx
+    Base.delete_binding(mod, :old_hyg_gsib_kwdef_G)
+    Base.delete_binding(test_mod, :old_hyg_gsib_kwdef_G)
+
+    # sibling assignment and op-assignment write the home-module global
+    fl_eval(test_mod, :(global old_hyg_gsib_asgn_G = 42))
+    fl_eval(test_mod, :(macro old_hyg_gsib_asgn();
+                            quote
+                                global old_hyg_gsib_asgn_G
+                                old_hyg_gsib_asgn_G = 99
+                                old_hyg_gsib_asgn_G += 1
+                            end
+                        end))
+    run(:(import ..test_mod.@old_hyg_gsib_asgn))
+    Core.@latestworld
+    run(:(@old_hyg_gsib_asgn))
+    Core.@latestworld
+    @test getglobal(test_mod, :old_hyg_gsib_asgn_G) == 100 context=ctx
+    @test !Base.isdefinedglobal(mod, :old_hyg_gsib_asgn_G) context=ctx
+    Base.delete_binding(mod, :old_hyg_gsib_asgn_G)
+    Base.delete_binding(test_mod, :old_hyg_gsib_asgn_G)
+
+    # a sibling `const` also targets the home module
+    fl_eval(test_mod, :(macro old_hyg_gsib_const();
+                            quote
+                                global old_hyg_gsib_const_G
+                                const old_hyg_gsib_const_G = 3
+                            end
+                        end))
+    run(:(import ..test_mod.@old_hyg_gsib_const))
+    Core.@latestworld
+    run(:(@old_hyg_gsib_const))
+    Core.@latestworld
+    @test getglobal(test_mod, :old_hyg_gsib_const_G) == 3 context=ctx
+    @test !Base.isdefinedglobal(mod, :old_hyg_gsib_const_G) context=ctx
+    Base.delete_binding(mod, :old_hyg_gsib_const_G)
+    Base.delete_binding(test_mod, :old_hyg_gsib_const_G)
+
+    # a def in a nested scope is NOT reached by the declaration: it stays an
+    # (invisible) local of that scope, in neither module
+    fl_eval(test_mod, :(macro old_hyg_gsib_nested();
+                            quote
+                                global old_hyg_gsib_nested_G
+                                let
+                                    old_hyg_gsib_nested_G() = 44
+                                end
+                            end
+                        end))
+    run(:(import ..test_mod.@old_hyg_gsib_nested))
+    Core.@latestworld
+    run(:(@old_hyg_gsib_nested))
+    Core.@latestworld
+    @test !Base.isdefinedglobal(test_mod, :old_hyg_gsib_nested_G) context=ctx
+    @test !Base.isdefinedglobal(mod, :old_hyg_gsib_nested_G) context=ctx
+    Base.delete_binding(mod, :old_hyg_gsib_nested_G)
+    Base.delete_binding(test_mod, :old_hyg_gsib_nested_G)
+end
+
+@testset "(AI) @isdefined sees imported globals (#31)" begin
+    # allow_import=true matches flisp: implicit Core/Base visibility and
+    # `using`-provided names count as defined at module scope.
     m = Module(:IsdefM)
     @test JuliaLowering.include_string(m, "@isdefined Core") === true
     @test JuliaLowering.include_string(m, "@isdefined Base") === true

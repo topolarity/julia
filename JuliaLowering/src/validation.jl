@@ -1337,7 +1337,7 @@ vst2(vcx::Validation2Context, st::SyntaxTree) = @stm st begin
     [K"always_defined" x] -> vst2_ident(vcx, x)
     [K"assert" [K"Symbol"] x] -> vst2(vcx, x)
     [K"removable" x] -> vst2(vcx, x)
-    [K"relayered_global" [K"Identifier"]] -> pass()
+    [K"relayered_global" [K"Identifier"] [K"Identifier"]] -> pass()
 
     # Could be made stricter
     [K"foreigncall" _ [K"static_eval" rt] [K"static_eval" at] cconv roots_args...] ->

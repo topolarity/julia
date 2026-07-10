@@ -521,6 +521,31 @@ function _find_scope_decls!(ctx, scope, ex)
         explicit_declare_in_scope!(ctx, scope, ex[1], var_k)
     elseif k === K"global" && kind(ex[1]) === K"Identifier"
         explicit_declare_in_scope!(ctx, scope, ex[1], :global)
+    elseif k === K"relayered_global"
+        # `(relayered_global orig relayered)`: an unhygienic old-macro `global`
+        # declaration, relayered to the macrocall module.  flisp additionally
+        # exempts the declared name from hygiene renaming, so sibling bare
+        # occurrences of the same raw symbol -- references, assignments, and
+        # method-def targets -- classify as global in this scope and resolve in
+        # the macro's home module.  Declare the relayered global first (it may
+        # shadow a same-named identity-mapped parameter, redirecting `orig`'s
+        # key), then bind `orig`'s key to a home-module global unless it is
+        # already bound or aliased.  A pre-existing non-global binding for the
+        # raw name is a genuine hygienic collision and errors, as in the
+        # `K"relayered_global"` check during resolution.
+        _record_layer!(ctx, ex[1])
+        _record_layer!(ctx, ex[2])
+        explicit_declare_in_scope!(ctx, scope, ex[2], :global)
+        nk = NameKey(ex[1])
+        bid = get(scope.vars, nk, nothing)
+        if isnothing(bid)
+            haskey(scope.arg_aliases, nk) ||
+                declare_in_scope!(ctx, scope, ex[1], :global)
+        elseif get_binding(ctx, bid).kind !== :global
+            throw(LoweringError(ex, string(
+                "unhygienic global name `$(nk.name)` conflicts ",
+                "with an existing $(_var_str(get_binding(ctx, bid).kind))")))
+        end
     elseif k === K"function_decl"
         k1 = kind(ex[1])
         _record_layer!(ctx, ex[1])

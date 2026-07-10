@@ -95,9 +95,13 @@ function _register_kinds()
             # [K"always_defined" x] is an assertion that variable `x` is assigned before use
             # ('local-def in flisp implementation is K"local" plus K"always_defined"
             "always_defined"
-            # `(relayered_global old::Identifier)` is used to tell scope
-            # resolution that any declaration conflicting with `(global old)`
-            # should fail, even though `old` was never actually declared
+            # `(relayered_global orig::Identifier relayered::Identifier)`
+            # marks an unhygienic old-macro `global` declaration: `relayered`
+            # is the declaration's identifier relayered to the macrocall
+            # module, `orig` the identifier as written.  Scope resolution
+            # declares the relayered global, gives sibling occurrences of
+            # `orig` global reach in the scope, and rejects declarations
+            # genuinely conflicting with `orig`
             "relayered_global"
             "_while"
             "_do_while"
