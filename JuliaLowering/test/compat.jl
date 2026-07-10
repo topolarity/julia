@@ -680,6 +680,39 @@ end
     @test_throws JL.LoweringError JL.core_lowering_hook(bad, test_mod)
 end
 
+@testset "`(meta generated gen)` keeps the generator evaluable" begin
+    # Generated functions declared with the raw stub idiom reference their
+    # generator BY NAME (MacroUtilities' `@method_def_constant`, e.g. in
+    # ForwardMethods; also Base's bootstrap):
+    #     function f(...); $(Expr(:meta, :generated, gen_name)); ...; end
+    # The runtime resolves the payload by *evaluating* it at method-definition
+    # time (`method.c`'s `jl_toplevel_eval`), so it must stay a real binding
+    # reference. Blanket-quoting it like other meta payloads made the
+    # "generator" the `Symbol` itself, and the first staged call then crashed
+    # with "objects of type Symbol are not callable".
+    Core.eval(test_mod, quote
+        function _mdc_gen(world, source, self)
+            ex = Expr(:lambda, [Symbol("#self#")],
+                      Expr(Symbol("scope-block"), Expr(:block, Expr(:return, 42))))
+            ci = Meta.lower(@__MODULE__, ex)
+            ci.edges = Core.svec()
+            ci.min_world = one(UInt64)
+            ci.max_world = typemax(UInt64)
+            return ci
+        end
+    end)
+    fdef = Expr(:function, Expr(:call, :_mdc_f),
+        Expr(:block,
+            Expr(:meta, :generated, :_mdc_gen),
+            Expr(:meta, :generated_only)))
+    out = JL.core_lowering_hook(fdef, test_mod)
+    @test out isa Core.SimpleVector
+    Core.eval(test_mod, out[1])
+    f = Base.invokelatest(getglobal, test_mod, :_mdc_f)
+    @test first(methods(f)).generator isa Function
+    @test Base.invokelatest(f) == 42
+end
+
 @testset "bare `elseif` Expr == independent `if` (flisp parity)" begin
     # flisp maps `elseif` to the same `expand-if` handler as `if`, so an
     # `Expr(:elseif, ...)` that is NOT nested in the else-slot of a preceding

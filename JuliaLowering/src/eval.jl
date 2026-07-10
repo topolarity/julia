@@ -952,6 +952,23 @@ function _macroexpansion_loaderror(exc::MacroExpansionError,
     return LoadError(file, lnn.line, inner)
 end
 
+# Total version of the above for use on exception-reporting paths: the
+# `LoadError` conversion is diagnostic shaping only, so if it ever throws (it
+# is believed total today -- `source_location` is guarded and
+# `LineNumberNode.file` is constructor-checked to `Union{Nothing,Symbol}` --
+# but future edits could regress that), surface the original error rather than
+# masking it with the conversion's own exception. `convert_exc` exists for
+# dependency injection in tests.
+function _macroexpansion_loaderror_total(exc::MacroExpansionError,
+                                         fallback::LineNumberNode,
+                                         convert_exc::F=_macroexpansion_loaderror) where {F}
+    try
+        convert_exc(exc, fallback)
+    catch
+        exc
+    end
+end
+
 # flisp-compatible `eval` used by the `@eval` macro. Behaves like `eval`, but
 # restores flisp's user-facing error contract at the top-level-eval boundary
 # (there `@eval` expands to `Core.eval`):
@@ -979,7 +996,7 @@ function eval_flisp_compat(mod::Module, @nospecialize(ex);
         return eval(mod, ex; soft_scope, expr_compat_mode)
     catch exc
         if exc isa MacroExpansionError
-            throw(_macroexpansion_loaderror(exc))
+            throw(_macroexpansion_loaderror_total(exc, LineNumberNode(0, :none)))
         elseif exc isa LoweringError && !exc.internal
             throw(ErrorException(_lowering_error_message(exc)))
         end

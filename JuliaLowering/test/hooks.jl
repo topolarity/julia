@@ -319,4 +319,32 @@ end
             JL.activate!(false)
         end
     end
+
+    @testset "`LoadError` conversion failure cannot mask the original error" begin
+        # The `MacroExpansionError` -> `LoadError` conversion above is
+        # diagnostic shaping on an exception-reporting path: if it ever throws
+        # (believed total today, but future edits could regress that), the
+        # user's original error must surface, not the conversion's own
+        # exception (cf. the ForwardMethods triage, where an opaque error at
+        # the conversion's throw site was initially mistaken for exactly such
+        # masking). `_macroexpansion_loaderror_total` guarantees this; the
+        # conversion failure is injected via its test-only `convert_exc` hook.
+        mm = Module()
+        Core.eval(mm, :(macro boomc(); error("original cause"); end))
+        exc = try
+            JL.eval(mm, parsestmt(JL.SyntaxTree, "@boomc()"))
+            nothing
+        catch e
+            e
+        end
+        @test exc isa JL.MacroExpansionError
+        lnn = LineNumberNode(1, :none)
+        # the normal conversion result is unchanged
+        le = JL._macroexpansion_loaderror_total(exc, lnn)
+        @test le isa LoadError
+        @test le.error isa ErrorException && le.error.msg == "original cause"
+        # a broken conversion yields the original exception, unmasked
+        broken_convert = (e, fb) -> error("conversion machinery broke")
+        @test JL._macroexpansion_loaderror_total(exc, lnn, broken_convert) === exc
+    end
 end

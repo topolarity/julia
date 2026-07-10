@@ -724,6 +724,15 @@ function est_to_dst(st::SyntaxTree)
          when=(meta=get(s, :name_val, "")::String; meta in ("nospecialize", "specialize"))) ->
              # Should be handled in the function case
              newleaf(g, st, K"nothing")
+        # `(meta generated gen)`: the runtime resolves the generator by
+        # *evaluating* `gen` at method-definition time (`method.c`'s
+        # `jl_toplevel_eval`), so a by-name generator reference (e.g.
+        # MacroUtilities/Tricks `$(Expr(:meta, :generated, gensym_name))`) must
+        # stay a real binding that scope resolution turns into a globalref --
+        # quoting it to `K"Symbol"` like other meta payloads would make
+        # `jl_toplevel_eval` yield the `Symbol` itself as the "generator",
+        # which then fails staging with "objects of type Symbol are not
+        # callable". flisp likewise keeps this payload evaluable.
         ([K"meta" s gen], when=get(s, :name_val, "")::String == "generated") ->
             @ast g st [K"meta" setattr(s, :kind, K"Symbol") rec(gen)]
         [K"meta" syms...] ->

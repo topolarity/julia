@@ -108,7 +108,9 @@ function core_lowering_hook(@nospecialize(code), mod::Module, file::Union{String
             # keeps the raw `MacroExpansionError`, matching flisp's
             # `throw_load_error=0` for `jl_macroexpand`.) These are user/package
             # errors, not JuliaLowering bugs, so they skip the triage log below.
-            throw(_macroexpansion_loaderror(exc, LineNumberNode(line, Symbol(file))))
+            # (The `_total` variant guarantees a conversion failure can only
+            # surface `exc` itself, never mask it.)
+            throw(_macroexpansion_loaderror_total(exc, LineNumberNode(line, Symbol(file))))
         end
         # Diagnostic triage log for JuliaLowering failures (collected during
         # PkgEval etc). Skip it when lowering runs inside a `@generated`
