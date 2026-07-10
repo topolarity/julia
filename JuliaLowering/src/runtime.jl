@@ -417,22 +417,44 @@ function reserve_module_binding(mod, name)
     end
 end
 
-# Reserve a global binding named "$basename#$i" in module `mod` for the
-# smallest `i` starting at `0`.
+# Per-(module, basename) memo of the next candidate index for
+# `reserve_module_binding_i`, so repeated reservations of the same basename in
+# the same module amortize to O(1) instead of rescanning from `0` every time.
+#
+# The outer key is weak so that caching never keeps a module alive (important
+# for workloads that spin up many transient modules, e.g. macro sandboxes); when
+# a module is collected its per-basename counters are dropped with it. All access
+# is serialized by `_reserve_binding_lock` because lowering may run concurrently.
+const _reserve_binding_lock = ReentrantLock()
+const _reserve_binding_next = WeakKeyDict{Module,Dict{String,Int}}()
+
+# Reserve a global binding named "$basename$i" in module `mod` for the smallest
+# `i` (starting at `0`) that is not already bound.
+#
+# The observable naming is identical to a naive scan-from-`0`: every index below
+# the memoized `next` was reserved (and thus bound) by an earlier call here, so
+# the memo is never higher than the first free slot from our own reservations.
+# Bindings created from other sources between calls only ever push the first free
+# slot *higher*, and the reserve-fails retry loop below advances past them and
+# re-syncs the memo, so density from `0` is preserved exactly.
 #
 # TODO: Remove the use of this where possible. Currently this is used within
 # lowering to create unique global names for keyword function bodies and
 # closure types as a more local alternative to current-julia-module-counter.
 # However, we should ideally defer it to eval-time to make lowering itself
-# completely non-mutating.
+# completely non-mutating (which would also retire this memo).
 function reserve_module_binding_i(mod, basename)
-    i = 0
-    while true
-        name = "$basename$i"
-        if reserve_module_binding(mod, Symbol(name))
-            return name
+    @lock _reserve_binding_lock begin
+        counters = get!(() -> Dict{String,Int}(), _reserve_binding_next, mod)
+        i = get(counters, basename, 0)
+        while true
+            name = "$basename$i"
+            if reserve_module_binding(mod, Symbol(name))
+                counters[basename] = i + 1
+                return name
+            end
+            i += 1
         end
-        i += 1
     end
 end
 
