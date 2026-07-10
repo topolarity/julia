@@ -1479,3 +1479,46 @@ end
    @test only(Base.return_types(test_mod.f_boxed_localvar_typed, (Vector{Int}, Int))) ===
        Vector{Int}
 end
+
+@testset "global method capturing a re-executed local" begin
+    # A global method definition that captures a local is lowered to a CodeInfo
+    # template with `captured_local` markers that `replace_captured_locals!`
+    # fills in at run time. That template is a literal embedded in the enclosing
+    # thunk's IR and is therefore shared across repeated executions of the thunk.
+    # When such a method is (re)defined on every iteration of a top-level loop,
+    # each iteration must install a method carrying that iteration's capture --
+    # so the splice must happen into a fresh copy, not mutate the shared
+    # template in place. Regression for the ObservationDims `@testset ... for`
+    # failure, where every iteration after the first froze at the first capture.
+    # The method name must be module-qualified: that is what makes it a
+    # *global* method definition (capturing the local `foo`/`a`) rather than
+    # a local closure -- matching the ObservationDims pattern.
+    JuliaLowering.include_string(test_mod, """
+    module CaptureReexec
+        g(x) = -1
+        h(x) = -1
+    end
+    """)
+    @test JuliaLowering.include_string(test_mod, raw"""
+    let r = Int[]
+        for a in (10, 20, 30, 40)
+            foo(x) = x
+            CaptureReexec.g(::typeof(foo)) = a
+            push!(r, CaptureReexec.g(foo))
+        end
+        r
+    end
+    """) == [10, 20, 30, 40]
+
+    # The installed method itself must carry the last iteration's capture (the
+    # freeze bug is observable even outside the defining world, via invokelatest).
+    @test JuliaLowering.include_string(test_mod, raw"""
+    lastfoo = Ref{Any}()
+    for a in (1, 2, 3)
+        foo(x) = x
+        CaptureReexec.h(::typeof(foo)) = a * 100
+        lastfoo[] = foo
+    end
+    Base.invokelatest(CaptureReexec.h, lastfoo[])
+    """) == 300
+end

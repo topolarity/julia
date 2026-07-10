@@ -135,6 +135,11 @@ end
 
 # Interpolate captured local variables into the CodeInfo for a global method
 function replace_captured_locals(ci_in::Core.CodeInfo, locals::Core.SimpleVector)
+    # The template is a literal embedded in the enclosing thunk's IR, so the
+    # same object is reused every time that thunk runs (e.g. a method
+    # definition inside a top-level `for` loop, where each iteration captures
+    # different locals). Splice into a fresh copy so the pristine template
+    # remains available for later executions.
     ci = copy(ci_in)
     for (i, ex) in enumerate(ci.code)
         ci.code[i] = _replace_captured_locals(ex, locals)
