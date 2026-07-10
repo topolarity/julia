@@ -31,5 +31,6 @@ include("utils.jl")
 
     @testset "provenance" include("provenance.jl")
     @testset "compat" include("compat.jl")
+    @testset "reflection_parity" include("reflection_parity.jl")
     @testset "hooks" include("hooks.jl")
 end
