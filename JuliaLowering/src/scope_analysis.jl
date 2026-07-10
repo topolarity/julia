@@ -48,7 +48,7 @@ struct ScopeInfo
     # scope also contains all globals for resolution to fall back to.
     vars::Dict{NameKey,IdTag}
     # flisp-compat read-only aliases for cross-layer argument name references
-    # (see `register_arg_name_aliases!`): consulted by
+    # (see `register_arg_name_aliases!` and `register_kwarg_aliases!`): consulted by
     # `resolve_name` when `vars` misses, but invisible to assignment targets and
     # explicit declarations, which get fresh hygienic locals as under flisp.
     arg_aliases::Dict{NameKey,IdTag}
@@ -166,6 +166,7 @@ function explicit_declare_in_scope!(ctx, scope::ScopeInfo, ex, new_k::Symbol)
         $(_var_str(new_k)) name `$(NameKey(ex).name)` conflicts with an \
         existing $(_var_str(old_k)) from the same scope"""))
     end
+    register_kwarg_aliases!(ctx, scope, ex, result_bid)
     register_arg_name_aliases!(ctx, scope, ex, result_bid)
     return result_bid
 end
@@ -196,6 +197,34 @@ function register_arg_name_aliases!(ctx, scope::ScopeInfo, ex, bid)
         # An esc'd argument name of a named def is identity-mapped in flisp:
         # references to it are raw-symbol shadowable (see `resolve_name`).
         get_binding(ctx, bid).is_flisp_identity = true
+    end
+    return
+end
+
+# flisp compat, the reverse of the escaped-argument-name aliases registered in
+# `register_arg_name_aliases!`: an old-style macro emits a keyword-argument *name* bare (its
+# own layer) while esc'd defaults or the body reference it from an ancestor
+# (caller) layer.  flisp exempts keyword-arg names from hygiene renaming
+# (macroexpand.scm `safe-llist-keyword-args`), so those references bind to the
+# kwarg.  Desugaring tags kwarg-derived binding sites `:is_keyword_arg`; register
+# a read-only alias at each ancestor layer of the kwarg's own layer pointing back
+# to its binding.  As with the forward direction the alias is read-only, so a
+# bare name that is assigned or explicitly declared still gets a fresh hygienic
+# local (matching flisp's gensym renaming), and unrelated nested expansions,
+# whose layers are not on this ancestry, keep their hygiene.
+function register_kwarg_aliases!(ctx, scope::ScopeInfo, ex, bid)
+    (isnothing(bid) || kind(ex) !== K"Identifier") && return
+    getmeta(ex, :is_keyword_arg, false) || return
+    sc = ex.context::SyntaxContext
+    is_flisp_compat(sc) || return
+    # A keyword-arg name (bare or esc'd) is identity-mapped in flisp:
+    # references to it are raw-symbol shadowable (see `resolve_name`).
+    get_binding(ctx, bid).is_flisp_identity = true
+    aliases = scope.arg_aliases
+    l = sc.layer.escaped
+    while l !== nothing
+        get!(aliases, NameKey(ex.name_val, l), bid)
+        l = l.escaped
     end
     return
 end
@@ -324,9 +353,9 @@ function resolve_name(ctx, ex; exclude_toplevel_globals=false,
                     isnothing(b2) || return b2
                 end
             elseif get_binding(ctx, bid).is_flisp_identity
-                # Same, for a direct hit on an identity-mapped binding: flisp
-                # leaves the binder as the raw symbol too, so intervening esc'd
-                # binders shadow it.
+                # Same, for a direct hit on an identity-mapped binding (e.g. a
+                # bare keyword-arg name): flisp leaves the binder as the raw
+                # symbol too, so intervening esc'd binders shadow it.
                 b2 = _nearest_shadowing_binder(ctx, nk, i)
                 isnothing(b2) || return b2
             end
