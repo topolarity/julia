@@ -2167,3 +2167,58 @@ end
     @test mfl.results() == (0, 0)
     @test mjl.results() == mfl.results()
 end
+
+@testset "(AI) @eval'd non-method payload binds eval-target globals (flisp compat)" begin
+    # Companion to the method-def carve-out above: the same relay-to-`@eval` idiom
+    # (PETSc's `@for_libpetsc`) also carries non-method definitions.  A re-evaluated
+    # payload's unescaped top-scope `const` and plain-assignment targets bind plain
+    # globals of the eval target, and unescaped references resolve there too -- flisp
+    # evaluates the payload through an inert quote.  An *inline* hygienic expansion
+    # keeps the mangling/locality (tested separately), so this is reeval-specific.
+    same = """
+        macro relay(expr); quote; @eval \$expr; end; end
+        @relay begin
+            const KC = 11
+            ka = 22
+            TA = Vector{Int}
+        end
+        results() = (KC, ka, TA)
+    """
+    mfl = Module(); Base.include_string(mfl, same); Core.@latestworld
+    mjl = Module(); JuliaLowering.include_string(mjl, same; expr_compat_mode=true)
+    Core.@latestworld
+    @test mfl.results() == (11, 22, Vector{Int})
+    @test mjl.results() == mfl.results()
+
+    # Cross-module SafePETSc shape: the relaying macro lives in `Relayer`, but the
+    # payload -- a `const` whose value references the *caller* module's own struct
+    # `PooledVec` -- is written in `User`.  flisp binds the `const` in `User` and
+    # resolves `PooledVec` to `User.PooledVec`; before the fix JuliaLowering read
+    # `PooledVec` against `Relayer` (the macro's home), reproducing SafePETSc's
+    # `UndefVarError: PooledVec not defined in PETSc`.
+    cross = """
+        module Relayer
+            scalars = [Float64]
+            macro for_scalar(expr)
+                quote
+                    for PetscScalar in scalars
+                        @eval esc(\$expr)
+                    end
+                end
+            end
+        end
+        module User
+            using ..Relayer
+            struct PooledVec{T}; n::Int; end
+            Relayer.@for_scalar begin
+                const VEC_POOL_Float64 = Dict{Int, Vector{PooledVec{Float64}}}()
+            end
+        end
+        result() = valtype(typeof(User.VEC_POOL_Float64))
+    """
+    cfl = Module(); Base.include_string(cfl, cross); Core.@latestworld
+    cjl = Module(); JuliaLowering.include_string(cjl, cross; expr_compat_mode=true)
+    Core.@latestworld
+    @test cfl.result() == Vector{cfl.User.PooledVec{Float64}}
+    @test cjl.result() == Vector{cjl.User.PooledVec{Float64}}
+end
