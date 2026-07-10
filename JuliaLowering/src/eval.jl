@@ -159,6 +159,25 @@ end
 
 #-------------------------------------------------------------------------------
 
+# Compute `CodeInfo.has_fcall` for a lowered statement, mirroring the runtime's
+# `jl_code_info_set_ir` (src/method.c): a statement (or the right hand side of
+# an assignment statement) which is a `:foreigncall`, `:foreignglobal` or
+# `:cfunction` expression. The flag survives IR compression and gates the
+# optimizer's inlining of methods with unresolved static parameters
+# (`Compiler.may_have_fcalls`): fcall argument types must be instantiated at
+# compile time, so such methods must not be inlined when their sparams are
+# unknown.
+function stmt_has_fcall(@nospecialize(e))
+    if e isa Expr
+        if e.head === :(=)
+            return stmt_has_fcall(e.args[2])
+        end
+        return e.head === :foreigncall || e.head === :foreignglobal ||
+               e.head === :cfunction
+    end
+    return false
+end
+
 function codeinfo_has_image_globalref(@nospecialize(e))
     if e isa GlobalRef
         return 0x00 !== @ccall jl_object_in_image(e.mod::Any)::UInt8
@@ -550,8 +569,7 @@ function to_code_info(ex::SyntaxTree, slots::Vector{Slot}, meta::CompileHints)
     ssaflags = compute_ssaflags(ex[1])
     propagate_inbounds =
         get(meta, :propagate_inbounds, false)
-    # TODO: Set true if there's a foreigncall
-    has_fcall = false
+    has_fcall = any(stmt_has_fcall, stmts)
     nospecializeinfer =
         get(meta, :nospecializeinfer, false)
     inlining =

@@ -420,6 +420,55 @@ let raw_foreigncall_ex = Expr(
     @test JuliaLowering.eval(test_mod, JuliaLowering.expr_to_est(raw_foreigncall_ex)) == 11 + 18im
 end
 
+@testset "has_fcall flag and sparam-dependent @cfunction inlining" begin
+    # From PkgEval: Gadfly v1.4.1 test/runtests.jl:81, via Compose v0.9.7 -> Cairo v1.1.1 (write_to_png @cfunction inlined with unresolved sparam)
+    # `CodeInfo.has_fcall` must be set on methods containing `:foreigncall` /
+    # `:foreignglobal` / `:cfunction` statements, exactly as the runtime's
+    # `jl_code_info_set_ir` (src/method.c) does for flisp-lowered code. The
+    # optimizer relies on this flag (`Compiler.may_have_fcalls`) to refuse
+    # inlining a method whose static parameters are not fully resolved: fcall
+    # signature types must be instantiated at compile time. With the flag
+    # missing, an `@cfunction` whose argument types reference a static
+    # parameter was inlined into a caller that only knew that sparam
+    # abstractly, leaking an unbound TypeVar into the cfunction signature
+    # (runtime error "cfunction argument 1 type Ref should have an element
+    # type, not Ref{<:T}"; found via Gadfly -> Compose -> Cairo).
+    src_has_fcall(m::Method) = ccall(:jl_ir_flag_has_fcall, Bool, (Any,), m.source)
+    JuliaLowering.include_string(test_mod, """
+        hfc_cb(buf::Ptr{UInt8}, len::UInt32) = Int32(0)
+        hfc_get_ref(::Type{T}) where T =
+            @cfunction(hfc_cb, Int32, (Ref{T}, Ptr{UInt8}, UInt32))
+        hfc_get_ptr(::Type{T}) where T =
+            @cfunction(hfc_cb, Int32, (Ptr{T}, UInt32))
+        hfc_do_ref(stream::T) where {T<:IO} = hfc_get_ref(T)
+        hfc_do_ptr(stream::T) where {T<:IO} = hfc_get_ptr(T)
+
+        mutable struct HfcBox
+            x::IO  # abstract field: the sparam is only abstractly known below
+        end
+        hfc_call_ref(b::HfcBox) = hfc_do_ref(b.x)
+        hfc_call_ptr(b::HfcBox) = hfc_do_ptr(b.x)
+
+        mutable struct HfcCBox
+            x::IOBuffer  # concrete control: inlining all the way is fine here
+        end
+        hfc_call_conc(b::HfcCBox) = hfc_do_ref(b.x)
+
+        hfc_ccall(x) = ccall(:strlen, Csize_t, (Cstring,), x)
+        hfc_plain(x) = x + 1
+    """)
+    Core.@latestworld
+    # flag parity with flisp/jl_code_info_set_ir
+    @test src_has_fcall(only(methods(test_mod.hfc_get_ref)))
+    @test src_has_fcall(only(methods(test_mod.hfc_get_ptr)))
+    @test src_has_fcall(only(methods(test_mod.hfc_ccall)))
+    @test !src_has_fcall(only(methods(test_mod.hfc_plain)))
+    # end-to-end: the Cairo-shaped chains must construct valid cfunctions
+    @test test_mod.hfc_call_ref(test_mod.HfcBox(IOBuffer())) isa Ptr{Cvoid}
+    @test test_mod.hfc_call_ptr(test_mod.HfcBox(IOBuffer())) isa Ptr{Cvoid}
+    @test test_mod.hfc_call_conc(test_mod.HfcCBox(IOBuffer())) isa Ptr{Cvoid}
+end
+
 # Test that ccall can be passed static parameters in type signatures.
 #
 # Note that the cases where this works are extremely limited and tend to look
