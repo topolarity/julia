@@ -3206,12 +3206,24 @@ function _make_macro_name(ctx, ex)
     end
 end
 
+# flisp resolves a macro-definition name inside a flisp-compat hygienic
+# expansion like any other bare reference: a plain global of the macro's home
+# module, at *any* nesting depth (macroexpand.scm has no binding pattern for
+# `macro`, so the name is never gensym-renamed and falls through to the
+# `(globalref m e)` case).  Reuse the method-def-name marker so
+# `_find_scope_decls!` binds the definition in the layer's module.
+function _mark_flisp_macro_name(ex, name)
+    is_flisp_compat(ex) && kind(name) === K"Identifier" && !hasattr(name, :mod) ?
+        setmeta(name, :expansion_root_method, true) : name
+end
+
 # flisp: expand-macro-def
 function expand_macro_def(ctx, ex)
     if numchildren(ex) == 1
         # macro with zero methods
         # `macro m end`
-        return @ast ctx ex [K"function" _make_macro_name(ctx, ex[1])]
+        return @ast ctx ex [K"function"
+                            _mark_flisp_macro_name(ex, _make_macro_name(ctx, ex[1]))]
     end
     (sig, name, args) = @stm ex begin
         [K"macro" [K"call" n a...] _] -> (ex[1], n, remove_empty_parameters(a))
@@ -3226,7 +3238,7 @@ function expand_macro_def(ctx, ex)
         # aliases of a named method definition (see `tag_method_arg_names`).
         setmeta!(@ast(ctx, ex, [K"function"
             [K"call"(sig)
-                _make_macro_name(ctx, name)
+                _mark_flisp_macro_name(ex, _make_macro_name(ctx, name))
                 [K"::"
                     adopt_scope(sc_ref, @ast(ctx, sig, "__source__"::K"Identifier"))
                     "LineNumberNode"::K"core"

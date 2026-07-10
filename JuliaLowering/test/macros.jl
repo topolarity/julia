@@ -2704,3 +2704,45 @@ Core.@latestworld
     # layer's raw symbol and captures the spliced reference (2 + 1).
     @test run("@def_shadow_nested(shf6); shf6(40)") == 3
 end
+
+@testset "(AI) old-style macro-in-macro: name binds macro-home global (flisp compat)" begin
+    # flisp resolves a macro-definition *name* in a hygienic expansion like any
+    # bare reference -- a plain global of the macro's home module, at any
+    # nesting depth (macroexpand.scm has no binding pattern for `macro`) -- so
+    # a macro-generated macro lands in (and is callable from) the generating
+    # macro's module.  Macro *arguments*, however, get no identity mapping
+    # (flisp treats `macro` like `->`), so an escaped inner-macro argument
+    # does not alias a bare body reference.
+    src = """
+        module Mac
+            macro mkmac()
+                :(macro genm(); 42; end)
+            end
+            macro mkmac_nested()
+                quote
+                    begin
+                        macro genn(); 43; end
+                    end
+                    nothing
+                end
+            end
+        end
+        module User
+            using ..Mac
+            Mac.@mkmac
+            Mac.@mkmac_nested
+        end
+        results() = (Mac.@genm(), Mac.@genn(),
+                     isdefined(Mac, Symbol("@genm")), isdefined(User, Symbol("@genm")),
+                     isdefined(Mac, Symbol("@genn")), isdefined(User, Symbol("@genn")))
+    """
+    # Compares JuliaLowering's Expr-compat mode (the flisp round-trip path)
+    # against flisp; in non-compat mode `@mkmac` is a *new-style* macro whose
+    # Expr return value is rejected up front (a deliberate, separate
+    # restriction), so there is nothing to compare there.
+    mfl = Module(); Base.include_string(mfl, src); Core.@latestworld
+    mjl = Module(); JuliaLowering.include_string(mjl, src; expr_compat_mode=true)
+    Core.@latestworld
+    @test mfl.results() == (42, 43, true, false, true, false)
+    @test mjl.results() == mfl.results()
+end
