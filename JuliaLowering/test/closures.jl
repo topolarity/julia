@@ -821,3 +821,66 @@ M_capture_symbol_value.f(1)
     Base.invokelatest(CaptureReexec.h, lastfoo[])
     """) == 300
 end
+
+@testset "named local closure keeps its own name (nested-closure-nameof / D4)" begin
+    # From PkgEval: Pretend v1.0.0 (methods(f).name mock check) and MIRTjim v0.26.0 src/caller_name.jl:29-41 (stacktrace func name)
+    # A named local function's `Method.name`, `nameof(typeof(·))` and stack-frame
+    # `func` symbol must be the closure's OWN name, not the enclosing function's,
+    # matching flisp.  Real consumers: Pretend.jl keys
+    # `first(methods(f)).name == :___wrapped`; MIRTjim reads
+    # `stacktrace()[level].func`.  See `closure_type_basename`.
+    m = Module()
+
+    # Named closure returned from an enclosing method (Pretend.mocked shape).
+    g = JuliaLowering.include_string(m, """
+        function mocked(f)
+            function ___wrapped(args...; kwargs...)
+                f(args...; kwargs...)
+            end
+            ___wrapped
+        end
+        mocked(identity)
+        """)
+    @test first(methods(g)).name === :___wrapped
+    # `singletonname` (what `nameof` of the function reports) is the own name.
+    @test Base.typename(typeof(g)).singletonname === :___wrapped
+
+    # Short-form named closure nested in a method.
+    g2 = JuliaLowering.include_string(m, "function outer(); inner(z) = z + 1; inner; end; outer()")
+    @test first(methods(g2)).name === :inner
+
+    # Named local function in a bare `let` (no enclosing named function):
+    # MIRTjim `caller_name` shape.
+    g3 = JuliaLowering.include_string(m, "let; f1() = 1; f1; end")
+    @test first(methods(g3)).name === :f1
+
+    # Three levels deep: own name wins, flisp keeps [own, outermost].
+    g4 = JuliaLowering.include_string(m, """
+        function lvl1()
+            function lvl2()
+                lvl3(z) = z
+                lvl3
+            end
+            lvl2()
+        end
+        lvl1()
+        """)
+    @test first(methods(g4)).name === :lvl3
+
+    # StackTraces surface (MIRTjim `stacktrace()[level].func`).
+    fn = JuliaLowering.include_string(m, """
+        function outer_st()
+            function inner_st()
+                stacktrace()[1].func
+            end
+            inner_st()
+        end
+        outer_st
+        """)
+    @test fn() === :inner_st
+
+    # An anonymous function assigned to a name is NOT renamed after the variable
+    # (its RHS has no name) — distinct cell, unchanged by this fix.
+    a = JuliaLowering.include_string(m, "h = x -> x + 1; h")
+    @test startswith(String(first(methods(a)).name), "#")
+end

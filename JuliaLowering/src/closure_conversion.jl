@@ -313,6 +313,36 @@ function closure_type_fields(ctx, srcref, closure_binds, is_opaque)
     return field_syms, field_orig_bindings, field_inds, field_is_box
 end
 
+# Base name (before the disambiguating counter) of the type generated for a
+# closure nested as `name_stack = [outermost_method, ..., innermost, own_name]`.
+#
+# `jl_demangle_typename` (and hence `nameof`, `Method.name`, `methods()` display
+# and `StackTraces.StackFrame.func`) recovers the *first* `#`-delimited component
+# of the type name, so a named local function must have its OWN name first to be
+# reported under that name.  flisp puts the own name first in both shapes:
+# `#<own>#<own>##<i>` when the closure is not lexically nested in another method
+# and `#<own>#<outermost>##<i>` when it is (only the outermost enclosing method
+# contributes); the trailing `##<i>` is `reserve_module_binding_i`'s counter.
+# The raw strings and counter values differ from flisp's in some cells — only
+# the demangled name is observable, so we emit the simpler `#<own>#<i>` in the
+# un-nested case.  A bare `#<own>##<i>` would instead be read as a
+# canonicalized-anonymous typename (`is_canonicalized_anonfn_typename`) and
+# keep its leading `#`, which is the naming divergence this repairs.
+#
+# Anonymous functions and other already-mangled own names (starting with `#`)
+# keep JuliaLowering's outer-to-inner scheme.  For a *named* local function
+# whose own name starts with `#` (e.g. a gensym'd `var"#name"`), this still
+# reports the enclosing name where flisp strips the leading `#` and reports
+# `name` — a known residual divergence with no known consumer (such names are
+# themselves gensyms); see bugs/nested-closure-nameof/QUESTIONS.md.
+function closure_type_basename(name_stack)
+    own = name_stack[end]
+    startswith(own, '#') && return string("#", join(name_stack, "#"), "##")
+    length(name_stack) > 1 && !occursin('#', name_stack[1]) ?
+        string("#", own, "#", name_stack[1], "##") :
+        string("#", own, "#")
+end
+
 # Return a thunk which creates a new type for a closure with `field_syms` named
 # fields. The new type will be named `name_str` which must be an unassigned
 # name in the module.
@@ -457,8 +487,7 @@ function _convert_closures(ctx::ClosureConversionCtx, ex)
                 field_syms, field_orig_bindings, field_inds, field_is_box =
                     closure_type_fields(ctx, ex, closure_binds, false)
                 name_str = reserve_module_binding_i(
-                    ctx.mod,
-                    string("#", join(closure_binds.name_stack, "#"), "##"))
+                    ctx.mod, closure_type_basename(closure_binds.name_stack))
                 closure_type_def, closure_type_ =
                     type_for_closure(ctx, ex, name_str, field_syms, field_is_box)
                 if !ctx.is_toplevel_seq_point
