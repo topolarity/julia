@@ -626,6 +626,43 @@ end
     @test Base.invokelatest(g, 1) == [:a, :mid, :b]
 end
 
+@testset "pre-built `kw` node in `->`/`function` arglist (Dagger `@spawn`)" begin
+    # From PkgEval: Dagger v0.19.4, src/thunk.jl:471 (@spawn f(A; kw=v) do-block splices Expr(:kw) into closure params)
+    # A macro that captures a call's keyword arg as an `Expr(:kw, name, val)`
+    # and splices it into a forwarding closure's parameter list (Dagger's
+    # `@spawn f(A; dims=1) do ... end` builds `(A; dims=1) -> ...`) yields a
+    # `(block <positional> (kw name val))` lambda arglist.  Text parsing of
+    # `(A; dims=1)` gives an `=`-shaped kwarg node, but the spliced node stays
+    # `kw`-shaped; both spellings must lower identically and match flisp.
+    K(name, val) = Expr(:kw, name, val)
+    tup(xs...) = Expr(:tuple, xs...)
+    norm(ir) = replace(strip(sprint(JL.print_ir, ir)), r"#+\d+" => "#N")
+
+    kw_lam = Expr(:->, Expr(:block, :A, K(:dims, 1)), tup(:A, :dims))
+    eq_lam = Expr(:->, Expr(:block, :A, Expr(:(=), :dims, 1)), tup(:A, :dims))
+
+    # The `kw` and `=` spellings lower to byte-identical IR (`#N` normalizes the
+    # per-session closure-gensym counter).
+    @test norm(jl_lower(test_mod, kw_lam; expr_compat_mode=true)) ==
+          norm(jl_lower(test_mod, eq_lam; expr_compat_mode=true))
+
+    for lam in (kw_lam, eq_lam)
+        f = jl_eval(test_mod, lam; expr_compat_mode=true)
+        @test Base.invokelatest(f, 10) === (10, 1)
+        @test Base.invokelatest(f, 10; dims=2) === (10, 2)
+        # flisp parity of the observable call behavior.
+        g = fl_eval(test_mod, lam)
+        @test Base.invokelatest(g, 10) === (10, 1)
+        @test Base.invokelatest(g, 10; dims=2) === (10, 2)
+    end
+
+    # The anonymous-`function` head routes through the same validator arm.
+    kw_fn = Expr(:function, Expr(:block, :A, K(:dims, 1)), tup(:A, :dims))
+    h = jl_eval(test_mod, kw_fn; expr_compat_mode=true)
+    @test Base.invokelatest(h, 10) === (10, 1)
+    @test Base.invokelatest(h, 10; dims=2) === (10, 2)
+end
+
 @testset "qualified operator in comparison chain (Tullio `@fastmath` rewrite)" begin
     # From PkgEval: PolaronMobility v2.0.1, src/MobilityTheories.jl:377 (Tullio @fastmath emits qualified ops in Expr(:comparison))
     # `@fastmath`-style macros (e.g. Tullio's einsum kernel) build an

@@ -643,6 +643,7 @@ vst1_lam_lhs(vcx, st) = @stm st begin
     [K"block" x p] -> _calldecl_positionals(vcx, SyntaxList(x), true) &
         @stm p begin
             [K"=" kw v] -> vst1_param(vcx, kw) & vst1(vcx, v)
+            [K"kw" kw v] -> vst1_param(vcx, kw) & vst1(vcx, v)
             [K"..." kw] -> vst1_param_varkw(vcx, kw)
             _ -> vst1_param(vcx, p)
         end
