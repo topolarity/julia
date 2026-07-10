@@ -43,10 +43,14 @@
 #      body; `kwarg_decl` is parity. Benign.
 #   D3 kwcall `ci.slotflags`: JL emits 0 on the self/tmp slots where flisp marks
 #      them used (8) / used+assigned (24). Recomputed by inference. Benign.
-#   D4 kwcall `.name` for a nested kw closure: JL reports the OUTER function name
-#      (`outer4`), flisp the inner (`h`); the closure type gensym also orders the
-#      name components oppositely. This is the nested-closure `nameof` family
-#      (bugs/nested-closure-nameof, bugs/thisfunction-nested-kw). Cosmetic.
+#   D4 (FIXED) kwcall `.name` for a nested kw closure now reports the closure's
+#      OWN name (`h`), matching flisp, and the closure type name orders its
+#      components own-first (`#h#outer4##N`). Previously JL reported the enclosing
+#      function name (`outer4`) with the components reversed; that defeated
+#      `Method.name`/`nameof`/`StackFrame.func` for any named local closure
+#      (bugs/nested-closure-nameof: Pretend.jl keys `first(methods(f)).name`,
+#      MIRTjim reads `stacktrace()[level].func`). Pinned here at the corrected
+#      value; see `closure_type_basename` in closure_conversion.jl.
 #   D5 `f(var"#self#") = 1`: flisp raises `syntax: function argument name not
 #      unique: "#self#"`; JL accepts it (a second disambiguated `#self#` slot).
 #      JL is *more* permissive, so no compiling package can depend on flisp's
@@ -178,7 +182,7 @@ const _RP_EXPECTED = Dict{String,Any}(
     "closure_named_local" => (outer=[(sig="Tuple{typeof(MOD.outer)}", slot_syms="[#self#, g]", nargs=1, isva=false, kwarg_decl="[]", has_fcall=false), ], kwcall=[], nameof=["outer", ]),
     "closure_anon" => (outer=[(sig="Tuple{typeof(MOD.outer2)}", slot_syms="[#self#, #->#]", nargs=1, isva=false, kwarg_decl="[]", has_fcall=false), ], kwcall=[], nameof=["outer2", ]),
     "closure_do_block" => (outer=[(sig="Tuple{typeof(MOD.outer3), Any}", slot_syms="[#self#, c, #->#]", nargs=2, isva=false, kwarg_decl="[]", has_fcall=false), ], kwcall=[], nameof=["outer3", ]),
-    "closure_kw" => (outer=[(sig="Tuple{typeof(MOD.outer4)}", slot_syms="[#self#, #kw_body#h#N, h]", nargs=1, isva=false, kwarg_decl="[]", has_fcall=false), ], kwcall=[(slot_syms="[#unused#, kws, #self#, z, a, #kwtmp#]", nargs=4, isva=false, name="outer4", slotflags="[0, 8, 8, 8, 0, 8]"), ], nameof=["outer4", ]),  # kwcall: D1 D3 D4 (flisp name=h, closure type #h#outer4# vs JL #outer4#h#)
+    "closure_kw" => (outer=[(sig="Tuple{typeof(MOD.outer4)}", slot_syms="[#self#, #kw_body#h#N, h]", nargs=1, isva=false, kwarg_decl="[]", has_fcall=false), ], kwcall=[(slot_syms="[#unused#, kws, #self#, z, a, #kwtmp#]", nargs=4, isva=false, name="h", slotflags="[0, 8, 8, 8, 0, 8]"), ], nameof=["outer4", ]),  # kwcall: D1 D3 (D4 fixed: name=h and closure type #h#outer4# now match flisp)
     "callable_struct" => (outer=[(sig="Tuple{Type{Main.MOD.C}, Any}", slot_syms="[#ctor-self#, v]", nargs=2, isva=false, kwarg_decl="[]", has_fcall=false), ], kwcall=[], nameof=["C", ]),
     "callable_struct_kw" => (outer=[(sig="Tuple{Type{Main.MOD.D}, Any}", slot_syms="[#ctor-self#, v]", nargs=2, isva=false, kwarg_decl="[]", has_fcall=false), ], kwcall=[(slot_syms="[#unused#, kws, d, x, a, #kwtmp#]", nargs=4, isva=false, name="D", slotflags="[0, 8, 8, 8, 0, 8]"), ], nameof=["D", ]),  # kwcall: D1 D3 (flisp slot_syms=[#unused#, , d, x, a, ])
     "generated_fn" => (outer=[(sig="Tuple{typeof(MOD.g), Any}", slot_syms="[#self#, x]", nargs=2, isva=false, kwarg_decl="[]", has_fcall=missing), ], kwcall=[], nameof=["g", ]),

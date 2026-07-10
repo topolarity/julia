@@ -70,12 +70,12 @@ end
 1   (call core.svec)
 2   (call core.svec)
 3   (call core.svec)
-4   (call JuliaLowering.eval_closure_type TestMod :#f##0 %₁ %₂ %₃)
+4   (call JuliaLowering.eval_closure_type TestMod :#f#0 %₁ %₂ %₃)
 5   latestworld
-6   TestMod.#f##0
+6   TestMod.#f#0
 7   (new %₆)
 8   (= slot₁/f %₇)
-9   TestMod.#f##0
+9   TestMod.#f#0
 10  (call core.svec %₉)
 11  (call core.svec)
 12  SourceLocation::1:4
