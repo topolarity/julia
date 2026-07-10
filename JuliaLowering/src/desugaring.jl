@@ -2713,6 +2713,14 @@ function expand_kw_args(ctx, kws)
     kw_decls = SyntaxList(ctx.graph)
     kw_syms = SyntaxList(ctx.graph)
     kw_defaults = SyntaxList(ctx.graph)
+    # Track whether any keyword arg is required (given no default).  flisp lists
+    # every (non-rest) kwarg name on the *outer* positional-dispatch method's
+    # slot_syms past `nargs` whenever a kwarg is required: the synthesized
+    # `throw(UndefKeywordError(:k))` default textually contains the kwarg's own
+    # name, so flisp's blunt `ordered-defaults` scan fires and its nokw method
+    # binds every kwarg to a real slot.  We reproduce only that observable layout
+    # (see `keywords_method_def_expr`), not the slot binding itself.
+    has_required = false
     for raw_a in kargl
         a = expand_function_arg(ctx, raw_a, false)
         @stm a begin
@@ -2724,6 +2732,7 @@ function expand_kw_args(ctx, kws)
                 push!(kw_decls, a)
                 push!(kw_defaults, @ast ctx a [K"call" "throw"::K"core"
                     [K"call" "UndefKeywordError"::K"core" a[1]=>K"Symbol"]])
+                has_required = true
             end
         end
     end
@@ -2733,7 +2742,7 @@ function expand_kw_args(ctx, kws)
         SyntaxList(@ast ctx restkw [K"::"
             restkw [K"call" "pairs"::K"top" "NamedTuple"::K"core"]])
 
-    return (kw_decls, kw_names, kw_syms, kw_defaults, restkw_list)
+    return (kw_decls, kw_names, kw_syms, kw_defaults, restkw_list, has_required)
 end
 
 # Assumes `expand_function_arg` has run.  Note that user-supplied
@@ -2768,7 +2777,7 @@ function keywords_method_def_expr(ctx, src, mtable, sparams, argl, body, rett,
         pos_va && (l[end] = @ast ctx l[end] [K"..." l[end]])
         l
     end
-    (kw_decls, kw_names, kw_syms, kw_defaults, restkw) = expand_kw_args(ctx, kws)
+    (kw_decls, kw_names, kw_syms, kw_defaults, restkw, has_required) = expand_kw_args(ctx, kws)
     ordered_defaults = any(val->contains_identifier(val, kw_names), kw_defaults)
     pos_sparams = used_typevars(pargl, sparams)
 
@@ -2799,6 +2808,24 @@ function keywords_method_def_expr(ctx, src, mtable, sparams, argl, body, rett,
     mdefs2 = let rkw = isempty(restkw) ? nothing :
             @ast ctx restkw[1] [K"call"
                 "pairs"::K"top" [K"call" "NamedTuple"::K"core"]]
+        # flisp names every (non-rest) kwarg on the outer positional method's
+        # slot_syms past `nargs` whenever a kwarg is required (its
+        # UndefKeywordError default trips flisp's `ordered-defaults` scan).  In
+        # the `ordered_defaults` branch below we already bind `kw_names` as real
+        # slots via `scope_nest`, matching that.  In the inline branch the kwarg
+        # names would otherwise vanish from the outer method, so emit
+        # reflection-only `local` stubs (exactly like the named kw_temps and the
+        # restkw catch-all in the kwcall method) purely to surface the names for
+        # code that reads this raw layout directly (e.g. `Base.kwarg_decl`'s
+        # slot-name source, or packages peeking `slot_syms[nargs:end]`).  Skip
+        # placeholder (`_`) names: they are write-only and flisp rejects them.
+        refl_stubs = SyntaxList(ctx.graph)
+        if has_required && !ordered_defaults
+            for n in kw_names
+                kind(n) === K"Identifier" || continue
+                push!(refl_stubs, @ast ctx n [K"local" setmeta(n, :is_internal, true)])
+            end
+        end
         body2 = if !ordered_defaults
             @ast ctx src [K"call" m1_name kw_defaults... rkw forward_pargl...]
         else
@@ -2807,7 +2834,7 @@ function keywords_method_def_expr(ctx, src, mtable, sparams, argl, body, rett,
         end
         method_def_expr(
             ctx, src, mtable, pos_sparams, pargl,
-            @ast(ctx, src, [K"block" [K"return" body2]]))
+            @ast(ctx, src, [K"block" refl_stubs... [K"return" body2]]))
     end
     # (3) Core.kwcall(arg2::NamedTuple, pargl...) methods (one per optarg).
     # - for each kwarg:

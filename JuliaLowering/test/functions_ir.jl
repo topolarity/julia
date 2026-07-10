@@ -1940,15 +1940,17 @@ end
 20  SourceLocation::1:1
 21  (call core.svec %₁₈ %₁₉ %₂₀)
 22  --- method TestMod.f_kw_slurp %₂₁
-    slots: [slot₁/#self# slot₂/a(nospecialize)]
+    slots: [slot₁/#self# slot₂/a(nospecialize) slot₃/kw1(!read) slot₄/kw2(!read)]
     1   (meta :nospecialize)
-    2   TestMod.#kw_body#f_kw_slurp#1
-    3   (call core.UndefKeywordError :kw1)
-    4   (call core.throw %₃)
-    5   (call core.NamedTuple)
-    6   (call top.pairs %₅)
-    7   (call %₂ %₄ 2 %₆ slot₁/#self# slot₂/a)
-    8   (return %₇)
+    2   (newvar slot₃/kw1)
+    3   (newvar slot₄/kw2)
+    4   TestMod.#kw_body#f_kw_slurp#1
+    5   (call core.UndefKeywordError :kw1)
+    6   (call core.throw %₅)
+    7   (call core.NamedTuple)
+    8   (call top.pairs %₇)
+    9   (call %₄ %₆ 2 %₈ slot₁/#self# slot₂/a)
+    10  (return %₉)
 23  latestworld
 24  (call core.typeof core.kwcall)
 25  TestMod.f_kw_slurp

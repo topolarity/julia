@@ -1244,6 +1244,45 @@ end
     @test !any(s -> occursin('#', string(s)), kd(test_mod.f_restkw_defaults))
 end
 
+@testset "(AI) required kwargs are named on the outer positional method" begin
+    # flisp appends keyword-argument names onto the *outer* (positional-dispatch)
+    # Method's slot_syms past `nargs` whenever any kwarg is required (no default):
+    # the synthesized `throw(UndefKeywordError(:k))` default textually contains the
+    # kwarg's own name, so flisp's `ordered-defaults` scan fires and the sorter's
+    # nokw method binds every kwarg to a real slot.  Some packages (e.g. Tissue)
+    # read this raw layout directly rather than via `Base.kwarg_decl`, so match it.
+    # Regression: JuliaLowering dropped the required-kwarg name from the outer
+    # Method, making `argnames[nargs+1:end]` miss it.
+    JuliaLowering.include_string(test_mod, """
+    f_outer_req(a; graph) = (a, graph)
+    f_outer_opt(a; graph=1) = (a, graph)
+    f_outer_mix(a; x, y=2, kw...) = (a, x, y, kw)
+    f_outer_rest(a; kw...) = (a, kw)
+    """)
+    # Trailing slot names of the outer Method, past the positional `nargs`.
+    outer_kw_slots(f) = let m = first(methods(f))
+        argnames = ccall(:jl_uncompress_argnames, Vector{Symbol}, (Any,), m.slot_syms)
+        argnames[(m.nargs + 1):end]
+    end
+    # A required kwarg forces every (non-rest) kwarg name onto the outer Method...
+    @test outer_kw_slots(test_mod.f_outer_req) == [:graph]
+    @test outer_kw_slots(test_mod.f_outer_mix) == [:x, :y]
+    # ...but the restkw catch-all is not named on the outer Method (flisp parity).
+    @test !(Symbol("kw...") in outer_kw_slots(test_mod.f_outer_mix))
+    # With no required kwarg (all defaults / restkw-only) the outer Method carries
+    # no kwarg slots, exactly like flisp.
+    @test outer_kw_slots(test_mod.f_outer_opt) == Symbol[]
+    @test outer_kw_slots(test_mod.f_outer_rest) == Symbol[]
+    # The Tissue peek: `:graph in argnames[nargs:end]` is true only for the
+    # required-kwarg method.
+    peek(f) = :graph in outer_kw_slots(f)
+    @test peek(test_mod.f_outer_req)
+    @test !peek(test_mod.f_outer_opt)
+    # `Base.kwarg_decl` stays correct and does not double-list any name.
+    @test Base.kwarg_decl(first(methods(test_mod.f_outer_req))) == [:graph]
+    @test Base.kwarg_decl(first(methods(test_mod.f_outer_mix))) == [:x, :y, Symbol("kw...")]
+end
+
 @testset "Keyword call evaluation order" begin
     # Keyword calls must evaluate the receiver and their arguments in source
     # (left-to-right) program order, exactly like ordinary positional calls and
