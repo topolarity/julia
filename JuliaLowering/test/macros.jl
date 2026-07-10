@@ -2288,11 +2288,10 @@ fl_eval(test_mod, :(macro def_ctx_local(fname)
         end
     end
 end))
-# `global` declarations overlapping the escaped parameter: flisp reads the
-# module global; under JuliaLowering this is the pre-existing (alias-blind,
-# fix-independent) "globals may overlap args or sparams" divergence - see the
-# `@test_broken` coverage in test/scopes.jl - because the relayered global
-# collides with the escaped parameter's caller-layer binding.
+# `global` declarations overlapping the escaped parameter: the relayered
+# global shadows the identity-mapped parameter for the whole body, so the bare
+# reference reads the module global - see "globals may overlap args or
+# sparams" in test/scopes.jl.
 fl_eval(test_mod, :(macro def_ctx_global(fname)
     ctxparam = :($(esc(:__ctx__))::Any)
     quote
@@ -2331,18 +2330,92 @@ Core.@latestworld
     @test run("@def_ctx_local(ctxf6); ctxf6(41)") == 5
 end
 
-@testset "(AI) escaped parameter overlapped by `global` decl (known divergence)" begin
-    # flisp resolves the bare name to the module global; JL errors on the
-    # arg/global overlap (pre-existing divergence independent of the escaped-
-    # parameter read alias, cf. "globals may overlap args" in test/scopes.jl).
+@testset "(AI) escaped parameter overlapped by `global` decl" begin
+    # The `global` declaration shadows the identity-mapped escaped parameter
+    # for the whole body, so the bare name reads the module global (999), the
+    # passed argument being dead.  Matches flisp.
     @test fl_eval(test_mod, JuliaSyntax.parsestmt(
         Expr, "@def_ctx_global(ctxf7fl); ctxf7fl(41)")) == 999
-    @test_broken JuliaLowering.include_string(
+    @test JuliaLowering.include_string(
         test_mod, "@def_ctx_global(ctxf7jl); ctxf7jl(41)";
         expr_compat_mode=true) == 999
-    @test_broken JuliaLowering.include_string(
+    @test JuliaLowering.include_string(
         test_mod, "@def_ctx_global(ctxf7jl2); ctxf7jl2(41)";
         expr_compat_mode=false) == 999
+end
+
+# More global-shadow compositions with identity-mapped names: an esc'd `global`
+# assignment shadows the esc'd parameter (read-before-decl sees the pre-existing
+# global, the assignment writes it); a relayered bare `global` shadows a bare
+# keyword-arg name the same way; but a bare positional parameter is hygienic
+# (gensym-renamed by flisp), so a same-named esc'd `global` does NOT collide
+# with it and both stay live.
+fl_eval(test_mod, :(macro def_shg_esc(fname)
+    quote
+        function $(esc(fname))($(esc(:__shg__)))
+            before = $(esc(:__shg__))
+            $(esc(:(global __shg__ = 1000)))
+            (before, $(esc(:__shg__)))
+        end
+    end
+end))
+fl_eval(test_mod, :(macro def_shg_kw(fname)
+    quote
+        function $(esc(fname))(; __shg__ = 1)
+            before = __shg__
+            global __shg__ = 1001
+            (before, __shg__)
+        end
+    end
+end))
+fl_eval(test_mod, :(macro def_shg_hyg(fname)
+    quote
+        function $(esc(fname))(__shg__)
+            $(esc(:(global __shg__ = 1002)))
+            (__shg__, $(esc(:__shg__)))
+        end
+    end
+end))
+@testset "(AI) global shadow of identity-mapped esc'd/kwarg params" begin
+    Base.eval(test_mod, :(global __shg__ = 500))
+    @test fl_eval(test_mod, JuliaSyntax.parsestmt(
+        Expr, "@def_shg_esc(shgf1fl); shgf1fl(41)")) == (500, 1000)
+    @test getglobal(test_mod, :__shg__) == 1000
+    Base.eval(test_mod, :(global __shg__ = 500))
+    @test JuliaLowering.include_string(
+        test_mod, "@def_shg_esc(shgf1jl); shgf1jl(41)";
+        expr_compat_mode=true) == (500, 1000)
+    @test getglobal(test_mod, :__shg__) == 1000
+    Base.eval(test_mod, :(global __shg__ = 500))
+    @test JuliaLowering.include_string(
+        test_mod, "@def_shg_esc(shgf1jl2); shgf1jl2(41)";
+        expr_compat_mode=false) == (500, 1000)
+    @test getglobal(test_mod, :__shg__) == 1000
+
+    Base.eval(test_mod, :(global __shg__ = 500))
+    @test fl_eval(test_mod, JuliaSyntax.parsestmt(
+        Expr, "@def_shg_kw(shgf2fl); shgf2fl(__shg__ = 41)")) == (500, 1001)
+    Base.eval(test_mod, :(global __shg__ = 500))
+    @test JuliaLowering.include_string(
+        test_mod, "@def_shg_kw(shgf2jl); shgf2jl(__shg__ = 41)";
+        expr_compat_mode=true) == (500, 1001)
+    Base.eval(test_mod, :(global __shg__ = 500))
+    @test JuliaLowering.include_string(
+        test_mod, "@def_shg_kw(shgf2jl2); shgf2jl2(__shg__ = 41)";
+        expr_compat_mode=false) == (500, 1001)
+
+    # hygienic bare parameter: no collision, parameter stays live
+    Base.eval(test_mod, :(global __shg__ = 500))
+    @test fl_eval(test_mod, JuliaSyntax.parsestmt(
+        Expr, "@def_shg_hyg(shgf3fl); shgf3fl(41)")) == (41, 1002)
+    Base.eval(test_mod, :(global __shg__ = 500))
+    @test JuliaLowering.include_string(
+        test_mod, "@def_shg_hyg(shgf3jl); shgf3jl(41)";
+        expr_compat_mode=true) == (41, 1002)
+    Base.eval(test_mod, :(global __shg__ = 500))
+    @test JuliaLowering.include_string(
+        test_mod, "@def_shg_hyg(shgf3jl2); shgf3jl2(41)";
+        expr_compat_mode=false) == (41, 1002)
 end
 
 # Reverse of the escaped-parameter alias above: an old-style macro emits a

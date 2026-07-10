@@ -75,8 +75,8 @@ end
 |----------++------------+-------+--------------------+--------------------|
 | global   || no-op      | (*)   |                    |                    |
 | local    || error (*)  | no-op |                    |                    |
-| arg      || shadow(??) | error | error (not unique) |                    |
-| sparam   || shadow(??) | error | error (sparam/arg) | error (not unique) |
+| arg      || shadow     | error | error (not unique) |                    |
+| sparam   || shadow     | error | error (sparam/arg) | error (not unique) |
 =#
 @testset "Conflicts in the same local scope" begin
 
@@ -106,24 +106,40 @@ end
         @test_throws LoweringError JuliaLowering.include_string(test_mod, s)
     end
 
-    # globals may overlap args or sparams (buggy?)  TODO: decide whether it's
-    # worth replicating this behaviour.  We would likely need to copy the way
-    # flisp nests an extra scope block in every lambda.
+    # globals may overlap args or sparams: a `global x` declaration shadows a
+    # same-named argument or static parameter for the whole lambda body (every
+    # reference resolves to the module global; the arg/sparam slot stays live in
+    # the signature but is dead in the body).  Matches flisp.
     @testset "arg,global" begin
-        local f
         s = "function (a); global a = 1; a; end"
-        @test_broken f = JuliaLowering.include_string(test_mod, s)
-        @test_broken f isa Function
-        @test_broken f(999) === 1
-        @test_broken isdefinedglobal(test_mod, :a)
+        f = JuliaLowering.include_string(test_mod, s)
+        @test f isa Function
+        @test f(999) === 1
+        @test isdefinedglobal(test_mod, :a)
     end
     @testset "sparam,global" begin
-        local f
         s = "function (a::s) where {s}; global s = 1; s; end"
-        @test_broken f = JuliaLowering.include_string(test_mod, s)
-        @test_broken f isa Function
-        @test_broken f(999) === 1
-        @test_broken isdefinedglobal(test_mod, :s)
+        f = JuliaLowering.include_string(test_mod, s)
+        @test f isa Function
+        @test f(999) === 1
+        @test isdefinedglobal(test_mod, :s)
+    end
+    @testset "arg,global whole-scope shadow" begin
+        # The shadow spans the *whole* body: a reference textually before the
+        # `global` declaration also resolves to the global, and a bare write
+        # goes to the global (the VoxelModel `_add_geom`/`global gridID` shape).
+        JuliaLowering.include_string(test_mod, "global gsh = [10, 20, 30]")
+        s = """
+        function shadow_readwrite(gsh)
+            before = gsh          # read before the decl: resolves to the global
+            global gsh            # declaration shadows the arg for the whole body
+            gsh = before .+ 1     # bare assignment writes the global
+            return before
+        end"""
+        f = JuliaLowering.include_string(test_mod, s)
+        # argument [1,2,3] is dead: result derives from the pre-existing global
+        @test f([1, 2, 3]) == [10, 20, 30]
+        @test getglobal(test_mod, :gsh) == [11, 21, 31]
     end
 
     # sp/arg conflict

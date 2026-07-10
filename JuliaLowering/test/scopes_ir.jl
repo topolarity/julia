@@ -287,16 +287,27 @@ function f(x)
 end
 
 ########################################
-# Error: Conflicting argument and global
+# Argument shadowed by a same-name global declaration
 function f(x)
     global x
 end
 #---------------------
-LoweringError:
-function f(x)
-    global x
-#          ╙ ── global variable name `x` conflicts with an existing argument from the same scope
-end
+1   (method TestMod.f)
+2   latestworld
+3   (call core.declare_global TestMod :x false)
+4   latestworld
+5   TestMod.f
+6   (call core.TypeEqOf %₅)
+7   (call core.svec %₆ core.Any)
+8   (call core.svec)
+9   SourceLocation::1:1
+10  (call core.svec %₇ %₈ %₉)
+11  --- method TestMod.f %₁₀
+    slots: [slot₁/#self#(!read) slot₂/x(!read)]
+    1   (return core.nothing)
+12  latestworld
+13  TestMod.f
+14  (return %₁₃)
 
 ########################################
 # Error: Conflicting destructured argument and global
@@ -324,16 +335,28 @@ function f(::T) where T
 end
 
 ########################################
-# Error: Conflicting static parameter and global
+# Static parameter shadowed by a same-name global declaration
 function f(::T) where T
     global T
 end
 #---------------------
-LoweringError:
-function f(::T) where T
-    global T
-#          ╙ ── global variable name `T` conflicts with an existing static parameter from the same scope
-end
+1   (method TestMod.f)
+2   latestworld
+3   (call core.TypeVar :T)
+4   (call core.declare_global TestMod :T false)
+5   latestworld
+6   TestMod.f
+7   (call core.TypeEqOf %₆)
+8   (call core.svec %₇ %₃)
+9   (call core.svec %₃)
+10  SourceLocation::1:1
+11  (call core.svec %₈ %₉ %₁₀)
+12  --- method TestMod.f %₁₁
+    slots: [slot₁/#self#(!read) slot₂/#unused#(!read)]
+    1   (return core.nothing)
+13  latestworld
+14  TestMod.f
+15  (return %₁₄)
 
 ########################################
 # Error: Conflicting static parameter and implicit local

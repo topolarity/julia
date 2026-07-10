@@ -52,6 +52,12 @@ struct ScopeInfo
     # `resolve_name` when `vars` misses, but invisible to assignment targets and
     # explicit declarations, which get fresh hygienic locals as under flisp.
     arg_aliases::Dict{NameKey,IdTag}
+    # flisp-compat: arg/sparam bindings whose name is shadowed by a `global`
+    # declaration in the same lambda.  `vars` maps the name to the shadowing
+    # global for body resolution; this keeps the original arg/sparam binding so
+    # the lambda's declaring parameter list still binds its slot (see
+    # `resolve_lambda_params` and `explicit_declare_in_scope!`).
+    shadowed_params::Dict{NameKey,IdTag}
     # See `LambdaBindings`. Nothing if not a lambda scope.  This is the final
     # collecting place for locals going in to closure conversion.
     locals_capt::Union{Nothing, Dict{IdTag,Bool}}
@@ -75,7 +81,7 @@ function ScopeInfo(ctx, parent_id, ex::SyntaxTree)
     s = ScopeInfo(
         id, parent_id, lambda_id, ex._id, is_permeable, is_lifted,
         Dict{IdTag, NodeId}(), Dict{NameKey, NodeId}(), Dict{NameKey,IdTag}(),
-        Dict{NameKey,IdTag}(),
+        Dict{NameKey,IdTag}(), Dict{NameKey,IdTag}(),
         kind(ex) === K"lambda" ? Dict{IdTag,Bool}() : nothing)
     push!(ctx.scopes, s)
     return s
@@ -148,6 +154,11 @@ function explicit_declare_in_scope!(ctx, scope::ScopeInfo, ex, new_k::Symbol)
         if new_k === :argument
             declare_in_scope!(ctx, scope, ex, :argument;
                               is_nospecialize=getmeta(ex, :nospecialize, false))
+        elseif new_k === :global &&
+                (ip = find_identity_param(ctx, scope, ex); !isnothing(ip))
+            # An identity-mapped param spelled as the same raw symbol in flisp
+            # (see below) is shadowed even though its exact key differs.
+            shadow_param_with_global!(ctx, scope, ex, ip...)
         else
             real_k = new_k === :destructured_arg ? :local : new_k
             declare_in_scope!(ctx, scope, ex, real_k)
@@ -158,9 +169,23 @@ function explicit_declare_in_scope!(ctx, scope::ScopeInfo, ex, new_k::Symbol)
         else
             throw(LoweringError(ex, "function $(_var_str(new_k)) name not unique"))
         end
-    # See note in test/scopes.jl: "globals may overlap args or sparams"
-    # elseif new_k === :global && old_k in (:argument, :static_parameter)
-    #     declare_in_scope!(ctx, scope, ex, :global)
+    # flisp compat: a `global x` declaration written alongside an argument or
+    # static parameter also named `x` shadows that arg/sparam for the *whole*
+    # lambda body (see test/scopes.jl "globals may overlap args or sparams").
+    # Re-declare `x` as a global so every body reference and assignment resolves
+    # to the module global, but remember the arg/sparam binding so the lambda's
+    # own parameter list still binds its (now dead) slot in `resolve_lambda_params`.
+    # Only shadow when flisp would see the declaration and the parameter as the
+    # same raw symbol: they share a syntax context (both written in the same
+    # expansion), or the parameter is identity-mapped (a kwarg name or esc'd
+    # named-def argument, which flisp leaves raw, so a colliding raw `global`
+    # shadows it too).  An unhygienic old-macro `global` relayered onto a
+    # caller's anonymous-lambda arg or sparam (`relayer_global_if_unhygienic`)
+    # matches neither, and still errors as a rescoping conflict.
+    elseif new_k === :global && old_k in (:argument, :static_parameter) &&
+            ((ex.context::SyntaxContext) === (binding_ex(ctx, bid).context::SyntaxContext) ||
+             get_binding(ctx, bid).is_flisp_identity)
+        shadow_param_with_global!(ctx, scope, ex, NameKey(ex), bid)
     else
         throw(LoweringError(ex, """
         $(_var_str(new_k)) name `$(NameKey(ex).name)` conflicts with an \
@@ -169,6 +194,47 @@ function explicit_declare_in_scope!(ctx, scope::ScopeInfo, ex, new_k::Symbol)
     register_kwarg_aliases!(ctx, scope, ex, result_bid)
     register_arg_name_aliases!(ctx, scope, ex, result_bid)
     return result_bid
+end
+
+# Find an identity-mapped argument or static parameter in `scope` that flisp
+# would spell as the same raw symbol as the `global` declaration `ex`: same
+# name, on a related layer (`===` or ancestor in either direction; unrelated
+# layers are gensym-renamed by flisp and cannot collide).  This catches e.g. a
+# relayered old-macro `global x` whose key differs from a bare kwarg `x` of the
+# same expansion.  Returns `(key, binding_id)` or `nothing`.
+function find_identity_param(ctx, scope::ScopeInfo, ex)
+    nk = NameKey(ex)
+    best_key = nothing
+    best_bid = 0
+    for (k, bid) in scope.vars
+        k.name == nk.name || continue
+        k.layer === nk.layer || is_strict_ancestor_layer(k.layer, nk.layer) ||
+            is_strict_ancestor_layer(nk.layer, k.layer) || continue
+        b = get_binding(ctx, bid)
+        b.is_flisp_identity && b.kind in (:argument, :static_parameter) || continue
+        # Deterministic pick among (pathological) multiple matches
+        if isnothing(best_key) ||
+            get(ctx.layer_ids, k.layer, typemax(Int)) <
+            get(ctx.layer_ids, best_key.layer, typemax(Int))
+            best_key = k
+            best_bid = bid
+        end
+    end
+    isnothing(best_key) ? nothing : (best_key, best_bid)
+end
+
+# Apply the whole-scope global shadow: declare `ex` as a global, redirect the
+# shadowed param's name (and any `arg_aliases` still pointing at it) to the
+# global so every body reference resolves there, and record the param binding
+# for `resolve_lambda_params`.
+function shadow_param_with_global!(ctx, scope::ScopeInfo, ex, param_key::NameKey, param_bid)
+    scope.shadowed_params[param_key] = param_bid
+    gid = declare_in_scope!(ctx, scope, ex, :global)
+    scope.vars[param_key] = gid
+    for (k, v) in scope.arg_aliases
+        v == param_bid && (scope.arg_aliases[k] = gid)
+    end
+    return gid
 end
 
 # flisp compat, the forward direction: an old-style macro may escape an
@@ -634,6 +700,20 @@ function add_local_decls!(ctx, stmts, srcref, scope)
     end
 end
 
+# Resolve a lambda's argument (or static-parameter) list.  These are declaring
+# occurrences, so a parameter whose name is shadowed by a body `global`
+# declaration must still bind its own arg/sparam slot here even though `vars`
+# now maps the name to the shadowing global (see `explicit_declare_in_scope!`).
+function resolve_lambda_params(ctx, params, scope)
+    isempty(scope.shadowed_params) && return _resolve_scopes(ctx, params, scope)
+    mapchildren(ctx, params) do c
+        bid = kind(c) === K"Identifier" ?
+            get(scope.shadowed_params, NameKey(c), nothing) : nothing
+        isnothing(bid) ? _resolve_scopes(ctx, c, scope) :
+            newleaf(ctx, c, K"BindingId", bid)
+    end
+end
+
 function _resolve_scopes(ctx, ex::SyntaxTree,
                          @nospecialize(scope::Union{Nothing, ScopeInfo}))
     k = kind(ex)
@@ -695,11 +775,18 @@ function _resolve_scopes(ctx, ex::SyntaxTree,
         # opaque closures are the exception
         # scope isa ScopeInfo && @jl_assert scope.is_lifted ex
         newscope = enter_scope!(ctx, ex)
-        arg_bindings = _resolve_scopes(ctx, ex[1], newscope)
+        arg_bindings = resolve_lambda_params(ctx, ex[1], newscope)
         sparam_bindings = SyntaxList(ctx)
         for sp in children(ex[2])
             kind(sp) === K"Placeholder" && continue
-            push!(sparam_bindings, _resolve_scopes(ctx, sp, newscope))
+            # A body `global` may shadow a same-named sparam (see
+            # `resolve_lambda_params`); keep the original binding for the
+            # parameter list itself.
+            bid = kind(sp) === K"Identifier" ?
+                get(newscope.shadowed_params, NameKey(sp), nothing) : nothing
+            push!(sparam_bindings, isnothing(bid) ?
+                  _resolve_scopes(ctx, sp, newscope) :
+                  newleaf(ctx, sp, K"BindingId", bid))
         end
         self_id = if numchildren(arg_bindings) === 0
             0
