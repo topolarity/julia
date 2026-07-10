@@ -833,13 +833,39 @@ function lhs_local_defs(ctx, lhs)
     return defs
 end
 
+# Return true when `a` and `b` are both all-underscore placeholders (eg `_`)
+# with the same name. Unlike `is_same_identifier_like`, this ignores the scope
+# layer: placeholders are write-only and carry no value identity, so the two `_`
+# occurrences of an eta-reducible generator (its loop variable and its body)
+# denote the same placeholder even when they originate from different layers (as
+# happens for `[_ for _ in x]`, where the body `_` and loop `_` land in
+# different layers).
+function is_same_placeholder(a::SyntaxTree, b::SyntaxTree)
+    kind(a) == K"Placeholder" && kind(b) == K"Placeholder" && a.name_val == b.name_val
+end
+
 # Return the anonymous function taking an iterated value, for use with the
 # first argument to `Base.Generator`
 function func_for_generator(ctx, body, iter_value_destructuring)
-    if is_same_identifier_like(iter_value_destructuring, body)
+    if is_same_identifier_like(iter_value_destructuring, body) ||
+            is_same_placeholder(iter_value_destructuring, body)
         # Use Base.identity for generators which are filters such as
         # `(x for x in xs if f(x))`. This avoids creating a new type.
+        # The `is_same_placeholder` case also handles the placeholder identity
+        # `[_ for _ in x]`.
         @ast ctx body "identity"::K"top"
+    elseif kind(iter_value_destructuring) == K"Placeholder" &&
+            kind(body) == K"call" && numchildren(body) == 2 &&
+            is_same_placeholder(iter_value_destructuring, body[2]) &&
+            !contains_unquoted(e -> is_same_placeholder(iter_value_destructuring, e), body[1])
+        # eta-reduce `_ -> f(_)` => `f`, mirroring the (already-deprecated, see
+        # #18621) reducing branch of flisp's `func-for-generator-ranges`
+        # (src/julia-syntax.scm). The loop variable `_` is write-only, so the
+        # `_ -> f(_)` lambda body could not otherwise be lowered; reducing to the
+        # bare callee (evaluated once) makes `[f(_) for _ in x]` legal, matching
+        # the reference lowering. Restricted to a plain (non-dot) single-argument
+        # call whose callee does not itself mention `_`.
+        @ast ctx body body[1]
     elseif !is_identifier_like(iter_value_destructuring)
         # compat: arg::T should convert, not assert, and duplicated arg is OK
         arg = newsym(ctx, iter_value_destructuring, "#generator#")

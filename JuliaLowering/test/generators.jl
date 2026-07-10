@@ -243,3 +243,47 @@ end
     end
     """) == ones(Int, 5, 5)
 end
+
+@testset "(AI) eta-reduced underscore generator body" begin
+    # A generator/comprehension whose loop variable is the placeholder `_` and
+    # whose body reads `_` is legal only when the body is eta- or
+    # identity-reducible (mirrors flisp's `func-for-generator-ranges`, #18621).
+    local etamod = Module()
+    JuliaLowering.include_string(etamod, "sq(x) = x^2")
+    JuliaLowering.include_string(etamod, "add(a, b) = a + b")
+    jeval(str) = JuliaLowering.include_string(etamod, str)
+
+    # eta-reduce `_ -> f(_)` => `f` (the PlotlyBase `[f(_) for _ in x]` shape)
+    @test jeval("[sq(_) for _ in 1:3]") == [1, 4, 9]
+    @test jeval("collect(sq(_) for _ in 1:3)") == [1, 4, 9]
+    @test jeval("[sin(_) for _ in 1:3]") == sin.(1:3)   # builtin callee
+    @test jeval("[(sq(_)) for _ in 1:3]") == [1, 4, 9]  # parenthesized call
+    # identity `[_ for _ in x]`
+    @test jeval("[_ for _ in 1:3]") == [1, 2, 3]
+    @test jeval("collect(_ for _ in 1:3)") == [1, 2, 3]
+
+    # Observable consequence of the eta-reduction: the `Generator`'s `.f` is the
+    # bare callee, and an expression callee is evaluated exactly once (not once
+    # per element), matching flisp.
+    @test jeval("(sq(_) for _ in 1:3).f === sq")
+    # A named loop variable is *not* eta-reduced, so its `.f` is a fresh closure.
+    @test jeval("(sq(v) for v in 1:3).f === sq") == false
+    @test jeval("""
+    let count = Ref(0)
+        getf() = (count[] += 1; sq)
+        collect(getf()(_) for _ in 1:3)
+        count[]
+    end
+    """) == 1
+
+    # Shapes that are *not* reducible must still reject the write-only `_` read,
+    # exactly as flisp does.
+    @test_throws LoweringError jeval("[_ + 1 for _ in 1:3]")
+    @test_throws LoweringError jeval("[sq(_) + 1 for _ in 1:3]")
+    @test_throws LoweringError jeval("[add(_, _) for _ in 1:3]")
+    @test_throws LoweringError jeval("[add(_, 2) for _ in 1:3]")
+    @test_throws LoweringError jeval("[sq(identity(_)) for _ in 1:3]")  # nested call
+    @test_throws LoweringError jeval("[sq(_) .+ 0 for _ in 1:3]")       # dotcall
+    @test_throws LoweringError jeval("[sq(_) for _ in 1:3 if _ > 1]")   # `_` read in filter
+    @test_throws LoweringError jeval("collect(sq(_) for _ in 1:2, _ in 1:2)")  # product
+end

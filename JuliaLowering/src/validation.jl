@@ -87,6 +87,12 @@ Base.@kwdef struct Validation1Context <: ValidationContext
     # Mod._ is also readable
     readable_underscore::Bool=false
 
+    # Like `readable_underscore`, but independent of flisp-compat mode: set for
+    # shapes desugaring reduces away even in native syntax -- the eta/identity-
+    # reducible generator body `_` (see `vst1_generator_body`), whose read is
+    # removed by `func_for_generator` before it could reach the IR.
+    native_readable_underscore::Bool=false
+
     # vst0 shares this context type since macro expansion doesn't recurse
     # into some forms, and most parts of the AST are the same.
     unexpanded::Bool=false
@@ -100,10 +106,11 @@ function with(vcx::Validation1Context;
               inner_cond   =vcx.inner_cond,
               return_ok    =vcx.return_ok,
               readable_underscore=vcx.readable_underscore,
+              native_readable_underscore=vcx.native_readable_underscore,
               unexpanded   =vcx.unexpanded)
     Validation1Context(
         toplevel, in_gscope, in_loop, in_symblock, inner_cond, return_ok,
-        readable_underscore, unexpanded)
+        readable_underscore, native_readable_underscore, unexpanded)
 end
 
 """
@@ -532,7 +539,8 @@ vst1_ident(vcx, st; lhs=false) = @stm st begin
     _ -> @fail(st, "expected identifier")
 end
 function _ident_str(vcx, st, s::String; lhs=false)
-    if !lhs && (!vcx.readable_underscore || !is_flisp_compat(st)) &&
+    if !lhs && !vcx.native_readable_underscore &&
+        (!vcx.readable_underscore || !is_flisp_compat(st)) &&
         is_writeonly_est_name(s)
         @fail(st, "all-underscore identifiers are write-only and their values cannot be used in expressions")
     elseif lhs && s in ("ccall", "cglobal")
@@ -1047,16 +1055,45 @@ vst1_splat_or_val(vcx, st) = @stm st begin
     _ -> vst1(vcx, st)
 end
 
+# Return true when a generator/comprehension body `val` iterating over
+# `iterspecs` is eta- or identity-reducible with respect to a single
+# all-underscore loop variable (eg `[_ for _ in x]` or `[f(_) for _ in x]`). In
+# these cases desugaring (`func_for_generator`) reduces the body and the `_`
+# read is removed, so it must not be rejected as write-only here. Mirrors the
+# reducing branches of flisp's `func-for-generator-ranges`
+# (src/julia-syntax.scm).
+function generator_body_underscore_reducible(val, iterspecs)
+    length(iterspecs) == 1 || return false
+    spec = iterspecs[1]
+    (kind(spec) == K"=" && numchildren(spec) == 2) || return false
+    lv = spec[1]
+    (kind(lv) == K"Identifier" && is_writeonly_est_name(lv.name_val)) || return false
+    name = lv.name_val
+    is_the_underscore(e) = kind(e) == K"Identifier" && e.name_val == name
+    # identity `[_ for _ in x]`
+    is_the_underscore(val) && return true
+    # eta `[f(_) for _ in x]`: single-argument plain call whose sole argument is
+    # the loop `_` and whose callee does not itself mention `_`.
+    (kind(val) == K"call" && numchildren(val) == 2) || return false
+    is_the_underscore(val[2]) || return false
+    return !contains_unquoted(is_the_underscore, val[1])
+end
+
+vst1_generator_body(vcx, val, iterspecs) =
+    generator_body_underscore_reducible(val, iterspecs) ?
+        vst1(with(vcx; native_readable_underscore=true), val) :
+        vst1(vcx, val)
+
 vst1_generator(vcx, st) = let
     vcx = with(vcx; return_ok=false, toplevel=false, in_gscope=false)
     @stm st begin
         [K"generator" _] -> @fail(st, "`generator` requires >=2 args")
         [K"generator" val [K"filter" cond is...]] ->
-            vst1(vcx, val) &
+            vst1_generator_body(vcx, val, is) &
             vst1(vcx, cond) &
             all(vst1_iter, vcx, is)
         [K"generator" val is...] ->
-            vst1(vcx, val) & all(vst1_iter, vcx, is)
+            vst1_generator_body(vcx, val, is) & all(vst1_iter, vcx, is)
         [K"generator" _...] -> @fail(st, "malformed `generator`")
         _ -> @fail(st, "expected `generator`")
     end

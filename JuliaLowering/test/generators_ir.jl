@@ -154,12 +154,21 @@
 19  (return %₁₈)
 
 ########################################
-# Error: Use of placeholders in body
+# Use of placeholder identity in body (eta-reduces to `identity`)
 (_ for _ in xs)
 #---------------------
-LoweringError:
-(_ for _ in xs)
-#╙ ── all-underscore identifiers are write-only and their values cannot be used in expressions
+1   TestMod.xs
+2   (call top.Generator top.identity %₁)
+3   (return %₂)
+
+########################################
+# Eta-reduction of `_ -> f(_)` body to the bare callee (#18621)
+(f(_) for _ in xs)
+#---------------------
+1   TestMod.f
+2   TestMod.xs
+3   (call top.Generator %₁ %₂)
+4   (return %₃)
 
 ########################################
 # 1D generator with destructuring
