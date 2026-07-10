@@ -2705,6 +2705,38 @@ function optional_positional_defs(ctx, src, mtable, sparams, argl, body, rett)
     @ast ctx src [K"block" methods...]
 end
 
+# Tag every argument *name* of a named method definition -- positional args,
+# optional-arg names, vararg names, keyword-arg names (incl. rest kwargs), and
+# the components of destructured (tuple) arguments -- so scope analysis can
+# register the flisp-compat read-only alias binding a bare (macro-layer) body
+# reference to an esc'd (ancestor/caller-layer) argument name.  This mirrors
+# flisp's identity mapping of escaped argument names in the expansion
+# environment (macroexpand.scm `keywords-introduced-by` via
+# `safe-llist-keyword-args`/`try-arg-name`), which applies only to
+# `function`/`=` definitions with a call signature: anonymous functions, `->`
+# (and thus `do` blocks and generator lambdas), opaque closures, and macro
+# definitions get no identity mapping there, and neither does the self name of
+# a callable-object definition `function (obj::T)(...)`, so those names stay
+# untagged.  See `register_arg_name_aliases!`.
+function tag_method_arg_names(ex)
+    k = kind(ex)
+    if k === K"Identifier"
+        setmeta(ex, :is_method_arg_name, true)
+    elseif (k === K"::" && numchildren(ex) == 2) || k === K"..." ||
+            k === K"kw" || k === K"="
+        out1 = tag_method_arg_names(ex[1])
+        out1 == ex[1] ? ex : @ast ex._graph ex [k out1 ex[2:end]...]
+    elseif k === K"tuple" || k === K"parameters"
+        mapchildren(tag_method_arg_names, ex._graph, ex)
+    elseif k === K"meta" && numchildren(ex) == 2
+        # per-argument annotations, e.g. `@nospecialize x`
+        out2 = tag_method_arg_names(ex[2])
+        out2 == ex[2] ? ex : @ast ex._graph ex [k ex[1] out2]
+    else
+        ex
+    end
+end
+
 function expand_kw_args(ctx, kws)
     kargl, restkw = @stm kws begin
         [K"parameters" xs... [K"..." va]] -> (xs, va)
@@ -3164,7 +3196,11 @@ function expand_macro_def(ctx, ex)
 
     sc_ref = (kind(name) == K"." ? name[1] : name)
     if is_flisp_compat(ex)
-        @ast ctx ex [K"function"
+        # Marked `:is_macro_def_function` because flisp gives macro arguments
+        # no identity mapping (macroexpand.scm treats `macro` like `->` for
+        # hygiene), so the argument names must not get the flisp-compat
+        # aliases of a named method definition (see `tag_method_arg_names`).
+        setmeta!(@ast(ctx, ex, [K"function"
             [K"call"(sig)
                 _make_macro_name(ctx, name)
                 [K"::"
@@ -3178,7 +3214,7 @@ function expand_macro_def(ctx, ex)
                 mapsyntax(e->apply_arg_meta(e, :nospecialize), args)...
             ]
             ex[2]
-        ]
+        ]), :is_macro_def_function, true)
     else
         @ast ctx ex [K"function"
             [K"call"(sig)
@@ -4460,6 +4496,13 @@ function expand_forms_2(ctx::DesugaringContext, ex::SyntaxTree, docs=nothing)
             @ast ctx ex [K"block" [K"local" name] expand_function_def(
                 ctx, ex, SyntaxList(name, args...), wheres, ex[2], rett)]
         else
+            # Only *named* method definitions get the flisp-compat argument
+            # name aliases (see `tag_method_arg_names`); anonymous functions,
+            # `->` (and so `do` blocks and generator lambdas) and macro
+            # definitions do not.
+            if !getmeta(ex, :is_macro_def_function, false)
+                args = mapsyntax(tag_method_arg_names, args)
+            end
             expand_function_def(
                 ctx, ex, SyntaxList(name, args...), wheres, ex[2], rett)
         end

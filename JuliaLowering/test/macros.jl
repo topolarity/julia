@@ -2145,6 +2145,132 @@ end
     end
 end
 
+# Old-style macros that build a function whose parameter *name* is escaped
+# (`esc(:__ctx__)`) but whose body refers to that same symbol bare/unescaped.
+# flisp binds the two by plain name (escaped argument names get an identity
+# mapping in the expansion environment); JuliaLowering must match this for
+# flisp-compatible expansions.  This is the ZygoteRules `@adjoint`/`gradm`
+# pattern (`ZygoteRules.jl/src/adjoint.jl`).
+fl_eval(test_mod, :(macro def_ctx_fn(fname)
+    ctxparam = :($(esc(:__ctx__))::Any)
+    quote
+        function $(esc(fname))($ctxparam)
+            return __ctx__ + 1     # bare ref must bind to the escaped parameter
+        end
+    end
+end))
+fl_eval(test_mod, :(macro def_ctx_closure(fname)
+    ctxparam = :($(esc(:__ctx__))::Any)
+    quote
+        function $(esc(fname))($ctxparam)
+            g() = __ctx__ + 1      # inner closure captures the escaped parameter
+            return g()
+        end
+    end
+end))
+fl_eval(test_mod, :(macro def_ctx_multi(fname)
+    a = :($(esc(:__a__))::Any)
+    b = :($(esc(:__b__))::Any)
+    quote
+        function $(esc(fname))($a, $b)
+            return __a__ + __b__
+        end
+    end
+end))
+# Hygiene must be preserved: a *nested* macro that emits a bare same-named
+# reference belongs to a different expansion and must NOT bind to the outer
+# escaped parameter (it stays an ordinary, here-undefined, global).
+fl_eval(test_mod, :(macro hyg_inner(); quote __hyg__ + 100 end; end))
+fl_eval(test_mod, :(macro def_ctx_hygiene(fname)
+    hygparam = :($(esc(:__hyg__))::Any)
+    quote
+        function $(esc(fname))($hygparam)
+            return @hyg_inner()    # must resolve to (undefined) global __hyg__
+        end
+    end
+end))
+# The alias is READ-only: flisp's identity mapping for escaped argument names
+# is shadowed by the gensym-renaming of names *assigned* in the expansion, so
+# an assigned bare name is a fresh hygienic local (here read-before-assigned),
+# NOT the escaped parameter.
+fl_eval(test_mod, :(macro def_ctx_assign(fname)
+    ctxparam = :($(esc(:__ctx__))::Any)
+    quote
+        function $(esc(fname))($ctxparam)
+            __ctx__ = __ctx__ + 5  # renamed: fresh local, used before assignment
+            return __ctx__
+        end
+    end
+end))
+# Explicit `local` declarations must also be alias-blind: the bare name is
+# declared as a fresh hygienic local (flisp gensym-renames it), not rejected
+# as conflicting with the escaped parameter.
+fl_eval(test_mod, :(macro def_ctx_local(fname)
+    ctxparam = :($(esc(:__ctx__))::Any)
+    quote
+        function $(esc(fname))($ctxparam)
+            local __ctx__ = 5      # fresh local, not the parameter
+            return __ctx__
+        end
+    end
+end))
+# `global` declarations overlapping the escaped parameter: flisp reads the
+# module global; under JuliaLowering this is the pre-existing (alias-blind,
+# fix-independent) "globals may overlap args or sparams" divergence - see the
+# `@test_broken` coverage in test/scopes.jl - because the relayered global
+# collides with the escaped parameter's caller-layer binding.
+fl_eval(test_mod, :(macro def_ctx_global(fname)
+    ctxparam = :($(esc(:__ctx__))::Any)
+    quote
+        function $(esc(fname))($ctxparam)
+            global __ctx__
+            return __ctx__         # module global (999), not the parameter
+        end
+    end
+end))
+# A global of the same name exists in the macro-definition module: the escaped
+# parameter must still win over it (flisp identity mapping shadows the global).
+Base.eval(test_mod, :(global __ctx__ = 999))
+Base.eval(test_mod, :(global __a__ = 999))
+Base.eval(test_mod, :(global __b__ = 999))
+Core.@latestworld
+
+@testset "(AI) escaped parameter name, bare body reference (flisp compat)" for run in [
+    (x::String)->fl_eval(test_mod, JuliaSyntax.parsestmt(Expr, "#=FLISP SANITY-CHECK=# "*x)),
+    (x::String)->JuliaLowering.include_string(
+        test_mod, "#=JL COMPAT=# "*x; expr_compat_mode=true),
+    (x::String)->JuliaLowering.include_string(
+        test_mod, "#=JL=# "*x; expr_compat_mode=false)]
+
+    # Bare body reference binds to the escaped parameter (not the same-named
+    # global), for a plain function, an inner closure, and multiple parameters.
+    @test run("@def_ctx_fn(ctxf1); ctxf1(41)") == 42
+    @test run("@def_ctx_closure(ctxf2); ctxf2(41)") == 42
+    @test run("@def_ctx_multi(ctxf3); ctxf3(40, 2)") == 42
+    # Hygiene of a nested macro's identically-named reference is preserved.
+    @test_throws UndefVarError run("@def_ctx_hygiene(ctxf4); ctxf4(41)")
+    # READ-only: an assigned bare name is a fresh hygienic local, not the
+    # escaped parameter; reading it before assignment throws.
+    @test_throws UndefVarError run("@def_ctx_assign(ctxf5); ctxf5(41)")
+    # READ-only: an explicit `local` declaration introduces a fresh local
+    # rather than conflicting with (or resolving to) the escaped parameter.
+    @test run("@def_ctx_local(ctxf6); ctxf6(41)") == 5
+end
+
+@testset "(AI) escaped parameter overlapped by `global` decl (known divergence)" begin
+    # flisp resolves the bare name to the module global; JL errors on the
+    # arg/global overlap (pre-existing divergence independent of the escaped-
+    # parameter read alias, cf. "globals may overlap args" in test/scopes.jl).
+    @test fl_eval(test_mod, JuliaSyntax.parsestmt(
+        Expr, "@def_ctx_global(ctxf7fl); ctxf7fl(41)")) == 999
+    @test_broken JuliaLowering.include_string(
+        test_mod, "@def_ctx_global(ctxf7jl); ctxf7jl(41)";
+        expr_compat_mode=true) == 999
+    @test_broken JuliaLowering.include_string(
+        test_mod, "@def_ctx_global(ctxf7jl2); ctxf7jl2(41)";
+        expr_compat_mode=false) == 999
+end
+
 @testset "(AI) old-style macro method-def name -> macro-home global (flisp compat)" begin
     # An unescaped method-def *name* at the root of an old-style macro's
     # expansion binds a plain global of the *macro's* module (defining or
@@ -2264,4 +2390,203 @@ end
     Core.@latestworld
     @test cfl.result() == Vector{cfl.User.PooledVec{Float64}}
     @test cjl.result() == Vector{cjl.User.PooledVec{Float64}}
+end
+
+# Wholesale port of flisp's expansion-environment identity mapping
+# (macroexpand.scm `keywords-introduced-by`/`safe-llist-keyword-args`): the
+# escaped-argument-name alias applies to every argument-name position of a
+# *named* method definition -- destructured (tuple) components, optional-arg
+# names, varargs, rest kwargs -- and to nothing else: anonymous functions,
+# `->`, `do` blocks, generators, macro definitions, and the self name of a
+# callable-object definition get no identity mapping in flisp, so their
+# escaped names must NOT alias bare same-named body references (which resolve
+# as macro-home-module globals instead).
+
+# Aliased: escaped names in every arg-name position of a named def.
+fl_eval(test_mod, :(macro def_destr_fn(fname)
+    quote
+        function $(esc(fname))(($(esc(:__da__)), b))
+            return __da__ + b       # bare ref binds the destructured element
+        end
+    end
+end))
+fl_eval(test_mod, :(macro def_destr_short(fname)
+    quote
+        $(esc(fname))(($(esc(:__da__)), b)) = __da__ + b
+    end
+end))
+fl_eval(test_mod, :(macro def_destr_nested(fname)
+    quote
+        function $(esc(fname))((($(esc(:__da__)), b), c))
+            return __da__ + b + c
+        end
+    end
+end))
+fl_eval(test_mod, :(macro def_opt_arg(fname)
+    p = Expr(:kw, esc(:__oa__), 40)
+    quote
+        function $(esc(fname))($p)
+            return __oa__ + 2
+        end
+    end
+end))
+fl_eval(test_mod, :(macro def_va_arg(fname)
+    quote
+        function $(esc(fname))($(esc(:__va__))...)
+            return sum(__va__)
+        end
+    end
+end))
+fl_eval(test_mod, :(macro def_esc_kwname(fname)
+    p = Expr(:kw, esc(:__ek__), 1)
+    quote
+        function $(esc(fname))(; $p)
+            return __ek__ + 1       # bare body ref binds the esc'd kwarg
+        end
+    end
+end))
+fl_eval(test_mod, :(macro def_esc_restkw(fname)
+    p = Expr(:..., esc(:__rk__))
+    quote
+        function $(esc(fname))(; $p)
+            return length(__rk__)
+        end
+    end
+end))
+# NOT aliased: `->`, `do`, generators, and the callable-object self name.
+# flisp resolves the bare body reference as a global of the macro's home
+# module (here `test_mod`), so the planted 999-valued globals below are read.
+fl_eval(test_mod, :(macro mk_arrow()
+    :($(esc(:__na__)) -> __na__ + 1)
+end))
+fl_eval(test_mod, :(macro mk_do(f)
+    quote
+        $(esc(f))() do $(esc(:__na__))
+            __na__ + 1
+        end
+    end
+end))
+fl_eval(test_mod, :(macro mk_gen()
+    :(collect(__ng__ + 1 for $(esc(:__ng__)) in [5]))
+end))
+fl_eval(test_mod, :(macro def_esc_self(tname)
+    quote
+        function ($(esc(:__ns__))::$(esc(tname)))()
+            return __ns__          # NOT the callable object: macro-home global
+        end
+    end
+end))
+Base.eval(test_mod, :(global __da__ = 999))
+Base.eval(test_mod, :(global __oa__ = 999))
+Base.eval(test_mod, :(global __va__ = 999))
+Base.eval(test_mod, :(global __ek__ = 999))
+Base.eval(test_mod, :(global __rk__ = 999:999))
+Base.eval(test_mod, :(global __na__ = 999))
+Base.eval(test_mod, :(global __ng__ = 999))
+Base.eval(test_mod, :(global __ns__ = 999))
+Base.eval(test_mod, :(struct SelfCB1 end))
+Base.eval(test_mod, :(callf(g) = g(41)))
+Core.@latestworld
+
+@testset "(AI) escaped arg names: named-def positions alias, others don't (flisp compat)" for run in [
+    (x::String)->fl_eval(test_mod, JuliaSyntax.parsestmt(Expr, "#=FLISP SANITY-CHECK=# "*x)),
+    (x::String)->JuliaLowering.include_string(
+        test_mod, "#=JL COMPAT=# "*x; expr_compat_mode=true),
+    (x::String)->JuliaLowering.include_string(
+        test_mod, "#=JL=# "*x; expr_compat_mode=false)]
+
+    # Destructured argument components (function form, `=` short form, nested
+    # tuple): the bare body reference binds the escaped element, not the
+    # same-named macro-home global (999).
+    @test run("@def_destr_fn(daf1); daf1((40, 2))") == 42
+    @test run("@def_destr_short(daf2); daf2((40, 2))") == 42
+    @test run("@def_destr_nested(daf3); daf3(((40, 1), 1))") == 42
+    # Optional-arg name, vararg name, escaped kwarg name, escaped rest-kwarg.
+    @test run("@def_opt_arg(oaf1); oaf1()") == 42
+    @test run("@def_opt_arg(oaf2); oaf2(7)") == 9
+    @test run("@def_va_arg(vaf1); vaf1(40, 2)") == 42
+    @test run("@def_esc_kwname(ekf1); ekf1(__ek__ = 41)") == 42
+    @test run("@def_esc_restkw(rkf1); rkf1(a = 1, b = 2)") == 2
+    # No identity mapping for `->`/`do`/generator escaped "args": the bare
+    # body reference reads the macro-home global (999), like flisp.
+    @test run("(@mk_arrow())(41)") == 1000
+    @test run("@mk_do(callf)") == 1000
+    @test run("@mk_gen()") == [1000]
+    # No identity mapping for an escaped callable-object self name.
+    @test run("@def_esc_self(SelfCB1); SelfCB1()()") == 999
+end
+
+# flisp's identity mapping leaves the name as a *raw symbol*, so a reference to
+# an identity-mapped name (an esc'd named-def argument)
+# is subject to ordinary lexical shadowing by any intervening binder that flisp
+# also leaves as the raw symbol -- e.g. an esc'd `->`/`do`/generator argument
+# or an esc'd `let` binding of the same name.  Those binders carry a different
+# scope layer here, so the alias/binding must yield to them (raw-symbol
+# shadowing in `resolve_name`), while a bare binder belonging to an unrelated
+# nested expansion (which flisp gensym-renames) must not capture.
+fl_eval(test_mod, :(macro def_shadow_do(fname)
+    quote
+        function $(esc(fname))($(esc(:__sh__)))
+            map([2]) do $(esc(:__sh__))
+                __sh__ + 1         # binds the do-arg, not the outer argument
+            end
+        end
+    end
+end))
+fl_eval(test_mod, :(macro def_shadow_arrow(fname)
+    quote
+        function $(esc(fname))($(esc(:__sh__)))
+            ($(esc(:__sh__)) -> __sh__ + 1)(2)
+        end
+    end
+end))
+fl_eval(test_mod, :(macro def_shadow_gen(fname)
+    quote
+        function $(esc(fname))($(esc(:__sh__)))
+            collect(__sh__ for $(esc(:__sh__)) in [1, 2, 3])
+        end
+    end
+end))
+fl_eval(test_mod, :(macro def_shadow_let(fname)
+    quote
+        function $(esc(fname))($(esc(:__sh__)))
+            let $(esc(:__sh__)) = 2
+                __sh__ + 1
+            end
+        end
+    end
+end))
+# Splicing guard: the outer identity-mapped reference is passed into a nested
+# macro whose arrow binder is esc'd; that esc resolves to the outer macro's
+# layer -- the same raw symbol -- so it shadows there too, exactly as flisp.
+fl_eval(test_mod, :(macro shadow_inner_fn(body)
+    :(($(esc(:__sh__)) -> $(esc(body)))(2))
+end))
+fl_eval(test_mod, :(macro def_shadow_nested(fname)
+    quote
+        function $(esc(fname))($(esc(:__sh__)))
+            @shadow_inner_fn(__sh__ + 1)
+        end
+    end
+end))
+Base.eval(test_mod, :(global __sh__ = 999))
+Core.@latestworld
+
+@testset "(AI) identity-mapped names are raw-symbol shadowable (flisp compat)" for run in [
+    (x::String)->fl_eval(test_mod, JuliaSyntax.parsestmt(Expr, "#=FLISP SANITY-CHECK=# "*x)),
+    (x::String)->JuliaLowering.include_string(
+        test_mod, "#=JL COMPAT=# "*x; expr_compat_mode=true),
+    (x::String)->JuliaLowering.include_string(
+        test_mod, "#=JL=# "*x; expr_compat_mode=false)]
+
+    # An esc'd inner binder shadows the aliased outer esc'd argument (do,
+    # arrow, generator, let); without raw-symbol shadowing these would read
+    # the outer argument instead (41, 41, [10,10,10], 41).
+    @test run("@def_shadow_do(shf1); shf1(40)") == [3]
+    @test run("@def_shadow_arrow(shf2); shf2(40)") == 3
+    @test run("@def_shadow_gen(shf3); shf3(10)") == [1, 2, 3]
+    @test run("@def_shadow_let(shf4); shf4(40)") == 3
+    # Nested-expansion splice: the nested macro's esc'd binder is the outer
+    # layer's raw symbol and captures the spliced reference (2 + 1).
+    @test run("@def_shadow_nested(shf6); shf6(40)") == 3
 end

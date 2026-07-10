@@ -24,6 +24,11 @@ mutable struct BindingInfo
     is_captured::Bool
     is_always_defined::Bool
     is_used_undef::Bool
+    # flisp-compat identity-mapped binder (a keyword-arg name, or an esc'd
+    # argument name of a named method definition): flisp leaves such names as
+    # raw symbols, so references to them are subject to raw-symbol lexical
+    # shadowing (see `_nearest_shadowing_binder` in scope_analysis.jl).
+    is_flisp_identity::Bool
 end
 
 function BindingInfo(id::IdTag, name::AbstractString, kind::Symbol, node_id::Integer;
@@ -42,11 +47,12 @@ function BindingInfo(id::IdTag, name::AbstractString, kind::Symbol, node_id::Int
                      is_assigned_once::Bool = false,
                      is_captured::Bool = false,
                      is_always_defined::Bool = is_ssa || kind === :argument,
-                     is_used_undef::Bool = false)
+                     is_used_undef::Bool = false,
+                     is_flisp_identity::Bool = false)
     BindingInfo(id, name, kind, node_id, mod, type, lambda_id, is_const, is_ssa,
                 is_internal, is_ambiguous_local, unboxed, is_nospecialize,
                 is_read, is_called, is_assigned, is_assigned_once, is_captured,
-                is_always_defined, is_used_undef)
+                is_always_defined, is_used_undef, is_flisp_identity)
 end
 
 function Base.show(io::IO, binfo::BindingInfo)
@@ -70,6 +76,7 @@ function Base.show(io::IO, binfo::BindingInfo)
     binfo.is_captured        && print(io, ", is_captured=true")
     binfo.is_always_defined  && print(io, ", is_always_defined=true")
     binfo.is_used_undef      && print(io, ", is_used_undef=true")
+    binfo.is_flisp_identity  && print(io, ", is_flisp_identity=true")
     print(io, ")")
 end
 
