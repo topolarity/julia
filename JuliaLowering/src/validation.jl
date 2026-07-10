@@ -1082,16 +1082,48 @@ vst1_splat_or_val(vcx, st) = @stm st begin
     _ -> vst1(vcx, st)
 end
 
+# Return true when a generator/comprehension body `val` iterating over
+# `iterspecs` is one of the two shapes flisp lowers directly to
+# `Base.Generator`, with no closure built over the write-only `_` loop
+# variable: `[_ for _ in x]` (the `identity` shortcut) or `[f(_) for _ in x]`
+# (the bare callee; an eta-reduction, for readers who know the term).
+# Desugaring (`func_for_generator`) removes the `_` read for these shapes, so
+# it must not be rejected as write-only here. Mirrors flisp's
+# `func-for-generator-ranges` (src/julia-syntax.scm) -- including a branch
+# flisp marks `;; TODO: deprecate this (#18621)`; see the WARNING in
+# `func_for_generator`.
+function is_underscore_generator_shortcut(val, iterspecs)
+    length(iterspecs) == 1 || return false
+    spec = iterspecs[1]
+    (kind(spec) == K"=" && numchildren(spec) == 2) || return false
+    lv = spec[1]
+    (kind(lv) == K"Identifier" && is_writeonly_est_name(lv.name_val)) || return false
+    name = lv.name_val
+    is_the_underscore(e) = kind(e) == K"Identifier" && e.name_val == name
+    # identity `[_ for _ in x]`
+    is_the_underscore(val) && return true
+    # `[f(_) for _ in x]`: a single-argument plain call whose sole argument is
+    # the loop `_` and whose callee does not itself mention `_`.
+    (kind(val) == K"call" && numchildren(val) == 2) || return false
+    is_the_underscore(val[2]) || return false
+    return !contains_unquoted(is_the_underscore, val[1])
+end
+
+vst1_generator_body(vcx, val, iterspecs) =
+    is_underscore_generator_shortcut(val, iterspecs) ?
+        vst1(with(vcx; readable_underscore=true), val) :
+        vst1(vcx, val)
+
 vst1_generator(vcx, st) = let
     vcx = with(vcx; return_ok=false, toplevel=false, in_gscope=false)
     @stm st begin
         [K"generator" _] -> @fail(st, "`generator` requires >=2 args")
         [K"generator" val [K"filter" cond is...]] ->
-            vst1(vcx, val) &
+            vst1_generator_body(vcx, val, is) &
             vst1(vcx, cond) &
             all(vst1_iter, vcx, is)
         [K"generator" val is...] ->
-            vst1(vcx, val) & all(vst1_iter, vcx, is)
+            vst1_generator_body(vcx, val, is) & all(vst1_iter, vcx, is)
         [K"generator" _...] -> @fail(st, "malformed `generator`")
         _ -> @fail(st, "expected `generator`")
     end

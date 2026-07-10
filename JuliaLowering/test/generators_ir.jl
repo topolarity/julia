@@ -150,12 +150,22 @@
 18  (return %₁₇)
 
 ########################################
-# Error: Use of placeholders in body
+# Bare `_` body lowers directly to `Generator(identity, xs)` -- no closure
 (_ for _ in xs)
 #---------------------
-LoweringError:
-(_ for _ in xs)
-#╙ ── all-underscore identifiers are write-only and their values cannot be used in expressions
+1   TestMod.xs
+2   (call top.Generator top.identity %₁)
+3   (return %₂)
+
+########################################
+# `f(_)` body lowers directly to the bare callee, evaluated once -- no closure
+# (flisp behavior marked for deprecation there: #18621)
+(f(_) for _ in xs)
+#---------------------
+1   TestMod.f
+2   TestMod.xs
+3   (call top.Generator %₁ %₂)
+4   (return %₃)
 
 ########################################
 # 1D generator with destructuring

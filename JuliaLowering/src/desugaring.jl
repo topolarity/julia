@@ -851,13 +851,46 @@ function lhs_local_defs(ctx, lhs)
     return defs
 end
 
+# Return true when `a` and `b` are both all-underscore placeholders (eg `_`)
+# with the same name. Unlike `is_same_identifier_like`, this ignores the scope
+# layer: placeholders are write-only and carry no value identity, so the two `_`
+# occurrences of a `[_ for _ in x]`-style generator (its loop variable and its
+# body) denote the same placeholder even when they originate from different
+# scope layers.
+function is_same_placeholder(a::SyntaxTree, b::SyntaxTree)
+    kind(a) == K"Placeholder" && kind(b) == K"Placeholder" && a.name_val == b.name_val
+end
+
 # Return the anonymous function taking an iterated value, for use with the
 # first argument to `Base.Generator`
 function func_for_generator(ctx, body, iter_value_destructuring)
-    if is_same_identifier_like(iter_value_destructuring, body)
+    if is_same_identifier_like(iter_value_destructuring, body) ||
+            is_same_placeholder(iter_value_destructuring, body)
         # Use Base.identity for generators which are filters such as
         # `(x for x in xs if f(x))`. This avoids creating a new type.
+        # The `is_same_placeholder` case also handles `[_ for _ in x]`, which
+        # lowers to `Base.Generator(identity, x)` -- see the note on the `f(_)`
+        # branch below.
         @ast ctx body "identity"::K"top"
+    elseif kind(iter_value_destructuring) == K"Placeholder" &&
+            kind(body) == K"call" && numchildren(body) == 2 &&
+            is_same_placeholder(iter_value_destructuring, body[2]) &&
+            !contains_unquoted(e -> is_same_placeholder(iter_value_destructuring, e), body[1])
+        # `_` is write-only, so a generator body `f(_)` cannot become the usual
+        # `_ -> f(_)` closure. flisp instead lowers `[f(_) for _ in x]` directly
+        # to `Base.Generator(f, x)`: the bare callee, evaluated exactly once, no
+        # closure. (For readers who know the term: an eta-reduction of the
+        # body.) Port that so code that works under flisp keeps working.
+        # Restricted to a plain (non-dot) single-argument call whose callee does
+        # not itself mention `_`.
+        #
+        # WARNING: this ports behavior flisp itself marks for deprecation -- the
+        # matching branch of `func-for-generator-ranges` (src/julia-syntax.scm)
+        # carries `;; TODO: deprecate this (#18621)`. Packages rely on the idiom
+        # today, so a lowering-engine swap must not silently break it; removing
+        # it is a separate, deliberate deprecation decision
+        # (JuliaLang/julia#18621).
+        @ast ctx body body[1]
     elseif !is_identifier_like(iter_value_destructuring)
         # compat: arg::T should convert, not assert, and duplicated arg is OK
         arg = newsym(ctx, iter_value_destructuring, "#generator#")

@@ -243,3 +243,51 @@ end
     end
     """) == ones(Int, 5, 5)
 end
+
+@testset "(AI) write-only `_` generator bodies lower straight to Generator" begin
+    # From PkgEval: PlotlyBase src/convenience_api.jl:94; KeplerTools/CompScienceMeshes/QubiSim precompile-fail via it (+6 in both-fail audit)
+    # `_` is write-only, so a generator whose loop variable is `_` and whose
+    # body reads it can't become a closure. It is legal only for the two shapes
+    # flisp lowers directly to `Base.Generator` with no closure: `f(_)` (bare
+    # callee) and bare `_` (identity). Mirrors flisp's
+    # `func-for-generator-ranges` -- behavior flisp itself marks for
+    # deprecation (#18621); ported so flisp-working code keeps working.
+    local undmod = Module()
+    JuliaLowering.include_string(undmod, "sq(x) = x^2")
+    JuliaLowering.include_string(undmod, "add(a, b) = a + b")
+    jeval(str) = JuliaLowering.include_string(undmod, str)
+
+    # `[f(_) for _ in x]` lowers to `Generator(f, x)` (the PlotlyBase shape)
+    @test jeval("[sq(_) for _ in 1:3]") == [1, 4, 9]
+    @test jeval("collect(sq(_) for _ in 1:3)") == [1, 4, 9]
+    @test jeval("[sin(_) for _ in 1:3]") == sin.(1:3)   # builtin callee
+    @test jeval("[(sq(_)) for _ in 1:3]") == [1, 4, 9]  # parenthesized call
+    # `[_ for _ in x]` lowers to `Generator(identity, x)`
+    @test jeval("[_ for _ in 1:3]") == [1, 2, 3]
+    @test jeval("collect(_ for _ in 1:3)") == [1, 2, 3]
+
+    # Observable consequence of the direct lowering: the `Generator`'s `.f` is
+    # the bare callee, and an expression callee is evaluated exactly once (not
+    # once per element), matching flisp.
+    @test jeval("(sq(_) for _ in 1:3).f === sq")
+    # A named loop variable still gets the usual closure, so its `.f` is fresh.
+    @test jeval("(sq(v) for v in 1:3).f === sq") == false
+    @test jeval("""
+    let count = Ref(0)
+        getf() = (count[] += 1; sq)
+        collect(getf()(_) for _ in 1:3)
+        count[]
+    end
+    """) == 1
+
+    # Shapes that don't match the shortcut must still reject the write-only `_`
+    # read, exactly as flisp does.
+    @test_throws LoweringError jeval("[_ + 1 for _ in 1:3]")
+    @test_throws LoweringError jeval("[sq(_) + 1 for _ in 1:3]")
+    @test_throws LoweringError jeval("[add(_, _) for _ in 1:3]")
+    @test_throws LoweringError jeval("[add(_, 2) for _ in 1:3]")
+    @test_throws LoweringError jeval("[sq(identity(_)) for _ in 1:3]")  # nested call
+    @test_throws LoweringError jeval("[sq(_) .+ 0 for _ in 1:3]")       # dotcall
+    @test_throws LoweringError jeval("[sq(_) for _ in 1:3 if _ > 1]")   # `_` read in filter
+    @test_throws LoweringError jeval("collect(sq(_) for _ in 1:2, _ in 1:2)")  # product
+end
