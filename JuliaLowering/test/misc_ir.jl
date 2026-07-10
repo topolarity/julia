@@ -365,6 +365,20 @@ JuxtuposeTest.@emit_juxtupose
 3   (return %₂)
 
 ########################################
+# @cfunction bare-symbol callee is resolved in global scope by construction,
+# invisible to a co-named local (here the local `f`, which is also the
+# assignment target). This is the SCIP.jl event_handler.jl self-assignment
+# pattern: the callee below resolves to the global `TestMod.f`, not `slot₁/f`.
+let f = 1
+    @cfunction(f, Cint, (Cint,))
+end
+#---------------------
+1   1
+2   (= slot₁/f %₁)
+3   (cfunction Ptr{Nothing} (static_eval TestMod.f) (static_eval TestMod.Cint) (static_eval (call core.svec TestMod.Cint)) :ccall)
+4   (return %₃)
+
+########################################
 # Error: Bad arg types to @cfunction
 @cfunction(f, Int, NotATuple)
 #---------------------

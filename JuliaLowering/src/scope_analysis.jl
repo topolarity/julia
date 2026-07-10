@@ -236,6 +236,23 @@ function _typevar_refs!(out, ctx, ex)
     end
 end
 
+# Resolve an identifier as a global reference, ignoring any co-named local.
+# Used for positions that are global-by-construction, e.g. the bare-symbol
+# `@cfunction` callee: flisp resolves it in global scope at compile time,
+# invisible to local shadowing (matching `@cfunction`'s documented semantics).
+function resolve_as_global(ctx, ex)
+    @jl_assert kind(ex) === K"Identifier" ex
+    if (mod = get(ex, :mod, nothing); !isnothing(mod))
+        return new_global_binding(ctx, ex, ex.name_val, mod)
+    end
+    ts = top_scope(ctx)
+    bid = get(ts.vars, NameKey(ex), nothing)
+    if isnothing(bid) || get_binding(ctx, bid).kind !== :global
+        bid = declare_in_scope!(ctx, ts, ex, :global)
+    end
+    newleaf(ctx, ex, K"BindingId", bid)
+end
+
 function _record_layer!(ctx, ex)
     !hasattr(ex, :context) && return
     sl = (ex.context::SyntaxContext).layer
@@ -673,6 +690,22 @@ function _resolve_scopes(ctx, ex::SyntaxTree,
         out = _resolve_scopes(ctx, ex[1], scope)
         get_binding(ctx, out).kind !== :global ? (@ast ctx ex (::K"TOMBSTONE")) :
             @ast ctx ex [K"global" out]
+    elseif k == K"cfunction"
+        # The bare-symbol `@cfunction` callee (child 2, wrapped by compat.jl in
+        # a `K"static_eval"`) is resolved in global scope by construction: flisp
+        # looks it up as a global at compile time, invisible to any co-named
+        # local. Other callee forms (e.g. a `$`-interpolated runtime closure)
+        # are not wrapped in `static_eval` and resolve normally.
+        cs = SyntaxList(ctx)
+        for (i, e) in enumerate(children(ex))
+            if i == 2 && kind(e) === K"static_eval" && numchildren(e) === 1 &&
+                    kind(e[1]) === K"Identifier"
+                push!(cs, @ast ctx e [K"static_eval"(e) resolve_as_global(ctx, e[1])])
+            else
+                push!(cs, _resolve_scopes(ctx, e, scope))
+            end
+        end
+        @ast ctx ex [K"cfunction" cs...]
     else
         mapchildren(e->_resolve_scopes(ctx, e, scope), ctx, ex)
     end
@@ -740,29 +773,61 @@ function init_closure_bindings!(ctx, fname)
     end
 end
 
-# sparams, globals, and top-level locals interpolated into global methods are OK
-# (the last may or may not work intentionally)
-function static_eval_disallowed_binding(ctx, ex)
+# Search `ex` for a binding that is illegal in a compile-time-evaluated position
+# (`K"static_eval"` / `K"foreignsymbol"`).  Globals and static parameters are
+# always fine.  When `reject_lambda_id` is given (static_eval positions), only
+# genuine locals of that lambda are rejected: a binding captured from an
+# enclosing scope is deferred to codegen's static evaluation, which understands
+# closure capture (matching flisp, which leaves ccall/cfunction return- and
+# argument-type expressions unchecked at lowering time).  When it is `nothing`
+# (foreignsymbol, i.e. the ccall/cglobal function name and library expression),
+# any local is rejected -- except a top-level local referenced from a global
+# method, which lowering's expr-builder path supports (upstream 4f56102cb9).
+function find_any_local_binding(ctx, ex; reject_lambda_id=nothing)
     k = kind(ex)
     if k == K"BindingId"
         b = get_binding(ctx, ex.var_id)
-        if b.kind != :global && b.kind != :static_parameter
-            lam = ctx.scopes[ctx.lambda_bindings.scope_id]
-            if is_top_scope(lam) ||
-                !(b.lambda_id == top_scope(ctx).id &&
-                enclosing_lambda(ctx, parent(ctx, lam)).id == top_scope(ctx).id)
-                return ex
+        bkind = b.kind
+        if bkind != :global && bkind != :static_parameter
+            if !isnothing(reject_lambda_id)
+                b.lambda_id === reject_lambda_id && return ex
+            else
+                lam = ctx.scopes[ctx.lambda_bindings.scope_id]
+                if is_top_scope(lam) ||
+                    !(b.lambda_id == top_scope(ctx).id &&
+                    enclosing_lambda(ctx, parent(ctx, lam)).id == top_scope(ctx).id)
+                    return ex
+                end
             end
         end
     elseif !is_leaf(ex) && !is_quoted(ex)
         for e in children(ex)
-            r = static_eval_disallowed_binding(ctx, e)
+            r = find_any_local_binding(ctx, e; reject_lambda_id)
             if !isnothing(r)
                 return r
             end
         end
     end
     return nothing
+end
+
+# Mark bindings captured from an enclosing scope which appear inside a
+# `K"static_eval"` type expression, so closure conversion rewrites them into
+# `captured_local` interpolations.  Same-function locals are already rejected
+# before this runs; globals, static parameters and SSA values need no capture.
+function capture_static_eval_bindings!(ctx, ex)
+    k = kind(ex)
+    if k == K"BindingId"
+        b = get_binding(ctx, ex.var_id)
+        if b.kind !== :global && b.kind !== :static_parameter && !b.is_ssa
+            ensure_captured!(ctx, ctx.scopes[ctx.lambda_bindings.scope_id], b)
+        end
+    elseif !is_leaf(ex) && !is_quoted(ex)
+        for e in children(ex)
+            capture_static_eval_bindings!(ctx, e)
+        end
+    end
+    nothing
 end
 
 function add_assign!(b::BindingInfo)
@@ -845,7 +910,9 @@ function analyze_variables!(ctx, ex)
     elseif !needs_resolution(ex)
         return
     elseif k == K"static_eval" || k == K"foreignsymbol"
-        badvar = static_eval_disallowed_binding(ctx, ex[1])
+        reject_lambda_id = k == K"static_eval" ?
+            ctx.lambda_bindings.scope_id : nothing
+        badvar = find_any_local_binding(ctx, ex[1]; reject_lambda_id)
         if !isnothing(badvar)
             default = k == K"foreignsymbol" ?
                 "function name and library expression" : "syntax"
@@ -853,6 +920,14 @@ function analyze_variables!(ctx, ex)
             throw(LoweringError(badvar, "$(name_hint) cannot reference local variable"))
         end
         analyze_variables!(ctx, ex[1])
+        if k == K"static_eval"
+            # Bindings captured from an enclosing scope are legal in a
+            # static_eval type expression: mark them captured so closure
+            # conversion rewrites them into `captured_local` interpolations,
+            # which are spliced into the method at definition time (matching
+            # flisp, which builds such method bodies as spliced templates).
+            capture_static_eval_bindings!(ctx, ex[1])
+        end
         return
     elseif k == K"local" || k == K"global"
         # Presence of BindingId within local/global is ignored.

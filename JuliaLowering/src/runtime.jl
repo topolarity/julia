@@ -133,7 +133,25 @@ function eval_closure_type(mod::Module, closure_type_name::Symbol,
     type
 end
 
-# Interpolate captured local variables into the CodeInfo for a global method
+# Interpolate captured local variables into the CodeInfo for a global method.
+# `captured_local` markers may appear either as whole statements or nested
+# inside an expression (e.g. within a ccall/cfunction `static_eval` argument
+# type), so replacement recurses into sub-expressions.
+function _replace_captured_locals!(ex, locals::Core.SimpleVector)
+    ex isa Expr || return ex
+    if Meta.isexpr(ex, :captured_local)
+        # Use Base's own convention for splicing a runtime value into IR
+        # (see `Compiler/src/typeinfer.jl`'s `ReturnNode(quoted(val))`): values
+        # which are themselves AST/IR nodes (Symbol, Expr, ...) must be
+        # QuoteNode-wrapped so they're not misread as syntax.
+        return Base.quoted(locals[ex.args[1]::Int])
+    end
+    for i in eachindex(ex.args)
+        ex.args[i] = _replace_captured_locals!(ex.args[i], locals)
+    end
+    return ex
+end
+
 function replace_captured_locals(ci_in::Core.CodeInfo, locals::Core.SimpleVector)
     # The template is a literal embedded in the enclosing thunk's IR, so the
     # same object is reused every time that thunk runs (e.g. a method

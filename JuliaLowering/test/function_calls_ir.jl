@@ -471,6 +471,45 @@ let Cstring = 1
 end
 
 ########################################
+# ccall argument type may reference a local captured from an enclosing scope.
+# The captured local is spliced into the method at definition time via
+# `captured_local` / `replace_captured_locals!` (matching flisp, which builds
+# such method bodies as spliced templates). This is the BandedMatrices
+# `@eval`-loop LAPACK-wrapper idiom.
+begin
+    local Relty = Cchar
+    function ccall_captures_local()
+        ccall(:strlen, Csize_t, (Ptr{Relty},), "abc")
+    end
+end
+#---------------------
+1   TestMod.Cchar
+2   (= slot₁/Relty %₁)
+3   (method TestMod.ccall_captures_local)
+4   latestworld
+5   TestMod.ccall_captures_local
+6   (call core.TypeEqOf %₅)
+7   (call core.svec %₆)
+8   (call core.svec)
+9   SourceLocation::3:14
+10  (call core.svec %₇ %₈ %₉)
+11  --- code_info
+    slots: [slot₁/#self#(!read)]
+    1   TestMod.Ptr
+    2   (captured_local 1)
+    3   (call core.apply_type %₁ %₂)
+    4   (call top.cconvert %₃ "abc")
+    5   (call top.unsafe_convert %₃ %₄)
+    6   (foreigncall :strlen (static_eval TestMod.Csize_t) (static_eval (call core.svec (call core.apply_type TestMod.Ptr (captured_local 1)))) 0 :ccall %₅ %₄)
+    7   (return %₆)
+12  (call core.svec slot₁/Relty)
+13  (call JuliaLowering.replace_captured_locals! %₁₁ %₁₂)
+14  --- method TestMod.ccall_captures_local %₁₀ %₁₃
+15  latestworld
+16  TestMod.ccall_captures_local
+17  (return %₁₆)
+
+########################################
 # Error: ccall with too few arguments
 ccall(:strlen, Csize_t, (Cstring,))
 #---------------------

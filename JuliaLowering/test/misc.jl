@@ -445,6 +445,105 @@ let raw_foreigncall_ex = Expr(
     @test JuliaLowering.eval(test_mod, JuliaLowering.expr_to_est(raw_foreigncall_ex)) == 11 + 18im
 end
 
+@testset "cfunction/ccall references to outer-scope bindings" begin
+    # Bug A: a bare-symbol @cfunction callee is resolved in global scope by
+    # construction, invisible to any co-named local -- including the assignment
+    # target itself (SCIP.jl event_handler.jl self-assignment pattern).
+    cf = JuliaLowering.include_string(test_mod, """
+        cfa_callee(x::Cint)::Cint = x + Cint(1)
+        function cfa_selfassign()
+            cfa_callee = @cfunction(cfa_callee, Cint, (Cint,))
+            return cfa_callee
+        end
+        cfa_selfassign()
+    """)
+    @test cf isa Ptr{Cvoid}
+    @test ccall(cf, Cint, (Cint,), Cint(41)) == Cint(42)
+
+    # callee shadowed by a local introduced AFTER the @cfunction expression
+    cf2 = JuliaLowering.include_string(test_mod, """
+        function cfa_shadow_after()
+            p = @cfunction(cfa_callee, Cint, (Cint,))
+            cfa_callee = 99
+            return p
+        end
+        cfa_shadow_after()
+    """)
+    @test ccall(cf2, Cint, (Cint,), Cint(41)) == Cint(42)
+
+    # `\$f` interpolation (runtime closure) still produces a CFunction
+    cf3 = JuliaLowering.include_string(test_mod, """
+        let g = (x::Cint) -> x + Cint(2)
+            @cfunction(\$g, Cint, (Cint,))
+        end
+    """)
+    @test cf3 isa Base.CFunction
+
+    # Bug B: a `local` captured from an enclosing (top-level) scope is legal in
+    # a ccall argument/return type and is spliced into the method at definition
+    # time (BandedMatrices lapack.jl @eval-loop LAPACK-wrapper idiom).
+    n = JuliaLowering.include_string(test_mod, """
+        begin
+            local CcbAlias = Cchar
+            function ccb_captured()
+                ccall(:strlen, Csize_t, (Ptr{CcbAlias},), "abcd")
+            end
+        end
+        ccb_captured()
+    """)
+    @test n == 4
+
+    # BandedMatrices-shaped @eval loop over (name, type) pairs
+    JuliaLowering.include_string(test_mod, raw"""
+        for (nm, ety) in ((:ccb_g1, Cchar), (:ccb_g2, Cuchar))
+            @eval begin
+                local Relty = $ety
+                function $nm(s)
+                    ccall(:strlen, Csize_t, (Ptr{Relty},), s)
+                end
+            end
+        end
+    """)
+    Core.@latestworld
+    @test test_mod.ccb_g1("hello") == 5
+    @test test_mod.ccb_g2("hi") == 2
+
+    # A `where` static parameter in ccall argtype keeps working
+    JuliaLowering.include_string(test_mod, """
+        function ccb_sparam(s::Vector{T}) where {T}
+            GC.@preserve s ccall(:strlen, Csize_t, (Ptr{T},), pointer(s))
+        end
+    """)
+    Core.@latestworld
+    @test test_mod.ccb_sparam(UInt8['h', 'i', 0x00]) == 2
+
+    # Boundary: a genuine same-function local in a ccall argtype is rejected at
+    # lowering time (stricter than flisp, which rejects it later at codegen).
+    @test_throws JuliaLowering.LoweringError JuliaLowering.include_string(test_mod, """
+        function ccb_samefunc(x)
+            L = Float64
+            ccall(:strlen, Csize_t, (Ptr{L},), x)
+        end
+    """)
+
+    # Boundary: a local in the ccall function-name / library position is rejected.
+    @test_throws JuliaLowering.LoweringError JuliaLowering.include_string(test_mod, """
+        let lib = "libc"
+            ccall((:strlen, lib), Csize_t, (Cstring,), "abc")
+        end
+    """)
+
+    # Boundary: a closure capturing an enclosing function's plain local in a
+    # ccall argtype lowers, then fails at codegen -- exactly as flisp does.
+    @test_throws ErrorException JuliaLowering.include_string(test_mod, """
+        function ccb_nested_closure(x)
+            Tn = Float64
+            inner() = ccall(:strlen, Csize_t, (Ptr{Tn},), "abc")
+            inner()
+        end
+    """)
+end
+
 # Test that ccall can be passed static parameters in type signatures.
 #
 # Note that the cases where this works are extremely limited and tend to look
