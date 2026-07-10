@@ -264,6 +264,42 @@ end
     @testset "bulk parsed code, no linenodes" begin
         test_each_in_path(roundtrip_eq, JL_DIR)
     end
+
+    @testset "quoted Expr value preserves LineNumberNode absence" begin
+        # A quoted block that is a VALUE (e.g. a macro return) is inert data:
+        # its args -- including the *absence* of LineNumberNodes left by
+        # `Base.remove_linenums!`, an extremely common canonicalization idiom --
+        # must round-trip verbatim, matching flisp's inert quote payloads.
+        # Consumers compare such rebuilt Exprs with `==`/`hash` (ForwardMethods.jl
+        # via TestingUtilities `@test_cases`); re-synthesizing macrocall-site
+        # linenodes into the payload breaks that.
+        stripped = Expr(:block, :(z = f()), :(g(z)))       # no LineNumberNodes
+        @test roundtrip(Expr(:quote, stripped)) == Expr(:quote, stripped)
+        @test roundtrip(QuoteNode(stripped)) == QuoteNode(stripped)
+        # Existing linenodes inside a quoted block are still preserved exactly
+        # (only their absence was being lost):
+        with_lnn = Expr(:block, LineNumberNode(99, :foo), :(p()), :(q()))
+        @test roundtrip(QuoteNode(with_lnn)) == QuoteNode(with_lnn)
+        # An empty quoted block stays empty (no synthesized provenance linenode)
+        # and nested quote-in-quote keeps the inner payload verbatim:
+        @test roundtrip(QuoteNode(Expr(:block))) == QuoteNode(Expr(:block))
+        @test roundtrip(Expr(:quote, Expr(:quote, stripped))) ==
+            Expr(:quote, Expr(:quote, stripped))
+
+        # End-to-end through the macro pipeline (the ForwardMethods failure
+        # shape): a macro that strips linenodes and returns a quoted block must
+        # yield exactly that 2-statement block at runtime, with no linenodes.
+        val = JuliaLowering.include_string(test_mod, """
+            macro q_strip()
+                ex = :(begin z = f(); g(z) end)
+                Base.remove_linenums!(ex)
+                Expr(:quote, ex)
+            end
+            @q_strip
+            """; expr_compat_mode=true)
+        @test val == Expr(:block, :(z = f()), :(g(z)))
+        @test count(a -> a isa LineNumberNode, val.args) == 0
+    end
 end
 
 # taken from JuliaSyntax expr.jl

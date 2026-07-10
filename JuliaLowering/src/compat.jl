@@ -64,11 +64,12 @@ end
 # unquoted, then removed in certain forms.  If `src` is not an linenode, it is
 # assumed to be a better provenance source, so linenodes in `e` are not used for
 # provenance (but still removed).
-function _expr_to_est(graph::SyntaxGraph, @nospecialize(e), src::SourceAttrType)
+function _expr_to_est(graph::SyntaxGraph, @nospecialize(e), src::SourceAttrType,
+                      quote_depth::Int=0)
     st = if e isa Symbol
         setattr!(newleaf(graph, src, K"Identifier"), :name_val, String(e))
     elseif e isa QuoteNode
-        cid, _ = _expr_to_est(graph, e.value, src)
+        cid, _ = _expr_to_est(graph, e.value, src, quote_depth + 1)
         newnode(graph, src, K"inert", NodeId[cid])
     elseif e isa Expr && e.head === :lambda && length(e.args) == 2
         # flisp accepts any iterable of Symbols for the argnames slot (e.g.
@@ -96,7 +97,7 @@ function _expr_to_est(graph::SyntaxGraph, @nospecialize(e), src::SourceAttrType)
                 length(lam_body.args) == 1
             lam_body = lam_body.args[1]
         end
-        body_id, src = _expr_to_est(graph, lam_body, src)
+        body_id, src = _expr_to_est(graph, lam_body, src, quote_depth)
         args_block = newnode(graph, src, K"block", arg_cs)
         tvars_block = newnode(graph, src, K"block", NodeId[])
         st = newnode(graph, src, K"lambda",
@@ -106,14 +107,21 @@ function _expr_to_est(graph::SyntaxGraph, @nospecialize(e), src::SourceAttrType)
     elseif e isa Expr
         head_s = string(e.head)
         st_k = find_kind(head_s)
+        # Track quasiquote depth: inside a quoted payload (depth > 0) a block is
+        # inert data, not code, so its LineNumberNodes -- including their
+        # *absence* after `Base.remove_linenums!` -- must round-trip verbatim
+        # (see `est_to_expr`), matching flisp's inert quote. At depth 0 blocks
+        # are real code and their linenodes are still absorbed into provenance.
+        child_depth = (e.head === :quote || e.head === :inert) ? quote_depth + 1 :
+                      e.head === :$ ? max(quote_depth - 1, 0) : quote_depth
         src = old_src = src isa LineNumberNode ? _get_inner_lnn(e, src) : src
         cs = NodeId[]
-        rm_linenodes = e.head in (:block, :toplevel)
+        rm_linenodes = e.head in (:block, :toplevel) && quote_depth == 0
         for arg in e.args
             if rm_linenodes && arg isa LineNumberNode
                 src isa LineNumberNode && (src = arg)
             else
-                cid, src = _expr_to_est(graph, arg, src)
+                cid, src = _expr_to_est(graph, arg, src, child_depth)
                 push!(cs, cid)
             end
         end
@@ -134,6 +142,11 @@ function _expr_to_est(graph::SyntaxGraph, @nospecialize(e), src::SourceAttrType)
             src = e
         end
         setattr!(newleaf(graph, src, K"Value"), :value, e)
+    end
+    # Mark structural nodes ingested from inert quoted data so `est_to_expr`
+    # reproduces their linenode structure verbatim rather than re-synthesizing.
+    if quote_depth > 0 && !is_leaf(st)
+        setmeta!(st, :verbatim_lnn, true)
     end
     @jl_assert isa_lowering_ast_node(e) || is_expr_value(st) st
 
@@ -183,8 +196,14 @@ function est_to_expr(st::SyntaxTree, suppress_linenodes=false)
         # Macro authors are responsible for handling any linenodes that follow
         # the rules above (but the presence of optional linenodes can't be
         # counted upon).
+        # A node ingested from an inert quoted `Expr` VALUE (marked by
+        # `_expr_to_est`) is reproduced verbatim: its linenodes (or the absence
+        # left by `Base.remove_linenums!`) are carried as explicit children, so
+        # we neither synthesize per-child block linenodes nor inject extra
+        # provenance linenodes. Parsed/quoted *source* (no marker) is unaffected.
+        verbatim = getmeta(st, :verbatim_lnn, false)
         need_lnns = head in (:block, :toplevel) && !suppress_linenodes &&
-            !_is_meta_doc_block(st)
+            !_is_meta_doc_block(st) && !verbatim
         for (i, c) in enumerate(children(st))
             need_lnns && push!(out.args, source_location(LineNumberNode, c))
             let suppress_c = i == 1 && (k == K"for" || k == K"let")
@@ -192,7 +211,9 @@ function est_to_expr(st::SyntaxTree, suppress_linenodes=false)
             end
         end
         # Add extra linenodes to some blocks for better provenance
-        if head === :block && length(out.args) == 0 && !suppress_linenodes
+        if verbatim
+            # inert payload: keep verbatim, add nothing
+        elseif head === :block && length(out.args) == 0 && !suppress_linenodes
             push!(out.args, source_location(LineNumberNode, st))
         elseif head in (:module, :function, :macro) && length(out.args) > 0
             let b = out.args[end]
