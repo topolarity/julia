@@ -645,6 +645,41 @@ end
     end
 end
 
+@testset "flisp `with-static-parameters` lambda wrapper (Tricks.jl `spnames`)" begin
+    # With non-nothing `spnames`, Tricks.jl's `create_codeinfo_with_returnvalue`
+    # (via ValSplit -> PDDL, and MacroUtilities' `@method_def_constant` ->
+    # ForwardMethods) additionally wraps the hand-built lambda in flisp's
+    # sparam-binding form, `(with-static-parameters lam sp1 sp2 ...)`, which
+    # binds the given names positionally as the lambda's static parameters.
+    mklam(argnames, body) =
+        Expr(:lambda, argnames, Expr(Symbol("scope-block"), body))
+    for (spnames, body) in [
+            ([:T], Expr(:block, Expr(:return, 1))),
+            # PDDL's exact shape: several sparams, constant return value
+            ([:T, :N, :P], Expr(:block, Expr(:return, 1))),
+            (Symbol[], Expr(:block, Expr(:return, 1))),
+            # a body referencing an sparam exercises the actual binding
+            ([:T, :N, :P], Expr(:block, Expr(:return, :P))),
+        ]
+        expr = Expr(Symbol("with-static-parameters"),
+                    mklam([Symbol("#self#"), :x], body), spnames...)
+        out = JL.core_lowering_hook(expr, test_mod)
+        @test out isa Core.SimpleVector && out[1] isa Core.CodeInfo
+        flisp_ci = Meta.lower(test_mod, expr)
+        @test flisp_ci isa Core.CodeInfo
+        @test out[1].code == flisp_ci.code
+    end
+    # sparam references resolve to the *positional* index, matching flisp
+    expr = Expr(Symbol("with-static-parameters"),
+                mklam([Symbol("#self#"), :x], Expr(:block, Expr(:return, :P))),
+                :T, :N, :P)
+    ci = JL.core_lowering_hook(expr, test_mod)[1]
+    @test any(==(Expr(:static_parameter, 3)), ci.code)
+    # a non-lambda payload stays rejected (flisp: "malformed expression")
+    bad = Expr(Symbol("with-static-parameters"), Expr(:block, Expr(:return, 1)), :T)
+    @test_throws JL.LoweringError JL.core_lowering_hook(bad, test_mod)
+end
+
 @testset "bare `elseif` Expr == independent `if` (flisp parity)" begin
     # flisp maps `elseif` to the same `expand-if` handler as `if`, so an
     # `Expr(:elseif, ...)` that is NOT nested in the else-slot of a preceding

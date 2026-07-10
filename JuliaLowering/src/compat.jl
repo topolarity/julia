@@ -57,6 +57,11 @@ function is_expr_value(st::SyntaxTree)
     return JuliaSyntax.is_literal(k) || k === K"Value"
 end
 
+# An already-lowered flisp-form lambda, `(lambda argnames body)`, as hand-built
+# for `Meta.lower` by e.g. Tricks.jl's `create_codeinfo_with_returnvalue`.
+_is_flisp_lambda(@nospecialize(e)) =
+    e isa Expr && e.head === :lambda && length(e.args) == 2
+
 # Adding more cases to this function is almost certainly wrong, since this
 # operates on arbitrary heads and arguments throughout macro expansion, not
 # well-formed syntax after expansion is done.  Most of the complexity here is
@@ -71,7 +76,21 @@ function _expr_to_est(graph::SyntaxGraph, @nospecialize(e), src::SourceAttrType,
     elseif e isa QuoteNode
         cid, _ = _expr_to_est(graph, e.value, src, quote_depth + 1)
         newnode(graph, src, K"inert", NodeId[cid])
-    elseif e isa Expr && e.head === :lambda && length(e.args) == 2
+    elseif _is_flisp_lambda(e) ||
+            # flisp's sparam-binding wrapper around an already-lowered lambda:
+            # `(with-static-parameters lam sp1 sp2 ...)` binds the `sp*` names
+            # as `lam`'s static parameters, positionally. It maps onto
+            # `K"lambda"`'s own sparams slot (e.g. Tricks.jl's
+            # `create_codeinfo_with_returnvalue` with `spnames`, used by
+            # MacroUtilities/ForwardMethods). Other payloads are malformed in
+            # flisp too and keep falling through to `unknown_head`.
+            (e isa Expr && e.head === Symbol("with-static-parameters") &&
+             length(e.args) >= 1 && _is_flisp_lambda(e.args[1]))
+        spnames = ()
+        if e.head !== :lambda
+            spnames = @view (e.args)[2:end]
+            e = e.args[1]::Expr
+        end
         # flisp accepts any iterable of Symbols for the argnames slot (e.g.
         # Tricks.jl's `create_codeinfo_with_returnvalue`, used by ValSplit,
         # hands it a `Vector{Symbol}`); the per-name `::Symbol` assert below
@@ -84,6 +103,12 @@ function _expr_to_est(graph::SyntaxGraph, @nospecialize(e), src::SourceAttrType,
             id = newleaf(graph, src, K"Identifier")
             setattr!(id, :name_val, String(name::Symbol))
             push!(arg_cs, id._id)
+        end
+        tvar_cs = NodeId[]
+        for name in spnames
+            id = newleaf(graph, src, K"Identifier")
+            setattr!(id, :name_val, String(name::Symbol))
+            push!(tvar_cs, id._id)
         end
         # flisp spells an already-lowered lambda body as `(scope-block body)`;
         # that scope-block just delimits the lambda's own scope, which the
@@ -99,7 +124,7 @@ function _expr_to_est(graph::SyntaxGraph, @nospecialize(e), src::SourceAttrType,
         end
         body_id, src = _expr_to_est(graph, lam_body, src, quote_depth)
         args_block = newnode(graph, src, K"block", arg_cs)
-        tvars_block = newnode(graph, src, K"block", NodeId[])
+        tvars_block = newnode(graph, src, K"block", tvar_cs)
         st = newnode(graph, src, K"lambda",
                      NodeId[args_block._id, tvars_block._id, body_id])
         setattr!(st, :is_toplevel_thunk, false)
