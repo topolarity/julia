@@ -131,6 +131,14 @@ end
 
 # Interpolate captured local variables into the CodeInfo for a global method
 function replace_captured_locals!(codeinfo::Core.CodeInfo, locals::Core.SimpleVector)
+    # The `codeinfo` template is a literal embedded in the enclosing thunk's IR,
+    # so the same object is reused every time that thunk runs (e.g. a method
+    # definition inside a top-level `for` loop, where each iteration captures
+    # different locals). Splice into a fresh copy so the pristine template
+    # remains available for later executions -- otherwise the `captured_local`
+    # markers, replaced in place on the first run, are gone on subsequent runs
+    # and every later method freezes at the first iteration's captured values.
+    codeinfo = Base.copy(codeinfo)
     for (i, ex) in enumerate(codeinfo.code)
         if Meta.isexpr(ex, :captured_local)
             # Use Base's own convention for splicing a runtime value into IR
