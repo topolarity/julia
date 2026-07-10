@@ -2080,6 +2080,49 @@ end
     @test Base.invokelatest(m.GenHome.thefun, Base.invokelatest(m.GenCall.S)) == 1
 end
 
+@testset "(AI) @generated stub reserves at call site for interpolated GlobalRef" begin
+    # Straggler guard for THRASH-ANALYSIS cluster 1 ("@eval/module-targeting
+    # hygiene"): the @generated generator-stub reservation
+    # (`generated_method_defs`, desugaring.jl) is the sibling of the kw-body
+    # reservation, and the kw-body site regressed on exactly this shape three
+    # days after the stub was first fixed (commit 2e5b6be275 vs 5768eaa790 /
+    # aaccaa2c89).  When the extended function's name arrives as an interpolated
+    # `GlobalRef` *value*, `compat.jl` stamps a `:mod` attribute on the name node
+    # that short-circuits `syntax_module` straight to the owner module; a stub
+    # reserved via that module would land in a possibly-closed dependency.  The
+    # sibling kw-body path is pinned for this vector in test/functions.jl; pin it
+    # here for the generator stub too.  Both machineries reserve in
+    # `ctx.layer.mod` (the module being lowered into), so the stub must land in
+    # the extending module, never in the owner.  Verified non-vacuous: reserving
+    # via `syntax_module(mtable)` instead lands the stub in `OwnerG`.
+    genstub(mod) = filter(n -> occursin("generator", string(n)), names(mod; all=true))
+
+    OwnerG = Module()
+    JuliaLowering.include_string(OwnerG, "gfun(x) = -1")
+    o_before = Set(genstub(OwnerG))
+
+    ExtG = Module()
+    Core.eval(ExtG, :(import JuliaLowering))
+    @eval ExtG const OwnerG = $OwnerG
+    JuliaLowering.include_string(ExtG, raw"""
+        let fn = GlobalRef(OwnerG, :gfun)
+            @eval @generated function $fn(x::Int)
+                :(x + 1000)
+            end
+        end
+    """)
+    Core.@latestworld
+
+    # No new generator stub leaked into the owner (would be a closed module in the
+    # incremental-precompile shape this models).
+    @test isempty(setdiff(Set(genstub(OwnerG)), o_before))
+    # ... it landed in the extending module.
+    @test !isempty(genstub(ExtG))
+    # ... and both the new @generated method and the original fallback dispatch.
+    @test Base.invokelatest(OwnerG.gfun, 5) == 1005
+    @test Base.invokelatest(OwnerG.gfun, 2.0) == -1
+end
+
 @testset "(AI) @eval payload-hygiene residual (known divergence)" begin
     # Bare `const` (and method-definition) payloads in macro-generated @eval
     # resolve their binding via the payload's hygiene module rather than the
