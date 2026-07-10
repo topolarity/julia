@@ -403,6 +403,43 @@ function resolve_as_global(ctx, ex)
     newleaf(ctx, ex, K"BindingId", bid)
 end
 
+# The self argument that `@__FUNCTION__` (K"thisfunction") resolves to: the
+# enclosing lambda's first argument, unless another argument is explicitly marked
+# as the logical self (e.g. the keyword-body method, where the original generic
+# function is passed as a positional arg -- see `keywords_method_def_expr`).
+function thisfunction_self_arg(ctx, ex, scope::ScopeInfo)
+    lam = SyntaxTree(ex._graph, enclosing_lambda(ctx, scope).node_id)
+    self_arg = lam[1][1]
+    for a in children(lam[1])
+        getmeta(a, :thisfunction_original, false) && (self_arg = a)
+    end
+    return self_arg
+end
+
+# flisp-compat: flisp names a method's implicit self argument with the literal,
+# unhygienic symbol `#self#` (julia-syntax.scm), so user source that writes
+# `var"#self#"` resolves to the enclosing method's own function object -- a
+# long-standing idiom (predating `@__FUNCTION__`) for getting the enclosing
+# function without hardcoding its name.  JuliaLowering mints the implicit self as
+# a hygienic internal gensym, invisible to such a reference, so we recover the
+# leak here: an otherwise-unresolved `#self#` written in flisp-compat source
+# resolves to the same self as `@__FUNCTION__`, but only where flisp exposed one
+# -- i.e. where the enclosing lambda's self is the implicit `#self#` (plain
+# methods, closures, do-blocks, anonymous functions) or the keyword-body's
+# original-function arg.  When the self is explicitly named (e.g. a callable
+# `(self::T)(...)` method), flisp created no `#self#` binding and errored, so we
+# leave the reference unresolved to match.
+function is_self_hash_leak(ctx, ex, scope::Union{Nothing,ScopeInfo})
+    (scope isa ScopeInfo && kind(ex) === K"Identifier" &&
+        ex.name_val == "#self#" && is_flisp_compat(ex)) || return false
+    is_top_scope(enclosing_lambda(ctx, scope)) && return false
+    self_arg = thisfunction_self_arg(ctx, ex, scope)
+    # Only expose the leak where flisp did: an implicit `#self#`, or the
+    # keyword-body's redirected original-function arg.
+    return (kind(self_arg) === K"Identifier" && self_arg.name_val == "#self#") ||
+        getmeta(self_arg, :thisfunction_original, false)
+end
+
 function _record_layer!(ctx, ex)
     !hasattr(ex, :context) && return
     sl = (ex.context::SyntaxContext).layer
@@ -606,6 +643,11 @@ function _resolve_scopes(ctx, ex::SyntaxTree,
             return new_global_binding(ctx, ex, ex.name_val, mod)
         end
         b = resolve_name(ctx, ex)
+        # flisp-compat: a bare `#self#` that resolves to nothing is the leaked
+        # implicit-self idiom; redirect it to the enclosing function's self.
+        if isnothing(b) && is_self_hash_leak(ctx, ex, scope)
+            return _resolve_scopes(ctx, thisfunction_self_arg(ctx, ex, scope), scope)
+        end
         # Unresolved names are assumed global
         if isnothing(b)
             gid = declare_in_scope!(ctx, top_scope(ctx), ex, :global)
@@ -767,12 +809,7 @@ function _resolve_scopes(ctx, ex::SyntaxTree,
         push!(stmts, locals_dict)
         newnode(ctx, ex, K"block", stmts)
     elseif k == K"thisfunction"
-        lam = SyntaxTree(ex._graph, enclosing_lambda(ctx, scope::ScopeInfo).node_id)
-        self_arg = lam[1][1]
-        for a in children(lam[1])
-            getmeta(a, :thisfunction_original, false) && (self_arg = a)
-        end
-        return _resolve_scopes(ctx, self_arg, scope)
+        return _resolve_scopes(ctx, thisfunction_self_arg(ctx, ex, scope), scope)
     elseif k == K"assert"
         etype = extension_type(ex)
         if etype == "require_existing_locals"

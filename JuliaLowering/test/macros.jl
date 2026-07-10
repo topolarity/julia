@@ -1798,6 +1798,80 @@ end
     """; expr_compat_mode=true)
 end
 
+@testset "var\"#self#\" flisp-compat leak" begin
+    # flisp names a method's implicit self argument with the literal, unhygienic
+    # symbol `#self#`, so old code grabs the enclosing function via `var"#self#"`
+    # (a pre-`@__FUNCTION__` idiom).  In flisp-compat mode this resolves to the
+    # same self as `@__FUNCTION__`; it is *not* exposed at the new syntax version.
+    @testset "resolves to enclosing self in flisp-compat" begin
+        # Plain function (the TicraUtilities MWE)
+        JuliaLowering.include_string(test_mod, raw"""
+        self_leak_plain() = nameof(var"#self#")
+        """; expr_compat_mode=true)
+        @test test_mod.self_leak_plain() === :self_leak_plain
+
+        # Same self object as @__FUNCTION__
+        JuliaLowering.include_string(test_mod, raw"""
+        self_leak_same(x) = (var"#self#" === (@__FUNCTION__), x)
+        """; expr_compat_mode=true)
+        @test test_mod.self_leak_same(1) === (true, 1)
+
+        # Keyword-argument body (the real TicraUtilities `cut2sph` shape): the
+        # kw-body method sees the original generic function, so `nameof` returns
+        # the user-visible name for both the kw and no-kw call paths.
+        JuliaLowering.include_string(test_mod, raw"""
+        self_leak_kw(a; b=2) = nameof(var"#self#")
+        """; expr_compat_mode=true)
+        @test test_mod.self_leak_kw(1; b=5) === :self_leak_kw
+        @test test_mod.self_leak_kw(1) === :self_leak_kw
+
+        # Anonymous-function recursion via the leaked self
+        @test JuliaLowering.include_string(test_mod, raw"""
+        (n -> n <= 1 ? 1 : n * var"#self#"(n - 1))(5)
+        """; expr_compat_mode=true) == 120
+
+        # do-block closure gets its own self
+        JuliaLowering.include_string(test_mod, raw"""
+        function self_leak_do()
+            map([1]) do x
+                var"#self#" === (@__FUNCTION__)
+            end[1]
+        end
+        """; expr_compat_mode=true)
+        @test test_mod.self_leak_do() === true
+    end
+
+    @testset "matches flisp where no `#self#` is exposed" begin
+        # Not exposed at the new syntax version: use `@__FUNCTION__` there.
+        @test_throws UndefVarError JuliaLowering.include_string(test_mod, raw"""
+        self_leak_new() = var"#self#"
+        self_leak_new()
+        """; expr_compat_mode=false)
+
+        # No enclosing method at top level.
+        @test_throws UndefVarError JuliaLowering.include_string(test_mod,
+            raw"""var"#self#" """; expr_compat_mode=true)
+
+        # An explicitly-named self (callable struct) creates no `#self#` binding
+        # under flisp, so the reference stays unresolved.
+        @test_throws UndefVarError JuliaLowering.include_string(test_mod, raw"""
+        struct SelfLeakCallable end
+        (s::SelfLeakCallable)() = var"#self#"
+        SelfLeakCallable()()
+        """; expr_compat_mode=true)
+
+        # A local `#self#` still shadows the leak (redirect only fires when the
+        # reference is otherwise unresolved).
+        JuliaLowering.include_string(test_mod, raw"""
+        function self_leak_shadow()
+            var"#self#" = 99
+            var"#self#"
+        end
+        """; expr_compat_mode=true)
+        @test test_mod.self_leak_shadow() == 99
+    end
+end
+
 @testset "macro source LineNumberNode" begin
     Base.include_string(test_mod, raw"""
     macro srcfile()
