@@ -125,11 +125,19 @@ function _expr_to_est(graph::SyntaxGraph, @nospecialize(e), src::SourceAttrType,
                 push!(cs, cid)
             end
         end
-        if isnothing(st_k)
+        st_e = if isnothing(st_k)
             setattr!(newnode(graph, old_src, K"unknown_head", cs), :name_val, head_s)
         else
             newnode(graph, old_src, st_k, cs)
         end
+        # A block whose first arg is not a linenode is the parenthesized
+        # `(a; b)` shape (or macro-generated with the same layout); record that
+        # so `est_to_expr` does not synthesize a leading linenode when this
+        # tree is materialized again (see the `no_lead` rule there).
+        if rm_linenodes && !(!isempty(e.args) && e.args[1] isa LineNumberNode)
+            setmeta!(st_e, :no_leading_lnn, true)
+        end
+        st_e
     elseif e isa GlobalRef
         # Represent globalref as K"Identifier" with :mod attribute
         setattr!(newleaf(graph, src, K"Identifier", string(e.name)), :mod, e.mod)
@@ -202,10 +210,22 @@ function est_to_expr(st::SyntaxTree, suppress_linenodes=false)
         # we neither synthesize per-child block linenodes nor inject extra
         # provenance linenodes. Parsed/quoted *source* (no marker) is unaffected.
         verbatim = getmeta(st, :verbatim_lnn, false)
+        # flisp parity (JuliaSyntax `node_to_expr`): a block emits a linenode
+        # before every child, EXCEPT that a parenthesized `(a; b)` compound
+        # omits the leading one (and an empty `(;;)` stays empty). Third-party
+        # macros hard-code these element counts when matching compact
+        # `do (acc = init; x)`-style arguments (FLoops.jl `analyze_rf_args`),
+        # so the leading linenode is shape-breaking, not just noise. Blocks
+        # ingested from an `Expr` carry no parens flag; `_expr_to_est` marks
+        # the ones whose first arg was not a linenode so re-materialization
+        # (e.g. nested macro expansion) preserves that shape too.
+        no_lead = (k === K"block" && JS.has_flags(st, JS.PARENS_FLAG)) ||
+            getmeta(st, :no_leading_lnn, false)
         need_lnns = head in (:block, :toplevel) && !suppress_linenodes &&
             !_is_meta_doc_block(st) && !verbatim
         for (i, c) in enumerate(children(st))
-            need_lnns && push!(out.args, source_location(LineNumberNode, c))
+            need_lnns && !(no_lead && i == 1) &&
+                push!(out.args, source_location(LineNumberNode, c))
             let suppress_c = i == 1 && (k == K"for" || k == K"let")
                 push!(out.args, est_to_expr(c, suppress_c))
             end
@@ -213,7 +233,8 @@ function est_to_expr(st::SyntaxTree, suppress_linenodes=false)
         # Add extra linenodes to some blocks for better provenance
         if verbatim
             # inert payload: keep verbatim, add nothing
-        elseif head === :block && length(out.args) == 0 && !suppress_linenodes
+        elseif head === :block && length(out.args) == 0 && !suppress_linenodes &&
+                !no_lead
             push!(out.args, source_location(LineNumberNode, st))
         elseif head in (:module, :function, :macro) && length(out.args) > 0
             let b = out.args[end]

@@ -300,6 +300,50 @@ end
         @test val == Expr(:block, :(z = f()), :(g(z)))
         @test count(a -> a isa LineNumberNode, val.args) == 0
     end
+
+    @testset "block leading-linenode shape (flisp parity)" begin
+        # flisp/JuliaSyntax emit a linenode before every block child EXCEPT the
+        # leading one of a parenthesized `(a; b)` compound (and `(;;)` stays
+        # empty), regardless of line structure. Third-party macros hard-code
+        # these element counts when matching `do (acc = init; x)`-style
+        # arguments (FLoops.jl `analyze_rf_args` accepts only `block,2` or
+        # `block,3` with an interior linenode), so a leading linenode is
+        # shape-breaking for macro arguments.
+        blockshape(ex) = (length(ex.args),
+                          !isempty(ex.args) && ex.args[1] isa LineNumberNode)
+        est(str) = JL.est_to_expr(JS.parsestmt(SyntaxTree, str))
+        @test blockshape(est("(a = 0; b)")) == (3, false)
+        @test blockshape(est("(a = 0;\nb)")) == (3, false)   # parens rule, not line-based
+        @test blockshape(est("(a = 0; b; c)")) == (5, false)
+        @test blockshape(est("begin a; b end")) == (4, true) # begin keeps leading
+        @test blockshape(est("begin\na\nb\nend")) == (4, true)
+        @test blockshape(est("(;;)")) == (0, false)
+        @test blockshape(est("begin end")) == (1, true)
+
+        # Round-trip: a block Expr without a leading linenode must not grow one
+        # (nested macro expansion re-materializes spliced macro arguments).
+        rt1 = roundtrip(Expr(:block, :(a = 0), :b))
+        @test !(rt1.args[1] isa LineNumberNode)
+        @test roundtrip(Expr(:block)) == Expr(:block)
+        # A begin-style layout (leading linenode) keeps it verbatim.
+        beginish = Expr(:block, LineNumberNode(7, :x), :(a = 0), LineNumberNode(8, :x), :b)
+        @test roundtrip(beginish) == beginish
+
+        # End-to-end: the FLoops.jl `@reduce() do (acc = 0; x)` shape -- the
+        # do-argument tuple's block must arrive as `block,3` with the only
+        # linenode in the middle.
+        shp = JuliaLowering.include_string(test_mod, """
+            macro rfshape(ex)
+                blk = ex.args[1].args[1]   # do-lambda -> arg tuple -> block
+                QuoteNode((length(blk.args),
+                           findall(a -> a isa LineNumberNode, blk.args)))
+            end
+            @rfshape() do (acc = 0; x)
+                acc + x
+            end
+            """; expr_compat_mode=true)
+        @test shp == (3, [2])
+    end
 end
 
 # taken from JuliaSyntax expr.jl
