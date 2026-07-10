@@ -2343,6 +2343,52 @@ end
         end
         """; expr_compat_mode) === (1, 2, 1, true, 1, true, Int)
     end
+
+    @testset "abstract-signature generator expansion" begin
+        # Inference may expand a `@generated` function at a non-concrete call
+        # signature when the generator doesn't inspect the abstract arguments
+        # (`Base.may_invoke_generator`). Our stub must describe its generator
+        # method's slot layout to reflection or every such call collapses to
+        # `Any` — e.g. StaticArrays' `_getindex_scalar` reached through a field
+        # of incompletely-parameterized `SMatrix` type, boxing whole loops
+        # (quadratic allocation growth in ContourDynamics).
+        @test JuliaLowering.include_string(test_mod, raw"""
+        begin
+            struct GenAbsWrap{T,L}
+                data::NTuple{L,T}
+            end
+            @generated function f_gen_abs_unused(w::GenAbsWrap, inds::Int...)
+                n = length(inds)
+                return :(getfield(w, :data)[inds[$n]])
+            end
+            @generated function f_gen_abs_used(w::GenAbsWrap, i::Int)
+                w <: GenAbsWrap{Float64} ? :(getfield(w, :data)[i]) : :(0)
+            end
+
+            f_gen_abs_unused(GenAbsWrap{Float64,4}((1.0, 2.0, 3.0, 4.0)), 2, 3)
+        end
+        """; expr_compat_mode) === 3.0
+        W = test_mod.GenAbsWrap
+        f_unused = test_mod.f_gen_abs_unused
+        f_used = test_mod.f_gen_abs_used
+        @static if isdefined(Base, :generated_function_stub_layout)
+            m = only(methods(f_unused))
+            @test Base.generated_function_stub_layout(m.generator) !== nothing
+            # `W{Float64}` (L free) is not a dispatch element, but the
+            # generator ignores `w`, so expansion must be allowed (flisp
+            # parity) ...
+            @test Base.may_invoke_generator(
+                m, Tuple{typeof(f_unused), W{Float64}, Int, Int}, Core.svec())
+            # ... while a generator that inspects the abstract argument's type
+            # must still be refused (monotonicity)
+            @test !Base.may_invoke_generator(
+                only(methods(f_used)), Tuple{typeof(f_used), W{Float64}, Int}, Core.svec())
+            # End-to-end: `may_invoke_generator` dispatches the layout hook
+            # in the stub-carrying method's own world, so even the
+            # pinned-world compiler (which predates this module) must see it.
+            @test Base.return_types(f_unused, (W{Float64}, Int, Int)) == Any[Float64]
+        end
+    end
 end
 
     genfunc_quote_s = """

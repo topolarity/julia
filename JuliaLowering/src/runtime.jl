@@ -304,7 +304,8 @@ end
 # Call the `@generated` code generator function and wrap the results of the
 # expression into a CodeInfo.
 #
-# `args` passed into stub by the Julia runtime are (parent_func, static_params..., arg_types...)
+# `args` passed into stub by the Julia runtime are (static_params..., arg_types...),
+# where arg_types begins with the parent function's own type.
 function (g::GeneratedFunctionStub)(world::UInt, source::Method, @nospecialize args...)
     # Some of the lowering pipeline from lower() and the pass-specific setup is
     # re-implemented here because generated functions are very much (but not
@@ -381,6 +382,15 @@ function _lower_generated_code(g::GeneratedFunctionStub, source::Method, graph,
     end
 
     return ci
+end
+
+# Describe our generator methods to reflection so that inference may expand
+# `@generated` functions at abstract signatures when the generator doesn't use
+# the abstract arguments (see `Base.may_invoke_generator`). Unlike
+# `Core.GeneratedFunctionStub` (layout 1: `#self#`), our generator methods
+# carry one extra leading slot: (#self#, __context__, sparams..., args...).
+@static if isdefined(Base, :generated_function_stub_layout)
+    Base.generated_function_stub_layout(g::GeneratedFunctionStub) = g.gen, 2
 end
 
 
