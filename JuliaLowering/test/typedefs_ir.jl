@@ -1450,3 +1450,83 @@ mutable struct A; x; y; x; end
 LoweringError:
 mutable struct A; x; y; x; end
 #                       ╙ ── duplicate field name
+
+########################################
+# (AI) Inner constructor with return-type annotation and `where` clause
+struct X{T}
+    x::T
+    function X{T}(x)::X{T} where {T}
+        return new{T}(x)
+    end
+end
+#---------------------
+1   (call core.declare_global TestMod :X false)
+2   latestworld
+3   (= slot₂/T (call core.TypeVar :T))
+4   slot₂/T
+5   (call core.svec %₄)
+6   (call core.svec :x)
+7   (call core.svec)
+8   (call core._structtype TestMod :X %₅ %₆ %₇ false 1)
+9   (= slot₁/X %₈)
+10  (call core._setsuper! %₈ core.Any)
+11  (call core.isdefinedglobal TestMod :X false)
+12  (gotoifnot %₁₁ label₁₆)
+13  TestMod.X
+14  (= slot₄/if_val (call core._equiv_typedef %₁₃ %₈))
+15  (goto label₁₇)
+16  (= slot₄/if_val false)
+17  slot₄/if_val
+18  (gotoifnot %₁₇ label₂₂)
+19  TestMod.X
+20  (= slot₅/if_val %₁₉)
+21  (goto label₂₃)
+22  (= slot₅/if_val false)
+23  slot₅/if_val
+24  (gotoifnot %₁₇ label₃₀)
+25  TestMod.X
+26  (call top.getproperty %₂₅ :body)
+27  (call top.getproperty %₂₆ :parameters)
+28  (call top.indexed_iterate %₂₇ 1)
+29  (= slot₂/T (call core.getfield %₂₈ 1))
+30  slot₂/T
+31  (call core.svec %₃₀)
+32  (call core._typebody! %₂₃ %₈ %₃₁)
+33  (call core.declare_const TestMod :X %₃₂)
+34  latestworld
+35  (= slot₃/T (call core.TypeVar :T))
+36  TestMod.X
+37  slot₃/T
+38  (call core.apply_type %₃₆ %₃₇)
+39  (call core.apply_type core.Type %₃₈)
+40  (call core.svec %₃₉ core.Any)
+41  slot₃/T
+42  (call core.svec %₄₁)
+43  SourceLocation::3:14
+44  (call core.svec %₄₀ %₄₂ %₄₃)
+45  --- method core.nothing %₄₄
+    slots: [slot₁/#ctor-self#(!read) slot₂/x slot₃/tmp slot₄/tmp(!read)]
+    1   TestMod.X
+    2   static_parameter₁
+    3   (call core.apply_type %₁ %₂)
+    4   TestMod.X
+    5   static_parameter₁
+    6   (call core.apply_type %₄ %₅)
+    7   (call core.fieldtype %₆ 1)
+    8   slot₂/x
+    9   (= slot₃/tmp %₈)
+    10  (call core.isa slot₃/tmp %₇)
+    11  (gotoifnot %₁₀ label₁₃)
+    12  (goto label₁₄)
+    13  (= slot₃/tmp (call top.convert %₇ slot₃/tmp))
+    14  slot₃/tmp
+    15  (= slot₄/tmp (new %₆ %₁₄))
+    16  (call core.isa slot₄/tmp %₃)
+    17  (gotoifnot %₁₆ label₁₉)
+    18  (goto label₂₁)
+    19  (call top.convert %₃ slot₄/tmp)
+    20  (= slot₄/tmp (call core.typeassert %₁₉ %₃))
+    21  slot₄/tmp
+    22  (return %₂₁)
+46  latestworld
+47  (return core.nothing)

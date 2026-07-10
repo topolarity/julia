@@ -3348,6 +3348,14 @@ end
 #   - ctor_self is the symbol we generated above
 #
 # Otherwise, sig2 is sig, and ctor_self is nothing.
+#
+# `sig2` is returned *without* re-attaching `wheres`: the caller
+# (`rewrite_ctor`) wraps the final signature in a single `where` at the true top
+# of the signature.  This matters for return-type-annotated ctors like
+# `T{X}(...)::R where {X}`, where the recursive `[K"::" ...]` branch below would
+# otherwise wrap `wheres` a second time, nesting it inside the `::`.  Any inner
+# `where`s discovered here (callable-type-style ctors) are `append!`ed to
+# `wheres` in place so the caller wraps with the full set.
 function rewrite_ctor_sig(ctx, sig, tname, global_tname, struct_typevars, wheres)
     sig2 = sig
     ctor_self = nothing
@@ -3396,8 +3404,7 @@ function rewrite_ctor_sig(ctx, sig, tname, global_tname, struct_typevars, wheres
         # anonymous function
         [K"tuple" _...] -> (sig, nothing)
     end
-    sig_out = isempty(wheres) ? sig2 : @ast ctx sig [K"where" sig2 wheres...]
-    return sig_out, ctor_self
+    return sig2, ctor_self
 end
 
 # Rewrite calls to `new` in bodies of inner constructors and inner functions
@@ -3438,8 +3445,13 @@ function rewrite_ctor(ctx, ex, tname, global_tname, struct_typevars, field_types
     @stm ex begin
         [K"inert" _] -> ex
         [K"function" call body] -> let (sig, wheres) = flatten_wheres(call)
-            call2, ctor_self =
+            sig2, ctor_self =
                 rewrite_ctor_sig(ctx, sig, tname, global_tname, struct_typevars, wheres)
+            # Re-attach `wheres` exactly once, at the true top of the signature,
+            # so that it scopes over any return-type annotation (`(:: call rett)`)
+            # and over the whole signature.  `rewrite_ctor_sig` may have appended
+            # inner `where`s (callable-type-style ctors) to `wheres`.
+            call2 = isempty(wheres) ? sig2 : @ast ctx sig [K"where" sig2 wheres...]
             body2 = _rewrite_ctor_new_calls(
                 ctx, body, global_tname,
                 mapsyntax(x->typevar_bounds(ctx, x), wheres),
