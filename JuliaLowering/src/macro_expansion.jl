@@ -435,6 +435,66 @@ function assert_expandable(st, l=base_layer(st.context::SyntaxContext))
     end
 end
 
+"""
+Give unescaped `@label`/`@goto` names their own hygienic identity per macro
+expansion, mirroring flisp's `rename-symbolic-labels` pass (`src/macroexpand.scm`).
+
+`@label`/`@goto` names are ordinary literal strings that would otherwise be
+compared verbatim when control flow is linearized, so two expansions of a
+label-emitting macro landing in one lambda would collide (and, conversely, a
+`@goto` in one expansion would wrongly resolve to a same-named `@label` in
+another). flisp avoids this by gensym-renaming each label per macro
+`hygienic-scope`, memoized so a label and its matching goto in the same
+expansion stay connected.
+
+We get the same effect for free from the layer system: every macro expansion
+allocates a fresh `ScopeLayer`, and `apply_expansion_layer` already resolves
+`esc` by popping a name to its caller's layer.  So we key the rename on
+`(layer, name)`: labels sharing a layer resolve to each other, distinct
+expansions get distinct names, and base-layer names (user-written labels, or
+labels escaped all the way to the call site) keep their literal spelling and
+stay reachable by an unescaped `@goto` at that site.
+
+Renamed labels use flisp's `#N#name` format with session-global counter
+semantics (flisp's `named-gensy` draws from the session-wide `*gensy-counter*`).
+A per-expansion counter would make the first renamed label deterministically
+`#1#name`, so user code literally spelling `var"#1#lbl"` would collide with (or
+silently bind to) a macro's renamed internal label; with the global counter such
+collisions are as improbable as under flisp. The renamed names are erased at
+linearization, so the global counter has no reproducibility cost for lowered
+code.
+"""
+const _label_rename_counter = Threads.Atomic{Int}(0)
+
+function rename_symbolic_labels!(st::SyntaxTree, relabels)
+    k = kind(st)
+    if is_leaf(st) || k in KSet"inert syntaxinert"
+        return st
+    elseif (k === K"symboliclabel" || k === K"symbolicgoto" ||
+            k === K"oldsymbolicgoto") && numchildren(st) == 1 &&
+            kind(st[1]) === K"Identifier"
+        name_node = st[1]
+        sc = get(name_node, :context, nothing)::Union{Nothing, SyntaxContext}
+        # Only rename names introduced by a macro expansion (non-base layer);
+        # base-layer names are the flisp `parent-scope` null case (no rename).
+        (isnothing(sc) || sc.layer.escaped === nothing) && return st
+        name = name_node.name_val
+        newname = get!(relabels, (sc.layer, name)) do
+            n = Threads.atomic_add!(_label_rename_counter, 1) + 1
+            string("#", n, "#", name)
+        end
+        newname == name && return st
+        return mknode(st, SyntaxList(setattr(name_node, :name_val, newname)))
+    else
+        return mapchildren(
+            c->rename_symbolic_labels!(c, relabels), st._graph, st)
+    end
+end
+
+function rename_symbolic_labels!(st::SyntaxTree)
+    rename_symbolic_labels!(st, Dict{Tuple{ScopeLayer, String}, String}())
+end
+
 @fzone "JL: macroexpand" function expand_forms_1(
     st::SyntaxTree, world::UInt, recursive::Bool)
 
@@ -443,5 +503,6 @@ end
     DEBUG && assert_expandable(st)
     ctx = MacroExpansionContext(st, world, recursive)
     st_out = expand_forms_1(ctx, st)
+    st_out = rename_symbolic_labels!(st_out)
     return st_out
 end

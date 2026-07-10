@@ -550,3 +550,87 @@ end
     end
     """) == [1,2]
 end
+
+#-------------------------------------------------------------------------------
+# Hygiene of macro-emitted `@label`/`@goto` names, matching flisp's
+# `rename-symbolic-labels` pass. An unescaped label gets a fresh identity per
+# macro expansion, so the same label-emitting macrocall spliced into one lambda
+# more than once no longer collides (the Test.jl `@test`/SimpleLooper shape);
+# conversely, a `@goto` cannot reach a same-named label from a *different*
+# expansion, and escaped labels keep their literal name.
+@testset "macro-hygienic goto/label" begin
+
+label_mod = Module()
+run_compat(s) = JuliaLowering.include_string(label_mod, s; expr_compat_mode=true)
+
+# A label-emitting macro (SimpleLooper's `@loop` shape): fixed literal label
+# name, relying on hygiene to keep distinct expansions from colliding.
+fl_eval(label_mod, :(macro countto(n)
+    quote
+        local c = 0
+        @label lbl
+        c += 1
+        c < $(esc(n)) && @goto lbl
+        c
+    end
+end))
+# Splices its argument twice into one returned expression (the shape Test.jl's
+# `get_test_result` produces: escaped value + inert display copy).
+fl_eval(label_mod, :(macro dup2(ex)
+    quote
+        $(esc(ex))
+        $(esc(ex))
+    end
+end))
+
+# The same `@countto` macrocall node, expanded into two positions of one
+# lambda, must not collide on the literal label name.
+@test run_compat("@dup2 (@countto 3)") == 3
+# Two separately-parsed invocations in one lambda: also no collision.
+@test run_compat("(@countto(2), @countto(4))") == (2, 4)
+
+# An escaped label keeps its literal name and is reachable by an unescaped
+# `@goto` at the call site (flisp: escape pops the name to the caller scope).
+fl_eval(label_mod, :(macro emitlabel_esc()
+    esc(quote @label shared end)
+end))
+@test run_compat("function reach_esc(); @emitlabel_esc(); @goto shared; end") isa Function
+
+# Unescaped labels are hygienic: a `@goto` in one expansion cannot reach a
+# same-named `@label` from another expansion, nor can a user `@goto` reach a
+# macro's unescaped label.
+fl_eval(label_mod, :(macro emitlabel()
+    quote @label shared end
+end))
+fl_eval(label_mod, :(macro emitgoto()
+    quote @goto shared end
+end))
+@test_throws JuliaLowering.LoweringError run_compat(
+    "function cross_macro(); @emitlabel(); @emitgoto(); end")
+@test_throws JuliaLowering.LoweringError run_compat(
+    "function user_to_macro(); @emitlabel(); @goto shared; end")
+
+# Two labels with the same name emitted by a single expansion still collide,
+# matching flisp (both rename to one gensym).
+fl_eval(label_mod, :(macro twolabels()
+    quote
+        @label twin
+        @label twin
+    end
+end))
+@test_throws JuliaLowering.LoweringError run_compat(
+    "function twin_labels(); @twolabels(); end")
+
+# The rename counter is session-global (flisp `*gensy-counter*` semantics), not
+# per-expansion, so renamed names are not deterministically predictable: after
+# at least one prior expansion has consumed a name, a later expansion's label
+# can never be `#1#lbl`.  A user label literally spelled `var"#1#lbl"` therefore
+# neither collides with (no_collide) nor silently captures a `@goto` intended
+# for it (no_bind) -- the latter must be an undefined-label error.
+run_compat("function warm_counter(); @countto(1); end")
+@test run_compat(
+    "function no_collide(); @countto(1); @label var\"#1#lbl\"; end") isa Function
+@test_throws JuliaLowering.LoweringError run_compat(
+    "function no_bind(); @countto(1); @goto var\"#1#lbl\"; end")
+
+end
