@@ -399,6 +399,10 @@ end
 # an `arg_aliases` entry must be invisible so that assigning a bare name
 # co-spelled with an escaped parameter introduces a fresh hygienic local
 # (matching flisp's gensym-renaming) instead of mutating the parameter.
+# One intentional exception: a target escaped OUT of a nested expansion
+# (`is_escaped_binding_target`) skips declaration registration entirely and
+# resolves here with aliases visible, like a reference — flisp resolves such
+# a target in the parent expansion's env exactly as it would a reference.
 function resolve_name(ctx, ex; exclude_toplevel_globals=false,
                       include_arg_aliases=true)
     # TODO: probably want to cache these lookups
@@ -512,6 +516,23 @@ function _record_layer!(ctx, ex)
     get!(ctx.layer_ids, sl, length(ctx.layer_ids)+1)
 end
 
+# flisp-compat: true when a binding form's target name was `esc`ed out of a
+# more deeply nested expansion than the one being resolved, i.e. the target's
+# layer is a strict ancestor of the form's own layer.  flisp's expansion-env
+# scan (`find-assigned-vars-in-expansion` and friends) resumes at `escape`s
+# but then sees only the escaped fragment -- here a bare name -- so such a
+# target is never counted as introduced by the enclosing expansion; it
+# resolves there like any other reference: to whatever the enclosing
+# expansion binds under that name, or else a plain global of the enclosing
+# macro's home module (the target layer's module).
+function is_escaped_binding_target(ctx, form, target)
+    kind(target) === K"Identifier" && !hasattr(target, :mod) || return false
+    sc = target.context::SyntaxContext
+    return is_flisp_compat(sc) && !is_base_layer(sc) && sc.layer !== ctx.layer &&
+        hasattr(form, :context) &&
+        is_strict_ancestor_layer(sc.layer, (form.context::SyntaxContext).layer)
+end
+
 function _find_scope_decls!(ctx, scope, ex)
     k = kind(ex)
     _record_layer!(ctx, ex)
@@ -568,7 +589,7 @@ function _find_scope_decls!(ctx, scope, ex)
                 haskey(scope.vars, nk) ||
                     (scope.vars[nk] = _new_binding(ctx, ex[1], nk.name, :global;
                                                    mod=sc.layer.mod).id)
-            else
+            elseif !is_escaped_binding_target(ctx, ex, ex[1])
                 hasattr(ex[1], :mod) && explicit_declare_in_scope!(ctx, scope, ex[1], :global)
                 get!(scope.assignments, NameKey(ex[1]), ex[1]._id)
                 get!(ctx.layer_ids, (ex[1].context::SyntaxContext).layer,
@@ -581,7 +602,11 @@ function _find_scope_decls!(ctx, scope, ex)
         k1 = kind(ex[1])
         _record_layer!(ctx, ex[1])
         sc = ex[1].context::SyntaxContext
-        if k === K"constdecl" && is_flisp_compat(ex[1]) &&
+        if is_escaped_binding_target(ctx, ex, ex[1])
+            # An `esc`ed target from a nested expansion is not introduced by
+            # this expansion; leave it unregistered so it resolves as a
+            # reference (see `is_escaped_binding_target`).
+        elseif k === K"constdecl" && is_flisp_compat(ex[1]) &&
             is_top_scope(scope) && sc.layer !== ctx.layer
             # flisp gensym-renames an unescaped top-level `const` target in a
             # hygienic expansion, binding a hidden (name-mangled) global in the

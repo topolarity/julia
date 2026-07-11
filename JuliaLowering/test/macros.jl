@@ -2894,6 +2894,91 @@ end
     @test mjl.results() == mfl.results()
 end
 
+@testset "(AI) escaped binding target from nested expansion (flisp compat)" begin
+    # An inner macro whose expansion binds `$(esc(name))`, invoked (unescaped)
+    # inside an outer macro's quote: the esc unwinds one hygiene level, to the
+    # *outer expansion's* layer.  flisp's expansion-env scan
+    # (find-assigned-vars-in-expansion) resumes at escapes but then sees only
+    # the escaped name -- a bare atom -- so the name is never counted as
+    # introduced by the outer expansion and resolves there like any reference:
+    # a plain global of the outer macro's home module (Gen.jl's
+    # `@gen (static) function name() ... end` inside a user macro).  Applies
+    # to `=`, `const`, and non-root method defs, at any nesting depth, and
+    # even in function scope (flisp assigns the macro-home global there too).
+    src = raw"""
+        module ModI
+            macro assign(name); :($(esc(name)) = 2); end
+            macro cdef(name); :(const $(esc(name)) = 3); end
+            macro fdef(name)
+                quote
+                    function $(esc(name))(); 4; end
+                    nothing
+                end
+            end
+            macro readback(name)
+                quote
+                    $(esc(name)) = 5
+                    $(esc(name)) + 10
+                end
+            end
+        end
+        module ModM
+            using ..ModI
+            macro mid(); quote ModI.@assign three end; end
+        end
+        module ModO
+            using ..ModI, ..ModM
+            macro assign_nested(); quote ModI.@assign x end; end
+            macro const_nested(); quote ModI.@cdef c end; end
+            macro fdef_nested(); quote ModI.@fdef f end; end
+            macro mid_nested(); quote ModM.@mid() end; end
+            macro readback_nested(); quote ModI.@readback r end; end
+            macro infn_nested(); quote (function (); ModI.@assign z; end)() end; end
+        end
+        module User
+            using ..ModO
+            ModO.@assign_nested
+            ModO.@const_nested
+            ModO.@fdef_nested
+            ModO.@mid_nested
+            const rb = ModO.@readback_nested
+            ModO.@infn_nested
+        end
+        results() = (ModO.x, ModO.c, isconst(ModO, :c), ModO.f(), ModM.three,
+                     User.rb, ModO.r, ModO.z,
+                     isdefined(User, :x), isdefined(ModI, :x),
+                     isdefined(ModO, :three), isdefined(User, :f))
+    """
+    mfl = Module(); Base.include_string(mfl, src); Core.@latestworld
+    mjl = Module(); JuliaLowering.include_string(mjl, src; expr_compat_mode=true)
+    Core.@latestworld
+    @test mfl.results() == (2, 3, true, 4, 2, 15, 5, 2, false, false, false, false)
+    @test mjl.results() == mfl.results()
+
+    # Gen.jl's exact bottom shape: `Core.@__doc__ $(esc(name)) = $(esc(:eval))(...)`
+    # nested in a user macro's quote, all in one module.
+    src2 = raw"""
+        eval(x) = Core.eval(@__MODULE__, x)
+        macro gen_static(name)
+            quote
+                Core.@__doc__ $(esc(name)) = $(esc(:eval))($(QuoteNode(:(41 + 1))))
+            end
+        end
+        macro make_foo()
+            quote
+                @gen_static foo_in_macro
+            end
+        end
+        @make_foo()
+        results() = foo_in_macro
+    """
+    gfl = Module(); Base.include_string(gfl, src2); Core.@latestworld
+    gjl = Module(); JuliaLowering.include_string(gjl, src2; expr_compat_mode=true)
+    Core.@latestworld
+    @test gfl.results() == 42
+    @test gjl.results() == 42
+end
+
 @testset "eval-free macro-name resolution (generated-function staging)" begin
     # A @generated generator can return a deferred macrocall whose name is a
     # dotted expression headed by an *interpolated value* (e.g. Unrolled.jl's
