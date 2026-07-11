@@ -436,7 +436,10 @@ function vst1_importpath(vcx, st; dots_ok)
             end
             continue
         end
-        ok = ok & vst1_ident(vcx, c)
+        # Import-path components are symbolic names, not value reads, so an
+        # all-underscore name is a legal (write-only) binding here rather than a
+        # forbidden read -- matching flisp's `using X: _` / `import X as _`.
+        ok = ok & vst1_ident(with(vcx; readable_underscore=true), c)
         seen_first = true
     end
     return !seen_first ? @fail(st, "expected identifier in `importpath`") : ok

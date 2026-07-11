@@ -242,12 +242,22 @@ function _dst_sink_parameters(sl::SyntaxList)
     return out
 end
 
+# Names within an import/using path are symbolic references, not variables, so
+# an all-underscore name is a genuine (write-only) binding rather than a discard:
+# flisp binds it for `import X as _`, `using X: a as _` and `using X: _`.  Undo
+# the K"Placeholder" conversion `est_to_dst` applies so the importer sees a normal
+# identifier.
+function _dst_importname(st::SyntaxTree)
+    d = est_to_dst(st)
+    kind(d) == K"Placeholder" ? setattr!(mkleaf(d), :kind, K"Identifier") : d
+end
+
 function _dst_importpath(st::SyntaxTree)
     return @stm st begin
         [K"as" p name] ->
-            @ast st._graph st [K"as" _dst_importpath(st[1]) est_to_dst(name)]
+            @ast st._graph st [K"as" _dst_importpath(st[1]) _dst_importname(name)]
         [K"." xs...] ->
-            @ast st._graph st [K"importpath" mapsyntax(est_to_dst, xs)...]
+            @ast st._graph st [K"importpath" mapsyntax(_dst_importname, xs)...]
     end
 end
 

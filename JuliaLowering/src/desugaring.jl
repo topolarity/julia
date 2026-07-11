@@ -4171,7 +4171,8 @@ function expand_import_or_using(ctx, ex)
     for spec in paths
         if kind(spec) == K"as"
             @jl_assert numchildren(spec) == 2 spec
-            @jl_assert kind(spec[2]) == K"Identifier" spec
+            kind(spec[2]) == K"Identifier" ||
+                throw(LoweringError(spec[2], "expected an identifier as the `as` rename target"))
             path = @ast ctx spec [K"as" expand_importpath(ctx, spec[1]) spec[2]]
         else
             path = expand_importpath(ctx, spec)
