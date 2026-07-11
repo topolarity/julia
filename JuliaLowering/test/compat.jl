@@ -568,3 +568,34 @@ end
     out = JL.core_lowering_hook(lambda, test_mod)
     @test out isa Core.SimpleVector && out[1] isa Core.CodeInfo
 end
+
+@testset "qualified operator in comparison chain (Tullio `@fastmath` rewrite)" begin
+    # From PkgEval: PolaronMobility v2.0.1, src/MobilityTheories.jl:377 (Tullio @fastmath emits qualified ops in Expr(:comparison))
+    # `@fastmath`-style macros (e.g. Tullio's einsum kernel) build an
+    # `Expr(:comparison, ...)` whose operators are *qualified* function
+    # references such as `Base.FastMath.eq_fast` — a `K"."` field-access node,
+    # not writable as infix source.  Comparison-chain desugaring must not
+    # mistake that for a broadcast-dot operator (also `K"."`, but single-child)
+    # and pull out its first child (`Base.FastMath`, a Module) as the callee.
+    op = :(Base.FastMath.eq_fast)
+    defn(head, ex) = Expr(:function, head, ex)
+    chain3 = defn(:(c3(a,b,c)), Expr(:comparison, :a, op, :b, op, :c))
+    single = defn(:(c1(a,b)),   Expr(:comparison, :a, op, :b))
+    qual2  = defn(:(q2(a,b,c)), Expr(:comparison, :a, :(Base.:<), :b, :(Base.:<), :c))
+
+    for fdef in (chain3, single, qual2)
+        f = jl_eval(test_mod, fdef; expr_compat_mode=true)
+        g = fl_eval(test_mod, fdef)
+        for args in ((1,1,1), (1,1,3), (1,2,3), (3,2,1))
+            n = length(fdef.args[1].args) - 1  # arity (drop the fn name)
+            a = args[1:n]
+            @test Base.invokelatest(f, a...) === Base.invokelatest(g, a...)
+        end
+    end
+    # The exact observed shape: the chain drives an `if`.
+    ifdef = defn(:(cif(a,b,c)),
+                 Expr(:if, Expr(:comparison, :a, op, :b, op, :c), 1, 2))
+    f = jl_eval(test_mod, ifdef; expr_compat_mode=true)
+    @test Base.invokelatest(f, 1, 1, 1) === 1
+    @test Base.invokelatest(f, 1, 1, 3) === 2
+end
