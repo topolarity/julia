@@ -1255,6 +1255,29 @@ State LateLowerGCFrame::LocalScan(Function &F) {
                         assert(return_roots);
                         HasDefBefore = true;
                         auto gc_allocas = FindAllocaBases(CI->getArgOperand(i)->stripInBoundsOffsets());
+                        // Record the buffer/sret pairing for GC frame slot
+                        // packing: the buffer must stay live as long as the
+                        // sret data it roots can be read.
+                        AllocaInst *SretAI = nullptr;
+                        if (CI->arg_size() > 0 && CI->paramHasAttr(0, Attribute::StructRet)) {
+                            auto sret_allocas = FindAllocaBases(CI->getArgOperand(0)->stripInBoundsOffsets());
+                            if (sret_allocas.size() == 1)
+                                SretAI = sret_allocas[0];
+                        }
+                        for (AllocaInst *SRet_gc : gc_allocas) {
+                            auto &Info = S.ReturnRootsBuffers[SRet_gc];
+                            Info.DefCalls.push_back(CI);
+                            if (gc_allocas.size() != 1) {
+                                // phi/select-merged buffers: liveness pairing is ambiguous
+                                Info.Unsafe = true;
+                            }
+                            else if (SretAI == nullptr) {
+                                Info.Unsafe = true;
+                            }
+                            else if (SretAI != SRet_gc) {
+                                Info.PairedSrets.push_back(SretAI);
+                            }
+                        }
                         // We know that with the right optimizations we can forward a sret directly from an argument
                         // This hasn't been seen without adding IPO effects to julia functions but it's possible we need to handle that too
                         if (gc_allocas.size() == 0) {
@@ -2402,6 +2425,280 @@ void LateLowerGCFrame::PlaceGCFrameStores(State &S, unsigned MinColorRoot,
     }
 }
 
+// Assign shared GC frame slots to single-slot "julia.return_roots" buffers
+// whose live ranges are provably disjoint. Every specsig call returning an
+// aggregate with tracked pointers gets a dedicated buffer from codegen, so
+// large functions can accumulate hundreds of such slots even though only a
+// few are ever live at once.
+//
+// A buffer must keep its slot from the call that writes it until the last
+// instruction that can read either the buffer itself or the paired sret
+// buffer whose data it roots (the raw pointer bits in the sret stay valid
+// only while the roots buffer is scanned by the GC; every handoff to other
+// storage goes through visible loads of the buffer). Any user of either
+// alloca that we cannot classify as a plain, non-capturing access makes the
+// buffer ineligible and it keeps a dedicated slot, as before.
+//
+// Slot reuse is safe for the GC: a shared slot always contains either null
+// (from the prologue frame clearing) or pointers stored by a callee, so
+// conservative scans between reuses only ever see valid roots.
+DenseMap<AllocaInst *, unsigned> LateLowerGCFrame::PackReturnRootsBuffers(State &S, unsigned &NumSharedSlots)
+{
+    NumSharedSlots = 0;
+    DenseMap<AllocaInst *, unsigned> Assignment;
+    // Returns-twice calls have unobservable control flow, so we cannot bound
+    // any buffer's live range.
+    if (!S.ReturnsTwice.empty() || S.ReturnRootsBuffers.empty())
+        return Assignment;
+
+    // Collect all instructions that may access memory reachable from Root,
+    // walking through geps and casts. Returns false if any user cannot be
+    // classified (address escapes, unknown intrinsic, ...).
+    auto collectUsers = [](AllocaInst *Root, SmallVectorImpl<Instruction *> &Uses) -> bool {
+        SmallVector<Value *, 8> Worklist{Root};
+        SmallPtrSet<Value *, 8> Visited;
+        while (!Worklist.empty()) {
+            Value *V = Worklist.pop_back_val();
+            if (!Visited.insert(V).second)
+                continue;
+            for (Use &U : V->uses()) {
+                auto *I = dyn_cast<Instruction>(U.getUser());
+                if (I == nullptr)
+                    return false;
+                if (isa<GetElementPtrInst>(I) || isa<BitCastInst>(I)) {
+                    Worklist.push_back(I);
+                    continue;
+                }
+                if (auto *II = dyn_cast<IntrinsicInst>(I)) {
+                    if (II->getIntrinsicID() == Intrinsic::lifetime_start ||
+                        II->getIntrinsicID() == Intrinsic::lifetime_end)
+                        continue;
+                    if (isa<MemTransferInst>(II) || isa<MemSetInst>(II)) {
+                        Uses.push_back(I);
+                        continue;
+                    }
+                    return false;
+                }
+                if (isa<LoadInst>(I)) {
+                    Uses.push_back(I);
+                    continue;
+                }
+                if (auto *SI = dyn_cast<StoreInst>(&*I)) {
+                    if (SI->getValueOperand() == V)
+                        return false; // address escapes
+                    Uses.push_back(I);
+                    continue;
+                }
+                if (auto *CB = dyn_cast<CallBase>(I)) {
+                    if (!CB->isArgOperand(&U) || !CB->doesNotCapture(U.getOperandNo()))
+                        return false;
+                    Uses.push_back(I);
+                    continue;
+                }
+                return false;
+            }
+        }
+        return true;
+    };
+
+    struct Candidate {
+        AllocaInst *AI;
+        unsigned NumSlots;
+        SmallVector<Instruction *, 8> Uses;
+        SmallPtrSet<Instruction *, 2> Defs;
+    };
+    SmallVector<Candidate, 8> Candidates;
+    for (auto &KV : S.ReturnRootsBuffers) {
+        AllocaInst *AI = KV.first;
+        auto &Info = KV.second;
+        if (Info.Unsafe)
+            continue;
+        auto it = S.ArrayAllocas.find(AI);
+        if (it == S.ArrayAllocas.end())
+            continue;
+        if (AI->getAlign().value() > sizeof(void *))
+            continue; // shared slots are only pointer-aligned
+        Candidate C;
+        C.AI = AI;
+        C.NumSlots = it->second;
+        if (!collectUsers(AI, C.Uses))
+            continue;
+        bool ok = true;
+        for (AllocaInst *Sret : Info.PairedSrets) {
+            // reads of the sret's raw pointer bits rely on this buffer for
+            // rooting, so they extend its live range
+            if (!Sret->isStaticAlloca() || S.ArrayAllocas.count(Sret) ||
+                !collectUsers(Sret, C.Uses)) {
+                ok = false;
+                break;
+            }
+        }
+        if (!ok)
+            continue;
+        for (CallInst *CI : Info.DefCalls)
+            C.Defs.insert(CI);
+        Candidates.push_back(std::move(C));
+    }
+    if (Candidates.size() <= 1)
+        return Assignment;
+
+    // Number instructions within each block once, for interval computation
+    DenseMap<const Instruction *, unsigned> InstPos;
+    for (auto &BB : *S.F) {
+        unsigned i = 0;
+        for (auto &I : BB)
+            InstPos[&I] = i++;
+    }
+
+    // For each candidate, compute a per-block over-approximation of its live
+    // range as an instruction interval, via backward liveness where uses
+    // (of the buffer or paired sret) generate liveness and defining calls
+    // kill it.
+    struct BBRange {
+        unsigned Begin;
+        unsigned End;
+    };
+    auto UINT_MAX_POS = std::numeric_limits<unsigned>::max();
+    SmallVector<DenseMap<const BasicBlock *, BBRange>, 8> LiveRanges(Candidates.size());
+    for (size_t ci = 0; ci < Candidates.size(); ci++) {
+        Candidate &C = Candidates[ci];
+        // per-block sorted event lists: (position, is-def)
+        DenseMap<const BasicBlock *, SmallVector<std::pair<unsigned, bool>, 4>> Events;
+        for (Instruction *I : C.Uses) {
+            bool isdef = C.Defs.count(I) != 0;
+            Events[I->getParent()].push_back({InstPos[I], isdef});
+        }
+        for (auto &KV : Events) {
+            auto &Evs = KV.second;
+            // a def call also appears as a use of the paired sret at the
+            // same position; the def (kill) must win, so order defs first
+            // among equal positions and keep only the first entry
+            std::sort(Evs.begin(), Evs.end(), [](const auto &a, const auto &b) {
+                return a.first != b.first ? a.first < b.first : a.second > b.second;
+            });
+            Evs.erase(std::unique(Evs.begin(), Evs.end(),
+                                  [](const auto &a, const auto &b) { return a.first == b.first; }),
+                      Evs.end());
+        }
+        // live-in given live-out, scanning the block's events bottom-up
+        auto scanBlock = [](ArrayRef<std::pair<unsigned, bool>> Evs, bool LiveOut) {
+            bool state = LiveOut;
+            for (auto it = Evs.rbegin(); it != Evs.rend(); ++it)
+                state = it->second ? false : true;
+            return state;
+        };
+        DenseMap<const BasicBlock *, bool> LiveIn;
+        SmallVector<const BasicBlock *, 8> Worklist;
+        for (auto &KV : Events)
+            Worklist.push_back(KV.first);
+        while (!Worklist.empty()) {
+            const BasicBlock *BB = Worklist.pop_back_val();
+            bool lo = false;
+            for (const BasicBlock *Succ : successors(BB)) {
+                auto it = LiveIn.find(Succ);
+                if (it != LiveIn.end() && it->second) {
+                    lo = true;
+                    break;
+                }
+            }
+            auto evit = Events.find(BB);
+            bool li = scanBlock(evit == Events.end() ? ArrayRef<std::pair<unsigned, bool>>()
+                                                     : ArrayRef<std::pair<unsigned, bool>>(evit->second),
+                                lo);
+            bool &cur = LiveIn[BB];
+            if (li && !cur) {
+                cur = true;
+                for (const BasicBlock *Pred : predecessors(BB))
+                    Worklist.push_back(Pred);
+            }
+        }
+        // materialize per-block intervals
+        auto &Ranges = LiveRanges[ci];
+        auto noteBlock = [&](const BasicBlock *BB) {
+            bool li = false;
+            {
+                auto it = LiveIn.find(BB);
+                li = it != LiveIn.end() && it->second;
+            }
+            bool lo = false;
+            for (const BasicBlock *Succ : successors(BB)) {
+                auto it = LiveIn.find(Succ);
+                if (it != LiveIn.end() && it->second) {
+                    lo = true;
+                    break;
+                }
+            }
+            auto evit = Events.find(BB);
+            if (!li && !lo && evit == Events.end())
+                return;
+            unsigned begin = li ? 0 : UINT_MAX_POS;
+            unsigned end = lo ? UINT_MAX_POS : 0;
+            if (evit != Events.end()) {
+                begin = std::min(begin, evit->second.front().first);
+                end = std::max(end, evit->second.back().first);
+            }
+            if (begin <= end)
+                Ranges[BB] = BBRange{begin, end};
+        };
+        for (auto &KV : Events)
+            noteBlock(KV.first);
+        for (auto &KV : LiveIn) {
+            if (KV.second && !Events.count(KV.first))
+                noteBlock(KV.first);
+        }
+    }
+
+    // Greedy first-fit assignment over the interference relation
+    auto interferes = [&](size_t a, size_t b) {
+        auto &RA = LiveRanges[a];
+        auto &RB = LiveRanges[b];
+        auto &Small = RA.size() <= RB.size() ? RA : RB;
+        auto &Big = RA.size() <= RB.size() ? RB : RA;
+        for (auto &KV : Small) {
+            auto it = Big.find(KV.first);
+            if (it == Big.end())
+                continue;
+            if (KV.second.Begin <= it->second.End && it->second.Begin <= KV.second.End)
+                return true;
+        }
+        return false;
+    };
+    // Contiguous first-fit range packing: a buffer of N slots occupies
+    // [offset, offset + N), and may overlap another buffer's range only if
+    // their live ranges are disjoint. Place larger buffers first.
+    SmallVector<size_t, 8> Order(Candidates.size());
+    for (size_t i = 0; i < Order.size(); i++)
+        Order[i] = i;
+    std::stable_sort(Order.begin(), Order.end(), [&](size_t a, size_t b) {
+        return Candidates[a].NumSlots > Candidates[b].NumSlots;
+    });
+    SmallVector<SmallVector<size_t, 4>, 8> SlotOccupants;
+    for (size_t ci : Order) {
+        unsigned n = Candidates[ci].NumSlots;
+        unsigned offset = 0;
+        for (;; offset++) {
+            bool ok = true;
+            for (unsigned s = offset; ok && s < offset + n && s < SlotOccupants.size(); s++) {
+                for (size_t other : SlotOccupants[s]) {
+                    if (interferes(ci, other)) {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if (ok)
+                break;
+        }
+        if (SlotOccupants.size() < offset + n)
+            SlotOccupants.resize(offset + n);
+        for (unsigned s = offset; s < offset + n; s++)
+            SlotOccupants[s].push_back(ci);
+        Assignment[Candidates[ci].AI] = offset;
+    }
+    NumSharedSlots = (unsigned)SlotOccupants.size();
+    return Assignment;
+}
+
 void LateLowerGCFrame::PlaceRootsAndUpdateCalls(ArrayRef<int> Colors, int PreAssignedColors, State &S,
                                                 std::map<Value *, std::pair<int, int>>) {
     auto F = S.F;
@@ -2466,17 +2763,14 @@ void LateLowerGCFrame::PlaceRootsAndUpdateCalls(ArrayRef<int> Colors, int PreAss
         toerase = nullptr;
 
         // Replace Allocas
-        unsigned AllocaSlot = 2; // first two words are metadata
-        auto replace_alloca = [this, gcframe, &AllocaSlot, T_int32](AllocaInst *&AI) {
-            // Pick a slot for the alloca.
-            AI->getAlign();
-            unsigned align = AI->getAlign().value() / sizeof(void*); // TODO: use DataLayout pointer size
-            assert(align <= 16 / sizeof(void*) && "Alignment exceeds llvm-final-gc-lowering abilities");
-            if (align > 1)
-                AllocaSlot = LLT_ALIGN(AllocaSlot, align);
+        unsigned NumSharedSlots = 0;
+        auto SharedSlots = PackReturnRootsBuffers(S, NumSharedSlots);
+        // first two words are metadata, then the shared return_roots region
+        unsigned AllocaSlot = 2 + NumSharedSlots;
+        auto replace_alloca = [this, gcframe, T_int32](AllocaInst *&AI, unsigned Slot) {
             Instruction *slotAddress = CallInst::Create(
                 getOrDeclare(jl_intrinsics::getGCFrameSlot),
-                {gcframe, ConstantInt::get(T_int32, AllocaSlot - 2)}, "gc_slot_addr" + StringRef(std::to_string(AllocaSlot - 2)));
+                {gcframe, ConstantInt::get(T_int32, Slot)}, "gc_slot_addr" + StringRef(std::to_string(Slot)));
             slotAddress->insertAfter(gcframe);
             slotAddress->takeName(AI);
 
@@ -2499,7 +2793,18 @@ void LateLowerGCFrame::PlaceRootsAndUpdateCalls(ArrayRef<int> Colors, int PreAss
             AI = NULL;
         };
         for (auto AI : S.ArrayAllocas) {
-            replace_alloca(AI.first);
+            auto shared = SharedSlots.find(AI.first);
+            if (shared != SharedSlots.end()) {
+                assert(shared->second + AI.second <= NumSharedSlots);
+                replace_alloca(AI.first, shared->second);
+                continue;
+            }
+            // Pick a dedicated slot for the alloca.
+            unsigned align = AI.first->getAlign().value() / sizeof(void*); // TODO: use DataLayout pointer size
+            assert(align <= 16 / sizeof(void*) && "Alignment exceeds llvm-final-gc-lowering abilities");
+            if (align > 1)
+                AllocaSlot = LLT_ALIGN(AllocaSlot, align);
+            replace_alloca(AI.first, AllocaSlot - 2);
             AllocaSlot += AI.second;
         }
         for (auto Store : S.TrackedStores) {

@@ -314,6 +314,16 @@ struct State {
     // We don't bother doing liveness on Allocas that were not mem2reg'ed.
     // they just get directly sunk into the root array.
     DenseMap<AllocaInst *, unsigned> ArrayAllocas;
+    // Buffers passed as a call's "julia.return_roots" argument, along with
+    // the call(s) that write them and the sret buffer(s) whose tracked data
+    // they root. Buffers whose live ranges are provably disjoint can share
+    // GC frame slots (see PackReturnRootsBuffers).
+    struct ReturnRootsBufferInfo {
+        SmallVector<CallInst *, 1> DefCalls;
+        SmallVector<AllocaInst *, 1> PairedSrets;
+        bool Unsafe = false;
+    };
+    DenseMap<AllocaInst *, ReturnRootsBufferInfo> ReturnRootsBuffers;
     DenseMap<AllocaInst *, AllocaInst *> ShadowAllocas;
     SmallVector<std::pair<StoreInst *, unsigned>, 0> TrackedStores;
     State(Function &F) : F(&F), DT(nullptr), MaxPtrNumber(-1), MaxSafepointNumber(-1) {}
@@ -355,6 +365,7 @@ private:
     State LocalScan(Function &F);
     void ComputeLiveness(State &S);
     void ComputeLiveSets(State &S);
+    DenseMap<AllocaInst *, unsigned> PackReturnRootsBuffers(State &S, unsigned &NumSharedSlots);
     std::pair<SmallVector<int, 0>, int> ColorRoots(const State &S);
     void PlaceGCFrameStore(State &S, unsigned R, unsigned MinColorRoot, ArrayRef<int> Colors, Value *GCFrame, Instruction *InsertBefore);
     void PlaceGCFrameStores(State &S, unsigned MinColorRoot, ArrayRef<int> Colors, int PreAssignedColors, Value *GCFrame);
