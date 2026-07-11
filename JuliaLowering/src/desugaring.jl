@@ -493,13 +493,18 @@ end
 #-------------------------------------------------------------------------------
 # Expand comparison chains
 
+# A broadcast-dot operator in a comparison chain (`.<`) is a single-child
+# `K"."` wrapping the operator; a qualified operator name
+# (`Base.FastMath.eq_fast`) is a multi-child field-access `K"."`.
+is_dotted_comparison_op(op) = kind(op) == K"." && numchildren(op) == 1
+
 function expand_scalar_compare_chain(ctx, srcref, terms, i)
     comparisons = nothing
     while i + 2 <= length(terms)
         lhs = terms[i]
         op = terms[i+1]
         rhs = terms[i+2]
-        if kind(op) == K"."
+        if is_dotted_comparison_op(op)
             break
         end
         comp = @ast ctx op [K"call"
@@ -539,7 +544,7 @@ function expand_compare_chain(ctx, ex)
     comparisons = nothing
     # Combine any number of dotted comparisons
     while i + 2 <= length(terms)
-        if kind(terms[i+1]) != K"."
+        if !is_dotted_comparison_op(terms[i+1])
             (comp, i) = expand_scalar_compare_chain(ctx, ex, terms, i)
         else
             lhs = terms[i]
