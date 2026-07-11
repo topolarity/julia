@@ -229,6 +229,13 @@ function _dst_eq_to_in(st::SyntaxTree)
                        [K"iteration" mapsyntax(_dst_eq_to_in, is)...]]
         [K"=" l r] ->
             @ast st._graph st [K"in" est_to_dst(l) est_to_dst(r)]
+        # A `.=`-headed iterspec is nonsense as broadcast-assignment, but flisp
+        # never inspects the head of an iterspec (it binds positionally), so a
+        # macro such as `@.` that rewrites `i = 1:n` to `i .= 1:n` inside a
+        # comprehension lowers fine there.  Match that leniency: treat `.=` as
+        # a plain binding, exactly like `=`.
+        [K".=" l r] ->
+            @ast st._graph st [K"in" est_to_dst(l) est_to_dst(r)]
     end
 end
 
@@ -478,6 +485,9 @@ function est_to_dst(st::SyntaxTree)
         [K"module" _...] -> st
         [K"toplevel" _...] -> st
         [K"for" [K"=" _ _] body] ->
+            @ast g st [K"for" [K"iteration"(st[1]) _dst_eq_to_in(st[1])] rec(body)]
+        # See `_dst_eq_to_in`: a `.=`-headed single iterspec binds positionally.
+        [K"for" [K".=" _ _] body] ->
             @ast g st [K"for" [K"iteration"(st[1]) _dst_eq_to_in(st[1])] rec(body)]
         [K"for" [K"block" iters...] body] ->
             @ast g st [K"for"

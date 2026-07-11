@@ -693,3 +693,54 @@ end
     @test Base.invokelatest(f, 1, 1, 1) === 1
     @test Base.invokelatest(f, 1, 1, 3) === 2
 end
+
+@testset "`.=` iteration spec (`@.` over a comprehension)" begin
+    # From PkgEval: ApproximateVanishingIdeals v0.1.2, via FrankWolfe src/alternating_methods.jl:320 (@. y = [f(i) for i in ...])
+    # `Base.__dot__` (the `@.` macro) guards `:for` but not `:generator`, so it
+    # rewrites a comprehension's `i = 1:n` iteration spec into `i .= 1:n`.  flisp
+    # binds an iterspec positionally and never inspects its head, so it accepts
+    # the `.=` as an ordinary binding; the compat layer must match that leniency
+    # or any use of `@.` around a comprehension/generator RHS fails to lower.
+    gen(body, iters...) = Expr(:comprehension, Expr(:generator, body, iters...))
+    dot(l, r) = Expr(:.=, l, r)
+    forloop(iter, body) = Expr(:for, iter, body)
+    cases = Any[
+        gen(:(2i), dot(:i, :(1:3))),                                  # single
+        gen(:(10i + j), dot(:i, :(1:2)), dot(:j, :(1:3))),            # cartesian
+        gen(:i, Expr(:filter, :(isodd(i)), dot(:i, :(1:5)))),        # filter
+        gen(:(a + b), dot(Expr(:tuple, :a, :b), :(zip(1:2, 10:11)))), # destructure
+        Expr(:comprehension, Expr(:flatten,                          # nested/flatten
+            Expr(:generator, Expr(:generator, :(10i + j), dot(:j, :(1:2))),
+                 dot(:i, :(1:2))))),
+        Expr(:typed_comprehension, :Float64,                         # typed
+            Expr(:generator, :(2i), dot(:i, :(1:3)))),
+        # plain for-loops: only reachable via an Expr (the parser rejects a `.=`
+        # iterspec in surface syntax), but flisp lowers them, so we must too.
+        Expr(:let, Expr(:(=), :s, 0),
+             Expr(:block, forloop(dot(:i, :(1:4)), :(s += i)), :s)),  # single
+        Expr(:let, Expr(:(=), :s, 0),                                 # block/multi
+             Expr(:block,
+                  forloop(Expr(:block, dot(:i, :(1:2)), dot(:j, :(1:3))),
+                          :(s += 10i + j)), :s)),
+        Expr(:let, Expr(:(=), :i, 0),                                 # `outer`
+             Expr(:block, forloop(dot(Expr(:outer, :i), :(1:3)), :(nothing)), :i)),
+    ]
+    for ex in cases
+        @test jl_eval(test_mod, ex; expr_compat_mode=true) == fl_eval(test_mod, ex)
+    end
+
+    # The real-world trigger: FrankWolfe's `grad!` (`@.` around a comprehension).
+    src = """
+        let storage = zeros(3), x = [1.0, 2.0, 3.0], N = 3
+            @. storage = [2 * (x[i] - x[mod(i - 2, N) + 1]) for i in 1:N]
+            storage
+        end
+        """
+    @test jl_eval(test_mod, Meta.parse(src); expr_compat_mode=true) == [-4.0, 2.0, 2.0]
+
+    # A `.=` iterspec is only leniency for `.=`: JuliaLowering stays strict on
+    # genuinely nonsensical heads such as `+=` (which flisp accepts solely by
+    # never checking the head, and which no macro emits).
+    @test_throws JuliaLowering.LoweringError jl_eval(test_mod,
+        gen(:(2i), Expr(:+=, :i, :(1:3))); expr_compat_mode=true)
+end
