@@ -780,6 +780,16 @@ function _resolve_scopes(ctx, ex::SyntaxTree,
         end
         # Unresolved names are assumed global
         if isnothing(b)
+            if kind(ex) === K"Identifier" && ex.name_val == "#self#" && is_flisp_compat(ex)
+                # A `#self#` that reaches here is a flisp-compat leak site whose
+                # enclosing self flisp did not expose (e.g. genuine top level);
+                # like flisp, leave it as an undefined global reference.  But do
+                # NOT register it in the top scope: `#self#` is never a real user
+                # global, and a persistent binding would be found first by a
+                # later, legitimately-leakable `#self#` in the same lowering
+                # unit, whose leak check only runs when resolution returns nothing.
+                return new_global_binding(ctx, ex, ex.name_val, syntax_module(ex))
+            end
             gid = declare_in_scope!(ctx, top_scope(ctx), ex, :global)
             b = get_binding(ctx, gid)
         end

@@ -1870,6 +1870,24 @@ end
         """; expr_compat_mode=true)
         @test test_mod.self_leak_shadow() == 99
     end
+
+    @testset "unexposed `#self#` doesn't poison a later leak in the same unit" begin
+        # An unexposed `#self#` (here a top-level one) is left unresolved, but it
+        # must not register a spurious `#self#` global: a later, legitimately-
+        # leakable `#self#` in the same top-level form would otherwise resolve to
+        # that bogus global -- whose value is never assigned -- instead of the
+        # enclosing self, since the leak redirect only fires on an otherwise-
+        # unresolved reference.  Both occurrences share one `let` form, the order
+        # that regressed.
+        JuliaLowering.include_string(test_mod, raw"""
+        let
+            top = try; var"#self#"; catch; :unresolved; end
+            inner() = nameof(var"#self#")
+            global self_leak_order = (top, inner())
+        end
+        """; expr_compat_mode=true)
+        @test test_mod.self_leak_order === (:unresolved, :inner)
+    end
 end
 
 @testset "macro source LineNumberNode" begin
