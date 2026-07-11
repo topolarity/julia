@@ -2688,3 +2688,45 @@ end
         "Base.Experimental.@consistent_overlay MtHome.mt gf(x::Int) = x + 1")
     @test in_overlay(Tuple{typeof(UserF.gf), Int}, MtHome.mt)
 end
+
+@testset "Method metadata propagates to keyword method wrappers" begin
+    # A keyword definition lowers to several methods; dispatch selects the
+    # positional-forwarder or `Core.kwcall` wrapper, not the hidden body method.
+    # Whole-method metadata (`@inline`/`@noinline`/`Base.@constprop`) must be
+    # replicated onto those wrappers, else e.g. `@inline` is silently dropped
+    # from the method callers actually invoke (StaticArrays' `@inline`
+    # `minimum(::Function, ::StaticArray; dims)` then failed to inline, leaking
+    # a heap allocation for the closure it reduces over).
+    M = Module(); Core.eval(M, :(using Base))
+    JuliaLowering.include_string(M, raw"""
+        @inline   f_inl(a::Int; k::Int=1)   = a + k
+        @noinline f_noinl(a::Int; k::Int=1) = a + k
+                  f_plain(a::Int; k::Int=1) = a + k
+    """)
+    # `.inlining`: 0x01 = force-inline, 0x02 = force-noinline, 0x00 = neither.
+    fwd(f) = Base.uncompressed_ast(which(f, Tuple{Int})).inlining
+    @test fwd(M.f_inl)   == 0x01
+    @test fwd(M.f_noinl) == 0x02
+    @test fwd(M.f_plain) == 0x00
+    kwc(f) = Base.uncompressed_ast(
+        which(Core.kwcall, Tuple{NamedTuple, typeof(f), Int})).inlining
+    @test kwc(M.f_inl)   == 0x01
+    @test kwc(M.f_noinl) == 0x02
+    @test kwc(M.f_plain) == 0x00
+
+    # Behavioral: a large `@inline` keyword method, which the cost heuristic
+    # alone would not inline, is inlined into its caller through the forwarder.
+    JuliaLowering.include_string(M, raw"""
+        @inline function bigkw(g, a::Float64; k=:)
+            s = g(a); s += g(a*2); s += g(a*3); s += g(a*4); s += g(a*5)
+            s += g(a*6); s += g(a*7); s += g(a*8); s += g(a*9); s += g(a*10)
+            s += g(a*11); s += g(a*12); s += g(a*13); s += g(a*14); s += g(a*15)
+            return s
+        end
+        caller(a) = bigkw(sin, a)
+    """)
+    M.caller(1.0)
+    ci = code_typed(M.caller, (Float64,))[1][1]
+    @test !any(s -> (s isa Expr && s.head === :invoke &&
+                     occursin("bigkw", string(s.args[1]))), ci.code)
+end

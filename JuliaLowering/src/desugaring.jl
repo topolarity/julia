@@ -2831,6 +2831,33 @@ is_vararg_type_expr(st) = @stm st begin
         (kind(st) in KSet"core Identifier" && st.name_val::String == "Vararg")
 end
 
+# flisp `method-meta-sym?` (+ purity): whole-method metadata a function body
+# carries in its prologue (`@inline`/`@noinline`/`Base.@constprop`/
+# `@propagate_inbounds`/purity).  A keyword definition lowers to several methods;
+# dispatch selects the positional-forwarder or `Core.kwcall` wrapper, not the
+# hidden body method, so this metadata must be replicated onto those wrappers or
+# it is silently lost from the method the caller actually invokes (flisp does
+# this via `keep-first`/`propagate-method-meta` in `keywords-method-def-expr`).
+const METHOD_META_SYMS = ("inline", "noinline", "aggressive_constprop",
+                          "no_constprop", "propagate_inbounds")
+
+function propagate_method_meta(ctx, body)
+    metas = SyntaxList(ctx.graph)
+    kind(body) === K"block" || return metas
+    for stmt in children(body)
+        kind(stmt) === K"meta" || continue
+        kept = SyntaxList(ctx.graph)
+        for c in children(stmt)
+            if kind(c) === K"purity" ||
+                    (kind(c) === K"Symbol" && c.name_val::String in METHOD_META_SYMS)
+                push!(kept, c)
+            end
+        end
+        isempty(kept) || push!(metas, @ast ctx stmt [K"meta" kept...])
+    end
+    metas
+end
+
 function keywords_method_def_expr(ctx, src, mtable, sparams, argl, body, rett,
                                   overlay=false)
     kws = argl[end]
@@ -2912,7 +2939,9 @@ function keywords_method_def_expr(ctx, src, mtable, sparams, argl, body, rett,
         end
         method_def_expr(
             ctx, src, mtable, pos_sparams, pargl,
-            @ast(ctx, src, [K"block" refl_stubs... [K"return" body2]]))
+            @ast(ctx, src, [K"block"
+                propagate_method_meta(ctx, body)...
+                refl_stubs... [K"return" body2]]))
     end
     # (3) Core.kwcall(arg2::NamedTuple, pargl...) methods (one per optarg).
     # - for each kwarg:
@@ -2995,10 +3024,14 @@ function keywords_method_def_expr(ctx, src, mtable, sparams, argl, body, rett,
                 # declare them for reflection purposes
                 push!(kw_assigns, @ast ctx n [K"local" setmeta(n, :is_internal, true)])
             end
-            @ast(ctx, src, [K"block" kw_assigns... handle_excess final_call])
+            @ast(ctx, src, [K"block"
+                propagate_method_meta(ctx, body)...
+                kw_assigns... handle_excess final_call])
         else
-            scope_nest(ctx, kw_assigns,
-                       @ast ctx src [K"block" handle_excess final_call])
+            @ast(ctx, src, [K"block"
+                propagate_method_meta(ctx, body)...
+                scope_nest(ctx, kw_assigns,
+                           @ast ctx src [K"block" handle_excess final_call])])
         end
         # Core.kwcall method has its own first argument.  Ensure closure
         # conversion knows not to put the closure there.
