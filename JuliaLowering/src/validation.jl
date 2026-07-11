@@ -1114,6 +1114,13 @@ vst1_iter(vcx, st) = @stm st begin
     # rare, malformed, happens to work in desugaring
     [K"=" i [K"..." v]] -> vst1_assign_lhs(vcx, i) & vst1(vcx, v)
     [K"=" i v] -> vst1_assign_lhs(vcx, i) & vst1(vcx, v)
+    # flisp binds an iterspec positionally without checking its head, so a
+    # `.=`-headed clause (e.g. from `@.` rewriting `i = 1:n` in a comprehension)
+    # is accepted there as a plain binding.  Mirror that; `est_to_dst` /
+    # `_dst_eq_to_in` desugar `.=` iterspecs identically to `=`.
+    [K".=" [K"outer" i] v] -> vst1_assign_lhs(vcx, i) & vst1(vcx, v)
+    [K".=" i [K"..." v]] -> vst1_assign_lhs(vcx, i) & vst1(vcx, v)
+    [K".=" i v] -> vst1_assign_lhs(vcx, i) & vst1(vcx, v)
     _ -> @fail(st, "expected one of `=`, `in`, `∈`")
 end
 
