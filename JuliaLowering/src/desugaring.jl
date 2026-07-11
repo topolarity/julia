@@ -2462,9 +2462,16 @@ function prepend_function_body(ctx, body, ex)
             ex_est = @stm ex begin
                 [K"meta" [K"Symbol"] n] ->
                     @ast ctx ex [K"meta" "nkw"::K"Identifier" n]
-                # TODO: need to handle destructuring arg assignments
-                [K"block" _... [K"nothing"]] ->
-                    newleaf(ctx, ex, K"Value", nothing)
+                # Destructuring-arg assignments (`(a, b) = destructured`) must
+                # also be prepended to the *generated* code path, so that the
+                # runtime staged method binds the component names before the
+                # generator's returned body reads them (flisp inserts them into
+                # `body` before the gen/nongen split).  Prepend the same
+                # statements into the syntaxquote as quoted syntax; drop the
+                # trailing `nothing` return (only meaningful for the eager `=`,
+                # and not valid quoted est here).
+                [K"block" stmts... [K"nothing"]] ->
+                    @ast ctx ex [K"block" stmts...]
                 _ -> @jl_assert false (ex, "unexpected prepend_function_body")
             end
             @ast ctx body [K"_generated_body"

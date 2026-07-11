@@ -1959,7 +1959,54 @@ end
         end
         """
         @test (genfunc_f = JL.include_string(test_mod, genfunc_s; expr_compat_mode)) isa Function
-        @test_broken genfunc_f((1,2)) == (1, 2, Tuple{Int, Int}, "gen")
+        # The destructured-arg components (`d1`, `d2`) must be bound in the
+        # *generated* code path, not only the non-generated fallback.
+        @test genfunc_f((1,2)) == (1, 2, Tuple{Int, Int}, "gen")
+    end
+
+    @testset "destructured args: shapes" begin
+        # From PkgEval: DigitalAssetExchangeFormatIO v1.1.5, via IterTools src/IterTools.jl:329-361 (Partition @generated iterate((els, xs_state), ...))
+        # A destructured-tuple argument in a fully-`@generated` function whose
+        # body is a `quote`/`Expr(:block)` (not a bare single expression): the
+        # implicit `(names...) = <arg>` prologue must reach the generated code.
+        @test JL.include_string(test_mod, raw"""
+            @generated function fds_named(x, (a, b)); quote a + b end; end
+            fds_named(1, (2, 3))
+        """; expr_compat_mode) == 5
+        # Same, with the generated body built as an explicit `Expr(:block, ...)`.
+        @test JL.include_string(test_mod, raw"""
+            @generated function fds_exprblock(x, (a, b)); Expr(:block, :(a + b)); end
+            fds_exprblock(1, (2, 3))
+        """; expr_compat_mode) == 5
+        # Nested destructuring.
+        @test JL.include_string(test_mod, raw"""
+            @generated function fds_nested(x, (a, (b, c))); quote a + b + c end; end
+            fds_nested(1, (2, (3, 4)))
+        """; expr_compat_mode) == 9
+        # Destructured first argument.
+        @test JL.include_string(test_mod, raw"""
+            @generated function fds_first((a, b)); quote a + b end; end
+            fds_first((2, 3))
+        """; expr_compat_mode) == 5
+        # Positional vararg after a destructured argument.
+        @test JL.include_string(test_mod, raw"""
+            @generated function fds_va((a, b), xs...); quote a + b + length(xs) end; end
+            fds_va((2, 3), 10, 20)
+        """; expr_compat_mode) == 7
+        # Destructured argument alongside keyword arguments.
+        @test JL.include_string(test_mod, raw"""
+            @generated function fds_kw((a, b); k=0); quote a + b + k end; end
+            fds_kw((2, 3); k=10)
+        """; expr_compat_mode) == 15
+        # Known separate divergence (NOT this fix): with two destructured
+        # arguments the generator stub's `argnames` svec carries two identical
+        # `destructured` placeholders, so staging fails with "function argument
+        # name not unique" (flisp accepts it).  Distinct root cause in the stub
+        # argname reconstruction, orthogonal to the dropped-prologue bug above.
+        @test_broken JL.include_string(test_mod, raw"""
+            @generated function fds_multi((a, b), (c, d)); quote a + b + c + d end; end
+            fds_multi((1, 2), (3, 4))
+        """; expr_compat_mode) == 10
     end
 
     @testset "keyword args" begin
