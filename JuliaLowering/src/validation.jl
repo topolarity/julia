@@ -772,6 +772,16 @@ vst1_pparam_va(vcx, st; eq_is_kw) = @stm st begin
     ([K"=" [K"..." va] val], when=eq_is_kw) ->
         vst1_pparam_typed_tuple(vcx, va) & vst1_splat_or_val(vcx, val)
     [K"..." va] -> vst1_pparam_typed_tuple(vcx, va)
+    # A `...` splat nested *inside* the type annotation of the final positional
+    # (`x::(T...)`, i.e. `(:: x (... T))`) is equally a positional vararg, as is
+    # its anonymous form `(:: (... T))`.  This shape comes from parenthesized
+    # source or from interpolating a splat into a type position (`x::$kt` with
+    # `kt` an `Expr(:..., T)`); flisp accepts it via `arg-type`/`dots->vararg`,
+    # and `expand_function_arg` normalizes it to `Vararg{T}`.  Validate the inner
+    # type in place of the stray `...` rather than rejecting it here.
+    [K"::" id [K"..." t]] -> vst1_ident(vcx, id; lhs=true) &
+        vst1(with(vcx; readable_underscore=true), t)
+    [K"::" [K"..." t]] -> vst1(with(vcx; readable_underscore=true), t)
     _ -> unknown()
 end
 

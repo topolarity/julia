@@ -2691,8 +2691,12 @@ end
 # positional argument `x::t` denotes a `Vararg`, i.e. a bare `Vararg`, a
 # `Vararg{T}`/`Vararg{T,N}`, or such wrapped in a `where`.  These forms make the
 # annotated argument a positional vararg that must be splatted when forwarded.
+# A splat nested inside the annotation (`x::(T...)`, i.e. `(:: x (... T))`) is
+# equally a positional vararg (see `expand_function_arg`), so recognize it here
+# too, matching flisp where such a type reaches `dots->vararg`.
 function is_vararg_type_expr(t)
-    is_same_identifier_like(t, "Vararg") ||
+    kind(t) === K"..." ||
+        is_same_identifier_like(t, "Vararg") ||
         (kind(t) in KSet"curly where" && numchildren(t) >= 1 && is_vararg_type_expr(t[1]))
 end
 
@@ -2928,6 +2932,20 @@ end
 # internally.  Desugar type, but desugar default values later, since
 # `default...` is unfortunately allowed, so do that in body desugaring.
 expand_function_arg(ctx, arg, used) = @stm arg begin
+    # A `...` splat nested *inside* the type annotation (`x::(T...)`) denotes a
+    # positional vararg, exactly as `x::T...` does.  This shape arises from
+    # parenthesized source (`f(x::(T...))`) and, more commonly, from
+    # interpolating a splat expression into a type position (`x::$kt` with `kt`
+    # an `Expr(:..., T)`, e.g. QuickHeaps' `@eval getindex(pq, key::$keytype)`
+    # over `keytype in (:Integer, :(FastIndex...))`).  Flisp normalizes it via
+    # `arg-type` + `dots->vararg`; mirror that here so both spellings converge on
+    # `Vararg{T}` rather than leaving a stray `...` for later stages to reject.
+    [K"::" x [K"..." t]] ->
+        @ast ctx arg [K"::" fix_argname(ctx, x, used) [K"curly" "Vararg"::K"core" t]]
+    [K"::" [K"..." t]] -> let aname = newsym(ctx, arg, "#arg#"; unused=true)
+        hasattr(arg, :meta) && setattr!(aname, :meta, arg.meta)
+        @ast ctx arg [K"::" fix_argname(ctx, aname, used) [K"curly" "Vararg"::K"core" t]]
+    end
     [K"::" x t] ->
         @ast ctx arg [K"::" fix_argname(ctx, x, used) t]
     [K"::" t] -> let aname = newsym(ctx, arg, "#arg#"; unused=true)

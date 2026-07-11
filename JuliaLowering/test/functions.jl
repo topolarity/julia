@@ -487,6 +487,67 @@ end
     end
 end
 
+@testset "Vararg via splat nested in type annotation" begin
+    # From PkgEval: Geomorphometry v0.7.4, via QuickHeaps v0.2.3 src/priorityqueues.jl:363 (@eval key::$kt with kt = :(T...))
+    # `x::(T...)` (i.e. `(:: x (... T))`, splat nested *inside* the `::`) is a
+    # positional vararg, equivalent to `x::T...`.  It arises from parenthesized
+    # source and, more commonly, from interpolating a splat expression into a
+    # type position (`x::$kt` with `kt` an `Expr(:..., T)`).  Flisp accepts both
+    # spellings; regression for a `LoweringError: unexpected `...`` on the
+    # nested form (QuickHeaps `getindex(pq, key::$keytype)` over
+    # `keytype in (:Integer, :(FastIndex...))`).
+
+    # long form
+    @test JL.include_string(test_mod, """
+        begin
+            function f_va_paren_long(x::(Int...))
+                x
+            end
+            (f_va_paren_long(), f_va_paren_long(1), f_va_paren_long(1,2,3))
+        end
+    """) === ((), (1,), (1,2,3))
+
+    # short form
+    @test JL.include_string(test_mod,
+        "begin; f_va_paren_short(x::(Int...)) = x; f_va_paren_short(1,2) end") === (1,2)
+
+    # anonymous / arrow form
+    @test JL.include_string(test_mod,
+        "((x::(Int...)) -> x)(1,2,3)") === (1,2,3)
+
+    # nested splat is genuinely a `Vararg` method: same signature as `x::Int...`
+    @test JL.include_string(test_mod, """
+        begin
+            g_va_paren(x::(Int...)) = x
+            only(methods(g_va_paren)).sig
+        end
+    """) === Tuple{typeof(JL.include_string(test_mod, "g_va_paren")), Vararg{Int}}
+
+    # the shape produced by interpolating an `Expr(:..., T)` into a type
+    # position, exactly as QuickHeaps generates it (define via `@eval`, then
+    # call once the defining world has advanced)
+    JL.include_string(test_mod, """
+        for kt in (:Int, :(Int...))
+            @eval h_va(x::\$kt) = x
+        end
+    """)
+    @test (test_mod.h_va(1), test_mod.h_va(1,2,3)) === (1, (1,2,3))
+
+    # keyword args after a nested-splat vararg: the wrapper must splat the
+    # vararg when forwarding to the keyword body (flisp mis-forwards this shape)
+    @test JL.include_string(test_mod, """
+        begin
+            k_va_paren(x::(Int...); y=0) = (x, y)
+            k_va_paren(1, 2; y=3)
+        end
+    """) === ((1,2), 3)
+
+    # a `...` nested in a type annotation that is *not* the final positional
+    # parameter is rejected (a vararg must be the final parameter)
+    @test_throws JuliaLowering.LoweringError JL.include_string(test_mod,
+        "nl_va_paren(x::(Int...), y) = (x, y)")
+end
+
 @testset "slotflags" begin
     JuliaLowering.include_string(test_mod, """
     function f_slotflags(x, y, f, z)
