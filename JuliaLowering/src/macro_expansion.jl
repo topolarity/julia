@@ -229,6 +229,12 @@ function _macrocall_expr_location(st::SyntaxTree)
         elseif loc isa LineNumberNode
             # Some macros, e.g. @cmd, don't play nicely with file == nothing
             isnothing(loc.file) ? LineNumberNode(loc.line, :none) : loc
+        elseif loc === nothing
+            # A source-less macrocall (`Expr(:macrocall, name, nothing, ...)`)
+            # gets `__source__ = LineNumberNode(0, nothing)`, exactly as flisp's
+            # `jl_invoke_julia_macro`; macros detect the missing source by the
+            # `nothing` file (e.g. Test's `@testset` backtrace scrubbing).
+            LineNumberNode(0, nothing)
         else
             LineNumberNode(0, :none)
         end

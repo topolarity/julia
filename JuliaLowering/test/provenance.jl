@@ -118,6 +118,66 @@ end
     @test caught_line([], "gl = 0\nf() = throw(ErrorException(\"x\"))\ntry\n    f()\n$catcher") == 2
 end
 
+@testset "macro-expansion frames match flisp's line shape" begin
+    # flisp holds the root codeloc of every statement inside a macro expansion
+    # at the region's first in-file line (`push_loc` regions never advance the
+    # root-level current line); the statement's own line lives in the deepest
+    # "macro expansion" edge. Check both on a `@testset`/`@test` body, the
+    # shape Test's backtrace-scrubbing suite asserts on.
+    m = Module(:MacroFrameMod)
+    Core.eval(m, :(using Base, Test))
+    src = "@testset \"t\" begin\n    @test 1 == 2\nend"
+    st = jl_lower(m, JuliaSyntax.parsestmt(SyntaxTree, src; filename="usage.jl"))
+    JuliaSyntax.ensure_attributes!(st._graph; debuginfo=Any)
+    add_debuginfo!(st)
+    di = st.debuginfo
+    testfile = basename(String(first(methods(Test.do_test)).file))
+    deepest = Set{Tuple{String,Int}}()
+    for pc in 1:numchildren(st[1])
+        loc = ccall(:jl_uncompress1_codeloc, NTuple{3,Int32}, (Any, Int), di, pc)
+        to, epc = Int(loc[2]), Int(loc[3])
+        to == 0 && continue
+        # Every edge-carrying statement's root line is the region anchor:
+        # the `@testset` body's first in-file line.
+        @test Base.Compiler.source_location(di, pc).line == 2
+        d = di
+        file = ""; line = 0
+        while to != 0
+            e = d.edges[to]::Core.DebugInfo
+            eloc = ccall(:jl_uncompress1_codeloc, NTuple{3,Int32}, (Any, Int), e, epc)
+            file = basename(String(e.def::Symbol)); line = Int(eloc[1])
+            d = e; to = Int(eloc[2]); epc = Int(eloc[3])
+        end
+        push!(deepest, (file, line))
+    end
+    # The `@test` statements' own location, one macro-expansion frame per file
+    # boundary: a Test.jl frame (the machinery) and the usage-file frame at
+    # the `@test` line.
+    @test ("usage.jl", 2) in deepest
+    @test any(f -> f[1] == testfile, deepest)
+end
+
+@testset "eval'd thunk adopts the quoted arguments' source file" begin
+    # flisp locates a thunk with no real source context (`eval` of a
+    # hand-built `Expr(:macrocall, name, nothing, ...)`) at the first
+    # real-file line node inside the code -- the caller's quoted arguments.
+    m = Module(:AltSrcMod)
+    Core.eval(m, :(using Base))
+    Core.eval(m, :(macro identwrap(x); esc(x); end))
+    q = quote
+        1 + 1
+    end # the quote's LineNumberNodes point at *this* file
+    qline = q.args[1].line
+    ex = Expr(:macrocall, Symbol("@identwrap"), nothing, q)
+    st = jl_lower(m, JuliaLowering.expr_to_est(ex, LineNumberNode(1, :none));
+                  expr_compat_mode=true)
+    JuliaSyntax.ensure_attributes!(st._graph; debuginfo=Any)
+    add_debuginfo!(st)
+    di = st.debuginfo
+    @test di.def === Symbol(@__FILE__)
+    @test Base.Compiler.source_location(di, 1).line == qline
+end
+
 @testset "cross-file macro content keeps byte-precise debuginfo" begin
     # Statements whose own provenance names a *foreign* file (a macro body
     # defined in another file/context) are attributed to their macrocall site

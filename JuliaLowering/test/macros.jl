@@ -1927,10 +1927,13 @@ end
 
     @test JuliaLowering.eval(test_mod, mac_st) === "goodfile"
 
-    # tolerate nothing
+    # A source-less macrocall gets `__source__ = LineNumberNode(0, nothing)`,
+    # exactly as flisp's `jl_invoke_julia_macro` (so `string(__source__.file)`
+    # is "nothing", and consumers that detect the missing source by the
+    # `nothing` file, e.g. Test's `@testset`, keep working).
     mac_ex = Expr(:macrocall, Symbol("@srcfile"), nothing)
     mac_st = JuliaLowering.expr_to_est(mac_ex, LineNumberNode(1, "badfile"))
-    @test JuliaLowering.eval(test_mod, mac_st) == "none"
+    @test JuliaLowering.eval(test_mod, mac_st) == "nothing"
 end
 
 @testset "macro QuoteNode + inert behavior" begin

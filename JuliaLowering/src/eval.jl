@@ -617,22 +617,49 @@ function build_edges(edges::Vector{DebugInfoEdge})
     return Core.svec(out...)
 end
 
-function add_ci_debuginfo!(st::SyntaxTree, file::Symbol,
+function add_ci_debuginfo!(st::SyntaxTree, file::Symbol, groupfile::Symbol,
                            top_sbt::Union{String, Nothing},
                            node_sources::Dict{NodeId, Tuple{Int32, Int32}},
                            spans::Vector{Tuple{Int32, Int32}})
     @jl_assert kind(st) === K"code_info" st
+    stmts = children(st[1])
+    # Per-statement macro-expansion frames, plus a per-region "anchor" for the
+    # top codeloc.  flisp holds the root codeloc of every statement inside a
+    # macro expansion at the region's first in-file line (the root-level
+    # current line never advances inside a `push_loc` region); the statement's
+    # own location lives in the deepest edge instead.  Mirror that by anchoring
+    # all edge-carrying statements of one outermost macrocall at the textually
+    # first in-file own provenance among them (falling back to the statement's
+    # own position when the region has none).
+    stmt_edges = Vector{Vector{Tuple{Symbol,Int32}}}(undef, length(stmts))
+    regions = zeros(NodeId, length(stmts))
+    anchors = Dict{NodeId, Tuple{Int32, Int32}}()
+    for (i, c) in enumerate(stmts)
+        rest = _macro_edge_groups(c, groupfile)
+        stmt_edges[i] = rest
+        isempty(rest) && continue
+        mp = JuliaSyntax.macro_prov_end(c)
+        mp === nothing && continue
+        regions[i] = mp._id
+        fl = _ref_file_line(JuliaSyntax.sourceref(c))
+        if fl !== nothing && fl[1] === groupfile
+            pos = node_sources[c._id]
+            anchors[mp._id] = min(get(anchors, mp._id, pos), pos)
+        end
+    end
     edges = DebugInfoEdge[]
-    locs = let a = sizehint!(Vector{Int32}(), 3*numchildren(st[1]))
-        for c in children(st[1])
+    locs = let a = sizehint!(Vector{Int32}(), 3*length(stmts))
+        for (i, c) in enumerate(stmts)
+            rest = stmt_edges[i]
+            pos = isempty(rest) ? node_sources[c._id] :
+                get(anchors, regions[i], node_sources[c._id])
             if top_sbt isa String # precise provenance
-                push!(a, Int32(searchsortedfirst(spans, node_sources[c._id])))
+                push!(a, Int32(searchsortedfirst(spans, pos)))
             else
-                i = searchsortedfirst(spans, node_sources[c._id])
-                @jl_assert spans[i][2] == LINENODE_SPAN_END (c, "lno with span end?")
-                push!(a, spans[i][1])
+                j = searchsortedfirst(spans, pos)
+                @jl_assert spans[j][2] == LINENODE_SPAN_END (c, "lno with span end?")
+                push!(a, spans[j][1])
             end
-            rest = _macro_edge_groups(c, file)
             if isempty(rest)
                 push!(a, Int32(0)); push!(a, Int32(0))
             else
@@ -649,6 +676,44 @@ function add_ci_debuginfo!(st::SyntaxTree, file::Symbol,
                                     numchildren(st[1])::Csize_t)::String)))
 end
 
+# First (file, line) with a real file inside `st`'s subtree provenance, also
+# checking `K"Value"`-wrapped `LineNumberNode`s (a quoted block's line nodes,
+# or a macrocall's location slot); `nothing` if there is none.
+function _first_real_file_ref(st::SyntaxTree)
+    x = JuliaSyntax.sourceref(st)
+    if x isa SourceRef
+        return (Symbol(JuliaSyntax.filename(x.file[]::SourceFile)),
+                Int32(JuliaSyntax.source_line(x)))
+    elseif x isa LineNumberNode && !(x.file === nothing || x.file === :none)
+        return (x.file::Symbol, Int32(x.line))
+    end
+    if kind(st) === K"Value"
+        v = st.value
+        v isa LineNumberNode && !(v.file === nothing || v.file === :none) &&
+            return (v.file::Symbol, Int32(v.line))
+    end
+    if !is_leaf(st)
+        for c in children(st)
+            r = _first_real_file_ref(c)
+            r !== nothing && return r
+        end
+    end
+    return nothing
+end
+
+# The (file, line) flisp would locate a synthetic-context thunk at: the first
+# real-file line node inside the pre-expansion code -- in practice the
+# `__source__` slot or quoted arguments of the outermost macrocall.
+function _thunk_alt_source(codeinfos)
+    isempty(codeinfos) && return nothing
+    for c in children(codeinfos[1][1])
+        mp = JuliaSyntax.macro_prov_end(c)
+        mp === nothing && continue
+        return _first_real_file_ref(mp)
+    end
+    return nothing
+end
+
 # Populate `.debuginfo` on all K"code_info" in `st`
 function add_debuginfo!(st::SyntaxTree)
     @jl_assert kind(st) === K"code_info" st
@@ -656,6 +721,19 @@ function add_debuginfo!(st::SyntaxTree)
     codeinfos = SyntaxList(st._graph)
     top_sf = _di_sourcefile(st)
     collect_locs!(node_sources, codeinfos, top_sf, st)
+    # A thunk lowered in a synthetic context (`eval` of a hand-built Expr:
+    # file "none") is still located by flisp at the first real-file line node
+    # inside the code (`jl_linetable_to_debuginfo`'s root entry).  Mirror
+    # that: adopt that ref as the file and constant root line for the whole
+    # thunk; the synthetic name still keys the macro-expansion edge grouping.
+    alt = top_sf === nothing ||
+          (!(top_sf isa SourceFile) && Symbol(top_sf) === :none) ?
+        _thunk_alt_source(codeinfos) : nothing
+    if alt !== nothing
+        for id in collect(keys(node_sources))
+            node_sources[id] = (alt[2], LINENODE_SPAN_END)
+        end
+    end
     byte_precise = _has_byte_precise_debuginfo && top_sf isa SourceFile
     if !byte_precise && top_sf isa SourceFile
         # Without byte-precise support, degrade each byte span to its line number
@@ -673,10 +751,13 @@ function add_debuginfo!(st::SyntaxTree)
         file = Symbol(top_sf.filename)
     else
         top_sbt = nothing
-        file = top_sf isa SourceFile ? Symbol(top_sf.filename) : Symbol(top_sf)
+        file = top_sf isa SourceFile ? Symbol(top_sf.filename) :
+               Symbol(something(top_sf, :none))
     end
+    groupfile = file
+    alt === nothing || (file = alt[1])
     for ci in codeinfos
-        add_ci_debuginfo!(ci, file, top_sbt, node_sources, spans)
+        add_ci_debuginfo!(ci, file, groupfile, top_sbt, node_sources, spans)
     end
 end
 
