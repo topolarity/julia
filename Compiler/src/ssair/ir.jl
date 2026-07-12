@@ -210,8 +210,12 @@ Core.DebugInfo(di::DebugInfoStream, nstmts::Int) =
 
 function getdebugidx(debuginfo::DebugInfo, pc::Int)
     if debuginfo.linetable isa String
-        # drop provenance for compatibility
-        ((pc <= 0 ? -1 : source_location(debuginfo, pc).line), 0, 0)
+        # Byte-precise linetable: the first field is a byte-span index rather
+        # than a line, so translate it to a line for callers, but keep the
+        # `edges` fields so macro-expansion frames remain reachable.
+        pc <= 0 && return (-1, 0, 0)
+        (_, to, epc) = ccall(:jl_uncompress1_codeloc, NTuple{3,Int32}, (Any, Int), debuginfo, pc)
+        (source_location(debuginfo, pc).line, Int(to), Int(epc))
     else
         ccall(:jl_uncompress1_codeloc, NTuple{3,Int32}, (Any, Int), debuginfo, pc)
     end
