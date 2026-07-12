@@ -914,6 +914,32 @@ end
     MethodError: no method matching var"@sig_mismatch"(""")
 end
 
+@testset "(AI) macro convention detection: variadic/composed bindings are old-style" begin
+    # From PkgEval: CallMode v1.0.0, src/CallMode.jl:25 (var"@call" = callable ∘ tuple, fully-variadic macro binding)
+    # The new-vs-old calling-convention check must not be fooled by a macro
+    # bound to a value whose only call method is fully variadic. A
+    # `ComposedFunction` (`inner ∘ tuple`, exactly how CallMode.jl defines its
+    # `@call`) matches every argument tuple — `MacroContext` included — yet is
+    # an ordinary old-style macro: it destructures `(__source__, __module__,
+    # args...)` and returns a raw `Expr`. A `hasmethod`-based check misclassifies
+    # it new-style and rejects its `Expr` return with "implicit expr->syntaxtree".
+    Base.eval(test_mod, :(var"@comp_old" =
+        ((a -> begin _, _, x = a; Expr(:call, :identity, esc(x)) end) ∘ tuple)))
+    @test JuliaLowering.include_string(test_mod, "@comp_old(42)") === 42
+
+    # A fixed-arity function-object macro binding (no `macro` sugar) is likewise
+    # old-style and is invoked with `(__source__, __module__, args...)`.
+    Base.eval(test_mod, :(var"@fixed_old" =
+        function (src, mod, x); Expr(:call, :identity, esc(x)); end))
+    @test JuliaLowering.include_string(test_mod, "@fixed_old(40 + 2)") === 42
+
+    # Control: a genuine new-style macro (defined via `macro ... end`, whose
+    # first parameter `expand_macro_def` stamps `::MacroContext`) is still
+    # detected new-style and round-trips its `SyntaxTree` argument.
+    JuliaLowering.include_string(test_mod, "macro new_ctrl(x); x; end")
+    @test JuliaLowering.include_string(test_mod, "@new_ctrl(41) + 1") === 42
+end
+
 @testset "old macros producing exotic expr heads (or are otherwise complex)" for expr_compat_mode in [true, false]
     @test JuliaLowering.include_string(test_mod, """
     let # example from @preserve docstring

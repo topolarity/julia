@@ -213,6 +213,36 @@ function _macrocall_expr_location(st::SyntaxTree)
     end
 end
 
+# Decide whether `macfunc` should be invoked with the new (`MacroContext`-based,
+# `SyntaxTree` in and out) calling convention or the old
+# (`(__source__, __module__, args...)`, `Expr` in and out) one.
+#
+# The discriminator is what our own `macro ... end` lowering stamps (see
+# `expand_macro_def`): a new-style method declares its first positional
+# parameter as `::MacroContext`. So we look up the method dispatch would select
+# for a `MacroContext`-led call and check that parameter's type. A plain
+# `hasmethod` on `Tuple{typeof(mctx), ...}` is not enough: any fully-variadic
+# binding (e.g. a `ComposedFunction`, whose sole method is `(::ComposedFunction)
+# (x...; kw...)`) matches every argument tuple, `MacroContext` included, and so
+# would be misclassified as new-style even though it is an ordinary old-style
+# macro returning an `Expr`.
+# Returns the MethodInstance for a new-style invocation, or `nothing` if the
+# binding is not a new-style macro (so the caller can reuse the lookup).
+function new_style_macro_mi(macfunc, macro_args, world::UInt)
+    mi = lookup_method_instance(macfunc, macro_args, world)
+    mi === nothing && return nothing
+    sig = Base.unwrap_unionall(mi.def.sig)
+    sig isa DataType || return nothing
+    params = sig.parameters
+    # params[1] is `typeof(macfunc)`; params[2] is the first user-facing argument
+    length(params) >= 2 || return nothing
+    P = params[2]
+    # `P isa Type` excludes a `Vararg` first parameter (the variadic catch-all
+    # case above), which is not a `Type`.
+    P isa Type || return nothing
+    return P <: MacroContext ? mi : nothing
+end
+
 function expand_macro(ctx::MacroExpansionContext, st::SyntaxTree)
     @jl_assert kind(st) === K"macrocall" st
     numchildren(st) >= 2 || throw(LoweringError(
@@ -225,11 +255,17 @@ function expand_macro(ctx::MacroExpansionContext, st::SyntaxTree)
 
     # `ctx.world === typemax(UInt)` is our sentinel for "latest world"
     macro_world = ctx.world === typemax(UInt) ? Base.get_world_counter() : ctx.world
-    has_new_macro = hasmethod(macfunc, Tuple{typeof(mctx), typeof.(raw_args)...}; world=macro_world)
+    # The resolved MethodInstance doubles as the new-style test and as the
+    # pre-resolved method for invocation below: a nested `require`/precompile
+    # inside the macro can perturb method-table visibility at `ctx.world`, so
+    # re-resolving after the body runs may fail. This matches flisp's single
+    # lookup in `jl_invoke_julia_macro`.
+    new_macro_args = Any[mctx, raw_args...]
+    new_macro_mi = new_style_macro_mi(macfunc, new_macro_args, macro_world)
 
-    if has_new_macro
-        macro_args = [mctx, raw_args...]
-        macro_mi = lookup_method_instance(macfunc, macro_args, macro_world)
+    if new_macro_mi !== nothing
+        macro_args = new_macro_args
+        macro_mi = new_macro_mi
         expanded = try
             _invoke_in_world(ctx.world, macfunc, macro_args...)
         catch exc
@@ -273,7 +309,7 @@ function expand_macro(ctx::MacroExpansionContext, st::SyntaxTree)
     mod_for_ast = macro_mi !== nothing ? macro_mi.def.module : parentmodule(macfunc)
     sc2 = SyntaxContext(
         ScopeLayer(mod_for_ast, sc_in.layer), st,
-        (has_new_macro ? JL_NEW_SYNTAX_VERSION : JL_OLD_SYNTAX_VERSION), false)
+        (new_macro_mi !== nothing ? JL_NEW_SYNTAX_VERSION : JL_OLD_SYNTAX_VERSION), false)
     st_out2 = apply_expansion_layer(ctx, st_out, sc2, true, 0, 0)
     !ctx.recursive ? st_out2 : expand_forms_1(ctx, st_out2)
 end
