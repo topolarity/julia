@@ -521,11 +521,108 @@ function collect_locs!(node_sources, codeinfos, top_sf, st)
     nothing
 end
 
+# (filename, line) of a source ref, for the macro-expansion edge chain, or
+# `nothing` for a file-less `LineNumberNode` (which, like flisp, only updates
+# the line within the enclosing file and so introduces no macro boundary).
+function _ref_file_line(x)
+    if x isa SourceRef
+        (Symbol(JuliaSyntax.filename(x.file[]::SourceFile)), Int32(JuliaSyntax.source_line(x)))
+    elseif x.file === nothing
+        nothing
+    else
+        (x.file::Symbol, Int32(x.line))
+    end
+end
+
+# The nested "macro expansion" frames for statement `c`, one per file boundary
+# its provenance crossed, shallowest (nearest the enclosing scope) first.
+#
+# flisp marks macro expansion with `push_loc`/`pop_loc` whenever a lowered block
+# enters source from a different file, producing a stack of file-keyed
+# `DebugInfo` edges rendered as `"macro expansion"` frames (`method.c`
+# `jl_linetable_to_debuginfo`). JL reconstructs the same stack from each
+# statement's provenance chain: `sourceref(c)` climbing `macro_prov` outward,
+# with consecutive same-file levels merged. The outermost in-`top_sf` level is
+# the statement's own byte-precise location (the top codeloc), so edges are the
+# levels inside it. Returns `(shallow->deep)` `(file, line)` pairs, empty when
+# `c` was not macro-expanded across a file boundary.
+function _macro_edge_groups(c::SyntaxTree, topfile::Symbol)
+    groups = Tuple{Symbol,Int32}[]
+    push_group!(x) = let fl = _ref_file_line(x)
+        if fl !== nothing
+            (f, l) = fl
+            (!isempty(groups) && groups[end][1] === f) ? (groups[end] = (f, l)) :
+                push!(groups, (f, l))
+        end
+    end
+    push_group!(JuliaSyntax.sourceref(c))
+    mp = JuliaSyntax.macro_prov(c)
+    while mp !== nothing
+        push_group!(JuliaSyntax.sourceref(mp))
+        mp = JuliaSyntax.macro_prov(mp)
+    end
+    # The top codeloc represents the outermost `topfile` level; edges are the
+    # levels inside it. No in-file level (fully foreign provenance) is handled
+    # as parent attribution by `collect_locs!`, so emit no edges here.
+    root = findlast(g -> g[1] === topfile, groups)
+    (root === nothing || root == 1) && return Tuple{Symbol,Int32}[]
+    return [groups[i] for i in (root-1):-1:1]
+end
+
+# Nested macro-expansion edge under construction, mirroring `method.c`'s
+# per-file `edge`/`edge_list2` arraylists.
+mutable struct DebugInfoEdge
+    file::Symbol
+    children::Vector{DebugInfoEdge}
+    locs::Vector{Tuple{Int32,Int32,Int32}} # (line, edge_index, edge_pc)
+end
+DebugInfoEdge(file::Symbol) = DebugInfoEdge(file, DebugInfoEdge[], Tuple{Int32,Int32,Int32}[])
+
+# Register `rest[i:end]` (shallow->deep) into the file-keyed edge list, returning
+# this statement's `(edge_index, edge_pc)` (both 1-based).  Mirror of `add_edge`.
+function add_edge!(edges::Vector{DebugInfoEdge}, rest::Vector{Tuple{Symbol,Int32}}, i::Int)
+    file, line = rest[i]
+    ei = findfirst(e -> e.file === file, edges)
+    if ei === nothing
+        push!(edges, DebugInfoEdge(file))
+        ei = length(edges)
+    end
+    edge = edges[ei]
+    to = Int32(0); pc = Int32(0)
+    if i < length(rest)
+        to, pc = add_edge!(edge.children, rest, i + 1)
+    end
+    loc = (line, to, pc)
+    li = findfirst(==(loc), edge.locs)
+    if li === nothing
+        push!(edge.locs, loc)
+        li = length(edge.locs)
+    end
+    return (Int32(ei), Int32(li))
+end
+
+# Convert the edge builders into the `Core.DebugInfo` svec.  Mirror of `alloc_edges`.
+function build_edges(edges::Vector{DebugInfoEdge})
+    isempty(edges) && return Core.svec()
+    out = Vector{Any}(undef, length(edges))
+    for (i, e) in enumerate(edges)
+        nlocs = length(e.locs)
+        locs = Vector{Int32}(undef, 3*nlocs)
+        for (j, (line, to, pc)) in enumerate(e.locs)
+            locs[3j-2] = line; locs[3j-1] = to; locs[3j] = pc
+        end
+        out[i] = Core.DebugInfo(e.file, nothing, build_edges(e.children),
+            @ccall(jl_compress_codelocs((0)::Int32, locs::Any, nlocs::Csize_t)::String))
+    end
+    return Core.svec(out...)
+end
+
 function add_ci_debuginfo!(st::SyntaxTree, file::Symbol,
                            top_sbt::Union{String, Nothing},
                            node_sources::Dict{NodeId, Tuple{Int32, Int32}},
                            spans::Vector{Tuple{Int32, Int32}})
     @jl_assert kind(st) === K"code_info" st
+    edges = DebugInfoEdge[]
     locs = let a = sizehint!(Vector{Int32}(), 3*numchildren(st[1]))
         for c in children(st[1])
             if top_sbt isa String # precise provenance
@@ -535,14 +632,19 @@ function add_ci_debuginfo!(st::SyntaxTree, file::Symbol,
                 @jl_assert spans[i][2] == LINENODE_SPAN_END (c, "lno with span end?")
                 push!(a, spans[i][1])
             end
-            push!(a, Int32(0))
-            push!(a, Int32(0))
+            rest = _macro_edge_groups(c, file)
+            if isempty(rest)
+                push!(a, Int32(0)); push!(a, Int32(0))
+            else
+                to, pc = add_edge!(edges, rest, 1)
+                push!(a, to); push!(a, pc)
+            end
         end
         a
     end
 
     setattr!(st, :debuginfo, Core.DebugInfo(
-        file, top_sbt, Core.svec(),
+        file, top_sbt, build_edges(edges),
         @ccall(jl_compress_codelocs((-1)::Int32, locs::Any,
                                     numchildren(st[1])::Csize_t)::String)))
 end
