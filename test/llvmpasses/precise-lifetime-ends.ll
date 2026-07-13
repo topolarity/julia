@@ -158,3 +158,69 @@ top:
 }
 
 attributes #0 = { noreturn }
+
+; A buffer pair read through a pointer phi (the shape SimplifyCFG sinking
+; produces): edge-substituting forwarder liveness bounds both buffers at the
+; join read.
+define swiftcc void @phi_forwarder(i1 %c, i64 %x) {
+; CHECK-LABEL: @phi_forwarder
+top:
+  %A = alloca [2 x i64], align 8
+  %B = alloca [2 x i64], align 8
+  br i1 %c, label %fa, label %fb
+
+fa:
+  call void @llvm.lifetime.start.p0(i64 -1, ptr %A)
+  store i64 %x, ptr %A, align 8
+  br label %join
+
+fb:
+  call void @llvm.lifetime.start.p0(i64 -1, ptr %B)
+  store i64 %x, ptr %B, align 8
+  br label %join
+
+join:
+  %p = phi ptr [ %A, %fa ], [ %B, %fb ]
+  %v = load i64, ptr %p, align 8
+; CHECK: %v = load i64, ptr %p
+; CHECK-NEXT: call void @llvm.lifetime.end.p0(i64 -1, ptr %{{[AB]}})
+; CHECK-NEXT: call void @llvm.lifetime.end.p0(i64 -1, ptr %{{[AB]}})
+  call void @use_value(i64 %v)
+  ret void
+}
+
+; The select flavor (if-converted): a read through the select is a may-read
+; of both inputs; both die after it.
+define swiftcc void @select_forwarder(i1 %c, i64 %x) {
+; CHECK-LABEL: @select_forwarder
+top:
+  %A = alloca [2 x i64], align 8
+  %B = alloca [2 x i64], align 8
+  call void @llvm.lifetime.start.p0(i64 -1, ptr %A)
+  store i64 %x, ptr %A, align 8
+  call void @llvm.lifetime.start.p0(i64 -1, ptr %B)
+  store i64 %x, ptr %B, align 8
+  %p = select i1 %c, ptr %A, ptr %B
+  %v = load i64, ptr %p, align 8
+; CHECK: %v = load i64, ptr %p
+; CHECK-NEXT: call void @llvm.lifetime.end.p0(i64 -1, ptr %{{[AB]}})
+; CHECK-NEXT: call void @llvm.lifetime.end.p0(i64 -1, ptr %{{[AB]}})
+  call void @use_value(i64 %v)
+  ret void
+}
+
+; A forwarder whose pointer escapes poisons every buffer it may carry.
+define swiftcc void @poisoned_forwarder(i1 %c, i64 %x) {
+; CHECK-LABEL: @poisoned_forwarder
+; CHECK-NOT: call void @llvm.lifetime.end
+top:
+  %A = alloca [2 x i64], align 8
+  %B = alloca [2 x i64], align 8
+  call void @llvm.lifetime.start.p0(i64 -1, ptr %A)
+  store i64 %x, ptr %A, align 8
+  call void @llvm.lifetime.start.p0(i64 -1, ptr %B)
+  store i64 %x, ptr %B, align 8
+  %p = select i1 %c, ptr %A, ptr %B
+  call void @capture_buf(ptr %p)
+  ret void
+}
