@@ -1509,6 +1509,34 @@ static const auto gc_preserve_end_func = new JuliaFunction<> {
     [](LLVMContext &C) { return FunctionType::get(getVoidTy(C), {Type::getTokenTy(C)}, false); },
     nullptr,
 };
+// Marks the point where a GC roots buffer's previous contents become dead:
+// codegen fully re-initializes the buffer after this point before any read.
+// llvm-late-gc-lowering uses this to bound the buffer's live range when
+// packing roots buffers into shared GC frame slots, and deletes the call.
+// The declared write to the argument keeps stores to the buffer from being
+// reordered above the marker; the declared read keeps DSE from deleting the
+// marker as a dead store when a later store fully clobbers the buffer (the
+// common case for single-root buffers).
+static const auto gc_roots_begin_func = new JuliaFunction<>{
+    "julia.gc_roots_begin",
+    [](LLVMContext &C) {
+        return FunctionType::get(getVoidTy(C), {PointerType::getUnqual(C)}, false);
+    },
+    [](LLVMContext &C) {
+        AttrBuilder FnAttrs(C);
+        FnAttrs.addMemoryAttr(MemoryEffects::argMemOnly(ModRefInfo::ModRef));
+        FnAttrs.addAttribute(Attribute::NoUnwind);
+        FnAttrs.addAttribute(Attribute::WillReturn);
+        FnAttrs.addAttribute(Attribute::NoRecurse);
+        FnAttrs.addAttribute(Attribute::NoSync);
+        AttrBuilder ArgAttrs(C);
+        addNoCaptureAttr(ArgAttrs);
+        return AttributeList::get(C,
+            AttributeSet::get(C, FnAttrs),
+            AttributeSet(),
+            {AttributeSet::get(C, ArgAttrs)});
+    },
+};
 static const auto pointer_from_objref_func = new JuliaFunction<>{
     "julia.pointer_from_objref",
     [](LLVMContext &C) { return FunctionType::get(JuliaType::get_pjlvalue_ty(C),
@@ -2637,8 +2665,76 @@ Value *jl_gc_roots_t::get_ptr(jl_codectx_t &ctx) const
 {
     if (ptr)
         return ptr;
+    // If every root was loaded from consecutive slots of a caller-provided
+    // roots buffer (a readonly pointer argument), forward a pointer into that
+    // buffer instead of copying the roots into a fresh GC frame buffer: the
+    // caller keeps those slots valid and unchanged for our whole activation,
+    // which in turn spans any callee we pass the pointer to. This is the
+    // common case in recursive tree traversals, where the roots of derived
+    // values are the same objects that root our own arguments.
+    do {
+        const DataLayout &DL = jl_Module->getDataLayout();
+        Value *base = nullptr;
+        int64_t off0 = 0;
+        bool forwardable = true;
+        for (size_t i = 0; forwardable && i < roots.size(); i++) {
+            auto *LI = dyn_cast<LoadInst>(roots[i]);
+            if (LI == nullptr || LI->isVolatile()) {
+                forwardable = false;
+                break;
+            }
+            // strip constant-offset geps only (no address space casts: the
+            // forwarded pointer must have the same type as a fresh buffer)
+            Value *B = LI->getPointerOperand();
+            APInt Off(DL.getIndexSizeInBits(0), 0);
+            while (auto *GEP = dyn_cast<GEPOperator>(B)) {
+                APInt GEPOff(DL.getIndexSizeInBits(0), 0);
+                if (!GEP->accumulateConstantOffset(DL, GEPOff))
+                    break;
+                Off += GEPOff;
+                B = GEP->getPointerOperand();
+            }
+            if (cast<PointerType>(B->getType())->getAddressSpace() != 0) {
+                forwardable = false;
+                break;
+            }
+            if (auto *Arg = dyn_cast<Argument>(B)) {
+                if (Arg->getParent() != ctx.f || !Arg->hasAttribute(Attribute::ReadOnly)) {
+                    forwardable = false;
+                    break;
+                }
+            }
+            else if (isa<GlobalVariable>(B)) {
+                // a global cell holding a permanently-rooted object (e.g. an
+                // interned symbol) is itself a valid one-slot roots buffer,
+                // provided its content is known not to change
+                if (!LI->hasMetadata(LLVMContext::MD_invariant_load)) {
+                    forwardable = false;
+                    break;
+                }
+            }
+            else {
+                forwardable = false;
+                break;
+            }
+            int64_t off = Off.getSExtValue();
+            if (i == 0) {
+                base = B;
+                off0 = off;
+                if (off0 % sizeof(void*) != 0)
+                    forwardable = false;
+            }
+            else if (B != base || off != off0 + (int64_t)(i * sizeof(void*))) {
+                forwardable = false;
+            }
+        }
+        if (!forwardable || base == nullptr)
+            break;
+        return off0 == 0 ? base : emit_ptrgep(ctx, base, off0);
+    } while (0);
     auto roots_ai = jl_aliasinfo_t::fromTBAA(ctx, ctx.tbaa().tbaa_gcframe);
     Value *copyptr = emit_static_roots(ctx, size());
+    ctx.builder.CreateCall(prepare_call(gc_roots_begin_func), {copyptr});
     for (size_t i = 0; i < size(); i++) {
         StoreInst *SI = ctx.builder.CreateAlignedStore(get(ctx, i), emit_ptrgep(ctx, copyptr, i * sizeof(void*)), Align(sizeof(void*)));
         roots_ai.decorateInst(SI);
@@ -10600,6 +10696,7 @@ static void init_jit_functions(void)
     add_named_global(jl_allocgenericmemory, &jl_alloc_genericmemory);
     add_named_global(gcroot_flush_func, (void*)NULL);
     add_named_global(gc_preserve_begin_func, (void*)NULL);
+    add_named_global(gc_roots_begin_func, (void*)NULL);
     add_named_global(gc_preserve_end_func, (void*)NULL);
     add_named_global(pointer_from_objref_func, (void*)NULL);
     add_named_global(julia_call, (void*)NULL);

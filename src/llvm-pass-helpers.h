@@ -55,6 +55,7 @@ struct JuliaPassContext {
     llvm::Function *gcroot_flush_func;
     llvm::Function *gc_preserve_begin_func;
     llvm::Function *gc_preserve_end_func;
+    llvm::Function *gc_roots_begin_func;
     llvm::Function *pointer_from_objref_func;
     llvm::Function *gc_loaded_func;
     llvm::Function *alloc_obj_func;

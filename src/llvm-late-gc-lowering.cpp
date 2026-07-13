@@ -1259,7 +1259,14 @@ State LateLowerGCFrame::LocalScan(Function &F) {
                         // packing: the buffer must stay live as long as the
                         // sret data it roots can be read.
                         AllocaInst *SretAI = nullptr;
-                        if (CI->arg_size() > 0 && CI->paramHasAttr(0, Attribute::StructRet)) {
+                        // The data buffer the roots pair with is operand 0:
+                        // either a formal sret, or (for the union-return
+                        // convention) a noalias nocapture buffer for the
+                        // union bytes that carries no sret attribute.
+                        if (CI->arg_size() > 0 &&
+                            (CI->paramHasAttr(0, Attribute::StructRet) ||
+                             (CI->paramHasAttr(0, Attribute::NoAlias) && CI->doesNotCapture(0) &&
+                              !CI->paramHasAttr(0, Attribute::ReadOnly)))) {
                             auto sret_allocas = FindAllocaBases(CI->getArgOperand(0)->stripInBoundsOffsets());
                             if (sret_allocas.size() == 1)
                                 SretAI = sret_allocas[0];
@@ -1320,6 +1327,15 @@ State LateLowerGCFrame::LocalScan(Function &F) {
                                 }
                             }
                             S.GCPreserves[CI] = args;
+                            continue;
+                        }
+                        if (gc_roots_begin_func && callee == gc_roots_begin_func) {
+                            // Marks the point where a roots buffer's previous
+                            // contents become dead (codegen fully initializes
+                            // it after this point, before any read); bounds
+                            // the buffer's live range for frame slot packing.
+                            if (auto *buf = dyn_cast<AllocaInst>(CI->getArgOperand(0)->stripInBoundsOffsets()))
+                                S.ReturnRootsBuffers[buf].DefCalls.push_back(CI);
                             continue;
                         }
                         // Known functions emitted in codegen that are not safepoints
@@ -1957,7 +1973,7 @@ bool LateLowerGCFrame::CleanupIR(Function &F, State *S, bool *CFGModified) {
             }
 
             if (callee && (callee == gcroot_flush_func || callee == gc_preserve_begin_func
-                        || callee == gc_preserve_end_func)) {
+                        || callee == gc_preserve_end_func || callee == gc_roots_begin_func)) {
                 /* No replacement */
             } else if (pointer_from_objref_func != nullptr && callee == pointer_from_objref_func) {
                 auto *obj = CI->getOperand(0);
@@ -2454,9 +2470,15 @@ DenseMap<AllocaInst *, unsigned> LateLowerGCFrame::PackReturnRootsBuffers(State 
     // Collect all instructions that may access memory reachable from Root,
     // walking through geps and casts. Returns false if any user cannot be
     // classified (address escapes, unknown intrinsic, ...).
-    auto collectUsers = [](AllocaInst *Root, SmallVectorImpl<Instruction *> &Uses) -> bool {
+    auto collectUsers = [this](AllocaInst *Root, SmallVectorImpl<Instruction *> &Uses) -> bool {
         SmallVector<Value *, 8> Worklist{Root};
         SmallPtrSet<Value *, 8> Visited;
+        auto bail = [Root](Value *BadUser) {
+            LLVM_DEBUG(dbgs() << "  roots-buffer walk-bail at root " << Root->getName()
+                              << " user: " << *BadUser << "\n");
+            (void)Root; (void)BadUser;
+            return false;
+        };
         while (!Worklist.empty()) {
             Value *V = Worklist.pop_back_val();
             if (!Visited.insert(V).second)
@@ -2464,8 +2486,16 @@ DenseMap<AllocaInst *, unsigned> LateLowerGCFrame::PackReturnRootsBuffers(State 
             for (Use &U : V->uses()) {
                 auto *I = dyn_cast<Instruction>(U.getUser());
                 if (I == nullptr)
-                    return false;
-                if (isa<GetElementPtrInst>(I) || isa<BitCastInst>(I)) {
+                    return bail(U.getUser());
+                if (isa<GetElementPtrInst>(I) || isa<BitCastInst>(I) ||
+                    isa<AddrSpaceCastInst>(I)) {
+                    Worklist.push_back(I);
+                    continue;
+                }
+                if (isa<SelectInst>(I) || isa<PHINode>(I)) {
+                    // The pointer may flow onward (e.g. a union result
+                    // selecting between a box and the stack payload); treat
+                    // everything reachable from the select/phi as a use.
                     Worklist.push_back(I);
                     continue;
                 }
@@ -2477,7 +2507,7 @@ DenseMap<AllocaInst *, unsigned> LateLowerGCFrame::PackReturnRootsBuffers(State 
                         Uses.push_back(I);
                         continue;
                     }
-                    return false;
+                    return bail(I);
                 }
                 if (isa<LoadInst>(I)) {
                     Uses.push_back(I);
@@ -2485,17 +2515,19 @@ DenseMap<AllocaInst *, unsigned> LateLowerGCFrame::PackReturnRootsBuffers(State 
                 }
                 if (auto *SI = dyn_cast<StoreInst>(&*I)) {
                     if (SI->getValueOperand() == V)
-                        return false; // address escapes
+                        return bail(I); // address escapes
                     Uses.push_back(I);
                     continue;
                 }
                 if (auto *CB = dyn_cast<CallBase>(I)) {
+                    if (CB->getCalledOperand() == gc_roots_begin_func)
+                        continue; // recorded separately, as a def
                     if (!CB->isArgOperand(&U) || !CB->doesNotCapture(U.getOperandNo()))
-                        return false;
+                        return bail(I);
                     Uses.push_back(I);
                     continue;
                 }
-                return false;
+                return bail(I);
             }
         }
         return true;
@@ -2508,28 +2540,45 @@ DenseMap<AllocaInst *, unsigned> LateLowerGCFrame::PackReturnRootsBuffers(State 
         SmallPtrSet<Instruction *, 2> Defs;
     };
     SmallVector<Candidate, 8> Candidates;
+    unsigned n_unsafe = 0, n_notarray = 0, n_align = 0, n_walkbail = 0, n_pairbail = 0;
+    (void)n_unsafe; (void)n_notarray; (void)n_align; (void)n_walkbail; (void)n_pairbail;
     for (auto &KV : S.ReturnRootsBuffers) {
         AllocaInst *AI = KV.first;
         auto &Info = KV.second;
-        if (Info.Unsafe)
+        if (Info.Unsafe) {
+            n_unsafe++;
             continue;
+        }
         auto it = S.ArrayAllocas.find(AI);
-        if (it == S.ArrayAllocas.end())
+        if (it == S.ArrayAllocas.end()) {
+            n_notarray++;
             continue;
-        if (AI->getAlign().value() > sizeof(void *))
+        }
+        if (AI->getAlign().value() > sizeof(void *)) {
+            n_align++;
             continue; // shared slots are only pointer-aligned
+        }
         Candidate C;
         C.AI = AI;
         C.NumSlots = it->second;
-        if (!collectUsers(AI, C.Uses))
+        if (!collectUsers(AI, C.Uses)) {
+            n_walkbail++;
+            LLVM_DEBUG(dbgs() << "  roots-buffer walk-bail: " << AI->getName() << "\n");
             continue;
+        }
         bool ok = true;
         for (AllocaInst *Sret : Info.PairedSrets) {
+            // A tracked (all-roots) payload buffer is GC-visible and roots its
+            // own contents, so reads of it never rely on this buffer.
+            if (S.ArrayAllocas.count(Sret))
+                continue;
             // reads of the sret's raw pointer bits rely on this buffer for
             // rooting, so they extend its live range
-            if (!Sret->isStaticAlloca() || S.ArrayAllocas.count(Sret) ||
+            if (!Sret->isStaticAlloca() ||
                 !collectUsers(Sret, C.Uses)) {
                 ok = false;
+                n_pairbail++;
+                LLVM_DEBUG(dbgs() << "  roots-buffer pair-bail: " << AI->getName() << " sret " << Sret->getName() << "\n");
                 break;
             }
         }
@@ -2568,6 +2617,11 @@ DenseMap<AllocaInst *, unsigned> LateLowerGCFrame::PackReturnRootsBuffers(State 
             bool isdef = C.Defs.count(I) != 0;
             Events[I->getParent()].push_back({InstPos[I], isdef});
         }
+        // defining instructions that are not also users (e.g. the
+        // julia.gc_roots_begin marker, which the user walk skips) must still
+        // kill liveness above them
+        for (Instruction *I : C.Defs)
+            Events[I->getParent()].push_back({InstPos[I], true});
         for (auto &KV : Events) {
             auto &Evs = KV.second;
             // a def call also appears as a use of the paired sret at the
@@ -2666,11 +2720,27 @@ DenseMap<AllocaInst *, unsigned> LateLowerGCFrame::PackReturnRootsBuffers(State 
     // Contiguous first-fit range packing: a buffer of N slots occupies
     // [offset, offset + N), and may overlap another buffer's range only if
     // their live ranges are disjoint. Place larger buffers first.
+    DenseMap<const BasicBlock *, unsigned> BlockNum;
+    {
+        unsigned bn = 0;
+        for (auto &BB : *S.F)
+            BlockNum[&BB] = bn++;
+    }
+    auto defKey = [&](const Candidate &C) {
+        uint64_t best = ~(uint64_t)0;
+        for (Instruction *D : C.Defs) {
+            uint64_t k = ((uint64_t)BlockNum[D->getParent()] << 32) | InstPos[D];
+            best = std::min(best, k);
+        }
+        return best;
+    };
     SmallVector<size_t, 8> Order(Candidates.size());
     for (size_t i = 0; i < Order.size(); i++)
         Order[i] = i;
     std::stable_sort(Order.begin(), Order.end(), [&](size_t a, size_t b) {
-        return Candidates[a].NumSlots > Candidates[b].NumSlots;
+        if (Candidates[a].NumSlots != Candidates[b].NumSlots)
+            return Candidates[a].NumSlots > Candidates[b].NumSlots;
+        return defKey(Candidates[a]) < defKey(Candidates[b]);
     });
     SmallVector<SmallVector<size_t, 4>, 8> SlotOccupants;
     for (size_t ci : Order) {
@@ -2696,6 +2766,11 @@ DenseMap<AllocaInst *, unsigned> LateLowerGCFrame::PackReturnRootsBuffers(State 
         Assignment[Candidates[ci].AI] = offset;
     }
     NumSharedSlots = (unsigned)SlotOccupants.size();
+    LLVM_DEBUG(dbgs() << "roots-buffer packing " << S.F->getName() << ": buffers="
+                      << S.ReturnRootsBuffers.size() << " unsafe=" << n_unsafe
+                      << " walk-bail=" << n_walkbail << " pair-bail=" << n_pairbail
+                      << " packed=" << Assignment.size() << " shared-slots="
+                      << NumSharedSlots << "\n");
     return Assignment;
 }
 
