@@ -581,6 +581,9 @@ static void buildIntrinsicLoweringPipeline(ModulePassManager &MPM, PassBuilder *
         JULIA_PASS(MPM.addPass(RemoveNIPass()));
         {
             FunctionPassManager FPM;
+            // Must stay after the last mid-level DSE-like pass (lifetime.end
+            // is a kill for DSE) and before markers are consumed downstream.
+            JULIA_PASS(FPM.addPass(PreciseLifetimeEndsPass()));
             JULIA_PASS(FPM.addPass(LateLowerGCPass()));
             JULIA_PASS(FPM.addPass(FinalLowerGCPass()));
             JULIA_PASS(FPM.addPass(ExpandAtomicModifyPass())); // after LateLowerGCPass so that all IPO is valid
@@ -710,6 +713,7 @@ PIC.addClassToPassName(decltype(CREATE_PASS)::name(), NAME);
         PIC.addClassToPassName("BeforeLoopOptimizationMarkerPass", "BeforeLoopOptimization");
         PIC.addClassToPassName("BeforeLICMMarkerPass", "BeforeLICM");
         PIC.addClassToPassName("AfterLICMMarkerPass", "AfterLICM");
+        PIC.addClassToPassName("PreciseLifetimeEndsPass", "PreciseLifetimeEnds");
         PIC.addClassToPassName("BeforeLoopSimplificationMarkerPass", "BeforeLoopSimplification");
         PIC.addClassToPassName("AfterLoopSimplificationMarkerPass", "AfterLoopSimplification");
         PIC.addClassToPassName("AfterLoopOptimizationMarkerPass", "AfterLoopOptimization");

@@ -2390,6 +2390,12 @@ static AllocaInst *emit_static_alloca(jl_codectx_t &ctx, unsigned nb, Align alig
     return emit_static_alloca(ctx, ArrayType::get(ctx.builder.getIntNTy(elsize * 8), alignTo(nb, elsize) / elsize), align, lifetime);
 }
 
+// INVARIANT: buffers of GC roots must never carry llvm.lifetime markers.
+// Marker-annotated allocas are fair game for LLVM's own StackColoring to
+// merge, but LLVM neither re-zeroes a merged slot (the GC would scan a
+// previous occupant's stale roots as if they were this buffer's) nor knows
+// that inventing undef in scanned memory is fatal. Only
+// llvm-late-gc-lowering's packing may merge these, using its own liveness.
 static AllocaInst *emit_static_roots(jl_codectx_t &ctx, unsigned nroots)
 {
     AllocaInst *staticroots = emit_static_alloca(ctx, ctx.types().T_prjlvalue, Align(sizeof(void*)), /*lifetime*/false);
