@@ -142,6 +142,20 @@ bool FinalLowerGC::runOnFunction(Function &F)
     initAll(*F.getParent());
     pgcstack = getPGCstack(F);
 
+    // Remove any leftover julia.gc_roots_begin markers (they carry no runtime
+    // semantics). LateLowerGCFrame normally consumes and erases them, but
+    // some functions (e.g. thunks) skip that pass entirely.
+    if (gc_roots_begin_func) {
+        SmallVector<CallInst *, 0> RootsBegins;
+        for (User *U : gc_roots_begin_func->users()) {
+            auto *CI = dyn_cast<CallInst>(U);
+            if (CI && CI->getFunction() == &F)
+                RootsBegins.push_back(CI);
+        }
+        for (CallInst *CI : RootsBegins)
+            CI->eraseFromParent();
+    }
+
     auto gc_alloc_bytes = getOrNull(jl_intrinsics::GCAllocBytes);
     SmallVector<CallInst*, 0> write_barriers;
     SmallVector<CallInst*, 0> alloc_bytes;
