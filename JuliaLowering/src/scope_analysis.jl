@@ -58,6 +58,13 @@ struct ScopeInfo
     # the lambda's declaring parameter list still binds its slot (see
     # `resolve_lambda_params` and `explicit_declare_in_scope!`).
     shadowed_params::Dict{NameKey,IdTag}
+    # Per-node binding for each declaring lambda parameter, keyed by the arg/sparam
+    # Identifier's node id.  Consulted by `resolve_lambda_params` so that two
+    # parameters sharing a `NameKey` -- a flisp-exempt keyword-arg name and a
+    # hygienically-renamed positional arg of the same raw text (see
+    # `explicit_declare_in_scope!`) -- resolve to their own distinct bindings
+    # rather than both to whatever currently owns `vars`.
+    param_bindings::Dict{NodeId,IdTag}
     # See `LambdaBindings`. Nothing if not a lambda scope.  This is the final
     # collecting place for locals going in to closure conversion.
     locals_capt::Union{Nothing, Dict{IdTag,Bool}}
@@ -81,7 +88,7 @@ function ScopeInfo(ctx, parent_id, ex::SyntaxTree)
     s = ScopeInfo(
         id, parent_id, lambda_id, ex._id, is_permeable, is_lifted,
         Dict{IdTag, NodeId}(), Dict{NameKey, NodeId}(), Dict{NameKey,IdTag}(),
-        Dict{NameKey,IdTag}(), Dict{NameKey,IdTag}(),
+        Dict{NameKey,IdTag}(), Dict{NameKey,IdTag}(), Dict{NodeId,IdTag}(),
         kind(ex) === K"lambda" ? Dict{IdTag,Bool}() : nothing)
     push!(ctx.scopes, s)
     return s
@@ -153,7 +160,8 @@ function explicit_declare_in_scope!(ctx, scope::ScopeInfo, ex, new_k::Symbol)
     result_bid = if isnothing(old_k)
         if new_k === :argument
             declare_in_scope!(ctx, scope, ex, :argument;
-                              is_nospecialize=getmeta(ex, :nospecialize, false))
+                              is_nospecialize=getmeta(ex, :nospecialize, false),
+                              is_keyword_arg=getmeta(ex, :is_keyword_arg, false))
         elseif new_k === :global &&
                 (ip = find_identity_param(ctx, scope, ex); !isnothing(ip))
             # An identity-mapped param spelled as the same raw symbol in flisp
@@ -166,6 +174,19 @@ function explicit_declare_in_scope!(ctx, scope::ScopeInfo, ex, new_k::Symbol)
     elseif old_k === new_k
         if new_k === :global || new_k === :local
             bid
+        elseif new_k === :argument && !getmeta(ex, :is_keyword_arg, false) &&
+                get_binding(ctx, bid).is_keyword_arg &&
+                is_hygienically_renamed_arg(ctx, scope, ex)
+            # flisp exempts keyword-arg names from hygiene renaming but renames a
+            # macro-introduced positional argument of the same raw text, so the two
+            # coexist as distinct parameters (e.g. a macro that emits
+            # `f(c=default; c=c)`, as KhepriBase's `@defregion` does).  The kwarg
+            # name (declared first) keeps its
+            # aliases for esc'd/caller references; give the renamed positional a
+            # fresh binding that takes over `vars`, so bare (macro-layer) defaults
+            # and body references bind to it, exactly as under flisp.
+            declare_in_scope!(ctx, scope, ex, :argument;
+                              is_nospecialize=getmeta(ex, :nospecialize, false))
         else
             throw(LoweringError(ex, "function $(_var_str(new_k)) name not unique"))
         end
@@ -193,7 +214,25 @@ function explicit_declare_in_scope!(ctx, scope::ScopeInfo, ex, new_k::Symbol)
     end
     register_kwarg_aliases!(ctx, scope, ex, result_bid)
     register_arg_name_aliases!(ctx, scope, ex, result_bid)
+    # Record the per-node binding so `resolve_lambda_params` can bind each
+    # declaring parameter to its own slot even when two parameters share a
+    # `NameKey` (see the keyword-arg/positional split above).
+    isnothing(result_bid) || (scope.param_bindings[ex._id] = result_bid)
     return result_bid
+end
+
+# True when flisp would hygienically rename this argument name: a bare
+# (non-escaped) identifier introduced by a flisp-compat macro expansion, i.e. on
+# the expanding macro's own layer, not the base layer nor an ancestor
+# (caller/esc'd) layer.  Such a positional name is renamed apart from a same-text
+# keyword-arg name (which flisp leaves raw), so the two do not collide; a plain
+# base-layer duplicate or an esc'd (identity-mapped) name still conflicts.
+function is_hygienically_renamed_arg(ctx, scope::ScopeInfo, ex)
+    sc = ex.context::SyntaxContext
+    (is_flisp_compat(sc) && !is_base_layer(sc)) || return false
+    lam_layer = (SyntaxTree(ctx.graph,
+        enclosing_lambda(ctx, scope).node_id).context::SyntaxContext).layer
+    return !is_strict_ancestor_layer(sc.layer, lam_layer)
 end
 
 # Find an identity-mapped argument or static parameter in `scope` that flisp
@@ -755,10 +794,15 @@ end
 # declaration must still bind its own arg/sparam slot here even though `vars`
 # now maps the name to the shadowing global (see `explicit_declare_in_scope!`).
 function resolve_lambda_params(ctx, params, scope)
-    isempty(scope.shadowed_params) && return _resolve_scopes(ctx, params, scope)
+    (isempty(scope.shadowed_params) && isempty(scope.param_bindings)) &&
+        return _resolve_scopes(ctx, params, scope)
     mapchildren(ctx, params) do c
+        # Prefer the exact binding recorded for this parameter node: it is
+        # authoritative when two parameters share a `NameKey`, and also carries
+        # the shadowed arg/sparam slot when a body `global` re-owns `vars`.
         bid = kind(c) === K"Identifier" ?
-            get(scope.shadowed_params, NameKey(c), nothing) : nothing
+            get(scope.param_bindings, c._id,
+                get(scope.shadowed_params, NameKey(c), nothing)) : nothing
         isnothing(bid) ? _resolve_scopes(ctx, c, scope) :
             newleaf(ctx, c, K"BindingId", bid)
     end

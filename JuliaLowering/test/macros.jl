@@ -2599,6 +2599,56 @@ end
     @test mjl2.M.results() == mfl.M.results()
 end
 
+# A keyword-argument name and a positional argument of the same raw text emitted
+# by one old-style macro expansion (e.g. KhepriBase `@defregion`, which builds
+# `f(c=default; c=c)` from a freshly-minted `Symbol` reused as both the
+# positional-optional name and the kwarg default).  flisp exempts the kwarg name
+# from hygiene renaming but renames the macro-introduced positional apart from
+# it, so the two coexist as distinct parameters; JuliaLowering collapsed them to
+# one `NameKey` and rejected the definition with "function argument name not
+# unique".  The positional (and defaults/bare references) share the macro-layer
+# identity; an esc'd (caller-layer) reference binds to the kwarg.
+fl_eval(test_mod, :(macro def_kw_posopt(fname)
+    Expr(:(=),
+         Expr(:call, esc(fname),
+              Expr(:parameters, Expr(:kw, :c, :c)),  # kwarg c, default c (macro layer)
+              Expr(:kw, :c, 1)),                      # positional-optional c = 1
+         esc(:c))                                      # esc'd body -> kwarg
+end))
+fl_eval(test_mod, :(macro def_kw_posopt_multi(fname)
+    Expr(:(=),
+         Expr(:call, esc(fname),
+              Expr(:parameters, Expr(:kw, :a, :a), Expr(:kw, :b, :b)),
+              Expr(:kw, :a, 1), Expr(:kw, :b, 2)),
+         esc(:(a + b)))
+end))
+@testset "(AI) keyword-arg name colliding with same-text positional (flisp compat)" for run in [
+    (x::String)->fl_eval(test_mod, JuliaSyntax.parsestmt(Expr, "#=FLISP SANITY-CHECK=# "*x)),
+    (x::String)->JuliaLowering.include_string(test_mod, "#=JL COMPAT=# "*x; expr_compat_mode=true)]
+    # esc'd body binds to the kwarg; positional-optional keeps its own default.
+    @test run("@def_kw_posopt(kwpo1); kwpo1()") == 1
+    @test run("@def_kw_posopt(kwpo1b); kwpo1b(c=9)") == 9
+    # several kwargs each colliding with a same-text positional-optional.
+    @test run("@def_kw_posopt_multi(kwpo2); kwpo2()") == 3
+    @test run("@def_kw_posopt_multi(kwpo2b); kwpo2b(a=10)") == 12
+    @test run("@def_kw_posopt_multi(kwpo2c); kwpo2c(a=10, b=20)") == 30
+end
+
+@testset "(AI) same-text arg names: genuine duplicates still error" begin
+    # A plain (base-layer) duplicate is not hygienically renameable, so it stays
+    # a conflict under flisp and JuliaLowering alike -- the kwarg-name exemption
+    # must not weaken this check.  Holds in both syntax modes.
+    for src in ("dupA(x, x) = x", "dupB(; x=1, x=2) = x",
+                "dupC(center; center=1) = center",
+                "dupD(center=2; center=3) = center", "dupE(a; a=5) = a")
+        @test_throws Exception fl_eval(test_mod, JuliaSyntax.parsestmt(Expr, src))
+        @test_throws Exception JuliaLowering.include_string(
+            test_mod, src; expr_compat_mode=true)
+        @test_throws Exception JuliaLowering.include_string(
+            test_mod, src; expr_compat_mode=false)
+    end
+end
+
 @testset "(AI) old-style macro method-def name -> macro-home global (flisp compat)" begin
     # An unescaped method-def *name* at the root of an old-style macro's
     # expansion binds a plain global of the *macro's* module (defining or
