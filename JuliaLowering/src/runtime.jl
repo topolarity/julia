@@ -81,8 +81,19 @@ function __interpolate_syntax(st::SyntaxTree, depth, @nospecialize(vals), val_i)
             @jl_assert numchildren(c) == 1 st
             @jl_assert kind(c[1]) === K"..." || length(tup) == 1 st
             for v in tup
-                v2 = !(v isa SyntaxTree) ? expr_to_est(st._graph, v, c._id) :
-                   copy_ast(st._graph, v)
+                v2 = if v isa SyntaxTree
+                    copy_ast(st._graph, v)
+                elseif v isa Expr
+                    # A spliced code `Expr` carries its own embedded
+                    # `LineNumberNode`s; honor them (flisp preserves a spliced
+                    # `Expr`'s own line provenance) rather than letting the
+                    # interpolation site override them.  Pass the site only as a
+                    # fallback `LineNumberNode` so `_expr_to_est` absorbs the
+                    # `Expr`'s linenodes instead of stamping the site node.
+                    expr_to_est(st._graph, v, JuliaSyntax.source_location(LineNumberNode, c))
+                else
+                    expr_to_est(st._graph, v, c._id)
+                end
                 push!(cs_out, v2)
             end
         else

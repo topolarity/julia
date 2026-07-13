@@ -118,6 +118,39 @@ end
     @test caught_line([], "gl = 0\nf() = throw(ErrorException(\"x\"))\ntry\n    f()\n$catcher") == 2
 end
 
+@testset "spliced Expr keeps its own embedded line provenance" begin
+    # A code `Expr` carrying its own embedded `LineNumberNode`s (a `quote`
+    # literal built elsewhere, e.g. a test stored in a `Dict`) spliced via `$f`
+    # into an `@eval` wrapper must report *its own* line in a thrown exception's
+    # backtrace, not the interpolation site's line.  This is
+    # ParallelTestRunner.jl's shape (a `quote`-literal test spliced into an
+    # `@eval mod begin ... $f ... end` runner); flisp preserves the spliced
+    # `Expr`'s own provenance, so `interpolate_syntax` must honor its linenodes
+    # rather than stamping them with the `$f` site (see `_interpolate_syntax`).
+    m = Module(:SpliceLineMod)
+    Core.eval(m, :(using Base))
+    # `f` (line 3) is the throwing statement's own line; the `$ff` splice site
+    # is line 7.  The reported line must be 3, not 7.
+    usage = join([
+        "gl = 0",                                                   # 1
+        "f = quote",                                                # 2
+        "    throw(ErrorException(\"x\"))",                         # 3  <- f's own line
+        "end",                                                      # 4
+        "function ex(mod, ff)",                                     # 5
+        "    @eval mod begin",                                      # 6
+        "        \$ff",                                             # 7  <- interpolation site
+        "    end",                                                  # 8
+        "end",                                                      # 9
+        "try",                                                      # 10
+        "    ex(@__MODULE__, f)",                                   # 11
+        "catch e",                                                  # 12
+        "    global gl = stacktrace(catch_backtrace())[1].line",   # 13
+        "end",                                                      # 14
+    ], "\n") * "\n"
+    JuliaLowering.include_string(m, usage, "usage.jl")
+    @test Core.eval(m, :gl) == 3
+end
+
 @testset "macro-expansion frames match flisp's line shape" begin
     # flisp holds the root codeloc of every statement inside a macro expansion
     # at the region's first in-file line (`push_loc` regions never advance the
