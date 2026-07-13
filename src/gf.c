@@ -2761,6 +2761,64 @@ static void _typename_invalidate_backedges(jl_typename_t *tn, int explct, void *
         jl_array_del_end(backedges, na - ins);
 }
 
+struct _typename_invalidate_deleted_backedge {
+    jl_value_t *type; // the signature of the method being deleted
+    jl_value_t **isect;
+    jl_value_t **isect2;
+    size_t max_world;
+    int invalidated;
+};
+
+// Scan the missing-match backedges for a method being deleted. This is the
+// deletion-side counterpart to `_typename_invalidate_backedges` (which runs on
+// method insertion): deleting a method may resolve an ambiguity that inference
+// relied on, just as inserting one may.
+static void _typename_invalidate_deleted_backedges(jl_typename_t *tn, int explct, void *env0)
+{
+    struct _typename_invalidate_deleted_backedge *env = (struct _typename_invalidate_deleted_backedge*)env0;
+    JL_GC_PROMISE_ROOTED(env->type);
+    JL_GC_PROMISE_ROOTED(env->isect); // isJuliaType considers jl_value_t** to be a julia object too
+    JL_GC_PROMISE_ROOTED(env->isect2); // isJuliaType considers jl_value_t** to be a julia object too
+    jl_array_t *backedges = (jl_array_t*)jl_eqtable_get(jl_method_table->backedges, (jl_value_t*)tn, NULL);
+    if (backedges == NULL)
+        return;
+    jl_value_t **d = jl_array_ptr_data(backedges);
+    size_t i, na = jl_array_nrows(backedges);
+    size_t ins = 0;
+    for (i = 1; i < na; i += 2) {
+        jl_value_t *backedgetyp = d[i - 1];
+        JL_GC_PROMISE_ROOTED(backedgetyp);
+        // A methodtable backedge records a call signature whose match set was
+        // incomplete when the caller was inferred (a region with no matches, or
+        // only partial matches). If the deleted method's signature intersects
+        // that region, then the method could only have been absent from the
+        // recorded match set because an ambiguity dropped it -- so its deletion
+        // can resolve that ambiguity and grow the match set, invalidating the
+        // conclusion inference recorded. Methods that were actually part of the
+        // match set are handled separately through their own MethodInstance
+        // backedges, so a plain intersection test here only over-invalidates
+        // callers that would already be invalidated through that path.
+        int missing = jl_type_intersection2(backedgetyp, (jl_value_t*)env->type, env->isect, env->isect2);
+        *env->isect = *env->isect2 = NULL;
+        if (missing) {
+            jl_code_instance_t *backedge = (jl_code_instance_t*)d[i];
+            JL_GC_PROMISE_ROOTED(backedge);
+            invalidate_code_instance(backedge, env->max_world, 0);
+            env->invalidated = 1;
+            if (_jl_debug_method_invalidation)
+                jl_array_ptr_1d_push(_jl_debug_method_invalidation, (jl_value_t*)backedgetyp);
+        }
+        else {
+            d[ins++] = d[i - 1];
+            d[ins++] = d[i - 0];
+        }
+    }
+    if (ins == 0)
+        jl_eqtable_pop(jl_method_table->backedges, (jl_value_t*)tn, NULL, NULL);
+    else if (na != ins)
+        jl_array_del_end(backedges, na - ins);
+}
+
 struct invalidate_mt_env {
     jl_value_t *newentry_sig;
     jl_array_t *shadowed;
@@ -2886,8 +2944,10 @@ static void jl_method_table_invalidate(jl_method_t *replaced, size_t max_world)
     mt_cache_env.replaced = replaced;
     _method_table_invalidate(mt->cache, &mt_cache_env);
     JL_GC_POP();
-    // XXX: this might have resolved an ambiguity, for which we have not tracked the edge here,
-    // and thus now introduce a mistake into inference
+    // Note: this might have resolved an ambiguity that a caller's inferred result
+    // depended on. Those missing-match backedges are tracked in
+    // `jl_method_table->backedges` and are scanned separately by
+    // `_typename_invalidate_deleted_backedges` (see `jl_method_table_disable`).
     if (invalidated && _jl_debug_method_invalidation) {
         jl_array_ptr_1d_push(_jl_debug_method_invalidation, (jl_value_t*)replaced);
         jl_value_t *loctag = jl_cstr_to_string("jl_method_table_disable");
@@ -2959,6 +3019,39 @@ JL_DLLEXPORT void jl_method_table_disable(jl_method_t *method)
         assert(jl_atomic_load_relaxed(&methodentry->max_world) == ~(size_t)0);
         jl_atomic_store_relaxed(&methodentry->max_world, world);
         jl_method_table_invalidate(method, world);
+        // Deleting a method may resolve an ambiguity that a caller's inferred
+        // result depended on (the deleted method was fully covering but dropped
+        // from the match set by the ambiguity, so the survivor now matches
+        // unambiguously). Scan the missing-match backedges recorded for the
+        // deleted signature and invalidate any caller whose recorded call
+        // signature intersects it. This mirrors the insertion-side scan in
+        // `jl_method_table_activate`.
+        jl_value_t *type = (jl_value_t*)method->sig;
+        jl_value_t *isect = NULL;
+        jl_value_t *isect2 = NULL;
+        JL_GC_PUSH2(&isect, &isect2);
+        jl_methcache_t *mc = jl_method_table->cache;
+        JL_LOCK(&mc->writelock);
+        struct _typename_invalidate_deleted_backedge env = {type, &isect, &isect2, world, 0};
+        if (!jl_foreach_top_typename_for(_typename_invalidate_deleted_backedges, type, 1, &env)) {
+            // if the deleted method cannot be split into exact backedges, scan the whole table for anything that might be affected
+            jl_genericmemory_t *allbackedges = jl_method_table->backedges;
+            for (size_t i = 0, n = allbackedges->length; i < n; i += 2) {
+                jl_value_t *tn = jl_genericmemory_ptr_ref(allbackedges, i);
+                jl_value_t *backedges = jl_genericmemory_ptr_ref(allbackedges, i+1);
+                if (tn && tn != jl_nothing && backedges)
+                    _typename_invalidate_deleted_backedges((jl_typename_t*)tn, 0, &env);
+            }
+        }
+        JL_UNLOCK(&mc->writelock);
+        if (env.invalidated && _jl_debug_method_invalidation) {
+            jl_array_ptr_1d_push(_jl_debug_method_invalidation, (jl_value_t*)method);
+            jl_value_t *loctag = jl_cstr_to_string("jl_method_table_disable");
+            JL_GC_PUSH1(&loctag);
+            jl_array_ptr_1d_push(_jl_debug_method_invalidation, loctag);
+            JL_GC_POP();
+        }
+        JL_GC_POP();
         jl_atomic_store_release(&jl_world_counter, world + 1);
     }
     JL_UNLOCK(&world_counter_lock);

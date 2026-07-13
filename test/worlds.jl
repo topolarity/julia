@@ -539,6 +539,34 @@ Base.delete_method(fshadow_m2)
 
 @test_throws "Method of fshadow already disabled" Base.delete_method(fshadow_m2)
 
+# delete_method must invalidate callers whose inferred result depended on a
+# method ambiguity that the deletion resolves. The concrete call below is fully
+# covered by both (pairwise ambiguous) methods, so `ml_matches` returns an empty
+# match set and inference concludes the call always throws a MethodError. Deleting
+# one partner resolves the ambiguity, so the survivor now matches unambiguously
+# and the stale caller must be invalidated.
+f_ambig_del(x::Integer, y) = 1
+f_ambig_del(x, y::AbstractString) = 2
+caller_ambig_del() = try; f_ambig_del(Int8(1), "s"); catch e; e isa MethodError ? :methoderror : rethrow(); end
+@test caller_ambig_del() === :methoderror
+let m = only(m for m in methods(f_ambig_del) if m.sig == Tuple{typeof(f_ambig_del), Any, AbstractString})
+    Base.delete_method(m)
+end
+@test Base.invokelatest(f_ambig_del, Int8(1), "s") == 1
+@test Base.invokelatest(caller_ambig_del) == 1
+
+# Same, but deleting the other partner of the ambiguous pair, so the surviving
+# method is the second one and the resolved call must return its value instead.
+f_ambig_del2(x::Integer, y) = 1
+f_ambig_del2(x, y::AbstractString) = 2
+caller_ambig_del2() = try; f_ambig_del2(Int8(1), "s"); catch e; e isa MethodError ? :methoderror : rethrow(); end
+@test caller_ambig_del2() === :methoderror
+let m = only(m for m in methods(f_ambig_del2) if m.sig == Tuple{typeof(f_ambig_del2), Integer, Any})
+    Base.delete_method(m)
+end
+@test Base.invokelatest(f_ambig_del2, Int8(1), "s") == 2
+@test Base.invokelatest(caller_ambig_del2) == 2
+
 # Generated functions without edges must have min_world = 1.
 # N.B.: If changing this, move this test to precompile and make sure
 # that the specialization survives revalidation.
