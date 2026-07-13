@@ -308,8 +308,12 @@ const install_packages_hooks = Any[]
 # N.B.: Any functions starting with __repl_entry cut off backtraces when printing in the REPL.
 # We need to do this for both the actual eval and macroexpand, since the latter can cause custom macro
 # code to run (and error).
+# Route through `jl_lower` (not a direct `Core._lower` call) so lowering dispatch
+# is pinned to `jl_lowering_world`; otherwise every REPL entry that follows new
+# method definitions re-infers the whole lowering pipeline at the latest world.
 __repl_entry_lower_with_loc(mod::Module, @nospecialize(ast), toplevel_file::Ref{Ptr{UInt8}}, toplevel_line::Ref{Csize_t}) =
-    Core._lower(ast, mod, toplevel_file[], toplevel_line[])[1]
+    ccall(:jl_lower, Any, (Any, Any, Ptr{UInt8}, UInt, UInt, Int32),
+          ast, mod, toplevel_file[], toplevel_line[], typemax(Csize_t), false)[1]
 __repl_entry_eval_expanded_with_loc(mod::Module, @nospecialize(ast), toplevel_file::Ref{Ptr{UInt8}}, toplevel_line::Ref{Csize_t}) =
     ccall(:jl_toplevel_eval_flex, Any, (Any, Any, Cint, Cint, Ptr{Ptr{UInt8}}, Ptr{Csize_t}), mod, ast, 1, 1, toplevel_file, toplevel_line)
 

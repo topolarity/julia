@@ -272,7 +272,12 @@ Takes the expression `x` and returns an equivalent expression in lowered form
 for executing in module `m`.
 See also [`code_lowered`](@ref).
 """
-lower(m::Module, @nospecialize(x)) = Core._lower(x, m, "none", 0, typemax(Csize_t), false)[1]
+# Route through the C entry `jl_lower`, which pins lowering dispatch to
+# `jl_lowering_world`; a direct `Core._lower` call runs at the caller's world
+# and re-infers the whole lowering pipeline once loaded code has invalidated it.
+lower(m::Module, @nospecialize(x)) =
+    ccall(:jl_lower, Any, (Any, Any, Ptr{UInt8}, UInt, UInt, Int32),
+          x, m, "none", 0, typemax(Csize_t), false)[1]
 
 """
     @lower [m] x
