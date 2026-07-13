@@ -36,17 +36,21 @@ top:
     ret void
 }
 
-define void @leftover_alloca({} addrspace(10)* %a) {
-; If this pass encounters an alloca, it'll just sink it into the gcframe,
-; relying on mem2reg to catch simple cases such as this earlier
+define void @leftover_alloca(i64 %a) {
+; If this pass encounters an alloca holding a value the GC may be responsible
+; for, it'll just sink it into the gcframe, relying on mem2reg to catch simple
+; cases such as this earlier. (An alloca holding only externally-rooted values,
+; such as an argument, is instead left out of the gcframe and zero-initialized;
+; see late-lower-gc-roots-packing.ll.)
 ; CHECK-LABEL: @leftover_alloca
 ; OPAQUE: %var = getelementptr inbounds ptr addrspace(10), ptr %gcframe
     %pgcstack = call {}*** @julia.get_pgcstack()
     %ptls = call {}*** @julia.ptls_states()
     %var = alloca {} addrspace(10)*
-    store {} addrspace(10)* %a, {} addrspace(10)** %var
+    %aboxed = call {} addrspace(10)* @jl_box_int64(i64 signext %a)
+    store {} addrspace(10)* %aboxed, {} addrspace(10)** %var
     %b = load {} addrspace(10)*, {} addrspace(10)** %var
-    call void @boxed_simple({} addrspace(10)* %a,
+    call void @boxed_simple({} addrspace(10)* %aboxed,
                             {} addrspace(10)* %b)
     ret void
 }
