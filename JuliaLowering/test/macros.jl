@@ -1339,6 +1339,40 @@ end
         ref_ci = find_method_ci(Meta.lower(test_mod, Meta.parse(prog_def)))
         our_ci = find_method_ci(jlower_e(prog_def))
         @test ref_ci.purity === our_ci.purity
+
+        # Legacy/stale `(purity)` arities (JuliaLang/julia PkgEval): packages such
+        # as VectorizationBase hand-build a Julia-1.8/1.9-era purity meta with 5 or
+        # 6 fields, but `Base.EffectsOverride` now has 11. flisp and method.c
+        # silently ignore any purity node whose arity is neither 0 nor the canonical
+        # field count, so lowering must accept it and apply no override rather than
+        # raising an internal lowering error.
+        def_purity(ex) = find_method_ci(JuliaLowering.to_lowered_expr(
+            jl_lower(test_mod, ex; expr_compat_mode))).purity
+        with_purity(name, args...) = Expr(:function,
+            Expr(:call, name, Expr(:(::), :b, :Bool)),
+            Expr(:block, Expr(:meta, Expr(:purity, args...), :inline), :b))
+        # Baseline: identical body with no purity meta.
+        none_purity = def_purity(Expr(:function,
+            Expr(:call, :f_purity_none, Expr(:(::), :b, :Bool)), Expr(:block, :b)))
+        # 6-field (VectorizationBase's actual output) and 5-field (pre-1.9) forms
+        # lower successfully and set no override — same as having no meta at all.
+        # From PkgEval: StanModels v2.1.7 / QSM v0.5.4, via VectorizationBase src/llvm_intrin/intrin_funcs.jl:42-43 (legacy 6-field Expr(:purity))
+        @test def_purity(with_purity(:f_purity_stale6,
+            true, true, true, true, false, true)) === none_purity
+        @test def_purity(with_purity(:f_purity_stale5,
+            true, true, true, true, false)) === none_purity
+        # A bare 0-field `(purity)` is the no-op form and likewise sets nothing.
+        @test def_purity(with_purity(:f_purity_zero)) === none_purity
+        # The canonical 11-field form still applies the overrides (non-zero).
+        @test def_purity(with_purity(:f_purity_full,
+            true, true, true, true, false, true, true, true, true, true, true)) !== none_purity
+        # Only the purity *arity* check was relaxed; an unrelated malformed meta
+        # (an unknown expr head) is still rejected.
+        @test_throws JuliaLowering.LoweringError JuliaLowering.to_lowered_expr(
+            jl_lower(test_mod, Expr(:function,
+                Expr(:call, :f_purity_badmeta, Expr(:(::), :b, :Bool)),
+                Expr(:block, Expr(:meta, Expr(:some_unknown_marker, 1)), :b));
+                expr_compat_mode))
     end
 end
 

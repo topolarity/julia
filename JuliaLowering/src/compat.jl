@@ -686,6 +686,11 @@ end
 
 function purity_expr_to_flags(st::SyntaxTree)
     @jl_assert kind(st) === K"purity" st
+    # method.c only applies overrides when the purity node has the canonical
+    # field count; any other arity (e.g. a stale/legacy encoding hand-built by a
+    # package) is dropped there with no override applied. Mirror that by emitting
+    # no flags rather than throwing from the `EffectsOverride` constructor.
+    numchildren(st) == fieldcount(Base.EffectsOverride) || return UInt16(0)
     args = Bool[x.value for x in children(st)]
     Base.encode_effects_override(Base.EffectsOverride(args...))
 end

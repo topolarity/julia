@@ -302,9 +302,10 @@ vst1(vcx::Validation1Context, st::SyntaxTree)::ValidationResult = @stm st begin
     ([K"inbounds" [K"Identifier"]], when=(st[1].name_val == "pop")) -> pass()
     ([K"inline" [K"Value"]], when=(st[1].value isa Bool)) -> pass()
     ([K"noinline" [K"Value"]], when=(st[1].value isa Bool)) -> pass()
-    [K"purity"] -> pass()
-    [K"purity" _ _...] -> numchildren(st) == fieldcount(Base.EffectsOverride) ?
-        pass() : @fail(st, "wrong number of args to `purity` expression")
+    # Any arity is accepted: a non-canonical arity (e.g. a stale/legacy effects
+    # encoding hand-built by a package) is silently ignored by method.c, so
+    # accept it here too; only the canonical field count applies overrides.
+    [K"purity" _...] -> pass()
     [K"locals"] -> pass()
     [K"islocal" _] -> pass()
     [K"isglobal" _] -> pass()
@@ -1391,9 +1392,9 @@ vst2(vcx::Validation2Context, st::SyntaxTree) = @stm st begin
     ([K"inbounds" [K"Value"]], when=(st[1].value isa Bool)) -> pass()
     ([K"inline" [K"Value"]], when=(st[1].value isa Bool)) -> pass()
     ([K"noinline" [K"Value"]], when=(st[1].value isa Bool)) -> pass()
-    [K"purity"] -> pass()
-    [K"purity" _ _...] -> numchildren(st) == fieldcount(Base.EffectsOverride) ?
-        pass() : @fail(st, "wrong number of args to `purity` expression")
+    # See the note in the first validation pass: method.c ignores a purity node
+    # whose arity isn't the canonical field count, so tolerate any arity here too.
+    [K"purity" _...] -> pass()
     [K"aliasscope"] -> pass()
     [K"popaliasscope"] -> pass()
 
