@@ -2109,6 +2109,7 @@ end
         f_gen_calls_macros(1)
     end
     """; expr_compat_mode) === "foo"
+    # From PkgEval: Static v1.4.4, src/Static.jl:715 (find_first_eq @generated returning Base.Cartesian.@nif; test/core_tests.jl:363)
     @test JuliaLowering.include_string(test_mod, raw"""begin
         @generated function calls_versioned_macro(::Type{T}, ::Val{i}) where {T, i}
             i isa Integer || @goto err
@@ -2119,6 +2120,26 @@ end
 
         calls_versioned_macro(Tuple{Int}, Val(1))
     end """; expr_compat_mode) == 1
+
+    # A generator whose returned body is a bare macrocall to an old-style macro
+    # that re-wraps `esc`'d fragments in a freshly-built, unescaped `Expr` (e.g.
+    # `Base.Cartesian.@nif`), referencing the generated function's own arguments
+    # and static parameters. Those escaped references unwind to the generator's
+    # base layer, so the synthesized argument/sparam names of the staged method
+    # must live in that same layer -- otherwise they resolve as bogus module
+    # globals (`UndefVarError`). Regressed as `Static.find_first_eq`.
+    @test JuliaLowering.include_string(test_mod, raw"""begin
+        @generated function find_first_eq(x, itr::I) where {N, I <: Tuple{Vararg{Any, N}}}
+            return :(Base.Cartesian.@nif $(N + 1) d -> (x == getfield(itr, d)) d -> (d) d -> (nothing))
+        end
+        (find_first_eq(20, (10, 20, 30)), find_first_eq(99, (10, 20, 30)))
+    end"""; expr_compat_mode) === (2, nothing)
+    @test JuliaLowering.include_string(test_mod, raw"""begin
+        @generated function nif_uses_sparam(x, ::Type{T}) where {T}
+            return :(Base.Cartesian.@nif 2 d -> (x isa T) d -> (T) d -> (nothing))
+        end
+        nif_uses_sparam(1, Int)
+    end"""; expr_compat_mode) === Int
 
     @testset "anonymous args promoted by optional/keyword args" begin
         # From PkgEval: SIMD v3.7.2, src/LLVM_intrinsics.jl:477 (@generated intrinsics wrappers with several anonymous ::Val args)

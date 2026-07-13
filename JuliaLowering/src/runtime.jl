@@ -261,11 +261,14 @@ struct GeneratedFunctionStub
     spnames::Core.SimpleVector
 end
 
-function _gen_args_from_syms(ctx, src, args)
+function _gen_args_from_syms(ctx, src, args, sc::SyntaxContext)
     out = SyntaxList(ctx.graph)
     for a in args
         id = newleaf(syntax_graph(ctx), src, K"Identifier", string(a))
         id = _est_to_dst_ident(id) # support placeholders
+        # Bind these names in the generator's base layer so `esc`'d references
+        # in the generated body resolve to them (see caller).
+        id = setattr(id, :context, sc)
         push!(out, id)
     end
     out
@@ -322,10 +325,17 @@ function _lower_generated_code(g::GeneratedFunctionStub, source::Method, graph,
     # Desugaring
     ctx2, ex2 = expand_forms_2(ex1, world)
 
-    # Wrap expansion in a non-toplevel lambda and run scope resolution
+    # Wrap expansion in a non-toplevel lambda and run scope resolution.
+    # The argument and static-parameter names must live in the generator's own
+    # base layer (`sc`), not whatever layer `ex1`'s root happens to carry after
+    # macro expansion: an `esc`'d reference to one of these names inside the
+    # generated body unwinds to the base layer, so the binding form must match it
+    # there. Deriving the names' context from `ex1` (as leaf provenance does)
+    # would instead stamp them with the expansion layer of a macro that wraps the
+    # returned body, leaving such references unresolved (a bogus global lookup).
     ex2 = @ast ctx2 ex0 [K"lambda"(is_toplevel_thunk=false, toplevel_pure=true)
-        [K"block" _gen_args_from_syms(ctx2, ex1, g.argnames)...]
-        [K"block" _gen_args_from_syms(ctx2, ex1, g.spnames)...]
+        [K"block" _gen_args_from_syms(ctx2, ex1, g.argnames, sc)...]
+        [K"block" _gen_args_from_syms(ctx2, ex1, g.spnames, sc)...]
         ex2
     ]
     ctx3, ex3 = resolve_scopes(ctx2, ex2)
