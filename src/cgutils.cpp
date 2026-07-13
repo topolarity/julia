@@ -4509,7 +4509,8 @@ static jl_cgval_t emit_new_struct(jl_codectx_t &ctx, jl_value_t *ty, size_t narg
                 }
             }
             else {
-                strct = emit_static_alloca(ctx, lt, Align(julia_alignment(ty)));
+                AllocaInst *bits = emit_static_alloca(ctx, lt, Align(julia_alignment(ty)));
+                strct = bits;
                 setName(ctx.emission_context, strct, arg_typename);
             }
 
