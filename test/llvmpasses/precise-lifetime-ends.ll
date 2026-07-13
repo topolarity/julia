@@ -224,3 +224,20 @@ top:
   call void @capture_buf(ptr %p)
   ret void
 }
+
+; A buffer with no markers at all (e.g. after MemCpyOpt's stack-move merges
+; two buffers and deletes both allocas' markers) gets a synthesized start at
+; its earliest access and precise ends.
+define swiftcc void @markerless(i64 %n) {
+; CHECK-LABEL: @markerless
+top:
+  %pgcstack = call ptr @julia.get_pgcstack()
+  %r = alloca [2 x i64], align 8
+; CHECK: call void @llvm.lifetime.start.p0(i64 -1, ptr %r)
+; CHECK-NEXT: store i64 %n, ptr %r
+  store i64 %n, ptr %r, align 8
+  call swiftcc void @use_buf(ptr readonly %r, ptr swiftself %pgcstack)
+; CHECK: call swiftcc void @use_buf
+; CHECK-NEXT: call void @llvm.lifetime.end.p0(i64 -1, ptr %r)
+  ret void
+}

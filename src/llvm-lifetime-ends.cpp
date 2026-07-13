@@ -330,9 +330,11 @@ bool PreciseLifetimeEnds::analyzeUsers(AllocaInst *AI, uint64_t Size,
             return false;
         }
     }
-    // Only buffers following codegen's start protocol are eligible.
-    if (C.Start == nullptr)
-        return false;
+    // Candidates either follow codegen's single-start protocol or carry no
+    // markers at all (e.g. after MemCpyOpt's stack-move merges two buffers
+    // and deletes both allocas' markers); in the latter case the start is
+    // synthesized at the tight position below. Foreign protocols (existing
+    // ends, multiple starts) bailed above.
     for (Value *V : Derived)
         DerivedCand[V] = CandIdx;
     return true;
@@ -558,23 +560,27 @@ bool PreciseLifetimeEnds::run()
         C.Size = SizeOpt->getFixedValue();
         if (C.Size == 0 || !analyzeUsers(AI, C.Size, DL, C, Cands.size()))
             continue;
-        // The start must dominate every direct access for marker-driven
-        // intervals to cover them. (Reads through forwarders are covered by
-        // the marker region's may-flow through the forwarding edge instead.)
-        bool Dominated = true;
-        auto checkDominated = [&](ArrayRef<Instruction *> Users) JL_NOTSAFEPOINT {
-            for (Instruction *U : Users) {
-                if (!DT.dominates(C.Start, U)) {
-                    Dominated = false;
-                    break;
+        // An existing start must dominate every direct access for
+        // marker-driven intervals to cover them; a synthesized start is
+        // placed at a dominating position by construction. (Reads through
+        // forwarders are covered by the marker region's may-flow through the
+        // forwarding edge instead.)
+        if (C.Start != nullptr) {
+            bool Dominated = true;
+            auto checkDominated = [&](ArrayRef<Instruction *> Users) JL_NOTSAFEPOINT {
+                for (Instruction *U : Users) {
+                    if (!DT.dominates(C.Start, U)) {
+                        Dominated = false;
+                        break;
+                    }
                 }
-            }
-        };
-        checkDominated(C.Reads);
-        checkDominated(C.Writes);
-        checkDominated(C.Kills);
-        if (!Dominated)
-            continue;
+            };
+            checkDominated(C.Reads);
+            checkDominated(C.Writes);
+            checkDominated(C.Kills);
+            if (!Dominated)
+                continue;
+        }
         CandidatesAnalyzed++;
         Cands.push_back(std::move(C));
     }
@@ -682,7 +688,9 @@ bool PreciseLifetimeEnds::run()
     // contents undef later is harmless. Forwarder reads sit below the phi
     // that the direct accesses feed, so they remain in the marker region's
     // may-flow.)
-    for (Candidate &C : Cands) {
+    bool SynthesizedStart = false;
+    for (unsigned c = 0; c < NumCands; c++) {
+        Candidate &C = Cands[c];
         BasicBlock *D = nullptr;
         auto joinBlocks = [&](ArrayRef<Instruction *> Users) JL_NOTSAFEPOINT {
             for (Instruction *U : Users)
@@ -691,8 +699,13 @@ bool PreciseLifetimeEnds::run()
         joinBlocks(C.Reads);
         joinBlocks(C.Writes);
         joinBlocks(C.Kills);
-        if (D == nullptr)
-            continue; // all accesses flow through forwarders; leave the start
+        if (D == nullptr) {
+            // All accesses flow through forwarders. An existing start stays
+            // where it is; with no start there is nowhere to anchor one.
+            if (C.Start == nullptr)
+                Bailed.set(c);
+            continue;
+        }
         Instruction *IP = D->getTerminator();
         auto tighten = [&](ArrayRef<Instruction *> Users) JL_NOTSAFEPOINT {
             for (Instruction *U : Users)
@@ -702,15 +715,25 @@ bool PreciseLifetimeEnds::run()
         tighten(C.Reads);
         tighten(C.Writes);
         tighten(C.Kills);
-        if (C.Start != IP && C.Start->getNextNode() != IP)
+        if (C.Start == nullptr) {
+            // Synthesize the start for a markerless buffer: before its
+            // earliest access there are no accesses at all, so declaring the
+            // contents undef up to this point is vacuously true.
+            IRBuilder<> Bld(IP->getParent(), IP->getIterator());
+            C.Start = cast<CallInst>(Bld.CreateLifetimeStart(C.AI));
+            SynthesizedStart = true;
+        }
+        else if (C.Start != IP && C.Start->getNextNode() != IP) {
             C.Start->moveBefore(*IP->getParent(), IP->getIterator());
+        }
     }
 
     // Build per-block event lists.
     for (unsigned c = 0; c < NumCands; c++) {
         Candidate &C = Cands[c];
-        addEvent(C.Start, c, false, /*Read*/ false, /*Kill*/ true, false,
-                 /*IsStart*/ true);
+        if (C.Start != nullptr)
+            addEvent(C.Start, c, false, /*Read*/ false, /*Kill*/ true, false,
+                     /*IsStart*/ true);
         for (Instruction *I : C.Reads)
             addEvent(I, c, false, true, false, false, false);
         for (Instruction *I : C.Kills)
@@ -898,7 +921,7 @@ bool PreciseLifetimeEnds::run()
         LLVM_DEBUG(dbgs() << "precise-lifetime-ends: " << Plans[c].size()
                           << " end(s) for " << *Cands[c].AI << "\n");
     }
-    return Inserted;
+    return Inserted || SynthesizedStart;
 }
 
 } // namespace
