@@ -1219,3 +1219,139 @@ _blackbox_licmloop_simple(1.0)
     @test count(re_licmcall, ir_bb_simple) == 5  # unrolled, not hoisted
     @test !occursin(re_raw_arg, ir_bb_simple)
 end
+
+# GC frame slot packing: the GC frame of a function should be O(1) in the
+# number of call sites that need rooting, not O(n), across CFG shapes
+# (straight-line sequences, brief overlaps, loop bodies, fan-out in loops).
+# Values that are genuinely live together still get distinct slots (control).
+module FrameScalingTest
+
+using Test
+using InteractiveUtils: code_llvm, code_native
+
+struct TB          # tracked + bits: returned via sret + return_roots
+    a::Any
+    b::Int
+end
+const CONST_OBJ = "const"
+@noinline mk(i::Int) = TB(CONST_OBJ, i)
+@noinline consume(t::TB) = t.b
+@noinline consume2(t::TB, u::TB) = t.b + u.b
+
+function gcframe_slots(f, types)
+    ir = sprint(io -> code_llvm(io, f, types;
+                raw=true, dump_module=false, optimize=true, debuginfo=:none))
+    m = match(r"%gcframe\d* = alloca \[(\d+) x ptr\]", ir)
+    return m === nothing ? 0 : parse(Int, m.captures[1])
+end
+
+# Machine frame size on x86_64: prologue "sub rsp, N" plus pushes. Used by
+# the (currently disabled) machine-frame scaling checks below.
+function machine_frame(f, types)
+    asm = sprint(io -> code_native(io, f, types; debuginfo=:none, dump_module=false))
+    subsz = 0; pushes = 0
+    for line in eachline(IOBuffer(asm))
+        l = strip(line)
+        isempty(l) && continue
+        startswith(l, "push") && (pushes += 1; continue)
+        m = match(r"^sub\s+rsp,\s*(\d+)", l)
+        m !== nothing && (subsz += parse(Int, m.captures[1]); continue)
+        m = match(r"^sub\s+r11,\s*(\d+)", l)   # stack-probe form
+        m !== nothing && (subsz += parse(Int, m.captures[1]); continue)
+        (occursin(r"^mov\s+qword\s+ptr\s+\[rsp\],\s*0$", l) ||
+         occursin(r"^mov\s+r11,\s*rsp$", l) || occursin(r"^cmp\s+rsp,\s*r11$", l) ||
+         startswith(l, "jne") || startswith(l, ".") || startswith(l, "L") ||
+         occursin(r"^mov\s+rbp,\s*rsp$", l)) && continue
+        break
+    end
+    return subsz + 8 * pushes
+end
+
+# Shape generators, at two sizes each so scaling is observable.
+for N in (4, 16)
+    # 1. straight line, each temporary dead before the next
+    body = [:(s += consume(mk(x + $i))) for i in 1:N]
+    @eval @noinline function $(Symbol(:straight_, N))(x::Int)
+        s = x
+        $(body...)
+        return s
+    end
+    # 2. control: all temporaries live to the end — slots MUST scale
+    vars = [Symbol(:t, i) for i in 1:N]
+    mks  = [:($(vars[i]) = mk(x + $i)) for i in 1:N]
+    uses = [:(s += consume($(vars[i]))) for i in 1:N]
+    @eval @noinline function $(Symbol(:straight_live_, N))(x::Int)
+        s = x
+        $(mks...)
+        $(uses...)
+        return s
+    end
+    # 3. two temporaries overlap briefly at each call
+    body = [:(s += consume2(mk(x + $i), mk(x + $(i + 100)))) for i in 1:N]
+    @eval @noinline function $(Symbol(:pairs_, N))(x::Int)
+        s = x
+        $(body...)
+        return s
+    end
+    # 4. straight-line body inside a loop
+    body = [:(s += consume(mk(j + $i))) for i in 1:N]
+    @eval @noinline function $(Symbol(:loop_straight_, N))(n::Int)
+        s = 0
+        for j in 1:n
+            $(body...)
+        end
+        return s
+    end
+    # 5. fan-out (mini kind-switch) inside a loop
+    arms = Expr(:if, :(k == 1), :(s += consume(mk(j))))
+    cur = arms
+    for i in 2:N
+        nxt = Expr(:elseif, :(k == $i), :(s += consume(mk(j + $i))))
+        push!(cur.args, nxt)
+        cur = nxt
+    end
+    push!(cur.args, :(s -= 1))
+    @eval @noinline function $(Symbol(:loop_fanout_, N))(n::Int)
+        s = 0
+        for j in 1:n
+            k = s % $N + 1
+            $arms
+        end
+        return s
+    end
+end
+
+const SHAPES = [
+    (:straight,      straight_4,      straight_16,      (Int,)),
+    (:pairs,         pairs_4,         pairs_16,         (Int,)),
+    (:loop_straight, loop_straight_4, loop_straight_16, (Int,)),
+    (:loop_fanout,   loop_fanout_4,   loop_fanout_16,   (Int,)),
+]
+
+if Base.JLOptions().opt_level >= 2 && Base.JLOptions().code_coverage == 0
+@testset "GC frame slots are O(1) across CFG shapes" begin
+    for (name, f4, f16, types) in SHAPES
+        @test gcframe_slots(f16, types) == gcframe_slots(f4, types)
+    end
+    # live-overlap control: N simultaneously-live values need O(N) slots;
+    # guards against over-merging of genuinely interfering buffers
+    @test gcframe_slots(straight_live_16, (Int,)) >=
+          gcframe_slots(straight_live_4, (Int,)) + 8
+end
+end
+
+# Machine frame scaling needs precise lifetime.end placement to merge
+# sequential/in-loop stack buffers (the PreciseLifetimeEnds pass); the GC
+# frame assertions above hold without it. Enable when that pass lands:
+# if Sys.ARCH === :x86_64
+#     @testset "machine frame is O(1) across CFG shapes" begin
+#         for (name, f4, f16, types) in SHAPES
+#             # allow small constant slack (alignment, spills)
+#             @test machine_frame(f16, types) <= machine_frame(f4, types) + 64
+#         end
+#         @test machine_frame(straight_live_16, (Int,)) >=
+#               machine_frame(straight_live_4, (Int,)) + 8 * 8
+#     end
+# end
+
+end # module FrameScalingTest
