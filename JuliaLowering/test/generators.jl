@@ -87,6 +87,47 @@ Tuple{Int,Int}[(x,y) for x in 1:2, y in 1:3]
     (3, 5, 7)
 ]
 
+@testset "return inside flattened generators" begin
+    # A `return` in the body of a flattened (multi-`for`) generator is legal:
+    # each nested `for` is its own closure, so `return` exits that closure and
+    # yields the element -- matching flisp.  A single-`for` generator (incl. the
+    # comma/product form) still forbids `return`.
+    jeval(str) = jl_eval(test_mod, parsestmt(SyntaxTree, str))
+    feval(str) = fl_eval(test_mod, parsestmt(Expr, str))
+
+    # return in the body of a flattened generator (regression: PosDefManifold
+    # `vecP`, pulled in by Diagonalizations, failed to precompile under JL)
+    @test jeval("[(if i==1 return i else return i*2 end) for j=1:2 for i=1:3]") ==
+        [1, 4, 6, 1, 4, 6]
+    # triply nested
+    @test jeval("[(if i==1 return i else return i*2 end) for k=1:2 for j=1:2 for i=1:3]") ==
+        [1, 4, 6, 1, 4, 6, 1, 4, 6, 1, 4, 6]
+    # body references an outer loop variable
+    @test jeval("[(if j==1 return -1 else i end) for j=1:2 for i=1:3]") ==
+        [-1, -1, -1, 1, 2, 3]
+    # `return` in an iterator/filter of a flattened generator is likewise legal
+    @test jeval("[i for j=1:2 for i in (j==1 ? (return 77) : 1:3)]") == [77, 1, 2, 3]
+    @test jeval("(f() = [i for j in (return 88) for i in 1:3]; f())") == 88
+
+    # PosDefManifold `vecP` shape: identical result under both lowerers
+    let s = """
+        let S = [1.0 2.0 3.0; 2.0 4.0 5.0; 3.0 5.0 6.0], sqrt2 = sqrt(2)
+            [(if i==j return S[i,j] else return S[i,j]*sqrt2 end) for j=1:3 for i=j:3]
+        end
+        """
+        @test jeval(s) == feval(s)
+    end
+
+    # A single-`for` generator (and the comma/product form) still rejects `return`
+    @test_throws LoweringError jeval("[(if i==1 return i else return i*2 end) for i=1:3]")
+    @test_throws LoweringError jeval("[(if i==1 return i else return i*2 end) for i=1:3, j=1:2]")
+    @test_throws LoweringError jeval("[i for i in (return 99)]")
+    # A distinct nested comprehension/generator inside a flattened body is its own
+    # single-level generator and keeps rejecting `return`
+    @test_throws LoweringError jeval("[(return 7 for z in 1:2) for j=1:2 for i=1:1]")
+    @test_throws LoweringError jeval("[([return z for z in 1:2])[1] for j=1:2 for i=1:1]")
+end
+
 # splat in lhs
 @test JuliaLowering.include_string(test_mod, """
 [(h, i, j) for (h, i..., j) in ((1,2,3,4),(5,6,7,8))]

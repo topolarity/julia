@@ -210,16 +210,16 @@ vst1(vcx::Validation1Context, st::SyntaxTree)::ValidationResult = @stm st begin
         all(vst1_splat_or_val, vcx, xs)
     [K"->" _...] ->
         vst1_lam(vcx, st)
-    [K"flatten" g] -> vst1_generator(vcx, g)
+    [K"flatten" g] -> vst1_gen_chain(vcx, g, true)
     [K"generator" _...] -> vst1_generator(vcx, st)
-    [K"comprehension" [K"flatten" g]] -> vst1_generator(vcx, g)
+    [K"comprehension" [K"flatten" g]] -> vst1_gen_chain(vcx, g, true)
     [K"comprehension" g] -> vst1_generator(vcx, g)
     [K"comprehension" xs...] ->
         # HACK: We shouldn't be creating trees here, but this is extremely rare
         # (deprecated even in 2016)
         vst1_generator(vcx, @ast st._graph st [K"generator" xs...])
     [K"typed_comprehension" t [K"flatten" g]] ->
-        vst1(vcx, t) & vst1_generator(vcx, g)
+        vst1(vcx, t) & vst1_gen_chain(vcx, g, true)
     [K"typed_comprehension" t g] ->
         vst1(vcx, t) & vst1_generator(vcx, g)
     [K"comparison" xs...] ->
@@ -1108,6 +1108,35 @@ vst1_generator(vcx, st) = let
         _ -> @fail(st, "expected `generator`")
     end
 end
+
+# A flattened generator (`for a=A for b=B`, parsed as `flatten`-wrapped nested
+# generators) compiles each nested `for` to its own closure, so `return` is legal
+# throughout the chain -- in the body, iterators and filters alike. This mirrors
+# flisp, whose `flatten` expander never runs the plain-generator return check.
+# We therefore keep the inherited `return_ok` (unlike `vst1_generator`, which
+# forbids `return`). `flat` follows flisp's `expand-generator` flag: a `flatten`
+# body re-arms the chain, a `generator` body consumes one step; once consumed, a
+# further nested generator/comprehension is a distinct subexpression and is
+# validated as an ordinary (return-forbidding) generator via `vst1`.
+vst1_gen_chain(vcx, st, flat) = let
+    vcx = with(vcx; toplevel=false, in_gscope=false)
+    @stm st begin
+        [K"generator" _] -> @fail(st, "`generator` requires >=2 args")
+        [K"generator" val [K"filter" cond is...]] ->
+            vst1_gen_chain_body(vcx, val, is, flat) &
+            vst1(vcx, cond) &
+            all(vst1_iter, vcx, is)
+        [K"generator" val is...] ->
+            vst1_gen_chain_body(vcx, val, is, flat) & all(vst1_iter, vcx, is)
+        [K"generator" _...] -> @fail(st, "malformed `generator`")
+        _ -> @fail(st, "expected `generator`")
+    end
+end
+
+vst1_gen_chain_body(vcx, val, iterspecs, flat) =
+    flat && kind(val) === K"generator" ? vst1_gen_chain(vcx, val, false) :
+    kind(val) === K"flatten"           ? vst1_gen_chain(vcx, val[1], true) :
+    vst1_generator_body(vcx, val, iterspecs)
 
 vst1_iter(vcx, st) = @stm st begin
     [K"=" [K"outer" i] v] -> vst1_assign_lhs(vcx, i) & vst1(vcx, v)

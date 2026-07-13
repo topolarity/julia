@@ -892,7 +892,15 @@ end
 function expand_generator(ctx, ex)
     @jl_assert numchildren(ex) >= 2 ex
     body = ex[1]
-    check_no_return(body)
+    # A flattened generator (multiple iteration specs, `for a=A for b=B`) compiles
+    # each nested `for` to its own closure, so a `return` in the body returns from
+    # that closure and is legal -- matching flisp, whose `flatten` expander performs
+    # no return check. Only a single-level generator forbids `return` in its body.
+    # (A genuinely nested comprehension/generator in the body is a separate node and
+    # re-enters here on its own, still forbidding `return` when single-level.)
+    if numchildren(ex) == 2
+        check_no_return(body)
+    end
     if numchildren(ex) > 2
         outervar_assignments = SyntaxList(ctx)
         for iterspecs in ex[2:end-1]
