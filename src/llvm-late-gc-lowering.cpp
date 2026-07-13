@@ -2815,6 +2815,80 @@ DenseMap<AllocaInst *, unsigned> LateLowerGCFrame::PackReturnRootsBuffers(State 
         Assignment[Candidates[ci].AI] = offset;
     }
     NumSharedSlots = (unsigned)SlotOccupants.size();
+
+    // Restore the zero "color" when a shared slot's occupant dies: between an
+    // occupant's death and the next occupant's first def (or the frame pop),
+    // the slot would otherwise hold stale roots that the GC keeps scanning,
+    // retaining dead objects. Store nulls at each within-block death point
+    // and at edges leaving the live region. Placement in a dead region is
+    // unconditionally sound — only the GC observes it, and a later occupant's
+    // def overwrites it — with one guard: an edge-top store must not land
+    // inside a same-slot co-occupant's live-in range.
+    for (unsigned ci = 0; ci < Candidates.size(); ci++) {
+        Candidate &C = Candidates[ci];
+        auto AsgIt = Assignment.find(C.AI);
+        if (AsgIt == Assignment.end())
+            continue;
+        unsigned Offset = AsgIt->second;
+        auto zeroAt = [&](Instruction *IP) {
+            IRBuilder<> Bld(IP);
+            for (unsigned k = 0; k < C.NumSlots; k++) {
+                Value *Slot = Bld.CreateConstInBoundsGEP1_64(
+                    Type::getInt8Ty(IP->getContext()), C.AI, k * sizeof(void *));
+                Bld.CreateAlignedStore(Constant::getNullValue(T_prjlvalue), Slot,
+                                       Align(sizeof(void *)));
+            }
+        };
+        auto sameSlotLiveIn = [&](const BasicBlock *S) {
+            for (unsigned s = Offset; s < Offset + C.NumSlots; s++) {
+                for (size_t other : SlotOccupants[s]) {
+                    if (other == ci)
+                        continue;
+                    auto RIt = LiveRanges[other].find(S);
+                    if (RIt != LiveRanges[other].end() && RIt->second.Begin == 0)
+                        return true;
+                }
+            }
+            return false;
+        };
+        for (auto &KV : LiveRanges[ci]) {
+            const BasicBlock *BB = KV.first;
+            const BBRange &R = KV.second;
+            if (R.End != UINT_MAX_POS) {
+                // Dies within the block at position R.End: find that
+                // instruction among the candidate's events.
+                Instruction *Last = nullptr;
+                for (Instruction *U : C.Uses) {
+                    if (U->getParent() == BB && InstPos[U] == R.End)
+                        Last = U;
+                }
+                if (Last == nullptr) {
+                    for (Instruction *D : C.Defs) {
+                        if (D->getParent() == BB && InstPos[D] == R.End)
+                            Last = D;
+                    }
+                }
+                if (Last != nullptr && !Last->isTerminator() &&
+                    Last->getNextNode() != nullptr)
+                    zeroAt(Last->getNextNode());
+            }
+            else {
+                // Live out: zero at the top of successors outside the region
+                // (skipping no-return blocks, where the frame dies anyway).
+                for (const BasicBlock *S : successors(BB)) {
+                    if (LiveRanges[ci].count(S))
+                        continue;
+                    if (isa<UnreachableInst>(S->getTerminator()))
+                        continue;
+                    if (S->getFirstInsertionPt() == S->end())
+                        continue;
+                    if (sameSlotLiveIn(S))
+                        continue;
+                    zeroAt(&*const_cast<BasicBlock *>(S)->getFirstInsertionPt());
+                }
+            }
+        }
+    }
 #ifndef NDEBUG
     LLVM_DEBUG({
         // Slot-weighted max concurrent liveness: a lower bound on the shared

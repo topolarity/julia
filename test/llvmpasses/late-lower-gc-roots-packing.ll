@@ -15,12 +15,16 @@ declare void @use_value(i64)
 @const_cell = external constant ptr addrspace(10)
 
 ; Two sret+return_roots call sites with disjoint buffer live ranges must share
-; one GC frame slot.
+; one GC frame slot. When an occupant dies, the slot is re-zeroed so the GC
+; does not retain the previous occupant's stale roots.
 define swiftcc void @pack_disjoint_return_roots() {
 ; CHECK-LABEL: @pack_disjoint_return_roots
 ; CHECK: %gcframe = call ptr @julia.new_gc_frame(i32 1)
 ; CHECK: call ptr @julia.get_gc_frame_slot(ptr %gcframe, i32 0)
 ; CHECK-NOT: call ptr @julia.get_gc_frame_slot(ptr %gcframe, i32 1)
+; CHECK: %bits1 = load i64, ptr %bits1p
+; CHECK-NEXT: getelementptr inbounds i8, ptr %roots1, i64 0
+; CHECK-NEXT: store ptr addrspace(10) null
 top:
   %pgcstack = call ptr @julia.get_pgcstack()
   %sret1 = alloca { ptr addrspace(10), i64 }, align 8
