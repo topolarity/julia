@@ -3502,6 +3502,14 @@ static jl_cgval_t emit_getfield_knownidx(jl_codectx_t &ctx, const jl_cgval_t &st
             LoadInst *Load = ctx.builder.CreateAlignedLoad(ctx.types().T_prjlvalue, addr, Align(sizeof(void*)));
             setNameWithField(ctx.emission_context, Load, get_objname, jt, idx, Twine());
             Load->setOrdering(order <= jl_memory_order_notatomic ? AtomicOrdering::Unordered : get_llvm_atomic_order(order));
+            if (jl_field_isconst(jt, idx)) {
+                // A const field can never be reassigned, so the loaded object
+                // stays reachable from (and thus rooted by) the parent object.
+                // This tag is only consumed by llvm-late-gc-lowering for root
+                // refinement; it carries no aliasing semantics.
+                Load->setMetadata("julia.constant_field",
+                                  MDNode::get(Load->getContext(), {}));
+            }
             maybe_mark_load_dereferenceable(Load, maybe_null, jl_field_type(jt, idx));
             jl_aliasinfo_t ai = jl_aliasinfo_t::fromTBAA(ctx, tbaa);
             Value *fldv = ai.decorateInst(Load);

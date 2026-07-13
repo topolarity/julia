@@ -867,6 +867,24 @@ static bool isLoadFromImmut(LoadInst *LI)
     return false;
 }
 
+// Whether this load reads from memory owned by a readonly pointer argument
+// of the current function (e.g. an argument roots buffer): such memory is
+// caller-managed and outlives this frame.
+static bool isLoadFromCallerRoots(LoadInst *LI)
+{
+    const DataLayout &DL = LI->getModule()->getDataLayout();
+    Value *B = LI->getPointerOperand();
+    while (auto *GEP = dyn_cast<GEPOperator>(B)) {
+        APInt Off(DL.getIndexSizeInBits(0), 0);
+        if (!GEP->accumulateConstantOffset(DL, Off))
+            break;
+        B = GEP->getPointerOperand();
+    }
+    auto *Arg = dyn_cast<Argument>(B);
+    return Arg != nullptr && Arg->hasAttribute(Attribute::ReadOnly) &&
+           cast<PointerType>(Arg->getType())->getAddressSpace() == 0;
+}
+
 static bool isConstGV(GlobalVariable *gv)
 {
     return gv->isConstant() || gv->getMetadata("julia.constgv");
@@ -1399,8 +1417,16 @@ State LateLowerGCFrame::LocalScan(Function &F) {
                 Type *Ty = LI->getType()->getScalarType();
                 bool refined_globally = false;
                 bool task_local = false;
-                if (isLoadFromImmut(LI) && isSpecialPtr(LI->getPointerOperand()->getType())) {
+                if ((isLoadFromImmut(LI) || LI->hasMetadata("julia.constant_field")) &&
+                    isSpecialPtr(LI->getPointerOperand()->getType())) {
                     RefinedPtr.push_back(Number(S, LI->getPointerOperand()));
+                }
+                else if (isLoadFromImmut(LI) && isLoadFromCallerRoots(LI)) {
+                    // Constant load of a tracked value from a caller-provided
+                    // (readonly pointer argument) roots buffer: the caller
+                    // keeps both the buffer and the objects it roots alive
+                    // for our whole activation.
+                    RefinedPtr.push_back(-1);
                 }
                 else if (isLoadFromConstGV(LI, task_local)) {
                     // If this is a const load from a global,
@@ -1488,6 +1514,12 @@ State LateLowerGCFrame::LocalScan(Function &F) {
                     if (auto LI = dyn_cast<LoadInst>(origin)) {
                         if (isLoadFromConstGV(LI, task_local)) {
                             RefinedPtr.push_back(task_local ? -1 : -2);
+                        }
+                        else if (isLoadFromImmut(LI) && isLoadFromCallerRoots(LI)) {
+                            // Constant load from a caller-provided (readonly
+                            // pointer argument) roots buffer: the caller keeps
+                            // the object alive for our whole activation.
+                            RefinedPtr.push_back(-1);
                         }
                     }
                     MaybeNoteDef(S, BBS, ASCI, std::move(RefinedPtr));
@@ -1812,6 +1844,23 @@ JL_USED_FUNC static void dumpColorAssignments(const State &S, const ArrayRef<int
     }
 }
 
+// Assign GC frame slots ("colors") to tracked values by greedy coloring along
+// a perfect elimination ordering of the safepoint co-liveness graph.
+//
+// Exactness invariant: everything colored here is an SSA value whose phis have
+// been lifted (LiftPhisAndSelects), and every live range is re-stored into its
+// slot at each definition point. Under those conditions a phi edge-store
+// installs a full clobber of the slot at every CFG merge, so path-exclusive
+// values never share a live range past a join, and co-liveness sampled at
+// safepoints is an exact interference criterion: safepoint-interference
+// coincides with live-range overlap, by SSA dominance of defs over uses. The
+// interference graph of SSA live ranges is chordal, for which greedy coloring
+// on a perfect elimination ordering is optimal, so the colored region of the
+// frame cannot shrink further without changing liveness itself. Note that this
+// argument does NOT hold for memory (allocas / roots buffers): those can be
+// read at merge points without an intervening definition, which is why
+// PackReturnRootsBuffers uses interval-based range packing instead of
+// point-sampled co-liveness.
 std::pair<SmallVector<int, 0>, int> LateLowerGCFrame::ColorRoots(const State &S) {
     SmallVector<int, 0> Colors;
     Colors.resize(S.MaxPtrNumber + 1, -1);
@@ -2766,6 +2815,31 @@ DenseMap<AllocaInst *, unsigned> LateLowerGCFrame::PackReturnRootsBuffers(State 
         Assignment[Candidates[ci].AI] = offset;
     }
     NumSharedSlots = (unsigned)SlotOccupants.size();
+#ifndef NDEBUG
+    LLVM_DEBUG({
+        // Slot-weighted max concurrent liveness: a lower bound on the shared
+        // region size, to quantify first-fit fragmentation.
+        unsigned MaxLive = 0;
+        for (auto &BB : *S.F) {
+            SmallVector<std::pair<unsigned, unsigned>, 8> Spans; // (Begin,End) x NumSlots
+            for (size_t ci = 0; ci < Candidates.size(); ci++) {
+                auto it = LiveRanges[ci].find(&BB);
+                if (it != LiveRanges[ci].end())
+                    for (unsigned k = 0; k < Candidates[ci].NumSlots; k++)
+                        Spans.push_back({it->second.Begin, it->second.End});
+            }
+            for (auto &SpanA : Spans) {
+                unsigned live = 0;
+                for (auto &SpanB : Spans)
+                    if (SpanB.first <= SpanA.first && SpanA.first <= SpanB.second)
+                        live++;
+                MaxLive = std::max(MaxLive, live);
+            }
+        }
+        dbgs() << "roots-buffer shared region " << S.F->getName() << ": shared="
+               << NumSharedSlots << " lower-bound=" << MaxLive << "\n";
+    });
+#endif
     LLVM_DEBUG(dbgs() << "roots-buffer packing " << S.F->getName() << ": buffers="
                       << S.ReturnRootsBuffers.size() << " unsafe=" << n_unsafe
                       << " walk-bail=" << n_walkbail << " pair-bail=" << n_pairbail
@@ -2867,11 +2941,114 @@ void LateLowerGCFrame::PlaceRootsAndUpdateCalls(ArrayRef<int> Colors, int PreAss
             AI->eraseFromParent();
             AI = NULL;
         };
+        // A tracked value whose (folded) refinement chain terminates only in
+        // externally/globally rooted markers (-1/-2) stays alive without any
+        // frame slot, independent of liveness, so neither a shadow store nor a
+        // GC-visible home for a buffer holding it is required.
+        auto terminally_rooted = [&S](int Num) {
+            if (Num < 0)
+                return true;
+            auto it = S.Refinements.find(Num);
+            if (it == S.Refinements.end() || it->second.empty())
+                return false;
+            for (int R : it->second) {
+                if (R >= 0)
+                    return false;
+            }
+            return true;
+        };
+        // An alloca need not live in the GC frame if the GC can never be
+        // responsible for keeping its contents alive: every tracked value
+        // stored into it is terminally rooted elsewhere for the whole
+        // activation, its address never escapes, and calls may only read it.
+        auto contents_terminally_rooted = [&](AllocaInst *Buf) {
+            SmallVector<Value *, 8> Worklist{Buf};
+            SmallPtrSet<Value *, 8> Visited;
+            while (!Worklist.empty()) {
+                Value *V = Worklist.pop_back_val();
+                if (!Visited.insert(V).second)
+                    continue;
+                for (Use &U : V->uses()) {
+                    User *TheUser = U.getUser();
+                    if (isa<GetElementPtrInst>(TheUser) || isa<BitCastInst>(TheUser) ||
+                        isa<AddrSpaceCastInst>(TheUser)) {
+                        Worklist.push_back(TheUser);
+                        continue;
+                    }
+                    if (isa<LoadInst>(TheUser))
+                        continue;
+                    if (auto *SI = dyn_cast<StoreInst>(TheUser)) {
+                        if (SI->getValueOperand() == V)
+                            return false; // address escapes
+                        Value *Val = SI->getValueOperand();
+                        auto tracked = CountTrackedPointers(Val->getType());
+                        if (!tracked.count)
+                            continue;
+                        if (isa<PointerType>(Val->getType())) {
+                            if (!terminally_rooted(Number(S, Val)))
+                                return false;
+                        }
+                        else {
+                            for (int Num : NumberAll(S, Val)) {
+                                if (!terminally_rooted(Num))
+                                    return false;
+                            }
+                        }
+                        continue;
+                    }
+                    if (auto *II = dyn_cast<IntrinsicInst>(TheUser)) {
+                        if (II->getIntrinsicID() == Intrinsic::lifetime_start ||
+                            II->getIntrinsicID() == Intrinsic::lifetime_end)
+                            continue;
+                    }
+                    if (auto *CI = dyn_cast<CallBase>(TheUser)) {
+                        if (!CI->isArgOperand(&U))
+                            return false;
+                        unsigned ArgNo = CI->getArgOperandNo(&U);
+                        if (!CI->paramHasAttr(ArgNo, Attribute::ReadOnly) ||
+                            !CI->doesNotCapture(ArgNo))
+                            return false;
+                        continue;
+                    }
+                    return false; // unknown user (phi/select/atomicrmw/...)
+                }
+            }
+            return true;
+        };
         for (auto AI : S.ArrayAllocas) {
             auto shared = SharedSlots.find(AI.first);
             if (shared != SharedSlots.end()) {
                 assert(shared->second + AI.second <= NumSharedSlots);
                 replace_alloca(AI.first, shared->second);
+                continue;
+            }
+            if (contents_terminally_rooted(AI.first)) {
+                // Every tracked value stored into this buffer stays alive
+                // without the GC's help, so the buffer does not need a
+                // GC-visible home. The GC frame is null-initialized, and code
+                // may rely on reading null from a slot before the first store
+                // to it (e.g. an @isdefined check of a maybe-undef variable
+                // slot on a path that skips the store), so preserve that:
+                // strip lifetime markers (which would make the initialization
+                // dead) and zero the buffer up front.
+                AllocaInst *Buf = AI.first;
+                SmallVector<CallInst *, 0> ToDelete;
+                RecursivelyVisit<IntrinsicInst>([&](Use &VU) {
+                    IntrinsicInst *II = cast<IntrinsicInst>(VU.getUser());
+                    if (II->getIntrinsicID() != Intrinsic::lifetime_start &&
+                        II->getIntrinsicID() != Intrinsic::lifetime_end)
+                        return;
+                    ToDelete.push_back(II);
+                }, Buf);
+                for (CallInst *II : ToDelete)
+                    II->eraseFromParent();
+                IRBuilder<> B(Buf->getNextNode());
+                const DataLayout &DL2 = Buf->getModule()->getDataLayout();
+                uint64_t Sz = DL2.getTypeAllocSize(Buf->getAllocatedType()) *
+                              cast<ConstantInt>(Buf->getArraySize())->getZExtValue();
+                B.CreateMemSet(Buf, ConstantInt::get(Type::getInt8Ty(Buf->getContext()), 0),
+                               Sz, Buf->getAlign());
+                LLVM_DEBUG(dbgs() << "elided GC frame home for alloca: " << *Buf << "\n");
                 continue;
             }
             // Pick a dedicated slot for the alloca.
@@ -2887,6 +3064,9 @@ void LateLowerGCFrame::PlaceRootsAndUpdateCalls(ArrayRef<int> Colors, int PreAss
             auto Base = SI->getValueOperand();
             //auto Tracked = TrackCompositeType(Base->getType());
             for (unsigned i = 0; i < Store.second; ++i) {
+                int TSNum = isa<PointerType>(Base->getType()) ? Number(S, Base) : NumberAll(S, Base)[i];
+                if (terminally_rooted(TSNum))
+                    continue;
                 auto slotAddress = CallInst::Create(
                     getOrDeclare(jl_intrinsics::getGCFrameSlot),
                     {gcframe, ConstantInt::get(T_int32, AllocaSlot - 2)}, "gc_slot_addr" + StringRef(std::to_string(AllocaSlot - 2)));
@@ -2906,6 +3086,10 @@ void LateLowerGCFrame::PlaceRootsAndUpdateCalls(ArrayRef<int> Colors, int PreAss
                 AllocaSlot++;
             }
         }
+        LLVM_DEBUG(dbgs() << "GC frame slot map " << F->getName() << ": shared=[0," << NumSharedSlots
+                          << ") alloca_end=" << (AllocaSlot - 2) << " colors=" << (MaxColor + 1)
+                          << " preassigned=" << PreAssignedColors
+                          << " total=" << (MaxColor + 1 + AllocaSlot - 2) << "\n");
         auto NRoots = ConstantInt::get(T_int32, MaxColor + 1 + AllocaSlot - 2);
         gcframe->setArgOperand(0, NRoots);
         pushGcframe->setArgOperand(1, NRoots);
