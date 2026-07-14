@@ -564,7 +564,16 @@ function _macro_edge_groups(c::SyntaxTree, topfile::Symbol)
     # The top codeloc represents the outermost `topfile` level; edges are the
     # levels inside it. No in-file level (fully foreign provenance) is handled
     # as parent attribution by `collect_locs!`, so emit no edges here.
-    root = findlast(g -> g[1] === topfile, groups)
+    #
+    # A synthetic-context thunk (`eval` of a hand-built `Expr`, file `:none`)
+    # has no source file of its own: its outermost provenance level is the top
+    # codeloc whatever file it names (`:none` itself, or a real file the code
+    # was quoted from), and every inner level is a `push_loc` macro-expansion
+    # frame -- exactly as flisp does.  Root at the outermost level rather than
+    # searching for a `:none` group (which real quoted content never carries,
+    # so the search would drop all its frames).
+    root = topfile === :none ? (isempty(groups) ? nothing : lastindex(groups)) :
+                               findlast(g -> g[1] === topfile, groups)
     (root === nothing || root == 1) && return Tuple{Symbol,Int32}[]
     return [groups[i] for i in (root-1):-1:1]
 end

@@ -233,3 +233,51 @@ end
         @test methods(f)[1].debuginfo.linetable isa String
     end
 end
+
+@testset "synthetic-context thunk emits foreign-file macro-expansion frames" begin
+    # A thunk with no real source context (`Core.eval` of a hand-built `Expr`,
+    # file "none") that wraps *foreign-file* content in a macrocall must still
+    # emit a "macro expansion" edge at the foreign line, matching flisp's
+    # `push_loc`.  This is ParallelTestRunner.jl's shape: an old-syntax `@eval`
+    # lowers to `Core.eval` of an `Expr` built by `interpolate_expr`, splicing a
+    # test `quote` from another file into a `@testset` wrapper.  The thunk
+    # adopts the wrapper's file as its root (`_thunk_alt_source`); the spliced
+    # code's own file is one level inside it and had been dropped because the
+    # macro-edge grouping keyed on the synthetic `:none` name instead of the
+    # adopted file (see `add_debuginfo!`/`_macro_edge_groups`).
+    m = Module(:XFThunkMod)
+    Core.eval(m, :(using Base))
+    Core.eval(m, :(macro identwrap(x); esc(x); end))
+    ex = Expr(:block,
+        LineNumberNode(17, Symbol("outer.jl")),
+        Expr(:macrocall, Symbol("@identwrap"), LineNumberNode(17, Symbol("outer.jl")),
+            Expr(:block,
+                LineNumberNode(4, Symbol("inner.jl")),
+                :(error("x")))))
+    st = jl_lower(m, JuliaLowering.expr_to_est(ex, LineNumberNode(1, :none));
+                  expr_compat_mode=true)
+    JuliaSyntax.ensure_attributes!(st._graph; debuginfo=Any)
+    add_debuginfo!(st)
+    di = st.debuginfo
+    # The thunk adopts the wrapper file (`outer.jl`) as its root.
+    @test di.def === Symbol("outer.jl")
+    # Walk each statement's edge chain to its deepest "macro expansion" frame.
+    deepest = Set{Tuple{String,Int}}()
+    for pc in 1:numchildren(st[1])
+        loc = ccall(:jl_uncompress1_codeloc, NTuple{3,Int32}, (Any, Int), di, pc)
+        to, epc = Int(loc[2]), Int(loc[3])
+        to == 0 && continue
+        # Root codeloc stays at the adopted-file region anchor.
+        @test Base.Compiler.source_location(di, pc).line == 17
+        d = di; file = ""; line = 0
+        while to != 0
+            e = d.edges[to]::Core.DebugInfo
+            eloc = ccall(:jl_uncompress1_codeloc, NTuple{3,Int32}, (Any, Int), e, epc)
+            file = basename(String(e.def::Symbol)); line = Int(eloc[1])
+            d = e; to = Int(eloc[2]); epc = Int(eloc[3])
+        end
+        push!(deepest, (file, line))
+    end
+    # The spliced `error(...)`'s own foreign line is emitted as a frame.
+    @test ("inner.jl", 4) in deepest
+end
