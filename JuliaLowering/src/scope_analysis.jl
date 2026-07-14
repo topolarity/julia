@@ -735,13 +735,29 @@ function enter_scope!(ctx, ex)
         b = resolve_name(ctx, ex; include_arg_aliases=false)
         if b === nothing
             sc = ex.context::SyntaxContext
-            # Top-level assignments are locals in hygienic expansions.  We may
-            # need to adjust this, as flisp makes them name-mangled globals.
             hygienic_toplevel = !is_base_layer(sc) && sc.layer !== ctx.layer
             if is_toplevel_thunk && !hygienic_toplevel
                 # top-level assignments in no scope and no expansion
                 push!(ctx.soft_assignable_globals, vk)
                 declare_in_scope!(ctx, top_scope(ctx), ex, :global)
+            elseif is_toplevel_thunk && hygienic_toplevel && is_flisp_compat(sc)
+                # flisp gensym-renames an unescaped top-level assignment target
+                # in a hygienic expansion and binds a hidden (name-mangled)
+                # global in the eval-target module, emitting the usual
+                # `declare_global`/`latestworld` for it.  Mirror that (see the
+                # `constdecl` case in `_find_scope_decls!`): the binding is
+                # invisible outside the expansion, but later unescaped
+                # references and assignments of the same hygienic name in the
+                # same expansion resolve to it via `scope.vars`.  New-style
+                # (non-flisp-compat) hygiene deliberately keeps such
+                # assignments local, pending the new-hygiene world-age story.
+                mangled = reserve_module_binding_i(ctx.layer.mod,
+                                                   string("#", vk.name, "#"))
+                b = _new_binding(ctx, ex, mangled, :global;
+                                 mod=ctx.layer.mod, is_internal=true)
+                push!(ctx.soft_assignable_globals, vk)
+                top_scope(ctx).vars[vk] = b.id
+                scope.vars[vk] = b.id
             elseif scope.is_permeable && !hygienic_toplevel &&
                 is_defined_and_owned_global(
                     syntax_module(sc), Symbol(vk.name), ctx.world)

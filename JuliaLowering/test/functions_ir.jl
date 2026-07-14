@@ -1310,35 +1310,43 @@ some docs
 function f()
 end
 #---------------------
-1   (newvar slot₁/val)
-2   (gotoifnot true label₁₅)
-3   (method TestMod.f)
-4   latestworld
-5   TestMod.f
-6   (call core.TypeEqOf %₅)
-7   (call core.svec %₆)
-8   (call core.svec)
-9   SourceLocation:nothing:4:0
-10  (call core.svec %₇ %₈ %₉)
-11  --- method TestMod.f %₁₀
+1   (gotoifnot true label₂₃)
+2   (method TestMod.f)
+3   latestworld
+4   TestMod.f
+5   (call core.TypeEqOf %₄)
+6   (call core.svec %₅)
+7   (call core.svec)
+8   SourceLocation:nothing:4:0
+9   (call core.svec %₆ %₇ %₈)
+10  --- method TestMod.f %₉
     slots: [slot₁/#self#(!read)]
     1   (return core.nothing)
-12  latestworld
-13  TestMod.f
-14  (= slot₁/val %₁₃)
-15  (call Base.Docs.Binding TestMod :f)
-16  (call Core.svec "some docs\n")
-17  (call Dict{Symbol, Any} :path => "none" :linenumber => 1 :module => TestMod)
-18  (call Base.Docs.docstr %₁₆ %₁₇)
-19  TestMod.Union
-20  TestMod.Tuple
-21  (call core.apply_type %₂₀)
-22  (call core.apply_type %₁₉ %₂₁)
-23  (call Base.Docs.doc! TestMod %₁₅ %₁₈ %₂₂)
-24  (gotoifnot true label₂₇)
-25  slot₁/val
-26  (return %₂₅)
-27  (return core.nothing)
+11  latestworld
+12  (call core.declare_global TestMod :#val#0 true)
+13  latestworld
+14  TestMod.f
+15  (call core.get_binding_type TestMod :#val#0)
+16  (= slot₁/tmp %₁₄)
+17  (call core.isa slot₁/tmp %₁₅)
+18  (gotoifnot %₁₇ label₂₀)
+19  (goto label₂₁)
+20  (= slot₁/tmp (call top.convert %₁₅ slot₁/tmp))
+21  slot₁/tmp
+22  (call core.setglobal! TestMod :#val#0 %₂₁)
+23  (call Base.Docs.Binding TestMod :f)
+24  (call Core.svec "some docs\n")
+25  (call Dict{Symbol, Any} :path => "none" :linenumber => 1 :module => TestMod)
+26  (call Base.Docs.docstr %₂₄ %₂₅)
+27  TestMod.Union
+28  TestMod.Tuple
+29  (call core.apply_type %₂₈)
+30  (call core.apply_type %₂₇ %₂₉)
+31  (call Base.Docs.doc! TestMod %₂₃ %₂₆ %₃₀)
+32  (gotoifnot true label₃₅)
+33  TestMod.#val#0
+34  (return %₃₃)
+35  (return core.nothing)
 
 ########################################
 # Binding docs to callable type
@@ -1348,31 +1356,40 @@ some docs
 function (x::T)()
 end
 #---------------------
-1   (newvar slot₁/val)
-2   (gotoifnot true label₁₁)
-3   TestMod.T
-4   (call core.svec %₃)
-5   (call core.svec)
-6   SourceLocation:nothing:4:0
-7   (call core.svec %₄ %₅ %₆)
-8   --- method core.nothing %₇
+1   (gotoifnot true label₂₀)
+2   TestMod.T
+3   (call core.svec %₂)
+4   (call core.svec)
+5   SourceLocation:nothing:4:0
+6   (call core.svec %₃ %₄ %₅)
+7   --- method core.nothing %₆
     slots: [slot₁/x(!read)]
     1   (return core.nothing)
-9   latestworld
-10  (= slot₁/val core.nothing)
-11  (call Base.Docs.Binding TestMod :T)
-12  (call Core.svec "some docs\n")
-13  (call Dict{Symbol, Any} :path => "none" :linenumber => 1 :module => TestMod)
-14  (call Base.Docs.docstr %₁₂ %₁₃)
-15  TestMod.Union
-16  TestMod.Tuple
-17  (call core.apply_type %₁₆)
-18  (call core.apply_type %₁₅ %₁₇)
-19  (call Base.Docs.doc! TestMod %₁₁ %₁₄ %₁₈)
-20  (gotoifnot true label₂₃)
-21  slot₁/val
-22  (return %₂₁)
-23  (return core.nothing)
+8   latestworld
+9   (call core.declare_global TestMod :#val#1 true)
+10  latestworld
+11  core.nothing
+12  (call core.get_binding_type TestMod :#val#1)
+13  (= slot₁/tmp %₁₁)
+14  (call core.isa slot₁/tmp %₁₂)
+15  (gotoifnot %₁₄ label₁₇)
+16  (goto label₁₈)
+17  (= slot₁/tmp (call top.convert %₁₂ slot₁/tmp))
+18  slot₁/tmp
+19  (call core.setglobal! TestMod :#val#1 %₁₈)
+20  (call Base.Docs.Binding TestMod :T)
+21  (call Core.svec "some docs\n")
+22  (call Dict{Symbol, Any} :path => "none" :linenumber => 1 :module => TestMod)
+23  (call Base.Docs.docstr %₂₁ %₂₂)
+24  TestMod.Union
+25  TestMod.Tuple
+26  (call core.apply_type %₂₅)
+27  (call core.apply_type %₂₄ %₂₆)
+28  (call Base.Docs.doc! TestMod %₂₀ %₂₃ %₂₇)
+29  (gotoifnot true label₃₂)
+30  TestMod.#val#1
+31  (return %₃₀)
+32  (return core.nothing)
 
 ########################################
 # Keyword function with defaults.

@@ -603,7 +603,16 @@ T{U}, (x::Float64, g()) = [Bool, (1, 2)]
 Base.Experimental.@aliasscope 1
 #---------------------
 1   (aliasscope)
-2   (= slot₁/aliasscope_result 1)
-3   (popaliasscope)
-4   slot₁/aliasscope_result
-5   (return %₄)
+2   (call core.declare_global TestMod :#aliasscope_result#0 true)
+3   latestworld
+4   (call core.get_binding_type TestMod :#aliasscope_result#0)
+5   (= slot₁/tmp 1)
+6   (call core.isa slot₁/tmp %₄)
+7   (gotoifnot %₆ label₉)
+8   (goto label₁₀)
+9   (= slot₁/tmp (call top.convert %₄ slot₁/tmp))
+10  slot₁/tmp
+11  (call core.setglobal! TestMod :#aliasscope_result#0 %₁₀)
+12  (popaliasscope)
+13  TestMod.#aliasscope_result#0
+14  (return %₁₃)

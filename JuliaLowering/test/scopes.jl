@@ -1283,3 +1283,67 @@ end
     @test JuliaLowering.include_string(m, "@isdefined not_a_thing_anywhere") === false
     @test JuliaLowering.include_string(m, "f() = @isdefined(Core); f()") === true
 end
+
+# flisp lowers an unescaped assignment at the top level of a hygienic (non-esc)
+# macro expansion to a name-mangled *global* of the eval-target module
+# (`convert-global-assignment`, julia-syntax.scm), emitting a
+# `declare_global`/`latestworld` pair.  JuliaLowering used to classify it as a
+# plain local, which both hid the assignment from the module and skipped the
+# world-age refresh `latestworld` provides -- the latter breaking the
+# `trixi_include`/`@test_include_example` idiom (KernelInterpolation.jl), where a
+# later read of a global defined by a nested `include` in the same top-level
+# thunk failed a world-age check.
+@testset "(AI) hygienic top-level assignment is a name-mangled global (flisp compat)" begin
+    global_names(mod, needle) =
+        filter(s -> occursin(needle, String(s)), names(mod; all=true))
+
+    m = Module(:HygTop)
+    Core.eval(m, :(using JuliaLowering))
+
+    # assignment + later read resolve to the same mangled global, and the
+    # expansion evaluates to the assigned value
+    fl_eval(m, :(macro assign_read(); quote; values_test = 41 + 1; values_test; end; end))
+    @test JuliaLowering.include_string(m, "@assign_read()") == 42
+    # exactly one name-mangled global carrying the base name leaked into the
+    # module, and it is *not* the bare (user-visible) name
+    @test length(global_names(m, "values_test")) == 1
+    @test !Base.isdefinedglobal(m, :values_test)
+
+    # world-age refresh: a nested `include` defines a new global mid-thunk; the
+    # mangled-global assignment's `latestworld` makes it visible to a later read
+    # in the same top-level thunk.  Without the refresh this throws a world-age
+    # UndefVarError (the original KernelInterpolation symptom).
+    Core.eval(m, :(_def_g(mod) = Base.include_string(mod, "itp_g = 100")))
+    fl_eval(m, :(macro include_then_read()
+                     quote
+                         _def_g(@__MODULE__)
+                         values2 = itp_g + 1
+                         values2
+                     end
+                 end))
+    @test JuliaLowering.include_string(m, "@include_then_read()") == 101
+
+    # sibling shapes that stay local: a `let`-bound target and a
+    # function-body target are not at the expansion's top level, so no module
+    # global leaks
+    fl_eval(m, :(macro in_let(); quote; let only_local = 7; only_local + 1; end; end; end))
+    @test JuliaLowering.include_string(m, "@in_let()") == 8
+    @test isempty(global_names(m, "only_local"))
+
+    fl_eval(m, :(macro in_func(); quote; f_hyg() = (fn_local = 3; fn_local); f_hyg(); end; end))
+    @test JuliaLowering.include_string(m, "@in_func()") == 3
+    @test isempty(global_names(m, "fn_local"))
+
+    # an explicit `global` declaration is unaffected: it targets the bare
+    # (unmangled) name in the calling module
+    fl_eval(m, :(macro explicit_global(); quote; global explicitly_global_v = 9; explicitly_global_v; end; end))
+    @test JuliaLowering.include_string(m, "@explicit_global()") == 9
+    @test Base.isdefinedglobal(m, :explicitly_global_v)
+
+    # each expansion gets a *fresh* mangled global (flisp gensyms per
+    # expansion), so two expansions of the same macro don't collide
+    fl_eval(m, :(macro counter(); quote; cval = 5; cval; end; end))
+    @test JuliaLowering.include_string(m, "@counter()") == 5
+    @test JuliaLowering.include_string(m, "@counter()") == 5
+    @test length(global_names(m, "cval")) == 2
+end
