@@ -531,9 +531,21 @@ vst1_calldecl_dot_name_rhs(vcx, st) = @stm st begin
     _ -> @fail(st, "invalid `.` syntax")
 end
 
+# Try the assignment shape *first* so its specific error wins -- e.g. the
+# "all-underscore identifiers are write-only" message for `local x = _`, matching
+# flisp -- instead of being masked by the generic fallback (`|` prefers the first
+# operand's errors when both fail). The generic `@fail` deliberately sits *before*
+# `vst1_symdecl` here, rather than last as at the sibling call sites: unlike the
+# `unknown()`-returning validators those chains fall through, `vst1_symdecl`'s own
+# `_` branch emits a *concrete* "expected identifier or `identifier::type`" error
+# (describing only its `::` half). Placing the generic fallback ahead of it keeps
+# that half-message from surfacing for non-assign, non-symdecl shapes (e.g.
+# `let local a = 1`, which must keep reporting "expected identifier or
+# assignment").
 vst1_symdecl_or_assign(vcx, st) =
+    vst1_assign(vcx, st) |
     @fail(st, "expected identifier or assignment") |
-    vst1_symdecl(vcx, st) | vst1_assign(vcx, st)
+    vst1_symdecl(vcx, st)
 
 vst1_symdecl(vcx, st) = @stm st begin
     [K"Identifier"] -> pass()
