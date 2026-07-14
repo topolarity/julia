@@ -1253,3 +1253,19 @@ end
     @test_throws JuliaLowering.LoweringError JuliaLowering.include_string(
         Module(), "let; global no_such_fn(); end")
 end
+
+@testset "(AI) all-underscore rvalue in a local/global decl reports the specific message" begin
+    # Regression: `vst1_symdecl_or_assign` used to place its generic "expected
+    # identifier or assignment" `@fail` first in a `|` chain, masking
+    # `vst1_assign`'s specific "all-underscore identifiers are write-only" error
+    # for the `local/global x = _` shape (`|` prefers the first operand's errors
+    # when both fail). The message must match flisp and JL's own bare `x = _`
+    # shape.
+    @test_throws JuliaLowering.LoweringError JuliaLowering.include_string(Module(), "local x = _")
+    @test_throws "all-underscore identifiers are write-only" JuliaLowering.include_string(Module(), "local x = _")
+    @test_throws "all-underscore identifiers are write-only" JuliaLowering.include_string(Module(), "global y = _")
+    # Shapes that are genuinely neither a symdecl nor an assignment still get the
+    # generic fallback, unchanged (e.g. a `local`/`function` form as a `let`
+    # binding argument).
+    @test_throws "expected identifier or assignment" JuliaLowering.include_string(Module(), "let local a = 1; end")
+end

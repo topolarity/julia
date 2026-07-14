@@ -73,6 +73,26 @@ y = global x
 #          ╙ ── global declaration doesn't read the variable and can't return a value
 
 ########################################
+# Error: reading a write-only all-underscore rvalue in a local declaration
+# assignment must report the specific "all-underscore" message (as the bare
+# `x = _` / `f(_)` shapes do, and as flisp does), not the generic "expected
+# identifier or assignment" fallback of `vst1_symdecl_or_assign`.
+local x = _
+#---------------------
+LoweringError:
+local x = _
+#         ╙ ── all-underscore identifiers are write-only and their values cannot be used in expressions
+
+########################################
+# Error: reading a write-only all-underscore rvalue in a global declaration
+# assignment must likewise report the specific "all-underscore" message.
+global y = _
+#---------------------
+LoweringError:
+global y = _
+#          ╙ ── all-underscore identifiers are write-only and their values cannot be used in expressions
+
+########################################
 # const
 const xx = 10
 #---------------------
