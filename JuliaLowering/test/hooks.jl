@@ -175,16 +175,19 @@ end
             end
             e
         end
-        # `Expr(:&, ...)` is invalid syntax outside a `ccall` argument list,
-        # so this deterministically throws a `LoweringError` in
+        # `Expr(:&, ...)` is invalid syntax outside a `ccall` argument list, so
+        # this deterministically throws a (non-internal) lowering error in
         # `core_lowering_hook`, with `deep_binary_expr(9)` (~1000s of nodes)
-        # attached as (part of) `code`/`st0`/`st1`.
+        # attached as (part of) `code`/`st0`/`st1`. The hook converts non-internal
+        # lowering errors to `ErrorException` (flisp-compat, see the
+        # `core_lowering_hook` path testset below); the triage log still fires
+        # first, which is what this test exercises.
         ex = Expr(:block, Expr(:&, deep_binary_expr(9)))
 
         io = IOBuffer()
         logger = Base.CoreLogging.SimpleLogger(io)
         Base.CoreLogging.with_logger(logger) do
-            @test_throws JL.LoweringError JL.core_lowering_hook(ex, test_mod)
+            @test_throws ErrorException JL.core_lowering_hook(ex, test_mod)
         end
         logtext = String(take!(io))
 
@@ -242,6 +245,58 @@ end
         try
             JL.activate!()
             @test Core.eval(test_mod, prog) === true
+        finally
+            JL.activate!(false)
+        end
+    end
+
+    @testset "(AI) flisp-compat lowering errors (`core_lowering_hook` path)" begin
+        # The `Core._lower` hook underlying plain `eval`/`include`/toplevel code
+        # must apply the *same* non-internal `LoweringError` -> `ErrorException`
+        # conversion as the `@eval` path above, so `@test_throws ErrorException
+        # eval(bad)` keeps matching (found via Chain, whose `@chain begin _ end`
+        # lowers to a read of an all-underscore temp). `LoweringError <: Exception`
+        # but not `<: ErrorException`.
+        io = IOBuffer()
+        hookerr = Base.CoreLogging.with_logger(Base.CoreLogging.SimpleLogger(io)) do
+            try
+                JL.core_lowering_hook(parsestmt(JL.SyntaxTree, "local x = _"), test_mod)
+                nothing
+            catch e; e; end
+        end
+        @test hookerr isa ErrorException
+        @test occursin("all-underscore", hookerr.msg)
+        # ...and, unlike the `MacroExpansionError` branch, the triage log MUST
+        # still fire for these: PkgEval both-fail sweeps grep this marker to
+        # classify equivalent failures, so the conversion runs *after* logging.
+        @test occursin("JuliaLowering threw given input", String(take!(io)))
+
+        # An `internal` (assertion-class) `LoweringError` stays loud and
+        # propagates unconverted through the hook. `const (a, b) = c = (1, 2)`
+        # currently trips an internal lowering error (see the `@test_broken` in
+        # test/assignments.jl); if that path is ever fixed, pick another
+        # internal-error trigger here.
+        io2 = IOBuffer()
+        ierr = Base.CoreLogging.with_logger(Base.CoreLogging.SimpleLogger(io2)) do
+            try
+                JL.core_lowering_hook(parsestmt(Expr, "const (hk_a, hk_b) = hk_c = (1, 2)"), test_mod)
+                nothing
+            catch e; e; end
+        end
+        @test ierr isa JL.LoweringError
+        @test ierr.internal === true
+
+        # The programmatic API keeps raising the richer `LoweringError` unchanged
+        # (the rest of this suite relies on that).
+        @test_throws JL.LoweringError JL.eval(test_mod, parsestmt(JL.SyntaxTree, "local x = _"))
+        @test_throws JL.LoweringError JL.include_string(test_mod, "local x = _")
+
+        # End-to-end through the real `Core.eval` toplevel path under an active
+        # lowerer (Chain's exact `eval(quote ... end)` shape): the ubiquitous
+        # `@test_throws ErrorException eval(bad)` idiom now matches.
+        try
+            JL.activate!()
+            @test_throws ErrorException Core.eval(test_mod, :(local ex_u = _))
         finally
             JL.activate!(false)
         end

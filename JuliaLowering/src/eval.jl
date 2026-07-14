@@ -1174,9 +1174,13 @@ end
 #   `@test_throws LoadError @eval @somemacro(bad)` -- found via StationXML /
 #   StrLiterals).
 #
-# The conversions live here, on the `@eval` path (and, for the
-# `MacroExpansionError` case, in `core_lowering_hook`, the `Core.eval`/`include`
-# path), rather than in `eval` itself: `eval`/`include_string`/`lower` are
+# Both conversions live here, on the `@eval` path, and are mirrored in
+# `core_lowering_hook` -- the `Core._lower` hook underlying plain
+# `eval`/`include`/toplevel code -- which performs the same
+# `MacroExpansionError`->`LoadError` and non-internal
+# `LoweringError`->`ErrorException` conversions so every top-level-eval entry
+# point honors flisp's contract, not just explicit `@eval`. They live here (and
+# in the hook) rather than in `eval` itself: `eval`/`include_string`/`lower` are
 # JuliaLowering's programmatic API and its own test suite asserts the richer
 # `LoweringError`/`MacroExpansionError` through them, so they must keep raising
 # them (mirroring flisp's introspection-only `macroexpand`, which does not

@@ -675,9 +675,11 @@ end
                 :T, :N, :P)
     ci = JL.core_lowering_hook(expr, test_mod)[1]
     @test any(==(Expr(:static_parameter, 3)), ci.code)
-    # a non-lambda payload stays rejected (flisp: "malformed expression")
+    # a non-lambda payload stays rejected (flisp: "malformed expression"). The
+    # hook converts this non-internal lowering error to `ErrorException` for
+    # flisp compat (see the `core_lowering_hook` path testset in test/hooks.jl).
     bad = Expr(Symbol("with-static-parameters"), Expr(:block, Expr(:return, 1)), :T)
-    @test_throws JL.LoweringError JL.core_lowering_hook(bad, test_mod)
+    @test_throws ErrorException JL.core_lowering_hook(bad, test_mod)
 end
 
 @testset "`(meta generated gen)` keeps the generator evaluable" begin

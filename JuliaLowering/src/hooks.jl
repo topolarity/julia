@@ -125,6 +125,27 @@ function core_lowering_hook(@nospecialize(code), mod::Module, file::Union{String
                   code=TruncatedForLog(code), st0=TruncatedForLog(st0), st1=TruncatedForLog(st1),
                   file=file, line=line, mod=mod)
         end
+        if exc isa LoweringError && !exc.internal
+            # A user-facing (`internal=false`) lowering error. flisp surfaces these
+            # from plain `eval`/`include`/toplevel code as an ordinary
+            # `ErrorException` (its `Expr(:error, msg)` sentinel becomes `jl_error`
+            # at the C/lisp boundary), but `LoweringError` is `<: Exception` and NOT
+            # `<: ErrorException`, silently breaking the very common
+            # `@test_throws ErrorException eval(bad)` idiom (found via Chain). Mirror
+            # `eval_flisp_compat`'s `@eval`-path conversion here so this
+            # `Core._lower` boundary -- hit by plain `eval`, `include`, module
+            # bodies, REPL input, etc. -- honors the same flisp contract. When this
+            # rethrows through the C `include` driver it is wrapped in `LoadError`
+            # exactly as flisp's `ErrorException` would be. `internal`
+            # (assertion-class) `LoweringError`s stay loud and unconverted.
+            #
+            # Unlike the `MacroExpansionError` branch above, this conversion runs
+            # *after* the triage log on purpose: our PkgEval both-fail sweeps grep
+            # the "JuliaLowering threw given input" line to classify equivalent
+            # failures, so these must keep being logged even though we then rewrite
+            # the exception type.
+            throw(ErrorException(_lowering_error_message(exc)))
+        end
         rethrow(exc)
 
         # TODO: Re-enable flisp fallback once we're done collecting errors
