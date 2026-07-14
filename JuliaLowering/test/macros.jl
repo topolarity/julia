@@ -3176,3 +3176,60 @@ end
         @test JuliaLowering.include_string(stage_mod, "fgen(3)") == 6
     end
 end
+
+@testset "(AI) shape-preserving decorator over escaped def stays let-local (flisp compat)" begin
+    # A "decorator" macro whose entire expansion is just the user's own
+    # *escaped* definition (`@id(x) = esc(x)`, the `@inline`/`@noinline`/
+    # `@propagate_inbounds` shape) must NOT be mistaken for a macro that emits a
+    # method at the root of its *own* expansion.  The def name keeps its
+    # caller-side hygiene layer (it is not on the decorator's fresh expansion
+    # layer), so a `let`-scoped `f` stays a lexical local -- defined in no
+    # module -- exactly as flisp resolves it, rather than being reclassified a
+    # global of the calling macro's home module (`M` below).
+    #
+    # This is the latent 1-level divergence: even where the old code did not
+    # error, it leaked `M.f` as a global; flisp keeps `f` a let-local.  Once the
+    # same macro self-nests >= 2 levels the inner def sits inside a real
+    # enclosing function, and the mis-reclassification used to raise a spurious
+    # "Global method definition needs to be placed at the top level"
+    # LoweringError.  (Real-world: Trapz's `@trapz` recursing through a
+    # `let`-scoped `@inline f(...) = ...`.)  A decorator at *genuine* top level
+    # still defines in the caller's module, and a macro that genuinely emits an
+    # unescaped root method still binds a macro-home global (see the
+    # "old-style macro method-def name" testset above).
+    src = raw"""
+        const HERE = @__MODULE__
+        module Dec
+            macro id(x); esc(x); end
+        end
+        module M
+            using ..Dec
+            macro m(v, expr)
+                quote
+                    let
+                        Dec.@id f($(esc(v))) = $(esc(expr))
+                        f(1)
+                    end
+                end
+            end
+        end
+        using .M
+        Dec.@id topf(z) = z + 100           # decorator at genuine top level
+        one_level = M.@m x begin x + 1 end  # 1-level: `f` is a let-local
+        two_level = M.@m x begin            # 2-level self-nesting
+            M.@m y begin
+                x + y
+            end
+        end
+        results() = (topf(1), one_level, two_level,
+                     isdefined(HERE, :topf),        # decorator@toplevel defines here
+                     isdefined(HERE, :f), isdefined(M, :f), isdefined(Dec, :f))
+    """
+    mfl = Module(); Base.include_string(mfl, src); Core.@latestworld
+    mjl = Module(); JuliaLowering.include_string(mjl, src; expr_compat_mode=true)
+    Core.@latestworld
+    # topf defined at top level; both nesting levels evaluate to 2; `f` is a
+    # let-local defined in no module.
+    @test mfl.results() == (101, 2, 2, true, false, false, false)
+    @test mjl.results() == mfl.results()
+end

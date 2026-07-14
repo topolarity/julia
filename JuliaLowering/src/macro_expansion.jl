@@ -345,7 +345,7 @@ function expand_macro(ctx::MacroExpansionContext, st::SyntaxTree)
         (new_macro_mi !== nothing ? JL_NEW_SYNTAX_VERSION : JL_OLD_SYNTAX_VERSION), false)
     st_out2 = apply_expansion_layer(ctx, st_out, sc2, true, 0, 0)
     st_res = !ctx.recursive ? st_out2 : expand_forms_1(ctx, st_out2)
-    mark_expansion_root_method!(st_res)
+    mark_expansion_root_method!(st_res, sc2.layer)
     st_res
 end
 
@@ -353,7 +353,20 @@ end
 # expansion as a plain global of the macro's home module, unlike a nested (e.g.
 # block- or quote-wrapped) def, which stays hygienically renamed.  Mark the root
 # def name so scope analysis can reproduce that rule (see `_find_scope_decls!`).
-function mark_expansion_root_method!(st)
+#
+# The name must belong to *this* macro's own expansion layer (`expansion_layer`,
+# the fresh layer `apply_expansion_layer` stamps on unescaped syntax).  A name
+# the macro instead passed through with `esc` keeps its caller-side layer, so it
+# is not the root of this expansion: flisp resolves it in the caller's scope (a
+# lexical local, or a global of the *caller's* module), never as a global of
+# this macro's home module.  Without this check, a shape-preserving "decorator"
+# macro (e.g. `@inline f(x) = ...`, or a bare `@id(x) = esc(x)`) whose entire
+# expansion is just the user's escaped definition would be mistaken for a macro
+# that genuinely emits a method at the root of its expansion -- reclassifying a
+# `let`-local `f` as a home-module global and, once such a def is nested inside
+# a real enclosing function (self-recursive macro use), raising a spurious
+# "Global method definition needs to be placed at the top level" error.
+function mark_expansion_root_method!(st, expansion_layer)
     k = kind(st)
     if k === K"function" && numchildren(st) == 1
         name = st[1] # `function f end` forward declaration
@@ -367,8 +380,11 @@ function mark_expansion_root_method!(st)
     else
         return
     end
-    kind(name) === K"Identifier" && !hasattr(name, :mod) &&
-        setmeta!(name, :expansion_root_method, true)
+    if kind(name) === K"Identifier" && !hasattr(name, :mod)
+        nsc = get(name, :context, nothing)::Union{Nothing, SyntaxContext}
+        nsc !== nothing && nsc.layer === expansion_layer &&
+            setmeta!(name, :expansion_root_method, true)
+    end
     nothing
 end
 
