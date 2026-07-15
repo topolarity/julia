@@ -1168,19 +1168,11 @@ precompile_test_harness("precompiletools") do dir
 end
 
 precompile_test_harness("cfunction adapter serialization") do dir
-    # A @cfunction whose declared C ABI differs from its target's specsig needs an ABI
-    # adapter. When the enclosing method is precompiled with native code, that adapter is
-    # compiled into the package image and its dispatch trampoline (jl_dispatch_trampoline_t) is
-    # serialized with the adapter wired into `fptr` -- exercising the trampoline serializer
-    # (jl_get_adapter_id / fptr_record) and jl_reintern_trampoline on load. Each adapter branch
-    # reachable from @cfunction is covered: specsig widening (well-inferred Cint boxed to `Any`)
-    # and narrowing (`Any`-returning target narrowed to `Cint`), const-return, the boxed args ABI
-    # (vararg target), and the codeinst == NULL dispatcher (both a missing method that throws and
-    # an abstract `Any` argument that dispatches at call time).
     CFuncMod = :CFuncAdapter0x6f2c1d8a
     write(joinpath(dir, "$CFuncMod.jl"),
           """
           module $CFuncMod
+              llvm_version() = ccall(:jl_get_LLVM_VERSION, UInt32, ())       # 0 = no-codegen stub
               box_target(x::Cint) = x                                        # well-inferred Cint
               any_target(x::Cint) = Core.compilerbarrier(:type, x + Cint(1)) # inferred ::Any
               const_target(x::Cint) = Cint(42)                               # const-return
@@ -1224,6 +1216,7 @@ precompile_test_harness("cfunction adapter serialization") do dir
               precompile(run_unresolved, (Cint,))
               precompile(run_dispatch, (Cint,))
               precompile(run_dup, (Cint,))
+              precompile(llvm_version, ())
           end
           """)
     Base.compilecache(Base.PkgId(string(CFuncMod)))
@@ -1238,17 +1231,54 @@ precompile_test_harness("cfunction adapter serialization") do dir
     @test Base.invokelatest(M.run_args, Cint(9)) == Cint(1)
     @test_throws MethodError Base.invokelatest(M.run_unresolved, Cint(3))
     @test Base.invokelatest(M.run_dispatch, Cint(5)) === Cint(5)
-    # Two @cfunction call sites with the same (sigt, rt) share one interned trampoline, so the
-    # image can emit duplicate adapter records for it. Each record gets its own fvar slot (just as
-    # each CodeInstance does), so `fptr_record` stays 1:1 and every record's fptr is wired -- a
-    # shared fvar slot would instead leave one record's fptr NULL (a null call after load).
     @test Base.invokelatest(M.run_dup, Cint(5)) === (Cint(5), Cint(5))
-    # With pkgimage native code the adapters were compiled in and wired into the trampolines'
-    # `fptr`s, so these calls reuse them and never JIT a fresh adapter (the no-JIT path that
-    # --trim relies on). Without pkgimages nothing was precompiled to reuse, so only check the
-    # results above.
     if Bool(Base.JLOptions().use_pkgimages)
+        # With pkgimage native code the adapters were compiled in and wired into the trampolines'
+        # `fptr`s, so these calls reuse them and never JIT a fresh adapter (the no-JIT path that
+        # --trim relies on).
+        # Without pkgimages nothing was precompiled to reuse, so only check the results above.
         @test adapter_count() == n0
+
+        # Re-run the whole adapter matrix in a build without codegen (julia#61949):
+        # JULIA_LOAD_CODEGEN_LIB=0 makes the loader skip libjulia-codegen and install the
+        # codegen-stubs fallbacks, so every call below must be served by the adapters serialized
+        # into the pkgimage above -- and after a method redefinition, the resolver must fall
+        # back to the image-serialized ci == NULL dynamic-dispatch adapter rather than error.
+        # The llvm=0 probe proves codegen was really absent (a top-level ccall needs the
+        # compiler, so the probe lives in the precompiled module).
+        sep = Sys.iswindows() ? ";" : ":"
+        script = """
+            using $CFuncMod
+            const M = $CFuncMod
+            println("llvm=", M.llvm_version())
+            println("widen=", M.run_widen(Cint(5)))
+            println("narrow=", M.run_narrow(Cint(7)))
+            println("const=", M.run_const(Cint(3)))
+            println("args=", M.run_args(Cint(9)))
+            println("dispatch=", M.run_dispatch(Cint(5)))
+            println("dup=", M.run_dup(Cint(5)))
+            println("unresolved=", try; M.run_unresolved(Cint(3)); "no-error"; catch e; e isa MethodError ? "MethodError" : "other-error"; end)
+            @eval M box_target(x::Cint) = x + Cint(100)
+            println("redef=", Base.invokelatest(M.run_widen, Cint(5)))
+            """
+        outbuf = IOBuffer(); errbuf = IOBuffer()
+        cmd = addenv(`$(Base.julia_cmd()) --startup-file=no -e $script`,
+                     "JULIA_LOAD_CODEGEN_LIB" => "0",
+                     "JULIA_LOAD_PATH" => dir * sep * "@stdlib",
+                     "JULIA_DEPOT_PATH" => first(DEPOT_PATH) * sep)
+        proc = run(pipeline(ignorestatus(cmd), stdout=outbuf, stderr=errbuf))
+        out = String(take!(outbuf))
+        success(proc) || println(stderr, "codegen-free child failed:\n", String(take!(errbuf)))
+        @test success(proc)
+        @test occursin("llvm=0", out)              # codegen really was absent
+        @test occursin("widen=5", out)             # cached specsig-widening adapter
+        @test occursin("narrow=8", out)            # cached narrowing adapter
+        @test occursin("const=42", out)            # cached const-return adapter
+        @test occursin("args=1", out)              # cached boxed-args adapter
+        @test occursin("dispatch=5", out)          # cached dynamic-dispatch adapter
+        @test occursin("dup=(5, 5)", out)          # shared trampoline, both sites wired
+        @test occursin("unresolved=MethodError", out)
+        @test occursin("redef=105", out)           # dispatcher re-query after redefinition
     end
 end
 

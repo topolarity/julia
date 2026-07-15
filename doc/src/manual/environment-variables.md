@@ -616,3 +616,10 @@ Arguments to be passed to the LLVM backend.
 ### `JULIA_FALLBACK_REPL`
 
 Forces the fallback repl instead of REPL.jl.
+
+### `JULIA_LOAD_CODEGEN_LIB`
+
+If set to `0` or `no`, the loader does not load `libjulia-codegen`, and the
+fallback (interpreter-only) implementations in `libjulia-internal` are used
+instead — exactly as if the library were absent from the installation. Intended
+for testing and debugging the no-codegen configuration.

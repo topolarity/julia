@@ -362,7 +362,10 @@ __attribute__((constructor)) void jl_load_libjulia_internal(void) {
                 libjulia_internal = load_library(curr_dep, lib_dir, 1);
             } else if (special_idx == 2) {
                 // This special library is `libjulia-codegen`
-                libjulia_codegen = load_library(curr_dep, lib_dir, 0);
+                const char *load_codegen = getenv("JULIA_LOAD_CODEGEN_LIB");
+                if (load_codegen == NULL ||
+                        (strcmp(load_codegen, "0") != 0 && strcmp(load_codegen, "no") != 0))
+                    libjulia_codegen = load_library(curr_dep, lib_dir, 0);
             }
             special_idx++;
         } else {
