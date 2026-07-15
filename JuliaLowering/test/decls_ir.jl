@@ -66,11 +66,37 @@ end
 
 ########################################
 # Error: Global declaration not allowed in value position
+# flisp's `expand-local-or-global-decl` special-cases a lone bare `global x`
+# (no type) and leaves it value-less, so `y = global x` is a syntax error
+# ("misplaced global declaration") -- we reject the same shape here.
 y = global x
 #---------------------
 LoweringError:
 y = global x
 #          ╙ ── global declaration doesn't read the variable and can't return a value
+
+########################################
+# (AI) A *typed* (or multi-name) global decl in value position lowers to
+# `nothing`, mirroring flisp's `expand-decls` trailing `(null)`.  This is the
+# shape `@doc` generates for a docstring on a bare `global x::T`.
+y = global x::Int
+#---------------------
+1   TestMod.Int
+2   (call core.declare_global TestMod :x true %₁)
+3   latestworld
+4   (call core.declare_global TestMod :x false)
+5   latestworld
+6   (call core.declare_global TestMod :y true)
+7   latestworld
+8   (call core.get_binding_type TestMod :y)
+9   (= slot₁/tmp core.nothing)
+10  (call core.isa slot₁/tmp %₈)
+11  (gotoifnot %₁₀ label₁₃)
+12  (goto label₁₄)
+13  (= slot₁/tmp (call top.convert %₈ slot₁/tmp))
+14  slot₁/tmp
+15  (call core.setglobal! TestMod :y %₁₄)
+16  (return core.nothing)
 
 ########################################
 # Error: reading a write-only all-underscore rvalue in a local declaration

@@ -241,6 +241,46 @@ test_mod_2 = Module()
     @test Base.binding_kind(test_mod_2, :v6) == Base.PARTITION_KIND_CONST
 end
 
+@testset "(AI) bare decl in value position is `nothing` (flisp compat)" begin
+    # A docstring attached to a definition expands (via `@doc`) to code that
+    # captures the definition's *value*, so any declaration form can end up in
+    # value position.  flisp's `expand-decls` (src/julia-syntax.scm) appends a
+    # trailing `(null)` when a decl carries no initializer, giving it the value
+    # `nothing` in any expression context.  Regression for the FlatRBAC/Revise
+    # precompile failure (docstring on a bare `global basesrccache::String`).
+    m = Module()
+    # typed global decl in value position -> nothing
+    @test JuliaLowering.include_string(m, "val = (global gx::Int); val") === nothing
+    # multi-name global decls (untyped and typed) -> nothing
+    @test JuliaLowering.include_string(m, "val = (global gy, gz); val") === nothing
+    @test JuliaLowering.include_string(m, "val = (global gp::Int, gq::Float64); val") === nothing
+    # the decl is *not* the value-producing tail here: value comes from `7`
+    @test JuliaLowering.include_string(m, "val = begin; global gr::Int; 7; end; val") === 7
+    # decl as the tail of a nested if-branch -- the exact shape `@doc` generates
+    @test JuliaLowering.include_string(m, "val = (if true; global gs::Int; else; 2; end); val") === nothing
+    # local decls in value position (inside a function body) -> nothing
+    @test JuliaLowering.include_string(m, "f() = (v = (local lx); v); f()") === nothing
+    @test JuliaLowering.include_string(m, "g() = (v = (local ly::Int); v); g()") === nothing
+    @test JuliaLowering.include_string(m, "h() = (v = (local lm, ln); v); h()") === nothing
+    # an *initializing* global/const decl still yields the assigned value
+    @test JuliaLowering.include_string(m, "val = (global gi = 5); val") === 5
+    @test JuliaLowering.include_string(m, "val = (const gc = 6); val") === 6
+    # end-to-end: a docstring on a bare `global x::T` (reduced MWE) lowers,
+    # evaluates to `nothing`, and registers the docstring.
+    dm = Module()
+    @test JuliaLowering.include_string(dm, "\"\"\"docstring for gd\"\"\"\nglobal gd::Int") === nothing
+    @test occursin("docstring for gd", string(JuliaLowering.include_string(dm, "@doc gd")))
+end
+
+@testset "(AI) bare single-name global in value position is rejected (flisp compat)" begin
+    # flisp's `expand-local-or-global-decl` special-cases a *single* bare
+    # `global x` (a lone symbol, no type) by leaving it a value-less
+    # declaration, so `y = global x` is a syntax error ("misplaced global
+    # declaration").  JuliaLowering keeps rejecting exactly this shape.
+    m = Module()
+    @test_throws JuliaLowering.LoweringError JuliaLowering.include_string(m, "y = global gg")
+end
+
 @testset "decls on functions" begin
     # local
     @gensym func func2

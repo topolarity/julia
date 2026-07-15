@@ -2333,8 +2333,10 @@ function expand_decls(ctx, ex)
     declkind = kind(ex)
     @jl_assert declkind in KSet"local global" ex
     stmts = SyntaxList(ctx)
+    has_assign = false
     for c in children(ex)
         simple = kind(c) in KSet"Identifier :: Placeholder"
+        has_assign |= !simple
         if declkind === K"global"
             if kind(c) === K"="
                 (lhs, relayered) = relayer_global_if_unhygienic(ctx, c[1]);
@@ -2358,6 +2360,19 @@ function expand_decls(ctx, ex)
         # type decls are handled elsewhere unless simple
         make_lhs_decls(ctx, stmts, declkind, get(ex, :meta, nothing), lhs, simple)
         simple || push!(stmts, expand_forms_2(ctx, c))
+    end
+    # Mirror flisp's `expand-decls` (src/julia-syntax.scm): when a decl carries
+    # no initializing assignment, append a trailing `nothing` so the whole form
+    # has a well-defined value (`nothing`) in any expression context.  flisp's
+    # `expand-local-or-global-decl` special-cases a *single* bare name
+    # (`global x` / `local x`) by leaving it untouched (no trailing null), so a
+    # bare single-name `global` decl remains value-less and is still rejected in
+    # value position -- we reproduce that by not appending here for that shape.
+    # (A lone `Placeholder` lowers to an empty decl block that already evaluates
+    # to `nothing`, so its inclusion in the bypass is behavior-neutral.)
+    is_single_bare_name = numchildren(ex) == 1 && kind(ex[1]) in KSet"Identifier Placeholder"
+    if !has_assign && !is_single_bare_name
+        push!(stmts, @ast ctx ex (::K"nothing"))
     end
     newnode(ctx, ex, K"block", stmts)
 end
