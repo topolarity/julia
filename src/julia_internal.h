@@ -1903,6 +1903,17 @@ jl_typemap_entry_t *jl_typemap_assoc_by_type(
         struct jl_typemap_assoc *search,
         int8_t offs, uint8_t subtype) JL_CANSAFEPOINT;
 
+// jl_typemap_list_t operations (see julia.h for the structure and its invariants).
+// Readers are lock-free; mutation requires the owning cache's writelock, and a
+// lock-free lookup miss is definitive only under that lock. The caller computes the
+// query key's hash in place with the same scheme as the cache's `config->hash`.
+JL_DLLEXPORT jl_value_t *jl_typemap_list_lookup(jl_typemap_list_t *map JL_PROPAGATES_ROOT,
+        jl_value_t *sigt, uintptr_t hash, void *key) JL_CANSAFEPOINT;
+// Caller holds the cache writelock, has confirmed absence, and roots `rec` (which must
+// keep `sigt` reachable).
+JL_DLLEXPORT void jl_typemap_list_insert(jl_typemap_list_t *map, jl_value_t *owner,
+        jl_value_t *sigt, jl_value_t *rec) JL_CANSAFEPOINT;
+
 jl_typemap_entry_t *jl_typemap_level_assoc_exact(jl_typemap_level_t *cache, jl_value_t *arg1, jl_value_t **args, size_t n, int8_t offs, size_t world) JL_CANSAFEPOINT;
 jl_typemap_entry_t *jl_typemap_entry_assoc_exact(jl_typemap_entry_t *mn, jl_value_t *arg1, jl_value_t **args, size_t n, size_t world) JL_CANSAFEPOINT;
 STATIC_INLINE jl_typemap_entry_t *jl_typemap_assoc_exact(

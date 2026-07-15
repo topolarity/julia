@@ -1052,6 +1052,27 @@ typedef struct _jl_methtable_t {
     jl_genericmemory_t *backedges; // IdDict{top typenames, Vector{uncovered (sig => caller::CodeInstance)}}
 } jl_methtable_t;
 
+// jl_typemap_list_t: a two-tier cache of intrusive records: `sigt` is compared by
+// type-equality (via a TypeMap tree, since type-equality admits no sound hash), then
+// records within a sigt bucket by the cache's `match` predicate. A bucket is an
+// append-only list until it reaches the cache's `max_list_count`, after which it is
+// re-indexed as an open-addressed table over the cache's `hash`, which must be
+// match-compatible (matching records hash equally; a constant is legal). The `config`
+// pointer is hidden (non-GC) state, (re)set by the owning cache's init hook at
+// bootstrap and after image restore.
+#define JL_TYPEMAP_LIST_NO_HASHMAP (~(unsigned)0)
+typedef struct {
+    size_t next_offset;           // offsetof the record's intrusive `next` field
+    unsigned max_list_count;      // bucket size that triggers hash re-indexing
+    uintptr_t (*hash)(jl_value_t *rec);
+    int (*match)(jl_value_t *rec, void *key);
+} jl_typemap_list_config_t;
+typedef struct _jl_typemap_list_t {
+    _Atomic(jl_typemap_t*) root;  // (sigt) -> record list or Memory{Any} table
+// hidden fields:
+    const jl_typemap_list_config_t *config;
+} jl_typemap_list_t;
+
 typedef struct {
     JL_DATA_TYPE
     jl_sym_t *head;
