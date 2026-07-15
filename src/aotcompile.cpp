@@ -904,7 +904,7 @@ static int jl_experiment_skip_from_image(void) JL_NOTSAFEPOINT
 // relocatable object and includes it in the final image link. This process
 // writes a manifest (<output-o>.reuse) listing the donor images and the GOT
 // slot bindings the unlinker must apply.
-static int jl_reuse_image_code_enabled(void) JL_NOTSAFEPOINT
+extern "C" JL_DLLEXPORT_CODEGEN int jl_reuse_image_code_enabled(void) JL_NOTSAFEPOINT
 {
 #if !defined(_OS_LINUX_)
     return 0;   // prototype is ELF/Linux-only
@@ -1444,6 +1444,8 @@ static void jl_emit_native_to_output(jl_native_code_desc_t *data, jl_array_t *co
     // image's data (inference-only cache entry, natively compiled for the
     // first time here) vs allocated fresh in this session
     size_t n_ci_inferonly = 0, n_ci_inferonly_const = 0, n_ci_session = 0;
+    std::map<std::string, size_t> session_fresh_mods;
+    std::vector<std::string> session_fresh_samples;
     size_t i, l;
     for (i = 0, l = jl_array_nrows(codeinfos); i < l; i++) {
         // each item in this list is either a CodeInstance followed by a CodeInfo indicating something
@@ -1460,8 +1462,22 @@ static void jl_emit_native_to_output(jl_native_code_desc_t *data, jl_array_t *co
                     if (jl_atomic_load_relaxed(&codeinst->invoke) == jl_fptr_const_return_addr)
                         n_ci_inferonly_const++;
                 }
-                else
+                else {
                     n_ci_session++;
+                    if (getenv("JULIA_REUSE_DEBUG")) {
+                        jl_method_instance_t *mi = jl_get_ci_mi(codeinst);
+                        if (jl_is_method(mi->def.method)) {
+                            jl_module_t *mod = mi->def.method->module;
+                            while (mod->parent != NULL && mod->parent != mod)
+                                mod = mod->parent;
+                            session_fresh_mods[jl_symbol_name(mod->name)]++;
+                            if (session_fresh_samples.size() < 25)
+                                session_fresh_samples.push_back(
+                                    std::string(jl_symbol_name(mi->def.method->module->name)) + "." +
+                                    jl_symbol_name(mi->def.method->name));
+                        }
+                    }
+                }
             }
             if (jl_atomic_load_relaxed(&codeinst->flags) & JL_CI_FLAGS_FROM_IMAGE) {
                 n_ci_from_image++;
@@ -1530,9 +1546,25 @@ static void jl_emit_native_to_output(jl_native_code_desc_t *data, jl_array_t *co
     }
 
     if (jl_experiment_skip_from_image() || reuse_mode || getenv("JULIA_REPORT_IMAGE_REUSE"))
+    {
         jl_safe_printf("jl_emit_native_to_output: %zu CodeInstance events: machine code %zu reused / %zu emitted; %zu const/no-code, %zu duplicate, %zu skipped (origin: %zu FROM_IMAGE, %zu inference-only-from-image (%zu const/builtin), %zu session-fresh)\n",
                        n_ci_total, n_ci_reused, n_ci_emitted, n_ci_const, n_ci_dup, n_ci_skipped,
                        n_ci_from_image, n_ci_inferonly, n_ci_inferonly_const, n_ci_session);
+        if (getenv("JULIA_REUSE_DEBUG") && !session_fresh_mods.empty()) {
+            std::vector<std::pair<size_t, std::string>> by_count;
+            for (auto &kv : session_fresh_mods)
+                by_count.push_back({kv.second, kv.first});
+            std::sort(by_count.rbegin(), by_count.rend());
+            std::string line = "session-fresh by root module:";
+            for (size_t k = 0; k < by_count.size() && k < 12; k++)
+                line += " " + by_count[k].second + "=" + std::to_string(by_count[k].first);
+            jl_safe_printf("%s\n", line.c_str());
+            line = "session-fresh samples:";
+            for (auto &s2 : session_fresh_samples)
+                line += " " + s2;
+            jl_safe_printf("%s\n", line.c_str());
+        }
+    }
 
     emit_always_inline(out,
                        [&ci_infos](jl_code_instance_t *ci) { return ci_infos.lookup(ci); });
