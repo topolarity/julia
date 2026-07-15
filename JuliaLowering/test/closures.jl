@@ -1584,3 +1584,85 @@ end
     a = JuliaLowering.include_string(m, "h = x -> x + 1; h")
     @test startswith(String(first(methods(a)).name), "#")
 end
+
+@testset "(AI) nested anonymous closure keeps its `#`-leading name" begin
+    # A genuinely anonymous closure (`->`, anonymous `function`, `do`-block)
+    # nested inside a named enclosing method must still report a `#`-leading
+    # "anonymous" name — `startswith(string(f), "#")` — matching flisp.  The
+    # folk idiom `startswith(string(f), "#")` as an "is this anonymous?" test is
+    # a de-facto public observable (e.g. Kirstine v0.9.0
+    # `src/transformation.jl`).  Regression for the `closure_type_basename`
+    # anonymous-closure branch; see `bugs/closure-anon-naming`.
+    m = Module()
+
+    # Each shape returns the nested anonymous closure value.
+    arrow = JuliaLowering.include_string(m,
+        "function gen_a(); dt = p -> p; dt; end; gen_a()")
+    anonfn = JuliaLowering.include_string(m,
+        "function gen_f(); dt = function (p); p; end; dt; end; gen_f()")
+    doblock = JuliaLowering.include_string(m, """
+        function gen_d()
+            local captured = nothing
+            map([1]) do x
+                captured = (y -> y)
+                x
+            end
+            captured
+        end
+        gen_d()
+        """)
+    anon_in_named = JuliaLowering.include_string(m, """
+        function gen_deep()
+            function inner()
+                z -> z
+            end
+            inner()
+        end
+        gen_deep()
+        """)
+    anon_in_anon = JuliaLowering.include_string(m,
+        "function gen_n(); o = p -> (q -> (p, q)); (o, o(1)); end; gen_n()")
+
+    for (shape, f) in (("nested arrow", arrow),
+                       ("nested anonymous function", anonfn),
+                       ("nested do-block", doblock),
+                       ("anon in named-inner in method", anon_in_named),
+                       ("anon nested in anon (outer)", anon_in_anon[1]),
+                       ("anon nested in anon (inner)", anon_in_anon[2]))
+        # The `string(f)` observable begins with `#` ...
+        @test startswith(string(f), "#")
+        # ... and `string` reports the demangled name, not the `var"..."()`
+        # constructor fallback (which would occur if `name === singletonname`).
+        @test !occursin("(", string(f))
+        # `singletonname` (what `show`/`string`/`nameof` use) is distinct from
+        # the raw type name and is itself `#`-leading.
+        tn = Base.typename(typeof(f))
+        @test tn.name !== tn.singletonname
+        @test startswith(String(tn.singletonname), "#")
+    end
+
+    # Numbering: multiple anonymous closures in one parent get distinct types
+    # (distinct disambiguating counters), each `#`-leading.
+    multi = JuliaLowering.include_string(m, """
+        function gen_m()
+            a = p -> p
+            b = q -> q
+            c = function (r); r; end
+            (a, b, c)
+        end
+        gen_m()
+        """)
+    @test all(startswith(string(f), "#") for f in multi)
+    @test typeof(multi[1]) !== typeof(multi[2]) !== typeof(multi[3])
+
+    # Non-regression: a BARE (non-nested) anonymous closure is `#`-leading.
+    bare = JuliaLowering.include_string(m, "p -> p")
+    @test startswith(string(bare), "#")
+
+    # Non-regression: a NAMED inner function is NOT `#`-leading (reports its own
+    # name), unchanged by this fix (see the 404020bd01 testset above).
+    named = JuliaLowering.include_string(m,
+        "function gen_named(); inner(p) = p; inner; end; gen_named()")
+    @test !startswith(string(named), "#")
+    @test string(named) == "inner"
+end

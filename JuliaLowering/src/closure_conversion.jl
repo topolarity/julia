@@ -300,14 +300,44 @@ end
 # canonicalized-anonymous typename (`is_canonicalized_anonfn_typename`) and
 # keep its leading `#`, which is the naming divergence this repairs.
 #
-# Anonymous functions and other already-mangled own names (starting with `#`)
-# keep JuliaLowering's outer-to-inner scheme.  For a *named* local function
-# whose own name starts with `#` (e.g. a gensym'd `var"#name"`), this still
-# reports the enclosing name where flisp strips the leading `#` and reports
-# `name` — a known residual divergence with no known consumer (such names are
-# themselves gensyms); see bugs/nested-closure-nameof/QUESTIONS.md.
+# Genuinely anonymous closures (`->`, anonymous `function`, `do`-blocks) are
+# desugared with the synthetic own-names in `_ANON_OWNNAMES` (see
+# `desugaring.jl`).  These own-names themselves contain embedded `#`s, so the
+# generic `startswith(own, '#')` scheme below splices the enclosing method name
+# *between* the leading `#` and those embedded `#`s (`#<outer>##anon###<i>`).
+# `jl_new_typename_in` derives the displayed name (`singletonname`, used by
+# `show`/`string`/`repr` of the closure and by `nameof` of a bound singleton)
+# by running the C demangler `jl_demangle_typename` over this raw name.  For
+# `#<outer>##anon###<i>` the demangler's canonical-anonymous check
+# (`is_canonicalized_anonfn_typename`) fails — after the first `##` comes
+# `anon`/`->`, not digits — so it falls through to its default branch and strips
+# the leading `#`, giving `outer##anon`, which loses the "looks anonymous"
+# signal that `startswith(string(f), "#")` consumers (e.g. Kirstine) rely on.
+#
+# We instead emit `##<outermost>##` (a *doubled* leading `#`), so the raw name
+# is `##<outermost>##<i>`.  The demangler strips exactly one leading `#`,
+# yielding the singletonname `#<outermost>##<i>` — leading `#` preserved, and
+# distinct from the raw name (so `show` reports the name rather than the
+# `var"..."()` constructor).  This matches flisp's displayed name for a nested
+# anonymous closure (`#<outermost>##<i>`, which likewise names it after only the
+# outermost enclosing method); only the disambiguating counter value differs.
+# Bare/top-level anonymous closures (no enclosing named method) already carry a
+# doubled leading `#` via the generic scheme (`##anon###<i>`) and keep their
+# leading `#`; they are left unchanged.
+#
+# Other already-mangled own names (starting with `#`) keep JuliaLowering's
+# outer-to-inner scheme.  For a *named* local function whose own name starts
+# with `#` (e.g. a gensym'd `var"#name"`), this still reports the enclosing name
+# where flisp strips the leading `#` and reports `name` — a known residual
+# divergence with no known consumer (such names are themselves gensyms); see
+# bugs/nested-closure-nameof/QUESTIONS.md.
+const _ANON_OWNNAMES = ("#anon#", "#->#")
+
 function closure_type_basename(name_stack)
     own = name_stack[end]
+    if own in _ANON_OWNNAMES && length(name_stack) > 1 && !occursin('#', name_stack[1])
+        return string("##", name_stack[1], "##")
+    end
     startswith(own, '#') && return string("#", join(name_stack, "#"), "##")
     length(name_stack) > 1 && !occursin('#', name_stack[1]) ?
         string("#", own, "#", name_stack[1], "##") :

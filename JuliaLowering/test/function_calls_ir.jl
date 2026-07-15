@@ -491,7 +491,7 @@ end
 6   (call core.TypeEqOf %₅)
 7   (call core.svec %₆)
 8   (call core.svec)
-9   SourceLocation::3:14
+9   SourceLocation::3:5
 10  (call core.svec %₇ %₈ %₉)
 11  --- code_info
     slots: [slot₁/#self#(!read)]
@@ -503,7 +503,7 @@ end
     6   (foreigncall :strlen (static_eval TestMod.Csize_t) (static_eval (call core.svec (call core.apply_type TestMod.Ptr (captured_local 1)))) 0 :ccall %₅ %₄)
     7   (return %₆)
 12  (call core.svec slot₁/Relty)
-13  (call JuliaLowering.replace_captured_locals! %₁₁ %₁₂)
+13  (call JuliaLowering.replace_captured_locals %₁₁ %₁₂)
 14  --- method TestMod.ccall_captures_local %₁₀ %₁₃
 15  latestworld
 16  TestMod.ccall_captures_local
