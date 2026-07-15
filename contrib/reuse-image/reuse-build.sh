@@ -28,7 +28,7 @@ PRE='Sys.__init__(); Base.reinit_stdio(); Base.init_depot_path(); Base.init_load
 echo "--- building object (reuse enabled)"
 env JULIA_REUSE_IMAGE_CODE=1 JULIA_IMAGE_THREADS="${JULIA_IMAGE_THREADS:-8}" \
     "$JULIA" --startup-file=no -J "$SYS" --cpu-target=native \
-    --output-o "$OUT_O" --output-incremental=no \
+    --output-o "$OUT_O" ${SPLIT_JI:+--output-ji "${OUT_SO%.so}.ji"} --output-incremental=no \
     -e "$PRE $APP; nothing"
 
 DONOR_OBJS=()

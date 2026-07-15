@@ -76,6 +76,16 @@ including the selection fast-path (no re-inference for reused code):
   unlinker drops donor DWARF (a fixable omission); they also carry the donor's
   unreused code as dead text until gc-sections support lands.
 
+## Split heap images (JuliaLang/julia#61649)
+The branch incorporates PR 61649: with SPLIT_JI=1 the drivers pass
+--output-ji alongside --output-o, so the serialized heap is written directly
+to the .ji instead of round-tripping through an LLVM constant array in the
+object. A no-op rebuild then produces a 32MB .so (code + tables only) plus a
+160MB .ji, booted via -J app.so with the sibling .ji; pipeline time is
+unchanged (~18.5s) but peak memory drops and the heap write becomes a plain
+stream — the intended substrate for delta/mmap heap-serialization tricks.
+Reuse works identically in both modes.
+
 ## Known limitations (prototype)
 - Multi-target output images: donor clone slots are snapshot-bound to the
   builder's selected target; folding donor slots into the image's own clone
