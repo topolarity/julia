@@ -343,6 +343,13 @@ namespace {
 
 #define JULIA_PASS(ADD_PASS) if (!options.llvm_only) { ADD_PASS; } else do { } while (0)
 
+static llvm::cl::opt<bool> EnableSplitting(
+    "julia-split-enable", llvm::cl::init(true), llvm::cl::Hidden,
+    llvm::cl::desc("Enable the splitting passes: basic-block chunking before "
+                   "early InstCombine and function outlining before the loop "
+                   "optimizations. Sizing is controlled by the "
+                   "-julia-split-* thresholds."));
+
 static void buildEarlySimplificationPipeline(ModulePassManager &MPM, PassBuilder *PB, OptimizationLevel O, const OptimizationOptions &options) JL_NOTSAFEPOINT {
     MPM.addPass(BeforeEarlySimplificationMarkerPass());
 #ifdef JL_VERIFY_PASSES
@@ -371,6 +378,17 @@ static void buildEarlySimplificationPipeline(ModulePassManager &MPM, PassBuilder
               FPM.addPass(EarlyCSEPass());
           }
           MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM)));
+          // Chunk oversized basic blocks before any InstCombine runs: several
+          // InstCombine queries (e.g. isKnownNonZero dominance checks) trigger
+          // O(block-size) instruction renumbering per query, which is
+          // quadratic on the huge basic blocks this pass exists to break up.
+          // Block chunking alone serves that purpose (measured: outlining
+          // adds nothing to a within-block quadratic); all outlining is
+          // deferred to the late FunctionSplitting position, which also
+          // avoids re-splitting early regions there.
+          if (EnableSplitting) {
+              JULIA_PASS(MPM.addPass(createModuleToFunctionPassAdaptor(BasicBlockSplittingPass())));
+          }
           if (O.getSpeedupLevel() >= 1) {
             FunctionPassManager GlobalFPM;
             MPM.addPass(GlobalOptPass());
@@ -636,6 +654,13 @@ static void buildPipeline(ModulePassManager &MPM, PassBuilder *PB, OptimizationL
     if (options.always_inline)
         MPM.addPass(AlwaysInlinerPass());
     buildEarlyOptimizerPipeline(MPM, PB, O, options);
+    // Bound function/basic-block sizes before the super-linear passes (GVN,
+    // LateLowerGCFrame, instruction selection, regalloc). Must run before
+    // LateLowerGCFrame so outlined callees get their own GC frames; no-op
+    // unless -julia-split-block-threshold is set.
+    if (EnableSplitting) {
+        JULIA_PASS(MPM.addPass(FunctionSplittingPass()));
+    }
     {
         FunctionPassManager FPM;
         buildLoopOptimizerPipeline(FPM, PB, O, options);

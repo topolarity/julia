@@ -3,6 +3,7 @@
 MODULE_PASS("CPUFeatures", CPUFeaturesPass())
 MODULE_PASS("RemoveNI", RemoveNIPass())
 MODULE_PASS("JuliaMultiVersioning", MultiVersioningPass())
+MODULE_PASS("JuliaFunctionSplitting", FunctionSplittingPass())
 MODULE_PASS("RemoveJuliaAddrspaces", RemoveJuliaAddrspacesPass())
 MODULE_PASS("RemoveAddrspaces", RemoveAddrspacesPass())
 MODULE_PASS("LowerPTLSPass", LowerPTLSPass())
@@ -17,6 +18,7 @@ FUNCTION_PASS("PropagateJuliaAddrspaces", PropagateJuliaAddrspacesPass())
 FUNCTION_PASS("GCInvariantVerifier", GCInvariantVerifierPass())
 FUNCTION_PASS("FinalLowerGC", FinalLowerGCPass())
 FUNCTION_PASS("ExpandAtomicModify", ExpandAtomicModifyPass())
+FUNCTION_PASS("JuliaBasicBlockSplitting", BasicBlockSplittingPass())
 #endif
 
 //Loop passes
