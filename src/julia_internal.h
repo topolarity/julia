@@ -1902,6 +1902,24 @@ jl_typemap_entry_t *jl_typemap_assoc_by_type(
         struct jl_typemap_assoc *search,
         int8_t offs, uint8_t subtype) JL_CANSAFEPOINT;
 
+// jl_typemap_list_t: an intrusive, append-only record list held as the value of a TypeMap
+// entry keyed exactly on a signature type, chained through an atomic `next` field embedded
+// in each record at `next_offset` (the ABI-adapter and dispatch-trampoline caches). Keys
+// stay packed inline in the records; `match` reads them directly. Reads are lock-free;
+// mutation requires the owning cache's writelock.
+typedef jl_value_t jl_typemap_list_t;
+typedef int (*jl_typemap_list_match_t)(jl_value_t *rec, void *key);
+JL_DLLEXPORT jl_value_t *jl_typemap_list_find(jl_typemap_list_t *head JL_PROPAGATES_ROOT, size_t next_offset,
+        jl_typemap_list_match_t match JL_CANSAFEPOINT, void *key) JL_CANSAFEPOINT;
+JL_DLLEXPORT jl_typemap_entry_t *jl_typemap_list_entry(_Atomic(jl_typemap_t*) *cache JL_PROPAGATES_ROOT,
+        jl_value_t *sigt) JL_CANSAFEPOINT;
+JL_DLLEXPORT jl_value_t *jl_typemap_list_lookup(_Atomic(jl_typemap_t*) *cache JL_PROPAGATES_ROOT, jl_value_t *sigt,
+        size_t next_offset, jl_typemap_list_match_t match JL_CANSAFEPOINT, void *key) JL_CANSAFEPOINT;
+JL_DLLEXPORT void jl_typemap_list_append(jl_typemap_list_t *head, jl_value_t *rec,
+        size_t next_offset) JL_NOTSAFEPOINT;
+JL_DLLEXPORT void jl_typemap_list_insert(_Atomic(jl_typemap_t*) *cache, jl_value_t *owner,
+        jl_value_t *sigt, jl_value_t *rec, size_t next_offset) JL_CANSAFEPOINT;
+
 jl_typemap_entry_t *jl_typemap_level_assoc_exact(jl_typemap_level_t *cache, jl_value_t *arg1, jl_value_t **args, size_t n, int8_t offs, size_t world) JL_CANSAFEPOINT;
 jl_typemap_entry_t *jl_typemap_entry_assoc_exact(jl_typemap_entry_t *mn, jl_value_t *arg1, jl_value_t **args, size_t n, size_t world) JL_CANSAFEPOINT;
 STATIC_INLINE jl_typemap_entry_t *jl_typemap_assoc_exact(

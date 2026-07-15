@@ -424,6 +424,91 @@ exit:
     }
 }
 
+// ---- jl_typemap_list_t: sigt-keyed record lists ----
+// Shared machinery for caches that key a TypeMap *exactly* on a signature type and hold
+// several records per entry (the ABI-adapter and dispatch-trampoline caches): the entry's
+// value is a jl_typemap_list_t, an intrusive, append-only list chained through an atomic
+// `next` field embedded in each record at `next_offset`. Keys stay packed inline in the
+// records; the `match` callback reads them directly. Readers walk lock-free: entries are
+// created valid for all worlds, the list head in `entry->func.value` never moves, and
+// appends publish with release. Mutation requires the owning cache's writelock.
+
+static inline _Atomic(jl_value_t*) *typemap_list_next(jl_value_t *rec, size_t next_offset) JL_NOTSAFEPOINT
+{
+    return (_Atomic(jl_value_t*)*)((char*)rec + next_offset);
+}
+
+// Walk a record list (acquire) for a record satisfying `match`; NULL if none.
+JL_DLLEXPORT jl_value_t *jl_typemap_list_find(jl_typemap_list_t *head JL_PROPAGATES_ROOT, size_t next_offset,
+        jl_typemap_list_match_t match, void *key) JL_CANSAFEPOINT
+{
+    for (jl_value_t *e = head; e != NULL; e = jl_atomic_load_acquire(typemap_list_next(e, next_offset))) {
+        JL_GC_PROMISE_ROOTED(e); // rooted by the (append-only) cache TypeMap
+        if (match(e, key))
+            return e;
+    }
+    return NULL;
+}
+
+// The TypeMap entry holding `sigt`'s record list (exact match, like jl_methtable_lookup);
+// NULL if absent. Safe with or without the cache writelock.
+JL_DLLEXPORT jl_typemap_entry_t *jl_typemap_list_entry(_Atomic(jl_typemap_t*) *cache JL_PROPAGATES_ROOT,
+        jl_value_t *sigt) JL_CANSAFEPOINT
+{
+    jl_typemap_t *map = jl_atomic_load_relaxed(cache);
+    if ((jl_value_t*)map == jl_nothing)
+        return NULL;
+    struct jl_typemap_assoc search = { sigt, jl_atomic_load_acquire(&jl_world_counter), NULL };
+    return jl_typemap_assoc_by_type(map, &search, /*offs*/0, /*subtype*/0);
+}
+
+// Lock-free lookup of the record matching `key` in `sigt`'s list; NULL if absent.
+JL_DLLEXPORT jl_value_t *jl_typemap_list_lookup(_Atomic(jl_typemap_t*) *cache JL_PROPAGATES_ROOT, jl_value_t *sigt,
+        size_t next_offset, jl_typemap_list_match_t match, void *key) JL_CANSAFEPOINT
+{
+    jl_typemap_entry_t *te = jl_typemap_list_entry(cache, sigt);
+    if (te == NULL)
+        return NULL;
+    jl_typemap_list_t *head = jl_atomic_load_acquire((_Atomic(jl_value_t*)*)&te->func.value);
+    return jl_typemap_list_find(head, next_offset, match, key);
+}
+
+// Append `rec` at the tail of the list headed by `head` (the head never moves, so readers
+// stay lock-free). Caller holds the cache writelock and keeps `rec` rooted; `rec`'s next
+// field must be NULL.
+JL_DLLEXPORT void jl_typemap_list_append(jl_typemap_list_t *head, jl_value_t *rec,
+        size_t next_offset) JL_NOTSAFEPOINT
+{
+    jl_value_t *tail = head;
+    for (;;) {
+        jl_value_t *n = jl_atomic_load_relaxed(typemap_list_next(tail, next_offset));
+        if (n == NULL)
+            break;
+        tail = n;
+    }
+    jl_atomic_store_release(typemap_list_next(tail, next_offset), rec);
+    jl_gc_wb(tail, rec);
+}
+
+// Insert `rec` into `sigt`'s list: the first record becomes a new all-worlds TypeMap entry,
+// later ones are appended at the tail. Caller holds the cache writelock, has confirmed
+// `rec`'s key absent, and keeps `sigt`/`rec` rooted; `rec`'s next field must be NULL.
+JL_DLLEXPORT void jl_typemap_list_insert(_Atomic(jl_typemap_t*) *cache, jl_value_t *owner,
+        jl_value_t *sigt, jl_value_t *rec, size_t next_offset) JL_CANSAFEPOINT
+{
+    jl_typemap_entry_t *te = jl_typemap_list_entry(cache, sigt);
+    if (te == NULL) {
+        jl_typemap_entry_t *newentry = jl_typemap_alloc((jl_tupletype_t*)sigt, NULL,
+                jl_emptysvec, rec, 1, ~(size_t)0);
+        JL_GC_PUSH1(&newentry);
+        jl_typemap_insert(cache, owner, newentry, /*offs*/0);
+        JL_GC_POP();
+        return;
+    }
+    jl_typemap_list_t *head = jl_atomic_load_relaxed((_Atomic(jl_value_t*)*)&te->func.value);
+    jl_typemap_list_append(head, rec, next_offset);
+}
+
 static unsigned jl_supertype_height(jl_datatype_t *dt) JL_NOTSAFEPOINT
 {
     unsigned height = 1;
