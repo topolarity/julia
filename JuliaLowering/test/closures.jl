@@ -1666,3 +1666,113 @@ end
     @test !startswith(string(named), "#")
     @test string(named) == "inner"
 end
+
+@testset "(AI) self-referential signature reads the local's pre-rebind value" begin
+    # A local whose name is *reused* (bound to some earlier value, then redefined
+    # as a local function of the same name) and whose own signature reuses that
+    # name as an argument-type annotation must see the name's PRE-rebind value in
+    # the signature, not the freshly-created closure instance.  flisp emits the
+    # `Name = %new(...)` rebind only *after* the sibling `method_defs` (via its
+    # `toplevel-butfirst` idiom in `cl-convert`'s `method` case); JuliaLowering
+    # previously rebound the local *before* computing the argument-type svec, so
+    # `x::Alias` resolved to the closure instance (a non-Type value) and
+    # `jl_method_def` rejected it with `invalid type for argument`.  Found via
+    # PkgEval: OddEvenIntegers v0.2.0's `HalfOddInteger{T<:Integer} = Half{Odd{T}};
+    # HalfOddInteger(x::HalfOddInteger) = x` (chunk-105).
+    m = Module()
+    JuliaLowering.include_string(m, "struct Wrapper{T}; val::T; end")
+
+    # Core shape: a local type alias reused as its own argument-type annotation.
+    @test JuliaLowering.include_string(m, """
+    let
+        Alias{T<:Integer} = Wrapper{T}
+        Alias(x::Alias) = x
+        a = Alias(Wrapper(3))
+        Alias(a) === a
+    end
+    """) == true
+
+    # The self-name in a `where` bound is likewise part of the signature and must
+    # read the pre-rebind alias.
+    @test JuliaLowering.include_string(m, """
+    let
+        Alias{T<:Integer} = Wrapper{T}
+        Alias(x::S) where {S<:Alias} = (x, S)
+        r = Alias(Wrapper(3))
+        r[1] isa Wrapper{Int} && r[2] === Wrapper{Int}
+    end
+    """) == true
+
+    # Keyword methods (whose positional signature lands in several generated
+    # methods) must all read the pre-rebind alias too.
+    @test JuliaLowering.include_string(m, """
+    let
+        Alias{T<:Integer} = Wrapper{T}
+        Alias(x::Alias; y=0) = (x, y)
+        r = Alias(Wrapper(3); y=5)
+        r[1].val == 3 && r[2] == 5
+    end
+    """) == true
+
+    # A method-less `function Name end` (no `method_defs` to defer past) still
+    # binds a fresh generic function.
+    @test JuliaLowering.include_string(m, """
+    begin
+        local g_nomethod
+        function g_nomethod
+        end
+        g_nomethod isa Function
+    end
+    """) == true
+
+    # Class boundary: the deferral applies only to the *first* method definition
+    # of a reused name.  A subsequent, separate self-referential method sees the
+    # already-rebound closure instance -- matching flisp, which errors on the
+    # second definition.
+    @test_throws "invalid type for argument" JuliaLowering.include_string(m, """
+    let
+        Alias{T<:Integer} = Wrapper{T}
+        Alias(x::Alias) = x
+        Alias(x::Alias, y) = y
+    end
+    """)
+
+    # A reused name whose pre-rebind value is not a type errors just as in flisp
+    # (the signature reads that non-Type value).
+    @test_throws "invalid type for argument" JuliaLowering.include_string(m, """
+    let
+        notype = 1
+        notype(x::notype) = x
+    end
+    """)
+
+    # Return-type annotations are body-level (checked at call time), so they see
+    # the rebound closure instance and raise a runtime `TypeError`, as in flisp.
+    @test_throws TypeError JuliaLowering.include_string(m, """
+    let
+        Alias{T<:Integer} = Wrapper{T}
+        Alias(x)::Alias = x
+        Alias(Wrapper(3))
+    end
+    """)
+
+    # Default-argument values are also body-level: `x=Alias` evaluates at call
+    # time, yielding the closure instance (a Function), not the alias type.
+    @test JuliaLowering.include_string(m, """
+    let
+        Alias{T<:Integer} = Wrapper{T}
+        Alias(x=Alias) = x
+        Alias() isa Function
+    end
+    """) == true
+
+    # Non-regression: a name bound *only* by its own definition has no prior
+    # value, so the rebind stays inline and `x::typeof(f)` still resolves to the
+    # closure instance's type (a JuliaLowering extension over flisp, which errors
+    # here); see the "self-reference in let-function" tests above.
+    @test JuliaLowering.include_string(m, """
+    let f(x::typeof(f)) = x
+        f(f) isa Function
+    end
+    """) == true
+end

@@ -32,6 +32,15 @@ struct ClosureConversionCtx{Attrs} <: AbstractLoweringContext
     toplevel_pure::Bool
     toplevel_stmts::SyntaxList{Attrs, Vector{NodeId}}
     closure_infos::Dict{ClosureKey,ClosureInfo{Attrs}}
+    # Deferred closure instantiate+rebind blocks (`Name = %new(...)`) produced by
+    # `convert_local_function_decl`.  flisp emits this assignment only *after* the
+    # sibling `method_defs` (via its `toplevel-butfirst` idiom), so a
+    # self-referential signature annotation such as `Alias(x::Alias)` reads the
+    # local's pre-rebind value.  These are stashed here and spliced back into the
+    # enclosing `K"block"` right after the last `method_defs` (see
+    # `insert_deferred_closure_inits!`).  Shared by reference across all derived
+    # contexts so nested scopes truncate back to their own mark.
+    pending_closure_inits::SyntaxList{Attrs, Vector{NodeId}}
 end
 
 function current_lambda_bindings(ctx::ClosureConversionCtx)
@@ -419,9 +428,7 @@ function convert_local_function_decl(ctx, ex)
                   field_val])
         end
     end
-    @ast ctx ex [K"block"
-        define_clstruct
-        (::K"latestworld_if_toplevel")
+    closure_init = @ast ctx ex [K"block"
         closure_type := if isempty(type_params)
             global_clstruct
         else
@@ -429,8 +436,40 @@ function convert_local_function_decl(ctx, ex)
         end
         closure_val := [K"new" closure_type init_closure_args...]
         convert_assignment(ctx, [K"=" ex[1] closure_val])
-        (::K"TOMBSTONE")
     ]
+    # When the local's name is *reused* (assigned some earlier value, e.g. a type
+    # alias `Alias{T} = Wrapper{T}`, before being redefined as this closure), a
+    # self-referential signature annotation such as `Alias(x::Alias)` must read
+    # that pre-rebind value, not the freshly-created closure instance (a non-Type
+    # value that `jl_method_def` rejects).  flisp achieves this by emitting the
+    # `Name = %new(...)` assignment only *after* the sibling `method_defs` (its
+    # `toplevel-butfirst` idiom in `cl-convert`'s `method` case).  Mirror that
+    # here by deferring the instantiate+rebind: it is spliced back in after the
+    # last `method_defs` by the enclosing `K"block"` (`map_children_cl` /
+    # `insert_deferred_closure_inits!`).  The struct-type declaration
+    # (`define_clstruct`) stays emitted here (order-independent, matches flisp).
+    #
+    # A name bound *only* by this definition (`is_assigned_once`) has no prior
+    # value, so keep the original inline ordering: this both preserves JuliaLowering's
+    # deliberate support for `f(x::typeof(f)) = ...` (where the annotation needs
+    # the closure instance so `typeof` yields the closure type -- an extension over
+    # flisp, which errors there) and keeps method-less `function Name end`
+    # declarations, which have no `method_defs` to defer past, working.
+    if get_binding(ctx, ex[1]).is_assigned_once
+        @ast ctx ex [K"block"
+            define_clstruct
+            (::K"latestworld_if_toplevel")
+            closure_init
+            (::K"TOMBSTONE")
+        ]
+    else
+        push!(ctx.pending_closure_inits, closure_init)
+        @ast ctx ex [K"block"
+            define_clstruct
+            (::K"latestworld_if_toplevel")
+            (::K"TOMBSTONE")
+        ]
+    end
 end
 
 # Map the children of `ex` through _convert_closures, lifting any toplevel
@@ -442,15 +481,65 @@ function map_cl_convert(ctx::ClosureConversionCtx, ex)
             ctx.graph, ctx.bindings, ctx.mod,
             ctx.closure_bindings, ctx.capture_rewriting, ctx.top_bindings,
             ctx.lambda_bindings, ctx.sp_typevars, true, ctx.lifted,
-            ctx.toplevel_pure, toplevel_stmts, ctx.closure_infos)
-        res = mapchildren(e->_convert_closures(ctx2, e), ctx2, ex)
+            ctx.toplevel_pure, toplevel_stmts, ctx.closure_infos,
+            ctx.pending_closure_inits)
+        res = map_children_cl(ctx2, ex)
         if isempty(toplevel_stmts)
             res
         else
             @ast ctx ex [K"block" toplevel_stmts... res]
         end
     else
+        map_children_cl(ctx, ex)
+    end
+end
+
+# Like `mapchildren(e->_convert_closures(ctx, e), ...)`, but for `K"block"` nodes
+# additionally splices any deferred closure instantiate+rebind blocks
+# (`convert_local_function_decl`) opened while converting this block's own direct
+# children back in right after the block's last `method_defs`.  This mirrors
+# flisp's `toplevel-butfirst` deferral so a self-referential signature such as
+# `Alias(x::Alias)` sees the local's pre-rebind (type) value.
+function map_children_cl(ctx::ClosureConversionCtx, ex)
+    if kind(ex) == K"block" && !is_leaf(ex)
+        mark = length(ctx.pending_closure_inits)
+        cs = SyntaxList(ctx)
+        changed = false
+        for c in children(ex)
+            nc = _convert_closures(ctx, c)
+            nc == c || (changed = true)
+            push!(cs, nc)
+        end
+        if length(ctx.pending_closure_inits) > mark
+            insert_deferred_closure_inits!(ctx, ex, cs, mark)
+            changed = true
+        end
+        changed ? mknode(ex, cs) : ex
+    else
         mapchildren(e->_convert_closures(ctx, e), ctx, ex)
+    end
+end
+
+# Splice the deferred closure inits stashed at indices `mark+1:end` of
+# `ctx.pending_closure_inits` into the already-converted child list `cs`,
+# positioned right after the block's last `method_defs` (and thus before the
+# block's trailing value expression), then truncate the pending list back to
+# `mark`.
+function insert_deferred_closure_inits!(ctx, ex, cs, mark)
+    pend = ctx.pending_closure_inits
+    inits = SyntaxList(ctx)
+    for i in (mark+1):length(pend)
+        push!(inits, pend[i])
+    end
+    resize!(pend, mark)
+    insert_after = length(cs)
+    for (i, c) in enumerate(children(ex))
+        if kind(c) == K"method_defs"
+            insert_after = i
+        end
+    end
+    for (j, ini) in enumerate(inits)
+        insert!(cs, insert_after + j, ini)
     end
 end
 
@@ -603,7 +692,7 @@ function _convert_closures(ctx::ClosureConversionCtx, ex)
             ctx.closure_bindings, cap_rewrite,
             ctx.top_bindings, ctx.lambda_bindings, ctx.sp_typevars,
             ctx.toplevel, true, ctx.toplevel_pure, ctx.toplevel_stmts,
-            ctx.closure_infos)
+            ctx.closure_infos, ctx.pending_closure_inits)
         tvs = map_cl_convert(ctx2, ex[2])
         if !ctx.toplevel
             push!(ctx2.toplevel_stmts, tvs)
@@ -632,7 +721,8 @@ function _convert_closures(ctx::ClosureConversionCtx, ex)
             ctx.graph, ctx.bindings, ctx.mod,
             ctx.closure_bindings, capture_rewrites, ctx.top_bindings,
             ctx.lambda_bindings, ctx.sp_typevars, false, false,
-            ctx.toplevel_pure, ctx.toplevel_stmts, ctx.closure_infos)
+            ctx.toplevel_pure, ctx.toplevel_stmts, ctx.closure_infos,
+            ctx.pending_closure_inits)
 
         argt = _convert_closures(ctx, ex[2])
         rt_lb = _convert_closures(ctx, ex[3])
@@ -682,7 +772,7 @@ function closure_convert_lambda(ctx, ex, sps)
         lambda_bindings, ctx.sp_typevars,
         ex.is_toplevel_thunk, ex.is_toplevel_thunk,
         ctx.toplevel_pure && ex.toplevel_pure,
-        ctx.toplevel_stmts, ctx.closure_infos)
+        ctx.toplevel_stmts, ctx.closure_infos, ctx.pending_closure_inits)
     lambda_children = SyntaxList(ctx)
     args = ex[1]
     push!(lambda_children, args)
@@ -752,7 +842,8 @@ Invariants:
                                    ex.lambda_bindings, ex.lambda_bindings,
                                    ctx.sp_typevars,
                                    false, true, true, SyntaxList(ctx.graph),
-                                   Dict{ClosureKey,ClosureInfo{Attrs}}())
+                                   Dict{ClosureKey,ClosureInfo{Attrs}}(),
+                                   SyntaxList(ctx.graph))
     ex_out = closure_convert_lambda(ctx_out, ex, children(ex[2]))
     if !isempty(ctx_out.toplevel_stmts)
         throw(LoweringError(first(ctx_out.toplevel_stmts), "Top level code was found outside any top level context. `@generated` functions may not contain closures, including `do` syntax and generators/comprehension"))
