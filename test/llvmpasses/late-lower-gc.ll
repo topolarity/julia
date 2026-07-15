@@ -213,6 +213,29 @@ define swiftcc ptr addrspace(10) @insert_element(ptr swiftself "gcstack" %0) {
 }
 
 
+; An all-tracked AGGREGATE alloca (the canonicalized form of a tracked array
+; alloca) must be rooted eagerly even when this function never stores a
+; tracked value into it: the slots may be written by a callee through the
+; escaping address (the function-splitting pass passes region interface
+; pointers), so waiting for a local store (MaybeTrackStore) would leave the
+; slots unscanned and their contents collectible while still live.
+; CHECK-LABEL: @tracked_aggregate_alloca_escape
+; CHECK: %gcframe = call ptr @julia.new_gc_frame(i32 3)
+; CHECK: %buf = call ptr @julia.get_gc_frame_slot(ptr %gcframe, i32 0)
+; CHECK-NOT: = alloca [2 x ptr addrspace(10)]
+declare void @callee_writes(ptr)
+declare void @use_first(ptr addrspace(10))
+define void @tracked_aggregate_alloca_escape() {
+top:
+  %pgcstack = call {}*** @julia.get_pgcstack()
+  %buf = alloca [2 x ptr addrspace(10)], align 8
+  call void @callee_writes(ptr %buf)
+  call void @jl_safepoint()
+  %slot0 = load ptr addrspace(10), ptr %buf, align 8
+  call void @use_first(ptr addrspace(10) %slot0)
+  ret void
+}
+
 !0 = !{i64 0, i64 23}
 !1 = !{!1}
 !2 = !{!7} ; scope list

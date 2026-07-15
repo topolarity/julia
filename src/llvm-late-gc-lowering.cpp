@@ -1458,6 +1458,21 @@ State LateLowerGCFrame::LocalScan(Function &F) {
                 if (AI->isStaticAlloca() && isa<PointerType>(ElT) && ElT->getPointerAddressSpace() == AddressSpace::Tracked) {
                     S.ArrayAllocas[AI] = cast<ConstantInt>(AI->getArraySize())->getZExtValue();
                 }
+                else if (AI->isStaticAlloca()) {
+                    // All-tracked aggregate allocas (e.g. [N x ptr addrspace(10)],
+                    // the canonicalized form of a tracked array alloca) must be
+                    // registered eagerly as well: MaybeTrackStore only sees stores
+                    // in this function, but the slots may be written by a callee
+                    // through the alloca's address (function-splitting passes
+                    // region interface pointers), so waiting for a local store
+                    // would leave the slots unscanned.
+                    auto tracked = CountTrackedPointers(ElT);
+                    if (tracked.count && tracked.all && !tracked.derived) {
+                        S.ArrayAllocas[AI] =
+                            tracked.count *
+                            cast<ConstantInt>(AI->getArraySize())->getZExtValue();
+                    }
+                }
             }
         }
         // Pre-seed the dataflow variables;
