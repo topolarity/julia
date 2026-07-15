@@ -844,6 +844,17 @@ function to_code_info(ex::SyntaxTree, slots::Vector{Slot}, meta::CompileHints)
                 name = "$name@$ni"
             end
         end
+        # flisp parity: `jl_new_code_info_from_ir` reports a blank slot name for
+        # the implicit, compiler-generated `#self#` self-argument whenever it
+        # ends up in a non-leading slot -- i.e. when it was forwarded into the
+        # positional arguments of a generated keyword-sorter body method (the
+        # first slot, the method's own self, is always left intact). flisp blanks
+        # this post-hoc during CodeInfo construction rather than emitting an
+        # unnamed decl, so we mirror the same post-hoc rename here. Reflection
+        # tooling relies on this blank as the kwarg/positional-arg delimiter.
+        if i > 1 && slot.name == "#self#"
+            name = ""
+        end
         sname = Symbol(name)
         slotnames[i] = sname
         slotflags[i] =                   # Inference          | Codegen

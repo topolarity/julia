@@ -1343,6 +1343,54 @@ end
     @test Base.kwarg_decl(first(methods(test_mod.f_outer_mix))) == [:x, :y, Symbol("kw...")]
 end
 
+@testset "(AI) kwarg body method blanks the forwarded self slot" begin
+    # The auto-generated keyword-sorter *body* method (`Base.bodyfunction`)
+    # forwards the original method's own dispatch self as a trailing positional
+    # argument, used only for typing/recursion and never referenced in the body.
+    # flisp lowers this self as the implicit `#self#` in the AST, then blanks it
+    # to `Symbol("")` during CodeInfo construction (`jl_new_code_info_from_ir`,
+    # src/method.c: a non-leading slot whose name matches the `#<prefix>#<orig>`
+    # rename convention with an empty original becomes blank). That blank is a
+    # de-facto public API: MethodInspector.jl scans `Base.method_argnames` of the
+    # body method for the blank name as the boundary between the forwarded kwarg
+    # names and the forwarded positional-arg names.  Regression: JuliaLowering
+    # kept the literal `#self#`, so the delimiter was absent and MethodInspector's
+    # `kwarg_names` returned the whole argument list.
+    JuliaLowering.include_string(test_mod, """
+    f_body_self(a::Symbol; c::Int=30, d::Float64=1.0) = (a, c, d)
+    """)
+    bm = only(methods(Base.bodyfunction(only(methods(test_mod.f_body_self, (Symbol,))))))
+    argnames = Base.method_argnames(bm)
+    # Body-method layout: [<mangled body fn>, <kwargs...>, <blank self>, <positionals...>]
+    delimiter = findfirst(==(Symbol("")), argnames)
+    @test delimiter !== nothing
+    @test argnames[2:delimiter-1] == [:c, :d]          # forwarded kwarg names
+    @test argnames[delimiter+1:end] == [:a]            # forwarded positional args
+    # Exactly one slot is blanked (the forwarded self), and the literal `#self#`
+    # never survives into the body method's slot names.
+    @test count(==(Symbol("")), argnames) == 1
+    @test !(Symbol("#self#") in argnames)
+
+    # Class boundary (negative cases): the blanking is specific to the *implicit*
+    # `#self#`. When the self is written with an explicit name (a callable object
+    # / functor), that name is preserved in the forwarded slot, exactly as flisp.
+    JuliaLowering.include_string(test_mod, """
+    struct BodySelfFunctor; v::Int; end
+    (bsf::BodySelfFunctor)(a; b=2) = bsf.v + a + b
+    """)
+    ft = test_mod.BodySelfFunctor(1)
+    ft_argnames = Base.method_argnames(only(methods(Base.bodyfunction(only(methods(ft))))))
+    @test :bsf in ft_argnames                          # explicit self name kept
+    @test !(Symbol("") in ft_argnames)                 # nothing blanked
+
+    # And a *leading* `#self#` (the ordinary method self at slot 1) is never
+    # blanked -- only non-leading occurrences are.
+    JuliaLowering.include_string(test_mod, """
+    f_leading_self(a) = a
+    """)
+    @test Base.method_argnames(only(methods(test_mod.f_leading_self)))[1] == Symbol("#self#")
+end
+
 @testset "Keyword call evaluation order" begin
     # Keyword calls must evaluate the receiver and their arguments in source
     # (left-to-right) program order, exactly like ordinary positional calls and
