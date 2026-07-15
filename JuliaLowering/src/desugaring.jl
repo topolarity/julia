@@ -1591,7 +1591,20 @@ function expand_let(ctx, ex)
             lhs = binding[1]
             rhs = binding[2]
             if is_identifier_like(lhs)
-                kind(lhs) === K"Placeholder" && continue
+                if kind(lhs) === K"Placeholder"
+                    # `_ = rhs`: `_` is write-only, so nothing is bound, but
+                    # flisp still evaluates `rhs` (for its side effects) at this
+                    # position in the binding chain and discards the value. The
+                    # body is still wrapped in a scope block so the binding
+                    # introduces a new (hard) scope like every other let binding.
+                    blk = @ast ctx binding [K"block"
+                        rhs
+                        [K"scope_block"(ex, scope_type=scope_type)
+                            blk
+                        ]
+                    ]
+                    continue
+                end
                 blk = @ast ctx binding [K"block"
                     tmp := rhs
                     [K"scope_block"(ex, scope_type=scope_type)
@@ -1603,7 +1616,27 @@ function expand_let(ctx, ex)
                 ]
             elseif kind(lhs) == K"::"
                 var = lhs[1]
-                kind(var) === K"Placeholder" && continue
+                if kind(var) === K"Placeholder"
+                    # `_::T = rhs`: as above, `rhs` is evaluated and discarded,
+                    # and no local is bound. The declared type `T` is still
+                    # evaluated -- after `rhs`, mirroring flisp's
+                    # `(= tmp rhs)` / `(local-def (:: _ T))` order -- so side
+                    # effects in the type expression fire and an undefined `T`
+                    # raises UndefVarError. The value is never converted or
+                    # asserted against `T`, since nothing is assigned.
+                    # (flisp additionally treats the typed `_` decl as a typed
+                    # *global* declaration -- erroring inside functions and
+                    # setting the module binding type of `_` at top level --
+                    # which we deliberately do not reproduce.)
+                    blk = @ast ctx binding [K"block"
+                        rhs
+                        [K"scope_block"(ex, scope_type=scope_type)
+                            lhs[2]
+                            blk
+                        ]
+                    ]
+                    continue
+                end
                 if !is_identifier_like(var)
                     throw(LoweringError(var, "Invalid assignment location in let syntax"))
                 end

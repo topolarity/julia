@@ -49,6 +49,41 @@ end
 4   (return core.nothing)
 
 ########################################
+# (AI) let syntax with a placeholder binding evaluates (and discards) the rhs
+let _ = rhs
+end
+#---------------------
+1   TestMod.rhs
+2   (return core.nothing)
+
+########################################
+# (AI) let syntax with a typed placeholder binding evaluates the rhs, then the
+# declared type (rhs-then-type order, like flisp), but never converts or
+# asserts the value against the type
+let _::T = rhs
+end
+#---------------------
+1   TestMod.rhs
+2   TestMod.T
+3   (return core.nothing)
+
+########################################
+# (AI) a placeholder binding's rhs is evaluated in position between the other
+# bindings and inside the scope where earlier bindings are visible
+let x = f(), _ = g(x), y = h()
+end
+#---------------------
+1   TestMod.f
+2   (call %₁)
+3   (= slot₁/x %₂)
+4   TestMod.g
+5   (call %₄ slot₁/x)
+6   TestMod.h
+7   (call %₆)
+8   (= slot₂/y %₇)
+9   (return core.nothing)
+
+########################################
 # Let syntax with the same name creates nested bindings
 let x = f(x), x = g(x)
 end

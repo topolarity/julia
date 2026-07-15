@@ -70,6 +70,126 @@ begin
 end
 """) === :outer_y
 
+# (AI) A `let _ = rhs` binding must still evaluate `rhs` for its side effects,
+# matching flisp (where `_` is an ordinary write-only name and the rhs is always
+# assigned into a temporary). Previously JuliaLowering dropped the rhs entirely.
+@test JuliaLowering.include_string(test_mod, """
+begin
+    c = Ref(0)
+    let _ = (c[] += 1; nothing)
+        nothing
+    end
+    c[]
+end
+""") === 1
+
+# (AI) Same for a placeholder as the sole binding with an empty body.
+@test JuliaLowering.include_string(test_mod, """
+begin
+    c = Ref(0)
+    let _ = (c[] += 1; 5)
+    end
+    c[]
+end
+""") === 1
+
+# (AI) Multiple placeholder bindings each evaluate their rhs.
+@test JuliaLowering.include_string(test_mod, """
+begin
+    log = String[]
+    let _ = push!(log, "a"), _ = push!(log, "b")
+        nothing
+    end
+    log
+end
+""") == ["a", "b"]
+
+# (AI) Evaluation order and scope nesting: a placeholder binding's rhs runs in
+# its position in the chain (between the preceding and following bindings) and
+# inside the scope where earlier bindings are visible.
+@test JuliaLowering.include_string(test_mod, """
+begin
+    log = String[]
+    f() = (push!(log, "f"); 10)
+    g(x) = (push!(log, "g" * string(x)); nothing)
+    h() = (push!(log, "h"); 20)
+    let a = f(), _ = g(a), b = h()
+        (a, b)
+    end
+    log
+end
+""") == ["f", "g10", "h"]
+
+# (AI) A typed placeholder `_::T = rhs` also evaluates `rhs`, and the value is
+# never converted or asserted against `T` (nothing is assigned), so even a
+# value that could not convert to `T` is fine.
+@test JuliaLowering.include_string(test_mod, """
+begin
+    c = Ref(0)
+    let _::Int = (c[] += 1; "not an Int")
+        nothing
+    end
+    c[]
+end
+""") === 1
+
+# (AI) The declared type of a typed placeholder is still evaluated (like flisp's
+# `(local-def (:: _ T))`), after the rhs: side effects in the type expression
+# fire, in rhs-then-type order.
+@test JuliaLowering.include_string(test_mod, """
+begin
+    log = String[]
+    Tf() = (push!(log, "T"); Int)
+    rf() = (push!(log, "R"); 5)
+    let _::Tf() = rf()
+        nothing
+    end
+    log
+end
+""") == ["R", "T"]
+
+# (AI) An undefined declared type on a typed placeholder raises UndefVarError
+# (the type is looked up even though the value is discarded), and the rhs has
+# already been evaluated by then.
+@test JuliaLowering.include_string(test_mod, """
+begin
+    c = Ref(0)
+    err = try
+        let _::NoSuchTypeXYZ = (c[] += 1; 1)
+            nothing
+        end
+        nothing
+    catch e
+        e
+    end
+    (c[], err isa UndefVarError)
+end
+""") === (1, true)
+
+# (AI) `_` is write-only inside a let body: reading it is a lowering error, both
+# for the plain and the typed placeholder binding.
+@test_throws LoweringError JuliaLowering.include_string(test_mod, """
+let _ = 42
+    _
+end
+""")
+@test_throws LoweringError JuliaLowering.include_string(test_mod, """
+let _::Int = 5
+    _
+end
+""")
+
+# (AI) A `let _ = rhs` binding still introduces a (hard) scope for the body:
+# assignments in the body do not leak to the enclosing scope.
+@test JuliaLowering.include_string(test_mod, """
+begin
+    let _ = 1
+        leaked_from_let = 5
+    end
+    @isdefined(leaked_from_let)
+end
+""") === false
+
 #=
 | old\new: || global     | local | arg                | sparam             |
 |----------++------------+-------+--------------------+--------------------|
