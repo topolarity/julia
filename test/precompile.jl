@@ -1168,19 +1168,11 @@ precompile_test_harness("precompiletools") do dir
 end
 
 precompile_test_harness("cfunction adapter serialization") do dir
-    # A @cfunction whose declared C ABI differs from its target's specsig needs an ABI
-    # adapter. When the enclosing method is precompiled with native code, that adapter is
-    # compiled into the package image and its dispatch trampoline (jl_dispatch_trampoline_t) is
-    # serialized with the adapter wired into `fptr` -- exercising the trampoline serializer
-    # (jl_get_adapter_id / fptr_record) and jl_reintern_trampoline on load. Each adapter branch
-    # reachable from @cfunction is covered: specsig widening (well-inferred Cint boxed to `Any`)
-    # and narrowing (`Any`-returning target narrowed to `Cint`), const-return, the boxed args ABI
-    # (vararg target), and the codeinst == NULL dispatcher (both a missing method that throws and
-    # an abstract `Any` argument that dispatches at call time).
     CFuncMod = :CFuncAdapter0x6f2c1d8a
     write(joinpath(dir, "$CFuncMod.jl"),
           """
           module $CFuncMod
+              llvm_version() = ccall(:jl_get_LLVM_VERSION, UInt32, ())       # 0 = no-codegen stub
               box_target(x::Cint) = x                                        # well-inferred Cint
               any_target(x::Cint) = Core.compilerbarrier(:type, x + Cint(1)) # inferred ::Any
               const_target(x::Cint) = Cint(42)                               # const-return
@@ -1224,6 +1216,7 @@ precompile_test_harness("cfunction adapter serialization") do dir
               precompile(run_unresolved, (Cint,))
               precompile(run_dispatch, (Cint,))
               precompile(run_dup, (Cint,))
+              precompile(llvm_version, ())
           end
           """)
     Base.compilecache(Base.PkgId(string(CFuncMod)))
@@ -1242,17 +1235,173 @@ precompile_test_harness("cfunction adapter serialization") do dir
     @test Base.invokelatest(M.run_args, Cint(9)) == Cint(1)
     @test_throws MethodError Base.invokelatest(M.run_unresolved, Cint(3))
     @test Base.invokelatest(M.run_dispatch, Cint(5)) === Cint(5)
-    # Two @cfunction call sites with the same (sigt, rt) share one interned trampoline, so the
-    # image can emit duplicate adapter records for it. Each record gets its own fvar slot (just as
-    # each CodeInstance does), so `fptr_record` stays 1:1 and every record's fptr is wired -- a
-    # shared fvar slot would instead leave one record's fptr NULL (a null call after load).
     @test Base.invokelatest(M.run_dup, Cint(5)) === (Cint(5), Cint(5))
-    # With pkgimage native code the adapters were compiled in and wired into the trampolines'
-    # `fptr`s, so these calls reuse them and never JIT a fresh adapter (the no-JIT path that
-    # --trim relies on). Without pkgimages nothing was precompiled to reuse, so only check the
-    # results above.
     if Bool(Base.JLOptions().use_pkgimages)
+        # First use reuses the adapters restored from the pkgimage.
         @test adapter_count() == n0
+
+        # Repeat with codegen disabled, including retargeting after method redefinition
+        # through the serialized dynamic-dispatch adapter (julia#61949).
+        sep = Sys.iswindows() ? ";" : ":"
+        script = """
+            using $CFuncMod
+            const M = $CFuncMod
+            println("llvm=", M.llvm_version())
+            println("widen=", M.run_widen(Cint(5)))
+            println("narrow=", M.run_narrow(Cint(7)))
+            println("const=", M.run_const(Cint(3)))
+            println("args=", M.run_args(Cint(9)))
+            println("dispatch=", M.run_dispatch(Cint(5)))
+            println("dup=", M.run_dup(Cint(5)))
+            println("unresolved=", try; M.run_unresolved(Cint(3)); "no-error"; catch e; e isa MethodError ? "MethodError" : "other-error"; end)
+            @eval M box_target(x::Cint) = x + Cint(100)
+            println("redef=", Base.invokelatest(M.run_widen, Cint(5)))
+            """
+        outbuf = IOBuffer(); errbuf = IOBuffer()
+        cmd = addenv(`$(Base.julia_cmd()) --startup-file=no -e $script`,
+                     "JULIA_LOAD_CODEGEN_LIB" => "0",
+                     "JULIA_LOAD_PATH" => dir * sep * "@stdlib",
+                     "JULIA_DEPOT_PATH" => first(DEPOT_PATH) * sep)
+        proc = run(pipeline(ignorestatus(cmd), stdout=outbuf, stderr=errbuf))
+        out = String(take!(outbuf))
+        success(proc) || println(stderr, "codegen-free child failed:\n", String(take!(errbuf)))
+        @test success(proc)
+        @test occursin("llvm=0", out)              # codegen really was absent
+        @test occursin("widen=5", out)             # cached specsig-widening adapter
+        @test occursin("narrow=8", out)            # cached narrowing adapter
+        @test occursin("const=42", out)            # cached const-return adapter
+        @test occursin("args=1", out)              # cached boxed-args adapter
+        @test occursin("dispatch=5", out)          # cached dynamic-dispatch adapter
+        @test occursin("dup=(5, 5)", out)          # shared trampoline, both sites wired
+        @test occursin("unresolved=MethodError", out)
+        @test occursin("redef=105", out)           # dispatcher re-query after redefinition
+    end
+end
+
+# Shared trampolines load unresolved and retarget through adapters from the composed images.
+precompile_test_harness("cross-image dispatch trampolines") do dir
+    write(joinpath(dir, "CrossTrampolineA.jl"),
+          """
+          module CrossTrampolineA
+          target(x::Integer) = Cint(x + 1)
+          function run(x::Cint)
+              cf = @cfunction(target, Cint, (Cint,))
+              GC.@preserve cf ccall(Base.unsafe_convert(Ptr{Cvoid}, cf), Cint, (Cint,), x)
+          end
+          # Canonical trampoline for `run`.
+          trampoline() = ccall(:jl_get_dispatch_trampoline, Any, (Any, Any, Cint, Cint),
+                          Tuple{typeof(target), Cint}, Cint, Cint(1), Cint(0))
+          precompile(run, (Cint,))
+          precompile(trampoline, ())
+          # Ensure serialization sanitizes a previously resolved record.
+          const warm = run(Cint(0))
+          end
+          """)
+    Base.compilecache(Base.PkgId("CrossTrampolineA"))
+    write(joinpath(dir, "CrossTrampolineB.jl"),
+          """
+          module CrossTrampolineB
+          using CrossTrampolineA
+          CrossTrampolineA.target(x::Cint) = x + Cint(100)   # more specific: retargets A's trampoline
+          function runb(x::Cint)
+              cf = @cfunction(CrossTrampolineA.target, Cint, (Cint,))
+              GC.@preserve cf ccall(Base.unsafe_convert(Ptr{Cvoid}, cf), Cint, (Cint,), x)
+          end
+          precompile(runb, (Cint,))
+          precompile(CrossTrampolineA.run, (Cint,))
+          end
+          """)
+    Base.compilecache(Base.PkgId("CrossTrampolineB"))
+    write(joinpath(dir, "CrossTrampolineC.jl"),
+          """
+          module CrossTrampolineC
+          using CrossTrampolineA
+          CrossTrampolineA.target(x::Signed) = Cint(x + 1000)   # between A's Integer and B's Cint
+          function runc(x::Cint)
+              cf = @cfunction(CrossTrampolineA.target, Cint, (Cint,))
+              GC.@preserve cf ccall(Base.unsafe_convert(Ptr{Cvoid}, cf), Cint, (Cint,), x)
+          end
+          precompile(runc, (Cint,))
+          precompile(CrossTrampolineA.run, (Cint,))
+          end
+          """)
+    Base.compilecache(Base.PkgId("CrossTrampolineC"))
+    write(joinpath(dir, "CrossTrampolineAll.jl"),
+          """
+          module CrossTrampolineAll
+          using CrossTrampolineA, CrossTrampolineB, CrossTrampolineC
+          # Materialize every entry point needed without codegen.
+          precompile(CrossTrampolineA.run, (Cint,))
+          precompile(CrossTrampolineB.runb, (Cint,))
+          precompile(CrossTrampolineC.runc, (Cint,))
+          end
+          """)
+    Base.compilecache(Base.PkgId("CrossTrampolineAll"))
+    if Bool(Base.JLOptions().use_pkgimages)
+        sep = Sys.iswindows() ? ";" : ":"
+        function crosstrampoline_child(script; codegen::Bool)
+            outbuf = IOBuffer(); errbuf = IOBuffer()
+            cmd = `$(Base.julia_cmd()) --startup-file=no -e $script`
+            cmd = addenv(cmd, "JULIA_LOAD_PATH" => dir * sep * "@stdlib",
+                              "JULIA_DEPOT_PATH" => first(DEPOT_PATH) * sep)
+            codegen || (cmd = addenv(cmd, "JULIA_LOAD_CODEGEN_LIB" => "0"))
+            proc = run(pipeline(ignorestatus(cmd), stdout=outbuf, stderr=errbuf))
+            success(proc) || println(stderr, "cross-image child failed:\n", String(take!(errbuf)))
+            @test success(proc)
+            return String(take!(outbuf))
+        end
+        # The hot record loads unresolved and retargets to B without codegen.
+        out = crosstrampoline_child("""
+            using CrossTrampolineA, CrossTrampolineB
+            GC.gc(); GC.gc(); GC.gc()
+            tr = CrossTrampolineA.trampoline()
+            println("pre_invokee_defined=", isdefined(tr, :last_invokee))
+            println("pre_fptr_null=", getfield(tr, :fptr, :monotonic) == C_NULL)
+            println("pre_world=", getfield(tr, :last_world, :acquire))
+            println("a_run=", CrossTrampolineA.run(Cint(1)))
+            println("b_runb=", CrossTrampolineB.runb(Cint(1)))
+            println("post_world_current=", getfield(tr, :last_world, :acquire) == Base.get_world_counter())
+            println("post_fptr_set=", getfield(tr, :fptr, :monotonic) != C_NULL)
+            println("invokee_ok=", getfield(tr, :last_invokee) isa Union{Core.ABIAdapter, Core.CodeInstance})
+            """; codegen = false)
+        @test occursin("pre_invokee_defined=false", out)  # incremental images carry no hint
+        @test occursin("pre_fptr_null=true", out)   # hot record sanitized at serialization
+        @test occursin("pre_world=0", out)          # unresolved sentinel: no validity claim
+        @test occursin("a_run=101", out)            # A-image site reaches B-image target
+        @test occursin("b_runb=101", out)
+        @test occursin("post_world_current=true", out)  # poll published validity
+        @test occursin("post_fptr_set=true", out)
+        @test occursin("invokee_ok=true", out)
+        # The same record can instead retarget to C.
+        out = crosstrampoline_child("""
+            using CrossTrampolineA, CrossTrampolineC
+            GC.gc(); GC.gc()
+            println("a_run=", CrossTrampolineA.run(Cint(1)))
+            println("c_runc=", CrossTrampolineC.runc(Cint(1)))
+            """; codegen = false)
+        @test occursin("a_run=1001", out)
+        @test occursin("c_runc=1001", out)
+        # The composed world chooses B's most-specific target.
+        out = crosstrampoline_child("""
+            using CrossTrampolineAll, CrossTrampolineA, CrossTrampolineB, CrossTrampolineC
+            println("a_run=", CrossTrampolineA.run(Cint(1)))
+            println("b_runb=", CrossTrampolineB.runb(Cint(1)))
+            println("c_runc=", CrossTrampolineC.runc(Cint(1)))
+            """; codegen = false)
+        @test occursin("a_run=101", out)
+        @test occursin("b_runb=101", out)
+        @test occursin("c_runc=101", out)
+        # An in-session definition retargets every image-loaded site.
+        out = crosstrampoline_child("""
+            using CrossTrampolineA, CrossTrampolineB
+            println("before=", CrossTrampolineA.run(Cint(1)))
+            @eval CrossTrampolineA target(x::Cint) = x + Cint(7)
+            println("a_run=", Base.invokelatest(CrossTrampolineA.run, Cint(1)))
+            println("b_runb=", Base.invokelatest(CrossTrampolineB.runb, Cint(1)))
+            """; codegen = true)
+        @test occursin("before=101", out)
+        @test occursin("a_run=8", out)
+        @test occursin("b_runb=8", out)
     end
 end
 
