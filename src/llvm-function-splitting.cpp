@@ -995,6 +995,17 @@ static void spillInterface(Function &F, Region &R, DominatorTree &DT,
                 // itself.
                 if (isa<AllocaInst>(V->stripPointerCasts()))
                     break;
+                // The caller's pgcstack likewise stays direct: extraction
+                // turns it into the region's swiftself "gcstack" argument
+                // (see extractRegion), which spilling would defeat.
+                if (auto *A = dyn_cast<Argument>(V);
+                    A && A->getParent()->getAttributes().hasParamAttr(
+                             A->getArgNo(), "gcstack"))
+                    break;
+                if (auto *PC = dyn_cast<CallInst>(V);
+                    PC && PC->getCalledFunction() &&
+                    PC->getCalledFunction()->getName() == "julia.get_pgcstack")
+                    break;
                 if (V->getType()->isFirstClassType() && V->getType()->isSized())
                     UIn.push_back(V);
                 break;
@@ -1405,6 +1416,22 @@ static bool prepareRegion(Function &F, Region &R, DominatorTree &DT,
                           const JuliaPassContext &ctx) JL_NOTSAFEPOINT
 {
     localizeRegionInputs(R, Owned, HighFanout);
+    // Thread the caller's pgcstack through the interface: plant a use at the
+    // region entry so extraction turns it into an argument. The argument is
+    // tagged swiftself + "gcstack" after extraction (see extractRegion), so
+    // the caller forwards it for free (swiftself pins the same register on
+    // both sides) and the region needs no julia.get_pgcstack of its own --
+    // which would cost a TLS access per call and, in imaging mode, an
+    // entry-block fast/slow acquisition diamond. The marker freeze is erased
+    // once extraction (or rejection) is decided.
+    if (Value *CallerPG = ctx.getPGCstack(F)) {
+        BasicBlock::iterator IP = R.Blocks[0]->getFirstInsertionPt();
+        bool Planted = false;
+        if (auto *FI = dyn_cast<FreezeInst>(&*IP))
+            Planted = FI->getOperand(0) == CallerPG;
+        if (!Planted)
+            new FreezeInst(CallerPG, "pgcstack.keep", IP);
+    }
     auto now = []() JL_NOTSAFEPOINT { return std::chrono::steady_clock::now(); };
     auto msc = [](auto a, auto b) JL_NOTSAFEPOINT {
         return std::chrono::duration_cast<std::chrono::microseconds>(b - a).count();
@@ -1676,14 +1703,22 @@ static Function *extractRegion(Function &F, Region &R, const JuliaPassContext &c
             NewF->addParamAttr(i, Attribute::get(Ctx, Attribute::ReadOnly));
         }
     }
-    // Give the callee a pgcstack: reuse the caller's if it happened to be a
-    // region input, otherwise materialize julia.get_pgcstack in the entry
-    // block (both forms are recognized by LateLowerGCFrame).
+    // Give the callee a pgcstack: the caller's crossed the interface (a
+    // marker freeze planted in prepareRegion guarantees it whenever the
+    // caller has one), so tag that argument swiftself + "gcstack" on both
+    // sides -- swiftself pins the same register in caller and callee, so
+    // forwarding is free, and LateLowerGCFrame recognizes the attribute.
+    // Only when the caller itself has no pgcstack fall back to
+    // materializing julia.get_pgcstack, after the leading allocas: the
+    // imaging-mode LowerPTLS splits the entry block at that call, and any
+    // alloca below it would be demoted to a dynamic alloca.
     bool HavePG = false;
     if (CS && CallerPG) {
         for (unsigned i = 0; i < CS->arg_size(); i++) {
             if (CS->getArgOperand(i) == CallerPG) {
                 NewF->addParamAttr(i, Attribute::get(Ctx, "gcstack"));
+                NewF->addParamAttr(i, Attribute::get(Ctx, Attribute::SwiftSelf));
+                CS->addParamAttr(i, Attribute::get(Ctx, Attribute::SwiftSelf));
                 HavePG = true;
                 break;
             }
@@ -1694,8 +1729,20 @@ static Function *extractRegion(Function &F, Region &R, const JuliaPassContext &c
         if (!Getter)
             Getter = Function::Create(FunctionType::get(PointerType::get(Ctx, 0), false),
                                       GlobalValue::ExternalLinkage, "julia.get_pgcstack", M);
-        IRBuilder<> EB(&NewF->getEntryBlock(), NewF->getEntryBlock().begin());
+        BasicBlock &NE = NewF->getEntryBlock();
+        BasicBlock::iterator IP = NE.getFirstInsertionPt();
+        while (isa<AllocaInst>(*IP))
+            ++IP;
+        IRBuilder<> EB(&NE, IP);
         EB.CreateCall(Getter, {}, "pgcstack");
+    }
+    // The pgcstack marker freeze (see prepareRegion) has served its purpose.
+    for (BasicBlock &BB : *NewF) {
+        for (auto It = BB.begin(); It != BB.end();) {
+            auto *FI = dyn_cast<FreezeInst>(&*It++);
+            if (FI && FI->use_empty())
+                FI->eraseFromParent();
+        }
     }
     LLVM_DEBUG(dbgs() << "julia-function-splitting: extracted " << NewF->getName()
                       << " (" << NewF->getInstructionCount() << " instructions) from "
@@ -3299,6 +3346,17 @@ static bool splitFunction(Function &F, const JuliaPassContext &ctx) JL_NOTSAFEPO
         errs() << "julia-function-splitting: " << F.getName() << ": top level has "
                << Level.size() << " nodes\n";
     processLevel(F, Level, ctx);
+    // Erase the pgcstack marker freezes (see prepareRegion) that stayed in
+    // the caller: their region was rejected, so they no longer serve a
+    // purpose. Markers in extracted regions were consumed by extractRegion's
+    // argument tagging and are erased there.
+    for (BasicBlock &BB : F) {
+        for (auto It = BB.begin(); It != BB.end();) {
+            auto *FI = dyn_cast<FreezeInst>(&*It++);
+            if (FI && FI->use_empty())
+                FI->eraseFromParent();
+        }
+    }
     // Hoist back any sunk instruction stranded outside an entry block: its
     // region was rejected during extraction, so the sunk alloca now
     // re-executes on every visit of its block. A non-entry alloca is a
