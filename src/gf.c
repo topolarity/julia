@@ -3265,6 +3265,183 @@ static int method_in_interferences(jl_method_t *m2, jl_method_t *m1)
     return has_key(jl_atomic_load_relaxed(&m1->interferences), (jl_value_t*)m2);
 }
 
+// Packages whose foreign_specificities list is non-empty (mutated under
+// world_counter_lock, which both method activation and the usings-changed
+// handler hold). Enumerates the candidate walk for jl_methtable_usings_changed.
+static arraylist_t foreign_spec_roots;
+
+// Register a strict type-specificity win of `w` over `l` in the
+// foreign_specificities index: `l` (the holder of the pair's one-way
+// interference entry) is listed under every root of moduletype(w.sig), so a
+// `usings`-edge event can find the pair from the anchors whose closures
+// determine its verdict (see jl_methtable_usings_changed). Registration is
+// independent of the current visibility verdict and mode: verdicts change with
+// the module graph, and the index must already be complete when an event
+// arrives. Pairs whose verdict is stable at every world are skipped:
+// mt(l) ⊆ mt(w) syntactically (a root reaches itself; also covers empty mt(l),
+// e.g. the common extension-over-Base-fallback pair) and subtype-backed wins
+// (visibility-exempt).
+static void register_foreign_specificity(jl_method_t *w, jl_method_t *l)
+{
+    arraylist_t wmt, lmt;
+    arraylist_new(&wmt, 8);
+    arraylist_new(&lmt, 8);
+    collect_sig_moduletype((jl_value_t*)w->sig, &wmt, 0);
+    collect_sig_moduletype((jl_value_t*)l->sig, &lmt, 0);
+    int stable = 1;
+    for (size_t i = 0; i < lmt.len; i++) {
+        int found = 0;
+        for (size_t j = 0; j < wmt.len; j++) {
+            if (wmt.items[j] == lmt.items[i]) {
+                found = 1;
+                break;
+            }
+        }
+        if (!found) {
+            stable = 0;
+            break;
+        }
+    }
+    if (!stable && !jl_subtype((jl_value_t*)w->sig, (jl_value_t*)l->sig)) {
+        for (size_t j = 0; j < wmt.len; j++) {
+            jl_packageroot_t *root = (jl_packageroot_t*)wmt.items[j];
+            jl_packageroot_add_foreign_specificity(root, l);
+            // maintain the session-global list of roots with registrations
+            // (borrowed pointers: package roots are strongly rooted via the
+            // loaded-modules table / Main bindings). Rebuilt in-session at
+            // pkgimage load by re-activation; not serialized.
+            if (foreign_spec_roots.items == NULL)
+                arraylist_new(&foreign_spec_roots, 8);
+            int present = 0;
+            for (size_t i = 0; i < foreign_spec_roots.len; i++) {
+                if (foreign_spec_roots.items[i] == (void*)root) {
+                    present = 1;
+                    break;
+                }
+            }
+            if (!present)
+                arraylist_push(&foreign_spec_roots, root);
+        }
+    }
+    arraylist_free(&lmt);
+    arraylist_free(&wmt);
+}
+
+// Process a new package-graph edge `to -> from` committed at `new_world`
+// (the caller has already elided self-loops, duplicate edges, and edges into
+// the universal Base/Core packages).
+// Runs inside the jl_module_using transaction (world_counter_lock held, before
+// the world-counter store). A dependency-blocked specificity relation whose
+// visibility verdict flips to true at `new_world` invalidates the code that
+// concluded from its blockedness: callers whose inferred match set was missing
+// the contested region (recorded as missing-match mt-backedges, exactly as for
+// method deletion), and the loser's specializations applicable over the
+// winner's signature. No state is updated anywhere: the interference sets and
+// the foreign_specificities index record world-independent facts, and each
+// walk re-derives verdicts from them.
+JL_DLLEXPORT void jl_methtable_usings_changed(jl_packageroot_t *to, jl_packageroot_t *from, size_t new_world)
+{
+    // nothing registered anywhere: the universal case
+    if (foreign_spec_roots.items == NULL || foreign_spec_roots.len == 0)
+        return;
+    // Transitively-closed elision — exact on the package graph: if `to`
+    // already reached `from`, then any package reaching `to` already had
+    // `from`'s cone (redundant/diamond edges die here). The Main decree must
+    // not be consulted: it is not backed by edges, so it does not transfer
+    // through paths (a package that reaches Main via an explicit `using Main`
+    // edge walks Main's real cone, not its fiat one).
+    if (!(jl_main_module && to == jl_main_module->package) &&
+        jl_packageroot_reaches(to, from, new_world - 1, NULL, NULL))
+        return;
+    jl_value_t *isect = NULL, *isect2 = NULL, *loctag = NULL, *contested = NULL;
+    JL_GC_PUSH4(&isect, &isect2, &loctag, &contested);
+    for (size_t ri = 0; ri < foreign_spec_roots.len; ri++) {
+        jl_packageroot_t *r = (jl_packageroot_t*)foreign_spec_roots.items[ri];
+        // Only packages that reach `to` can gain anything from the new edge
+        // (reach into `to` is unaffected by an edge OUT of it, so either
+        // boundary world answers this identically) ...
+        if (r != to && !jl_packageroot_reaches(r, to, new_world - 1, NULL, NULL))
+            continue;
+        // ... and a package that already reached `from` gains nothing — exact
+        // on the package graph. (For r == Main this fires by decree,
+        // correctly: Main-anchored verdicts are constant.)
+        if (jl_packageroot_reaches(r, from, new_world - 1, NULL, NULL))
+            continue;
+        jl_value_t *list = r->foreign_specificities; // mutated only under world_counter_lock-holding insertions
+        if (list == jl_nothing || list == NULL)
+            continue;
+        for (size_t li = 0, ln = jl_array_nrows(list); li < ln; li++) {
+            jl_method_t *l = (jl_method_t*)jl_array_ptr_ref(list, li);
+            if (!(jl_atomic_load_relaxed(&l->dispatch_status) & METHOD_SIG_LATEST_WHICH))
+                continue; // deleted loser: nothing live to invalidate
+            jl_genericmemory_t *interferences = jl_atomic_load_relaxed(&l->interferences);
+            for (size_t k = 0; k < interferences->length; k++) {
+                jl_method_t *w = (jl_method_t*)jl_genericmemory_ptr_ref(interferences, k);
+                if (w == NULL)
+                    continue;
+                if (!(jl_atomic_load_relaxed(&w->dispatch_status) & METHOD_SIG_LATEST_WHICH))
+                    continue; // deleted winner: its win is not in any match set
+                if (method_in_interferences(l, w))
+                    continue; // mutual (type-ambiguous), not a win
+                // Exact flip test at the event boundary. Subtype-backed and
+                // stably-anchored pairs answer visible at both worlds and fall
+                // out here — and so does everything when the mode is off (no
+                // enforcement means nothing concluded from blockedness).
+                if (jl_method_morespecific_visible(w, l, new_world - 1, NULL, NULL))
+                    continue; // was already visible: no flip
+                if (!jl_method_morespecific_visible(w, l, new_world, NULL, NULL))
+                    continue; // still blocked
+                contested = jl_type_intersection((jl_value_t*)w->sig, (jl_value_t*)l->sig);
+                if (contested == jl_bottom_type)
+                    continue;
+                // scan 1: callers whose inferred match set was missing the
+                // contested region (they concluded no-match/ambiguous there)
+                jl_methcache_t *mc = jl_method_table->cache;
+                JL_LOCK(&mc->writelock);
+                struct _typename_invalidate_deleted_backedge env = {contested, &isect, &isect2, new_world - 1, 0};
+                if (!jl_foreach_top_typename_for(_typename_invalidate_deleted_backedges, contested, 1, &env)) {
+                    // cannot split into exact typenames: scan the whole table
+                    jl_genericmemory_t *allbackedges = jl_method_table->backedges;
+                    for (size_t i = 0, n = allbackedges->length; i < n; i += 2) {
+                        jl_value_t *tn = jl_genericmemory_ptr_ref(allbackedges, i);
+                        jl_value_t *bes = jl_genericmemory_ptr_ref(allbackedges, i + 1);
+                        if (tn && tn != jl_nothing && bes)
+                            _typename_invalidate_deleted_backedges((jl_typename_t*)tn, 0, &env);
+                    }
+                }
+                JL_UNLOCK(&mc->writelock);
+                // scan 2: the loser's specializations applicable over the
+                // winner's signature re-resolve (conservative: includes
+                // invoke edges)
+                loctag = jl_atomic_load_relaxed(&l->specializations); // gcroot
+                _Atomic(jl_method_instance_t*) *data;
+                size_t sl;
+                if (jl_is_svec(loctag)) {
+                    data = (_Atomic(jl_method_instance_t*)*)jl_svec_data(loctag);
+                    sl = jl_svec_len(loctag);
+                }
+                else {
+                    data = (_Atomic(jl_method_instance_t*)*)&loctag;
+                    sl = 1;
+                }
+                for (size_t si = 0; si < sl; si++) {
+                    jl_method_instance_t *mi = jl_atomic_load_relaxed(&data[si]);
+                    if ((jl_value_t*)mi == jl_nothing || mi == NULL)
+                        continue;
+                    if (!jl_has_empty_intersection(mi->specTypes, (jl_value_t*)w->sig))
+                        invalidate_backedges(mi, new_world - 1, "jl_methtable_usings_changed");
+                }
+                if (_jl_debug_method_invalidation) {
+                    jl_array_ptr_1d_push(_jl_debug_method_invalidation, (jl_value_t*)w);
+                    loctag = jl_cstr_to_string("jl_methtable_usings_changed");
+                    jl_array_ptr_1d_push(_jl_debug_method_invalidation, loctag);
+                }
+            }
+        }
+    }
+    JL_GC_POP();
+}
+
 // Find the index of a method in the method match array
 static int find_method_in_matches(jl_array_t *t, jl_method_t *method)
 {
@@ -3531,6 +3708,17 @@ void jl_method_table_activate(jl_typemap_entry_t *newentry)
                     m2_interferences = jl_idset_put_key(m2_interferences, (jl_value_t*)method, &idx);
                     jl_gc_write_atomic(m2, m2->interferences, jl_genericmemory_t, m2_interferences, release);
                 }
+                // Re-register one-way pairs for the replacing method (the
+                // replaced method's registrations point at its stale
+                // specializations; derive the direction from the copied sets)
+                if (m2) {
+                    int in_meth = method_in_interferences(m2, method); // !ms(method, m2)
+                    int in_m2 = method_in_interferences(method, m2);   // !ms(m2, method)
+                    if (in_meth && !in_m2)
+                        register_foreign_specificity(m2, method);      // m2 one-way beats method
+                    else if (in_m2 && !in_meth)
+                        register_foreign_specificity(method, m2);      // method one-way beats m2
+                }
             }
             loctag = jl_atomic_load_relaxed(&m->specializations); // use loctag for a gcroot
             _Atomic(jl_method_instance_t*) *data;
@@ -3579,6 +3767,13 @@ void jl_method_table_activate(jl_typemap_entry_t *newentry)
                 // Record the TYPE-level relation in the interference sets: the
                 // final relation is recovered at query time by gating one-way
                 // entries with jl_method_morespecific_visible.
+                if (ms_type_old[j] || ms_type_new) {
+                    // index the "morespecific but not subtype" pairs for
+                    // `usings`-edge event processing (winner-root anchored)
+                    jl_method_t *w2 = ms_type_old[j] ? m : method;
+                    jl_method_t *l2 = ms_type_old[j] ? method : m;
+                    register_foreign_specificity(w2, l2);
+                }
                 if (!ms_type_new) {
                     // !morespecific_type(new, old): add the old method to this interference set
                     ssize_t idx;

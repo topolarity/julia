@@ -925,6 +925,10 @@ typedef struct _jl_packageroot_t {
     // rootmodule->lock for mutation. Edges into Base/Core are not recorded
     // (universal-reachability decree).
     jl_value_t *deps;
+    // methods (rooted anywhere) holding a "morespecific but not subtype"
+    // interference entry whose winner's moduletype is anchored at this
+    // package; walked by jl_methtable_usings_changed on package-graph events
+    jl_value_t *foreign_specificities;
 } jl_packageroot_t;
 
 struct _jl_module_using {

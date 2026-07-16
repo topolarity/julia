@@ -1070,9 +1070,11 @@ JL_DLLEXPORT int jl_packageroot_reaches(jl_packageroot_t *from, jl_packageroot_t
                                         size_t *min_valid, size_t *max_valid);
 JL_DLLEXPORT int jl_module_reaches(jl_module_t *from, jl_module_t *to_root, size_t world,
                                    size_t *min_valid, size_t *max_valid);
-int jl_packageroot_add_dep(jl_packageroot_t *pr, jl_packageroot_t *dep, size_t new_world);
 JL_DLLEXPORT int jl_method_morespecific_visible(jl_method_t *winner, jl_method_t *loser, size_t world,
                                                 size_t *min_valid, size_t *max_valid);
+int jl_packageroot_add_dep(jl_packageroot_t *pr, jl_packageroot_t *dep, size_t new_world);
+int jl_packageroot_add_foreign_specificity(jl_packageroot_t *pr, jl_method_t *meth);
+JL_DLLEXPORT void jl_methtable_usings_changed(jl_packageroot_t *to, jl_packageroot_t *from, size_t new_world);
 JL_DLLEXPORT void jl_set_specificity_visibility_mode(int mode);
 JL_DLLEXPORT int jl_get_specificity_visibility_mode(void);
 void jl_add_scanned_method(jl_module_t *m, jl_method_t *meth);
