@@ -92,6 +92,7 @@
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/IntrinsicInst.h>
 #include <llvm/IR/Module.h>
+#include <llvm/IR/ValueHandle.h>
 #include <llvm/IR/Verifier.h>
 #include <llvm/Support/CommandLine.h>
 #include <llvm/Support/Debug.h>
@@ -1711,7 +1712,8 @@ static Function *extractRegion(Function &F, Region &R, const JuliaPassContext &c
 // values written by another region — each region can use a private copy
 // instead. All-or-nothing per buffer: privatizing only some regions would
 // starve the remaining readers of the shared one.
-static void privatizeRootBuffers(Function &F, std::vector<Region> &Leaves) JL_NOTSAFEPOINT
+static void privatizeRootBuffers(Function &F, std::vector<Region> &Leaves,
+                                 SmallVectorImpl<WeakTrackingVH> &Sunk) JL_NOTSAFEPOINT
 {
     const DataLayout &DL = F.getParent()->getDataLayout();
     DenseMap<BasicBlock *, Region *> RegionOf;
@@ -1891,6 +1893,7 @@ static void privatizeRootBuffers(Function &F, std::vector<Region> &Leaves) JL_NO
                                           AI->getAddressSpace(), AI->getArraySize(),
                                           AI->getAlign(), AI->getName() + ".priv");
                 NA->insertBefore(R->Blocks[0]->getFirstInsertionPt());
+                Sunk.push_back(NA);
                 C = NA;
             }
             else {
@@ -1942,7 +1945,14 @@ static void privatizeRootBuffers(Function &F, std::vector<Region> &Leaves) JL_NO
 // lie inside a single region can move into it (no other region can observe
 // the slot's contents, so a fresh per-call slot is equivalent); extraction
 // later hoists it into the new function's entry so it stays static.
-static void sinkEntryAllocas(Function &F, std::vector<Region> &Leaves) JL_NOTSAFEPOINT
+//
+// Every sunk instruction is recorded in Sunk so that any that end up
+// stranded outside an entry block (their region was rejected during
+// extraction) can be hoisted back: a non-entry alloca is dynamic and
+// re-executes on every visit -- inside a loop that grows the stack
+// unboundedly for the whole activation.
+static void sinkEntryAllocas(Function &F, std::vector<Region> &Leaves,
+                             SmallVectorImpl<WeakTrackingVH> &Sunk) JL_NOTSAFEPOINT
 {
     DenseMap<BasicBlock *, Region *> RegionOf;
     for (Region &R : Leaves)
@@ -2031,6 +2041,7 @@ static void sinkEntryAllocas(Function &F, std::vector<Region> &Leaves) JL_NOTSAF
                 continue;
             }
             A->moveBefore(IP);
+            Sunk.push_back(A);
         }
     }
 }
@@ -3261,8 +3272,9 @@ static bool splitFunction(Function &F, const JuliaPassContext &ctx) JL_NOTSAFEPO
     }
     if (Regions.empty())
         return Changed;
-    privatizeRootBuffers(F, Regions);
-    sinkEntryAllocas(F, Regions);
+    SmallVector<WeakTrackingVH, 64> SunkAllocas;
+    privatizeRootBuffers(F, Regions, SunkAllocas);
+    sinkEntryAllocas(F, Regions, SunkAllocas);
     // Build the hierarchical decomposition up front: regions become atomic
     // nodes and are folded, together with the glue blocks between them, into
     // parents by the same interval growth, level by level, so that no
@@ -3287,6 +3299,24 @@ static bool splitFunction(Function &F, const JuliaPassContext &ctx) JL_NOTSAFEPO
         errs() << "julia-function-splitting: " << F.getName() << ": top level has "
                << Level.size() << " nodes\n";
     processLevel(F, Level, ctx);
+    // Hoist back any sunk instruction stranded outside an entry block: its
+    // region was rejected during extraction, so the sunk alloca now
+    // re-executes on every visit of its block. A non-entry alloca is a
+    // dynamic alloca; inside a loop it grows the stack on every iteration
+    // for the rest of the activation. Successful extractions already
+    // re-anchored their allocas in the new function's entry (see
+    // extractRegion). Reverse iteration with insertion at the entry's front
+    // restores the original recorded order (allocas ahead of the address
+    // computations rooted at them).
+    for (WeakTrackingVH &VH : llvm::reverse(SunkAllocas)) {
+        auto *I = dyn_cast_or_null<Instruction>((Value *)VH);
+        if (!I)
+            continue;
+        BasicBlock *BB = I->getParent();
+        if (BB->isEntryBlock())
+            continue;
+        I->moveBefore(BB->getParent()->getEntryBlock().getFirstInsertionPt());
+    }
     auto T5 = now();
     if (SplitDebug || SplitTime)
         errs() << "julia-function-splitting: times(ms) chunk=" << ms(T0, T1)
