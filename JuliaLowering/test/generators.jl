@@ -128,6 +128,77 @@ Tuple{Int,Int}[(x,y) for x in 1:2, y in 1:3]
     @test_throws LoweringError jeval("[([return z for z in 1:2])[1] for j=1:2 for i=1:1]")
 end
 
+@testset "(AI) filter on non-innermost clause of flattened generator" begin
+    # Regression: a flattened (multi-`for`) generator whose *non-innermost*
+    # clause carries its own `if` filter (`for i=A if cond for j=B`) crashed
+    # `expand_generator` with an uncaught `BoundsError` -- its outer-variable
+    # pass walked the `K"filter"` node's test expression as if it were a loop
+    # spec. flisp accepts a filter on *any* clause (innermost, middle, or
+    # outermost, at any nesting depth); the fix restores that, so every case
+    # below must match the flisp oracle in *value* and in side-effect
+    # order/count (JuMP `test_constraint.jl`, PkgEval chunk-105).
+    local jeval(str) = jl_eval(test_mod, parsestmt(SyntaxTree, str))
+    local feval(str) = fl_eval(test_mod, parsestmt(Expr, str))
+    local agree(str) = @test jeval(str) == feval(str)
+
+    # Filter position across the clause list (2 and 3 syntactic `for` clauses).
+    @test jeval("sum(i for i in 1:3 for j in 1:i if true)") == 14      # innermost
+    @test jeval("sum(i for i in 1:3 if true for j in 1:i)") == 14      # outermost (the MWE)
+    @test jeval("sum(i for i in 1:3 if true for j in 1:i if true)") == 14  # both clauses
+    @test jeval("sum(1 for i in 1:2 for j in 1:2 if true for k in 1:2)") == 8  # middle of 3
+    @test jeval("sum(1 for i in 1:2 if true for j in 1:2 for k in 1:2)") == 8  # outermost of 3
+    @test jeval("sum(1 for i in 1:2 if true for j in 1:2 if true for k in 1:2)") == 8  # two filters
+    for s in ["sum(i for i in 1:3 if true for j in 1:i)",
+              "sum(1 for i in 1:2 for j in 1:2 if true for k in 1:2)",
+              "sum(1 for i in 1:2 if true for j in 1:2 if true for k in 1:2)"]
+        agree(s)
+    end
+
+    # Filter that references (and skips) outer loop variables: the skipped
+    # outer values (and everything nested under them) are dropped, matching an
+    # `if` placed as the first statement inside that level's loop body.
+    @test jeval("collect((i,j) for i in 1:3 if i>1 for j in 1:i)") ==
+        [(2,1),(2,2),(3,1),(3,2),(3,3)]
+    @test jeval("collect((i,j,k) for i in 1:3 if iseven(i) for j in 1:i for k in 1:j)") ==
+        [(2,1,1),(2,2,1),(2,2,2)]
+    agree("collect((i,j) for i in 1:3 if i>1 for j in 1:i)")
+    agree("collect((i,j,k) for i in 1:3 if iseven(i) for j in 1:i for k in 1:j)")
+
+    # Destructuring outer loop variable together with a filter (exercises the
+    # outer-variable pass' `foreach_lhs_name` over a tuple LHS behind a filter).
+    @test jeval("collect(a+b+j for (a,b) in zip(1:2,3:4) if a>0 for j in 1:2)") == [5,6,7,8]
+
+    # Interaction with the `_`-placeholder generator shortcut.
+    @test jeval("collect(i for i in 1:3 if true for _ in 1:2)") == [1,1,2,2,3,3]
+    @test jeval("collect(j for _ in 1:2 if true for j in 1:2)") == [1,2,1,2]
+
+    # Side-effect ORDER and COUNT and the laziness of the inner iterator: for a
+    # filtered-out outer value the inner range must never be constructed. Uses a
+    # shared log; the exact interleaving must match flisp.
+    local semmod = Module()
+    JuliaLowering.include_string(semmod, """
+        const LOG = String[]
+        cond(x, r) = (push!(LOG, "cond(\$x)"); r)
+        mkrange(x) = (push!(LOG, "mkrange(\$x)"); 1:x)
+    """)
+    jl_semlog(str) = (empty!(getglobal(semmod, :LOG));
+                      JuliaLowering.include_string(semmod, str);
+                      copy(getglobal(semmod, :LOG)))
+    fl_semlog(str) = (empty!(getglobal(semmod, :LOG));
+                      Base.include_string(semmod, str);
+                      copy(getglobal(semmod, :LOG)))
+    let s = "collect((i,j) for i in 1:3 if cond(i, i>1) for j in mkrange(i))"
+        # mkrange(1) must be absent: i=1 is filtered out before its range is built.
+        @test jl_semlog(s) == ["cond(1)","cond(2)","mkrange(2)","cond(3)","mkrange(3)"]
+        @test jl_semlog(s) == fl_semlog(s)
+    end
+    let s = "collect((i,j) for i in 1:3 if cond(i, false) for j in mkrange(i))"
+        # All outer values filtered out: no inner range ever constructed.
+        @test jl_semlog(s) == ["cond(1)","cond(2)","cond(3)"]
+        @test jl_semlog(s) == fl_semlog(s)
+    end
+end
+
 # splat in lhs
 @test JuliaLowering.include_string(test_mod, """
 [(h, i, j) for (h, i..., j) in ((1,2,3,4),(5,6,7,8))]

@@ -904,6 +904,13 @@ function expand_generator(ctx, ex)
     if numchildren(ex) > 2
         outervar_assignments = SyntaxList(ctx)
         for iterspecs in ex[2:end-1]
+            # A clause may carry its own `if` filter (`for i=A if cond for j=B`),
+            # wrapped in a `K"filter"` node whose first child is the genuine
+            # `K"iteration"` node; unwrap it (as pass 2 below does) so we only
+            # walk real loop-variable specs when collecting outer variables.
+            if kind(iterspecs) == K"filter"
+                iterspecs = iterspecs[1]
+            end
             for iterspec in children(iterspecs)
                 foreach_lhs_name(iterspec[1]) do var
                     @jl_assert kind(var) == K"Identifier" ex # Todo: K"BindingId"?
