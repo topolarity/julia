@@ -431,7 +431,11 @@ function stmt_effect_flags(𝕃ₒ::AbstractLattice, @nospecialize(stmt), @nospe
             rt_lb = argextype(args[2], src)
             rt_ub = argextype(args[3], src)
             source = argextype(args[5], src)
-            if !(⊑(𝕃ₒ, rt_lb, Type) && ⊑(𝕃ₒ, rt_ub, Type) && ⊑(𝕃ₒ, source, Method))
+            # The source is a `Method`, or (after the optimizer resolves the body
+            # into the construction site, see `handle_new_opaque_closure_call!`) a
+            # `CodeInstance`; both make the construction effect-free and removable.
+            if !(⊑(𝕃ₒ, rt_lb, Type) && ⊑(𝕃ₒ, rt_ub, Type) &&
+                 (⊑(𝕃ₒ, source, Method) || ⊑(𝕃ₒ, source, CodeInstance)))
                 return (false, false, false)
             end
             return (false, true, true)
