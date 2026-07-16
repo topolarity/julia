@@ -307,23 +307,37 @@ function register_arg_name_aliases!(ctx, scope::ScopeInfo, ex, bid)
 end
 
 # flisp compat, the reverse of the escaped-argument-name aliases registered in
-# `register_arg_name_aliases!`: an old-style macro emits a keyword-argument *name* bare (its
-# own layer) while esc'd defaults or the body reference it from an ancestor
-# (caller) layer.  flisp exempts keyword-arg names from hygiene renaming
-# (macroexpand.scm `safe-llist-keyword-args`), so those references bind to the
-# kwarg.  Desugaring tags kwarg-derived binding sites `:is_keyword_arg`; register
-# a read-only alias at each ancestor layer of the kwarg's own layer pointing back
-# to its binding.  As with the forward direction the alias is read-only, so a
-# bare name that is assigned or explicitly declared still gets a fresh hygienic
-# local (matching flisp's gensym renaming), and unrelated nested expansions,
-# whose layers are not on this ancestry, keep their hygiene.
+# `register_arg_name_aliases!`: an old-style macro emits an *identity-mapped*
+# argument name bare (its own layer) while esc'd defaults or the body reference
+# it from an ancestor (caller) layer.  flisp exempts two kinds of argument name
+# from hygiene renaming, so a bare occurrence stays the raw symbol and those
+# ancestor-layer references bind to it:
+#   * keyword-argument names (macroexpand.scm `safe-llist-keyword-args`),
+#     tagged `:is_keyword_arg` by desugaring; and
+#   * arguments annotated `@nospecialize`/`@specialize` (macroexpand.scm
+#     `try-arg-name`'s `meta` case via `nospecialize-meta?`, which matches both),
+#     tagged `:nospecialize`/`:specialize` by `apply_arg_meta`.  This is the
+#     ChainRulesCore `@non_differentiable` kwsorter shape: a gensym'd `kwargs`
+#     bag spliced bare as `@nospecialize($kwargs::Any)` and referenced only
+#     through an esc'd call `$(esc(... kwargs ...))`.  A plain (un-annotated)
+#     bare positional is renamed by flisp instead, so an esc'd reference to it
+#     does *not* resolve (flisp errors too) -- hence the gate is exactly these
+#     two identity-mapped classes, not every `:is_method_arg_name`.
+# Register a read-only alias at each ancestor layer of the name's own layer
+# pointing back to its binding.  As with the forward direction the alias is
+# read-only, so a bare name that is assigned or explicitly declared still gets a
+# fresh hygienic local (matching flisp's gensym renaming), and unrelated nested
+# expansions, whose layers are not on this ancestry, keep their hygiene.
 function register_kwarg_aliases!(ctx, scope::ScopeInfo, ex, bid)
     (isnothing(bid) || kind(ex) !== K"Identifier") && return
-    getmeta(ex, :is_keyword_arg, false) || return
+    (getmeta(ex, :is_keyword_arg, false) ||
+     getmeta(ex, :nospecialize, false) ||
+     getmeta(ex, :specialize, false)) || return
     sc = ex.context::SyntaxContext
     is_flisp_compat(sc) || return
-    # A keyword-arg name (bare or esc'd) is identity-mapped in flisp:
-    # references to it are raw-symbol shadowable (see `resolve_name`).
+    # An identity-mapped argument name (kwarg or `@nospecialize`d, bare or esc'd)
+    # is left as the raw symbol in flisp: references to it are raw-symbol
+    # shadowable (see `resolve_name`).
     get_binding(ctx, bid).is_flisp_identity = true
     aliases = scope.arg_aliases
     l = sc.layer.escaped

@@ -2649,6 +2649,79 @@ end
     end
 end
 
+# An old-style macro that splices an argument *name* bare (its own expansion
+# layer) but references it only through an `esc(...)` (caller layer).  flisp
+# renames a plain bare positional apart, so an esc'd reference to it does NOT
+# resolve (flisp errors); but flisp EXEMPTS from renaming two classes of arg
+# name -- keyword-arg names, and arguments annotated `@nospecialize`/`@specialize`
+# (macroexpand.scm `try-arg-name`'s `meta` case via `nospecialize-meta?`, which
+# matches both).  For those exempt names the bare declaration stays the raw
+# symbol, so the esc'd reference binds to it.  This is exactly ChainRulesCore's
+# `@non_differentiable` frule kwsorter shape: `@nospecialize($kwargs::Any)`
+# spliced bare, used only inside an esc'd forwarding call
+# `$(esc(... kwargs ...))`.  (frule's `_nondiff_frule_expr` broke; rrule's
+# `_nondiff_rrule_expr` escaped the *declaration* too, so it never hit this.)
+# See `register_kwarg_aliases!`; the standalone end-to-end reproducer is
+# bugs/chainrulescore-c110/mwe.jl in the fix notes.
+fl_eval(test_mod, :(macro def_nospec_esc(fname)
+    g = gensym(:kw)
+    quote
+        function $(esc(fname))(@nospecialize($g::Any))
+            $(esc(:($g + 1)))           # esc'd use of the bare-declared name
+        end
+    end
+end))
+fl_eval(test_mod, :(macro def_specialize_esc(fname)
+    g = gensym(:kw)
+    quote
+        function $(esc(fname))(@specialize($g::Any))
+            $(esc(:($g + 1)))
+        end
+    end
+end))
+fl_eval(test_mod, :(macro def_nospec_shadow(fname)
+    # `@nospecialize(w)`; body is an esc'd `let w = 5; w + 1 end`.  The
+    # identity-mapped arg name is raw-symbol shadowable, so the esc'd `let`
+    # binding of the same text wins over the argument -- as under flisp.
+    quote
+        function $(esc(fname))(@nospecialize(w::Any))
+            $(esc(:(let w = 5; w + 1 end)))
+        end
+    end
+end))
+fl_eval(test_mod, :(macro def_plainpos_esc(fname)
+    # No annotation: flisp renames the bare positional, so the esc'd reference
+    # does not resolve (errors).  Marks the precise boundary of the exemption --
+    # the alias fires for identity-mapped names only, not every method arg name.
+    g = gensym(:p)
+    quote
+        function $(esc(fname))($g::Any)
+            $(esc(:($g + 1)))
+        end
+    end
+end))
+@testset "(AI) @nospecialize/@specialize arg name bare-decl + esc'd use (flisp compat)" for run in [
+    (x::String)->fl_eval(test_mod, JuliaSyntax.parsestmt(Expr, "#=FLISP SANITY-CHECK=# "*x)),
+    (x::String)->JuliaLowering.include_string(test_mod, "#=JL COMPAT=# "*x; expr_compat_mode=true)]
+    # esc'd body reference resolves to the identity-mapped (exempt) arg name.
+    @test run("@def_nospec_esc(nspe1); nspe1(10)") == 11
+    @test run("@def_specialize_esc(spe1); spe1(10)") == 11
+    # an esc'd same-text binder still shadows the identity-mapped arg name.
+    @test run("@def_nospec_shadow(nssh1); nssh1(100)") == 6
+end
+
+@testset "(AI) plain bare positional arg name is NOT identity-mapped (flisp compat)" begin
+    # An un-annotated bare positional is hygienically renamed by flisp, so an
+    # esc'd reference to it is a free (global) name -- flisp errors, and so must
+    # JuliaLowering: the reverse alias must not over-fire on every arg name.
+    src = "@def_plainpos_esc(ppe1); ppe1(10)"
+    @test_throws Exception fl_eval(test_mod, JuliaSyntax.parsestmt(Expr, src))
+    @test_throws Exception JuliaLowering.include_string(
+        test_mod, src; expr_compat_mode=true)
+    @test_throws Exception JuliaLowering.include_string(
+        test_mod, src; expr_compat_mode=false)
+end
+
 @testset "(AI) old-style macro method-def name -> macro-home global (flisp compat)" begin
     # An unescaped method-def *name* at the root of an old-style macro's
     # expansion binds a plain global of the *macro's* module (defining or
