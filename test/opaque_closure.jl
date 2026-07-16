@@ -434,12 +434,17 @@ end
 let (bt, did_gc) = make_oc_and_collect_bt()
     GC.gc(true); GC.gc(true); GC.gc(true);
     @test did_gc[]
-    @test all(stacktrace(bt)) do frame
+    # The body frame must resolve to the OC's unregistered method through the
+    # executing CodeInstance (kept alive for backtraces by its global-root
+    # promotion at JIT registration), not merely to the method the transplanted
+    # IR was inferred from.
+    @test any(stacktrace(bt)) do frame
         li = frame.linfo
         isa(li, Core.CodeInstance) && (li = li.def)
         isa(li, Core.ABIOverride) && (li = li.def)
-        isa(li, Core.MethodInstance) && (li = li.def)
-        return isa(li, Method) || isa(li, Core.CodeInfo) || li === nothing
+        isa(li, Core.MethodInstance) || return false
+        isa(li.def, Method) || return false
+        return li.def.is_unregistered
     end
 end
 

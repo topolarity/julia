@@ -124,13 +124,28 @@ end
 # 1. Push our own frame
 # 2. If there is a linetable, recurse on edges there (and not the linetable)
 # 3. Recurse on any of our own edges
-function _add_di_frames!(frames, pointer, di::Core.DebugInfo, pc::Int)
+#
+# `outer_linfo` (root call only) is the executing CodeInstance, used as the
+# outermost frame's `linfo` when the DebugInfo root's `def` names a *different*
+# MethodInstance than the one the code was compiled for. That happens when IR is
+# transplanted at construction time -- e.g. an `OpaqueClosure(ir)` body carries
+# the debuginfo of the method the IR was inferred from -- and the debuginfo `def`
+# then describes the *source* of the code, not the code object executing in this
+# frame. Physical-frame consumers (e.g. resolving a backtrace whose code is kept
+# alive only through its CodeInstance root) need the latter.
+function _add_di_frames!(frames, pointer, di::Core.DebugInfo, pc::Int, outer_linfo=nothing)
     @assert pc > 0 "invalid pc"
+    linfo = di.def isa Core.MethodInstance ? di.def : nothing
+    if outer_linfo isa Core.CodeInstance && isempty(frames)
+        def = outer_linfo.def
+        isa(def, Core.ABIOverride) && (def = def.def)
+        linfo === def || (linfo = outer_linfo)
+    end
     push!(frames, StackFrame(
         di.def isa Symbol ? Symbol("macro expansion") : IRShow.method_name(di.def),
         IRShow.debuginfo_file1(di),
         @ccall(jl_cdi_firstxy(di::Any, pc::Int32)::NTuple{2, Int32})[1],
-        di.def isa Core.MethodInstance ? di.def : nothing,
+        linfo,
         false, # we can assume C frames aren't inlined into julia
         !isempty(frames),
         pointer,
@@ -183,7 +198,7 @@ Base.@constprop :none function lookup(pointer::Ptr{Cvoid})
         end
     else
         out = Vector{StackFrame}()
-        _add_di_frames!(out, pointer, di, pc)
+        _add_di_frames!(out, pointer, di, pc, frames[end][4])
         reverse!(out)
     end
     return out
