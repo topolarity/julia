@@ -940,6 +940,23 @@ extern "C" JL_DLLEXPORT_CODEGEN int jl_reuse_image_code_eligible(jl_code_instanc
     return 1;
 }
 
+// A valid, image-resident CodeInstance without native code: the image
+// ecosystem already processed this MethodInstance and chose not to give it
+// standalone code, so a reuse-mode sysimage build should not re-infer and
+// compile it either (pkgimage-aligned selection policy).
+extern "C" JL_DLLEXPORT_CODEGEN int jl_reuse_image_code_cert(jl_code_instance_t *ci) JL_NOTSAFEPOINT
+{
+    if (!jl_reuse_image_code_enabled())
+        return 0;
+    if (!jl_object_in_image((jl_value_t *)ci))
+        return 0;
+    if (jl_atomic_load_relaxed(&ci->max_world) != ~(size_t)0)
+        return 0;
+    if (jl_atomic_load_relaxed(&ci->invoke) != NULL)
+        return 0;   // has code (or const): handled elsewhere
+    return 1;
+}
+
 #if defined(_OS_LINUX_)
 
 #include <dlfcn.h>
@@ -1439,13 +1456,16 @@ static void jl_emit_native_to_output(jl_native_code_desc_t *data, jl_array_t *co
     if (reuse_mode)
         jl_reuse_build_plan(reuse_plan, out, codeinfos);
     size_t n_ci_total = 0, n_ci_from_image = 0, n_ci_skipped = 0, n_ci_reused = 0;
-    size_t n_ci_const = 0, n_ci_emitted = 0, n_ci_dup = 0;
+    size_t n_ci_const = 0, n_ci_emitted = 0, n_ci_dup = 0, n_ci_twin_skipped = 0;
     // classification of the non-FROM_IMAGE remainder: deserialized from an
     // image's data (inference-only cache entry, natively compiled for the
     // first time here) vs allocated fresh in this session
     size_t n_ci_inferonly = 0, n_ci_inferonly_const = 0, n_ci_session = 0;
     std::map<std::string, size_t> session_fresh_mods;
     std::vector<std::string> session_fresh_samples;
+    size_t n_fresh_shadowing_valid = 0, n_fresh_invalidated = 0, n_fresh_never_imaged = 0;
+    size_t n_emitted_shadow = 0, n_emitted_shadow_code = 0;
+    std::vector<std::string> emitted_shadow_samples;
     size_t i, l;
     for (i = 0, l = jl_array_nrows(codeinfos); i < l; i++) {
         // each item in this list is either a CodeInstance followed by a CodeInfo indicating something
@@ -1466,6 +1486,25 @@ static void jl_emit_native_to_output(jl_native_code_desc_t *data, jl_array_t *co
                     n_ci_session++;
                     if (getenv("JULIA_REUSE_DEBUG")) {
                         jl_method_instance_t *mi = jl_get_ci_mi(codeinst);
+                        // did this MethodInstance ever have an image-resident
+                        // CodeInstance (now invalidated/superseded), or was it
+                        // never compiled into any image?
+                        int had_image_ci = 0, image_ci_valid = 0;
+                        jl_code_instance_t *c = jl_atomic_load_relaxed(&mi->cache);
+                        while (c) {
+                            if (c != codeinst && jl_object_in_image((jl_value_t *)c)) {
+                                had_image_ci = 1;
+                                if (jl_atomic_load_relaxed(&c->max_world) == ~(size_t)0)
+                                    image_ci_valid = 1;
+                            }
+                            c = jl_atomic_load_relaxed(&c->next);
+                        }
+                        if (image_ci_valid)
+                            n_fresh_shadowing_valid++;
+                        else if (had_image_ci)
+                            n_fresh_invalidated++;
+                        else
+                            n_fresh_never_imaged++;
                         if (jl_is_method(mi->def.method)) {
                             jl_module_t *mod = mi->def.method->module;
                             while (mod->parent != NULL && mod->parent != mod)
@@ -1527,9 +1566,49 @@ static void jl_emit_native_to_output(jl_native_code_desc_t *data, jl_array_t *co
                 out.ci_funcs[codeinst] = {JL_INVOKE_CONST};
                 n_ci_const++;
             }
+            else if (reuse_mode && [&]() JL_NOTSAFEPOINT {
+                // a session-fresh CodeInstance whose MethodInstance already
+                // has a valid, code-bearing image CodeInstance (e.g. the
+                // compiler compiling itself while selection runs): the image
+                // twin serves dispatch, so emitting this one is redundant
+                jl_method_instance_t *mi = jl_get_ci_mi(codeinst);
+                jl_code_instance_t *c = jl_atomic_load_relaxed(&mi->cache);
+                while (c) {
+                    if (c != codeinst && jl_egal(c->owner, codeinst->owner) &&
+                        jl_reuse_image_code_eligible(c))
+                        return true;
+                    c = jl_atomic_load_relaxed(&c->next);
+                }
+                return false;
+            }()) {
+                n_ci_twin_skipped++;
+            }
             else {
                 jl_emit_codeinst(out, codeinst, src);
                 n_ci_emitted++;
+                if (getenv("JULIA_REUSE_DEBUG")) {
+                    jl_method_instance_t *mi = jl_get_ci_mi(codeinst);
+                    int shadow = 0;
+                    jl_code_instance_t *c = jl_atomic_load_relaxed(&mi->cache);
+                    while (c) {
+                        if (c != codeinst && jl_object_in_image((jl_value_t *)c) &&
+                            jl_atomic_load_relaxed(&c->max_world) == ~(size_t)0) {
+                            shadow = jl_atomic_load_relaxed(&c->invoke) != NULL ? 2 : 1;
+                            if (shadow == 2)
+                                break;
+                        }
+                        c = jl_atomic_load_relaxed(&c->next);
+                    }
+                    if (shadow) {
+                        n_emitted_shadow++;
+                        if (shadow == 2)
+                            n_emitted_shadow_code++;
+                        if (emitted_shadow_samples.size() < 15 && jl_is_method(mi->def.method))
+                            emitted_shadow_samples.push_back(
+                                std::string(jl_symbol_name(mi->def.method->module->name)) + "." +
+                                jl_symbol_name(mi->def.method->name));
+                    }
+                }
             }
             out.safepoint_on_entry = safepoint_on_entry;
             JL_GC_PROMISE_ROOTED(codeinst);
@@ -1547,14 +1626,21 @@ static void jl_emit_native_to_output(jl_native_code_desc_t *data, jl_array_t *co
 
     if (jl_experiment_skip_from_image() || reuse_mode || getenv("JULIA_REPORT_IMAGE_REUSE"))
     {
-        jl_safe_printf("jl_emit_native_to_output: %zu CodeInstance events: machine code %zu reused / %zu emitted; %zu const/no-code, %zu duplicate, %zu skipped (origin: %zu FROM_IMAGE, %zu inference-only-from-image (%zu const/builtin), %zu session-fresh)\n",
+        jl_safe_printf("jl_emit_native_to_output: %zu CodeInstance events: machine code %zu reused / %zu emitted; %zu const/no-code, %zu duplicate, %zu skipped, %zu twin-skipped (origin: %zu FROM_IMAGE, %zu inference-only-from-image (%zu const/builtin), %zu session-fresh)\n",
                        n_ci_total, n_ci_reused, n_ci_emitted, n_ci_const, n_ci_dup, n_ci_skipped,
-                       n_ci_from_image, n_ci_inferonly, n_ci_inferonly_const, n_ci_session);
+                       n_ci_twin_skipped, n_ci_from_image, n_ci_inferonly, n_ci_inferonly_const, n_ci_session);
         if (getenv("JULIA_REUSE_DEBUG") && !session_fresh_mods.empty()) {
             std::vector<std::pair<size_t, std::string>> by_count;
             for (auto &kv : session_fresh_mods)
                 by_count.push_back({kv.second, kv.first});
             std::sort(by_count.rbegin(), by_count.rend());
+            jl_safe_printf("session-fresh origin: %zu shadowing-valid-image-ci, %zu invalidated-image-ci, %zu never-imaged\n",
+                           n_fresh_shadowing_valid, n_fresh_invalidated, n_fresh_never_imaged);
+            std::string sline = "emitted-with-valid-image-twin: " + std::to_string(n_emitted_shadow) +
+                                " (twin has code: " + std::to_string(n_emitted_shadow_code) + ");";
+            for (auto &s3 : emitted_shadow_samples)
+                sline += " " + s3;
+            jl_safe_printf("%s\n", sline.c_str());
             std::string line = "session-fresh by root module:";
             for (size_t k = 0; k < by_count.size() && k < 12; k++)
                 line += " " + by_count[k].second + "=" + std::to_string(by_count[k].first);
