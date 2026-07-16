@@ -1210,6 +1210,100 @@ func_in_own_sp(func_in_own_sp)
     end
     f_global_in_tvbounds(1), f_global_in_tvbounds(1.5)
     """) == ((1, Int), (2, Float64))
+
+    #-------------------------------------------------------------------------------
+    # Captured static parameter surfaced through `locals()`/`@locals` inside a
+    # nested closure.  `locals()` enumerates every enclosing scope, including the
+    # method-definition scope where the `where` parameter is a `:typevar` binding
+    # (holding the runtime `TypeVar`); that binding is only assigned in the
+    # enclosing method-definition lambda, so a reference to it from a nested
+    # closure's own body used to hit "Found unexpected binding of kind typevar".
+    # The nested closure has the parameter available as its own static parameter,
+    # which is what flisp reports it through -- this is the shape that made
+    # `MLStyle` (and hence `Refactoring`) fail to precompile.
+
+    # Minimal case: `@locals` in a plain top-level `where T` method.  The
+    # `:typevar` binding is assigned in the enclosing (top-level) lambda, but
+    # `@locals` runs in the method body, a different lambda -- this already threw
+    # before nesting is involved.
+    @test JuliaLowering.include_string(test_mod, """
+    begin
+        function f_locals_plain(x::T) where T
+            d = Base.@locals
+            (T, d[:T])
+        end
+        (f_locals_plain(3), f_locals_plain(4.0))
+    end
+    """) == ((Int, Int), (Float64, Float64))
+
+    # 1-level: `where T` closure with a nested closure that only reads `@locals`.
+    let r = JuliaLowering.include_string(test_mod, """
+        begin
+            function f_locals_sp(a)
+                function name(x::AbstractArray{T,1}) where T
+                    T
+                    f = body -> (a, T, Base.@locals)
+                    f(a)
+                end
+                name
+            end
+            f_locals_sp(99)(Int[1,2,3])
+        end
+        """)
+        @test r[1] == 99
+        @test r[2] === Int
+        @test r[3][:T] === Int          # reported via the closure's static parameter
+        @test haskey(r[3], :body)
+    end
+
+    # 2-level: the `where T` closure is itself nested one closure deeper.
+    @test JuliaLowering.include_string(test_mod, """
+    begin
+        function f_locals_sp_deep(a)
+            matcher = z -> begin
+                function name(x::AbstractArray{T,1}) where T
+                    g = () -> Base.@locals
+                    (T, g()[:T])
+                end
+                name
+            end
+            matcher
+        end
+        f_locals_sp_deep(7)("m")(Float64[1.0])
+    end
+    """) == (Float64, Float64)
+
+    # Multiple captured static parameters enumerated by `@locals`.
+    @test JuliaLowering.include_string(test_mod, """
+    begin
+        function f_locals_multi_sp()
+            function name(x::S, y::T) where {S,T}
+                g = () -> Base.@locals
+                d = g()
+                (S, T, d[:S], d[:T])
+            end
+            name
+        end
+        f_locals_multi_sp()(1, 2.0)
+    end
+    """) == (Int, Float64, Int, Float64)
+
+    # 3-level nesting with `@locals` in the innermost closure.
+    @test JuliaLowering.include_string(test_mod, """
+    begin
+        function f_locals_sp_depth3()
+            function outer_wh(x::T) where T
+                mid = () -> begin
+                    inner = () -> Base.@locals
+                    (T, inner()[:T])
+                end
+                mid()
+            end
+            outer_wh
+        end
+        f_locals_sp_depth3()(1im)
+    end
+    """) == (Complex{Int}, Complex{Int})
 end
 
 # questionable test: g_shadowed_by_sparam is not an sparam of the single-arg

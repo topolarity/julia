@@ -80,6 +80,12 @@ struct LinearIRContext{Attrs} <: AbstractLoweringContext
     symbolic_block_labels::Set{String}  # labels that are symbolic blocks (not allowed as @goto targets)
     meta::Dict{Symbol, Any}
     mod::Module
+    # Maps each `:static_parameter` binding id to the `:typevar` binding id
+    # holding the runtime `TypeVar` for the same `where` parameter (from
+    # scope_analysis).  Used in `compile_lambda` to route cross-lambda `:typevar`
+    # references (e.g. from `locals()` inside a nested closure) back to the
+    # consuming lambda's own static parameter, matching flisp.
+    sp_typevars::Dict{IdTag, IdTag}
 end
 
 function rettype(ctx::LinearIRContext)
@@ -95,7 +101,8 @@ function LinearIRContext(graph, ctx, is_toplevel_thunk, lambda_bindings)
                     Ref(0), Dict{String,JumpTarget{Attrs}}(), String[],
                     SyntaxList(ctx), SyntaxList(ctx),
                     Vector{FinallyHandler{Attrs}}(), Dict{String,JumpTarget{Attrs}}(),
-                    Vector{JumpOrigin{Attrs}}(), Set{String}(), Dict{Symbol, Any}(), ctx.mod)
+                    Vector{JumpOrigin{Attrs}}(), Set{String}(), Dict{Symbol, Any}(), ctx.mod,
+                    ctx.sp_typevars)
 end
 
 function current_lambda_bindings(ctx::LinearIRContext)
@@ -1092,7 +1099,11 @@ function _renumber(ctx, ssa_rewrites, slot_rewrites, label_table, ex)
             binfo = get_binding(ctx, id)
             if !isnothing(new_id)
                 sk = binfo.kind == :local || binfo.kind == :argument ? K"slot"             :
+                     # A `:typevar` only appears in `slot_rewrites` when
+                     # `compile_lambda` routed it to this lambda's own static
+                     # parameter (see there); emit it as such.
                      binfo.kind == :static_parameter                 ? K"static_parameter" :
+                     binfo.kind == :typevar                          ? K"static_parameter" :
                      throw(LoweringError(ex, "Found unexpected binding of kind $(binfo.kind)"))
                 setattr!(newleaf(ctx, ex, sk), :var_id, new_id)
             else
@@ -1240,6 +1251,17 @@ function compile_lambda(outer_ctx, ex)
         info = get_binding(ctx.bindings, id)
         @jl_assert info.kind == :static_parameter arg
         slot_rewrites[id] = i
+        # A captured `where` parameter is represented by two bindings: this
+        # `:static_parameter` (available here, in the method body) and a
+        # `:typevar` binding holding the runtime `TypeVar` (assigned only in the
+        # enclosing method-definition lambda).  References to the `:typevar`
+        # binding can nonetheless surface in *this* body -- e.g. `locals()` /
+        # `@locals` enumerates the enclosing method-def scope and emits the
+        # `:typevar` -- where the `TypeVar` value is unavailable but the static
+        # parameter is.  Route such references to this static parameter, matching
+        # flisp, which reports the same `where` variable via `static_parameter`.
+        tv = get(ctx.sp_typevars, id, IdTag(0))
+        tv == 0 || (slot_rewrites[tv] = i)
     end
     let ns_slots = SyntaxList(ctx)
         for (i, s) in enumerate(slots)
