@@ -1363,6 +1363,18 @@ function analyze_variables!(ctx, ex)
         name = ex[1]
         if kind(name) == K"BindingId"
             get_binding(ctx, name).is_called = true
+        elseif kind(name) == K"core" && numchildren(ex) > 2 &&
+                (name.name_val == "kwcall" || name.name_val == "_apply_iterate")
+            # Calls of a variable through a keyword-argument or splat wrapper
+            # lower to `Core.kwcall(kws, f, args...)` resp.
+            # `Core._apply_iterate(iterate, f, args...)`, putting the callee `f`
+            # in argument position. Mark it called too, so its `SLOT_CALLED`
+            # flag / `Method.called` bit is set (mirrors flisp's special cases
+            # in `src/julia-syntax.scm`'s `analyze-vars`).
+            callee = ex[3]
+            if kind(callee) == K"BindingId"
+                get_binding(ctx, callee).is_called = true
+            end
         end
         foreach(e->analyze_variables!(ctx, e), children(ex))
     elseif k == K"method_defs"

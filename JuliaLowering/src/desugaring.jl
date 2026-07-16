@@ -1831,8 +1831,13 @@ function expand_kw_call(ctx, srcref, farg, all_args)
     end
     # Hoist side effects in source order. `_arg_to_temp` leaves effect-free
     # arguments (literals, identifiers, ...) in place so that simple calls don't
-    # gain gratuitous temporaries.
+    # gain gratuitous temporaries. The receiver is hoisted first (it is written
+    # first), and -- like flisp's `sym-ref?` guard in `lower-kw-call-` -- an
+    # effect-free receiver (e.g. a plain variable) is left in place. Keeping a
+    # variable receiver in argument position of the emitted `kwcall` is what lets
+    # `analyze_variables!` see it as called (see `src/scope_analysis.jl`).
     stmts = SyntaxList(ctx)
+    func = _arg_to_temp(ctx, stmts, farg)
     hoisted = SyntaxList(ctx)
     for arg in pre_semi
         push!(hoisted, _arg_to_temp(ctx, stmts, arg))
@@ -1850,7 +1855,6 @@ function expand_kw_call(ctx, srcref, farg, all_args)
     end
     append!(kws, para)
     @ast ctx srcref [K"block"
-        func := farg
         stmts...
         kw_container := expand_named_tuple(ctx, srcref, kws;
                                            field_name="keyword argument",

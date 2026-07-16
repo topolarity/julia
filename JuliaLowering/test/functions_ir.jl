@@ -882,7 +882,7 @@ end
 7   SourceLocation::1:1
 8   (call core.svec %₅ %₆ %₇)
 9   --- method TestMod.f %₈
-    slots: [slot₁/#self#]
+    slots: [slot₁/#self#(called)]
     1   (call core.tuple 1 2)
     2   (call core._apply_iterate top.iterate slot₁/#self# %₁)
     3   (return %₂)

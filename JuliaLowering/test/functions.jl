@@ -554,6 +554,65 @@ end
     @test only(methods(test_mod.f_slotflags)).called == 0b0100
 end
 
+@testset "(AI) called-bit through kwcall/_apply_iterate wrappers" begin
+    # A function-valued argument that is called *with keyword arguments* lowers
+    # to `Core.kwcall(nt, g, args...)`, and one called with a splat lowers to
+    # `Core._apply_iterate(iterate, g, args...)` -- both put the callee `g` in
+    # argument (not head) position. Its SLOT_CALLED flag / `Method.called` bit
+    # must still be set, matching flisp's `analyze-vars` special cases in
+    # `src/julia-syntax.scm`. A missing bit makes `jl_compilation_sig` widen the
+    # Function argument to abstract `Function`, forcing dynamic dispatch and
+    # allocation (regression: DiscreteVoronoi `_redac_voronoi!`).
+    JuliaLowering.include_string(test_mod, """
+        c_direct(x, g)     = g(x)
+        c_kw(x, g)         = g(x; k=1)
+        c_splat(x, g)      = g(x...)
+        c_combined(x, g)   = g(x...; k=1)
+        c_multikw(x, g, h) = (g(x; k=1); h(x; k=1))
+    """)
+    # `g` is argument slot 2 -> called bit 1 (0b10).
+    @test only(methods(test_mod.c_direct)).called == 0b010
+    @test only(methods(test_mod.c_kw)).called == 0b010
+    @test only(methods(test_mod.c_splat)).called == 0b010
+    # A combined splat+kwcall nests the wrappers (`_apply_iterate(iterate,
+    # kwcall, tuple, ...)`), so the callee is no longer a direct wrapper
+    # argument; flisp does not mark it either.
+    @test only(methods(test_mod.c_combined)).called == 0b000
+    # Two called slots: `g` (slot 2) and `h` (slot 3) -> 0b110.
+    @test only(methods(test_mod.c_multikw)).called == 0b110
+end
+
+@testset "(AI) kwcall callee kept concrete (no Function widening)" begin
+    # End-to-end observable of the called-bit fix: with the bit set,
+    # `jl_compilation_sig` keeps the Function argument concrete
+    # (`typeof(callee)`) rather than widening it to abstract `Function`, so the
+    # non-inlineable recursive kw-body compiles without dynamic dispatch or
+    # allocation. Mirrors DiscreteVoronoi's `_redac_voronoi!` shape. (The 0-byte
+    # allocation corroboration of this same shape is exercised end-to-end by the
+    # DiscreteVoronoi reproducer; here we assert the precise, deterministic
+    # specialization outcome via `code_typed`.)
+    JuliaLowering.include_string(test_mod, """
+        cee(x; k) = x + k
+        @noinline function recf(x, n; d, g)
+            n <= 0 && return x
+            y = g(x; k=d)
+            return recf(y, n - 1; d=d, g=g)
+        end
+    """)
+    # The `Core.kwcall` wrapper's only :invoke edge must specialize `g` as the
+    # concrete singleton type, not abstract `Function`.
+    kwt = typeof((d = 1, g = test_mod.cee))
+    ci = code_typed(Core.kwcall, (kwt, typeof(test_mod.recf), Int, Int); optimize=true)[1][1]
+    gt = nothing
+    for stmt in ci.code
+        Meta.isexpr(stmt, :invoke) || continue
+        tgt = stmt.args[1]
+        mi = tgt isa Core.MethodInstance ? tgt : tgt.def
+        gt = mi.specTypes.parameters[3]
+    end
+    @test gt === typeof(test_mod.cee)
+end
+
 @testset "nospecialize" begin
     # note f(a,b,c) means a is arg 1, not f
     function test_arg_unspecialized(f::Function, arg_i::Int)
