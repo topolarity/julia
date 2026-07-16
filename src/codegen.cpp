@@ -988,6 +988,11 @@ static const auto jlopaque_closure_call_func = new JuliaFunction<>{
     get_func_sig,
     get_func_attrs,
 };
+static const auto jltypedcallable_call_func = new JuliaFunction<>{
+    XSTR(jl_f_typed_callable_call),
+    get_func_sig,
+    get_func_attrs,
+};
 static const auto jlmethod_func = new JuliaFunction<>{
     XSTR(jl_method_def),
     [](LLVMContext &C) {
@@ -5849,6 +5854,91 @@ static jl_cgval_t emit_specsig_oc_call(jl_codectx_t &ctx, jl_value_t *oc_type, j
     return r;
 }
 
+// Specsig call site for a statically-typed TypedCallable `tc(args...)`.  Unlike
+// an OpaqueClosure (which stores a fixed adapter in `oc->specptr`), a
+// TypedCallable re-resolves its target at the *latest* world, so the adapter
+// lives behind a shared polling record (`tc->trampoline`).  We poll that record
+// inline (cfunction-style): if its cached fptr is valid for the current world,
+// call it; otherwise re-resolve via `jl_update_dispatch_trampoline`.  The adapter
+// (`JL_ABI_TYPED_CALLABLE`) only substitutes `tc->f` for the erased slot 0 -- we
+// install the polled latest world around the call here, so the resolved target
+// and the installed world are the same world.
+static jl_cgval_t emit_specsig_typed_callable_call(jl_codectx_t &ctx, jl_value_t *tc_type, jl_value_t *sigtype, MutableArrayRef<jl_cgval_t> argv /*n.b. mutated, as in emit_specsig_oc_call */, size_t nargs) JL_CANSAFEPOINT
+{
+    jl_datatype_t *tc_argt = (jl_datatype_t *)jl_tparam0(tc_type);
+    jl_value_t *tc_rett = jl_tparam1(tc_type);
+    jl_svec_t *types = jl_get_fieldtypes((jl_datatype_t*)tc_argt);
+    size_t ntypes = jl_svec_len(types);
+    for (size_t i = 0; i < nargs-1; ++i) {
+        jl_value_t *typ = i >= ntypes ? jl_svecref(types, ntypes-1) : jl_svecref(types, i);
+        if (jl_is_vararg(typ))
+            typ = jl_unwrap_vararg(typ);
+        emit_typecheck(ctx, argv[i+1], typ, "typeassert");
+        argv[i+1] = update_julia_type(ctx, argv[i+1], typ);
+        if (argv[i+1].typ == jl_bottom_type)
+            return jl_cgval_t();
+    }
+    jl_returninfo_t::CallingConv cc = jl_returninfo_t::CallingConv::Boxed;
+    unsigned return_roots = 0;
+
+    // Save the caller's world up front; we restore it after the call.  (An
+    // exception unwinds through the task's handler, which restores it too.)
+    Value *world_age_field = get_tls_world_age_field(ctx);
+    jl_aliasinfo_t ai = jl_aliasinfo_t::fromTBAA(ctx, ctx.tbaa().tbaa_gcframe);
+    Value *saved_world = ai.decorateInst(ctx.builder.CreateAlignedLoad(
+            ctx.types().T_size, world_age_field, ctx.types().alignof_ptr));
+
+    // Load the hidden trampoline record (field 1) and poll it.
+    jl_cgval_t &theArg = argv[0];
+    jl_cgval_t tramp = update_julia_type(ctx,
+        emit_getfield_knownidx(ctx, theArg, 1, (jl_datatype_t*)tc_type, jl_memory_order_notatomic),
+        (jl_value_t*)jl_dispatch_trampoline_type);
+    // Poll the record in the order last_world -> fptr -> counter, all acquire.
+    // This ordering is what makes the latest-world dispatch sound on weakly
+    // ordered (non-multi-copy-atomic) hardware, where a relaxed fptr load could
+    // otherwise observe a write from a world "in the future" relative to the
+    // counter we read (a WRC outcome -- no per-thread reordering required):
+    //  - last_world (acquire) first bounds the fptr we then read from below: it
+    //    is the adapter resolved for a world >= last_world, never older;
+    //  - fptr (acquire) before the counter builds the happens-before
+    //      bump -> resolver acquire-load(counter) -> resolver release-store(fptr)
+    //      -> our acquire-load(fptr) -> our counter load
+    //    so observing a newer fptr forces the counter load to observe its (newer)
+    //    world. A torn (fptr, world) pair therefore can never pass the
+    //    `last_world == counter` check. The matching release stores are in
+    //    jl_update_dispatch_trampoline.
+    jl_cgval_t lw_field = emit_getfield_knownidx(ctx, tramp, 4, jl_dispatch_trampoline_type, jl_memory_order_acquire);
+    Value *last_world_v = emit_unbox(ctx, ctx.types().T_size, lw_field);
+    jl_cgval_t fptr_field = emit_getfield_knownidx(ctx, tramp, 3, jl_dispatch_trampoline_type, jl_memory_order_acquire);
+    Value *cached_fptr = emit_inttoptr(ctx,
+        emit_unbox(ctx, ctx.types().T_size, update_julia_type(ctx, fptr_field, (jl_value_t*)jl_voidpointer_type)),
+        ctx.types().T_ptr);
+    LoadInst *world_v = ctx.builder.CreateAlignedLoad(ctx.types().T_size,
+        prepare_global_in(jl_Module, jlgetworld_global), ctx.types().alignof_ptr);
+    world_v->setOrdering(AtomicOrdering::Acquire);
+    // Install the polled world *before* the guard (covers the cached/fast path).
+    // On the slow path `jl_update_dispatch_trampoline` overwrites `world_age` with
+    // the world it actually resolved at (matching the fptr it returns), so the
+    // installed world and the called target are always the same world.  The
+    // adapter itself does no world switch.
+    ai.decorateInst(ctx.builder.CreateAlignedStore(world_v, world_age_field, ctx.types().alignof_ptr));
+    Value *age_not_ok = ctx.builder.CreateICmpNE(last_world_v, world_v);
+    Value *target = emit_guarded_test(ctx, age_not_ok, cached_fptr, [&] {
+            Function *resolver = prepare_call(jlupdatetrampoline_func);
+            CallInst *cw = ctx.builder.CreateCall(resolver, {get_current_task(ctx), boxed(ctx, tramp)});
+            cw->setAttributes(resolver->getAttributes());
+            return cw;
+        });
+    JL_GC_PUSH1(&sigtype);
+    // The adapter's input ABI has the TypedCallable at argv[0] (type-erased);
+    // pass it through as a derived ptr, exactly like the OC path.
+    jl_cgval_t r = emit_call_specfun_other(ctx, /*kind*/JL_ABI_TYPED_CALLABLE, sigtype, tc_rett, target, "", argv, nargs,
+        &cc, &return_roots, tc_rett);
+    JL_GC_POP();
+    ai.decorateInst(ctx.builder.CreateAlignedStore(saved_world, world_age_field, ctx.types().alignof_ptr));
+    return r;
+}
+
 static jl_cgval_t emit_call(jl_codectx_t &ctx, jl_expr_t *ex, jl_value_t *rt, bool is_promotable) JL_CANSAFEPOINT
 {
     ++EmittedCalls;
@@ -5906,7 +5996,34 @@ static jl_cgval_t emit_call(jl_codectx_t &ctx, jl_expr_t *ex, jl_value_t *rt, bo
                 JL_GC_POP();
                 return r;
             }
-            // TODO: else emit_oc_call
+            else {
+                // non-specsig: call the `jl_f_opaque_closure_call` builtin directly
+                // (it invokes `oc->invoke`), avoiding a full jl_apply_generic lookup
+                Value *ret = emit_jlcall(ctx, jlopaque_closure_call_func, boxed(ctx, f),
+                                         ArrayRef<jl_cgval_t>(argv).drop_front(), nargs - 1, julia_call);
+                return mark_julia_type(ctx, ret, true, rt);
+            }
+        }
+    }
+    // handle calling a TypedCallable (latest-world callable; see emit_specsig_typed_callable_call)
+    if (jl_is_concrete_type(f.typ) && jl_subtype(f.typ, (jl_value_t*)jl_typed_callable_type)) {
+        jl_value_t *tc_argt = jl_tparam0(f.typ);
+        jl_value_t *tc_rett = jl_tparam1(f.typ);
+        if (jl_is_datatype(tc_argt) && jl_tupletype_length_compat(tc_argt, nargs-1)) {
+            jl_value_t *sigtype = jl_argtype_with_function_type((jl_value_t*)f.typ, (jl_value_t*)tc_argt);
+            if (uses_specsig(sigtype, false, tc_rett, true)) {
+                JL_GC_PUSH1(&sigtype);
+                jl_cgval_t r = emit_specsig_typed_callable_call(ctx, f.typ, sigtype, argv, nargs);
+                JL_GC_POP();
+                return r;
+            }
+            else {
+                // non-specsig: call the `jl_f_typed_callable_call` builtin directly
+                // (it dispatches `tc->f` in the latest world), avoiding jl_apply_generic
+                Value *ret = emit_jlcall(ctx, jltypedcallable_call_func, boxed(ctx, f),
+                                         ArrayRef<jl_cgval_t>(argv).drop_front(), nargs - 1, julia_call);
+                return mark_julia_type(ctx, ret, true, rt);
+            }
         }
     }
     // emit function and arguments
@@ -7239,6 +7356,10 @@ static void emit_specsig_to_specsig(
     // save the caller's world, install `oc->world`, and unpack `oc->captures`
     // into slot 0.  After this point the adapter operates in STD ABI.  The
     // saved world is restored at each function-exit point below.
+    // `JL_ABI_TYPED_CALLABLE` substitutes `tc->f` for slot 0 the same way, but
+    // performs no world switch: the TypedCallable call site installs the polled
+    // latest world itself (see emit_specsig_typed_callable_call), so the
+    // installed world and the resolved target are always the same world.
     Value *saved_world_age = nullptr;
     Value *world_age_field = nullptr;
     if (kind == JL_ABI_OPAQUE_CLOSURE) {
@@ -7251,18 +7372,26 @@ static void emit_specsig_to_specsig(
         if (jl_abi_kind_erases_slot(kind, i)) {
             Value *arg_v = &*AI;
             ++AI;
-            // OC->STD conversion: install `oc->world` and unpack `oc->captures`
-            // into slot 0.  Both happen together at the conversion boundary;
-            // see the comment on this function's `kind` parameter.
-            Value *oc_this = decay_derived(ctx, arg_v);
+            // Conversion at the boundary: derive the body's slot 0 from the
+            // wrapper -- `oc->captures` / `tc->f` -- and (OC only) install
+            // `oc->world`.  See the comment on this function's `kind` parameter.
+            Value *wrapper_this = decay_derived(ctx, arg_v);
             Align alignof_ptr(ctx.types().alignof_ptr);
-            Value *worldaddr = emit_ptrgep(ctx, oc_this, offsetof(jl_opaque_closure_t, world));
-            jl_cgval_t closure_world = typed_load(ctx, worldaddr, NULL, (jl_value_t*)jl_long_type,
-                    nullptr, nullptr, false, AtomicOrdering::NotAtomic, false, alignof_ptr.value());
-            emit_unbox_store(ctx, closure_world, world_age_field, ctx.tbaa().tbaa_gcframe, alignof_ptr, alignof_ptr);
-            jl_value_t *captures_jt = jl_nth_slot_type(targetsig, 0);
-            Value *envaddr = emit_ptrgep(ctx, oc_this, offsetof(jl_opaque_closure_t, captures));
-            myargs[i] = typed_load(ctx, envaddr, NULL, captures_jt,
+            size_t slot0_offset = offsetof(jl_typed_callable_t, f);
+            if (kind == JL_ABI_OPAQUE_CLOSURE) {
+                slot0_offset = offsetof(jl_opaque_closure_t, captures);
+                Value *worldaddr = emit_ptrgep(ctx, wrapper_this, offsetof(jl_opaque_closure_t, world));
+                jl_cgval_t closure_world = typed_load(ctx, worldaddr, NULL, (jl_value_t*)jl_long_type,
+                        nullptr, nullptr, false, AtomicOrdering::NotAtomic, false, alignof_ptr.value());
+                emit_unbox_store(ctx, closure_world, world_age_field, ctx.tbaa().tbaa_gcframe, alignof_ptr, alignof_ptr);
+            }
+            // The extracted field (`captures`/`f`, both declared `::Any`) is left
+            // at its declared type: on the specsig-target route the downstream
+            // call re-narrows it to the target's formal slot-0 type, and on the
+            // dispatcher route it is boxed -- `targetsig` there is `from_abi.sigt`,
+            // whose slot 0 is the *wrapper* type, not the extracted field's.
+            Value *fieldaddr = emit_ptrgep(ctx, wrapper_this, slot0_offset);
+            myargs[i] = typed_load(ctx, fieldaddr, NULL, (jl_value_t*)jl_any_type,
                     nullptr, nullptr, /*isboxed*/true, AtomicOrdering::NotAtomic, false, sizeof(void*));
             continue;
         }
@@ -7470,26 +7599,32 @@ static void emit_fptr1_wrapper(Module *M, StringRef gf_thunk_name, Value *target
     // For `JL_ABI_OPAQUE_CLOSURE`, perform the OC->STD conversion at entry:
     // save the caller's world, install `oc->world`, and load `oc->captures`
     // to substitute for `F` in the forwarded call.  After this point the
-    // adapter operates in STD ABI.
+    // adapter operates in STD ABI.  `JL_ABI_TYPED_CALLABLE` substitutes
+    // `tc->f` the same way but performs no world switch (the call site
+    // installs the polled latest world; see emit_specsig_typed_callable_call).
     Value *saved_world_age = nullptr;
     Value *world_age_field = nullptr;
     Value *funcArg_for_target = &*w->arg_begin();
-    if (kind == JL_ABI_OPAQUE_CLOSURE) {
-        world_age_field = get_tls_world_age_field(ctx);
-        jl_aliasinfo_t wai = jl_aliasinfo_t::fromTBAA(ctx, ctx.tbaa().tbaa_gcframe);
-        saved_world_age = wai.decorateInst(ctx.builder.CreateAlignedLoad(
-                ctx.types().T_size, world_age_field, ctx.types().alignof_ptr));
+    if (kind != JL_ABI_STD) {
         Value *funcArg = &*w->arg_begin();
-        Value *oc_this = decay_derived(ctx, funcArg);
+        Value *wrapper_this = decay_derived(ctx, funcArg);
         Align alignof_ptr(ctx.types().alignof_ptr);
-        Value *worldaddr = emit_ptrgep(ctx, oc_this, offsetof(jl_opaque_closure_t, world));
-        jl_cgval_t closure_world = typed_load(ctx, worldaddr, NULL, (jl_value_t*)jl_long_type,
-                nullptr, nullptr, false, AtomicOrdering::NotAtomic, false, alignof_ptr.value());
-        emit_unbox_store(ctx, closure_world, world_age_field, ctx.tbaa().tbaa_gcframe, alignof_ptr, alignof_ptr);
-        Value *envaddr = emit_ptrgep(ctx, oc_this, offsetof(jl_opaque_closure_t, captures));
+        size_t slot0_offset = offsetof(jl_typed_callable_t, f);
+        if (kind == JL_ABI_OPAQUE_CLOSURE) {
+            slot0_offset = offsetof(jl_opaque_closure_t, captures);
+            world_age_field = get_tls_world_age_field(ctx);
+            jl_aliasinfo_t wai = jl_aliasinfo_t::fromTBAA(ctx, ctx.tbaa().tbaa_gcframe);
+            saved_world_age = wai.decorateInst(ctx.builder.CreateAlignedLoad(
+                    ctx.types().T_size, world_age_field, ctx.types().alignof_ptr));
+            Value *worldaddr = emit_ptrgep(ctx, wrapper_this, offsetof(jl_opaque_closure_t, world));
+            jl_cgval_t closure_world = typed_load(ctx, worldaddr, NULL, (jl_value_t*)jl_long_type,
+                    nullptr, nullptr, false, AtomicOrdering::NotAtomic, false, alignof_ptr.value());
+            emit_unbox_store(ctx, closure_world, world_age_field, ctx.tbaa().tbaa_gcframe, alignof_ptr, alignof_ptr);
+        }
+        Value *fieldaddr = emit_ptrgep(ctx, wrapper_this, slot0_offset);
         jl_aliasinfo_t cai = jl_aliasinfo_t::fromTBAA(ctx, ctx.tbaa().tbaa_const);
         funcArg_for_target = cai.decorateInst(ctx.builder.CreateAlignedLoad(
-                ctx.types().T_prjlvalue, envaddr, alignof_ptr));
+                ctx.types().T_prjlvalue, fieldaddr, alignof_ptr));
     }
 
     jl_cgval_t gf_retval;
@@ -7583,8 +7718,12 @@ std::string emit_abi_dispatcher(jl_codegen_output_t &out, jl_abi_t from_abi, jl_
         // No body CodeInstance.  By convention (see `emit_specsig_to_specsig`),
         // `JL_ABI_OPAQUE_CLOSURE` requires a body CI to convert to -- without
         // one, the caller uses `JL_ABI_STD` and the OC (if any) flows through
-        // as a plain value.
-        assert(from_abi.kind == JL_ABI_STD &&
+        // as a plain value.  A `JL_ABI_TYPED_CALLABLE` adapter CAN legitimately
+        // have no body CI: its target method may not exist at the latest world
+        // (e.g. it was deleted).  Then we still substitute `tc->f` for slot 0
+        // (in `emit_specsig_to_specsig`) and dispatch the converted args
+        // dynamically via `jl_apply_generic` below.
+        assert((from_abi.kind == JL_ABI_STD || from_abi.kind == JL_ABI_TYPED_CALLABLE) &&
                "JL_ABI_OPAQUE_CLOSURE adapters require a body CodeInstance");
         // Target-selection optimization: when `from_abi.sigt`'s slot 0 is
         // statically an `OpaqueClosure`, target `jl_f_opaque_closure_call`
@@ -8325,6 +8464,7 @@ static void gen_invoke_wrapper(jl_method_instance_t *lam, jl_value_t *abi, jl_va
     // For `JL_ABI_OPAQUE_CLOSURE`, perform the OC->STD conversion at entry:
     // save the caller's world, install `oc->world`.  The captures unpack
     // happens in the slot-0 branch of the arg loop below.
+    // (`JL_ABI_TYPED_CALLABLE` needs no world switch; see emit_specsig_to_specsig.)
     Value *saved_world_age = nullptr;
     Value *world_age_field = nullptr;
     if (kind == JL_ABI_OPAQUE_CLOSURE) {
@@ -8344,13 +8484,16 @@ static void gen_invoke_wrapper(jl_method_instance_t *lam, jl_value_t *abi, jl_va
     jl_aliasinfo_t ai = jl_aliasinfo_t::fromTBAA(ctx, ctx.tbaa().tbaa_const);
     for (size_t i = 0; i < nargs; ++i) {
         if (jl_abi_kind_erases_slot(kind, i)) {
-            // OC->STD conversion (continued from the world switch above):
-            // unpack `oc->captures` so the body's STD specsig sees its formal
-            // slot-0 captures type.
-            jl_value_t *captures_jt = jl_nth_slot_type(abi, 0);
-            Value *oc_this = decay_derived(ctx, funcArg);
-            Value *envaddr = emit_ptrgep(ctx, oc_this, offsetof(jl_opaque_closure_t, captures));
-            argv[i] = typed_load(ctx, envaddr, NULL, captures_jt,
+            // Conversion (continued from the world switch above): derive the
+            // body's slot 0 from the wrapper -- `oc->captures` / `tc->f` -- so
+            // the body's STD specsig sees its formal slot-0 type.
+            jl_value_t *slot0_jt = jl_nth_slot_type(abi, 0);
+            Value *wrapper_this = decay_derived(ctx, funcArg);
+            size_t slot0_offset = (kind == JL_ABI_OPAQUE_CLOSURE)
+                    ? offsetof(jl_opaque_closure_t, captures)
+                    : offsetof(jl_typed_callable_t, f);
+            Value *fieldaddr = emit_ptrgep(ctx, wrapper_this, slot0_offset);
+            argv[i] = typed_load(ctx, fieldaddr, NULL, slot0_jt,
                     nullptr, nullptr, /*isboxed*/true, AtomicOrdering::NotAtomic, false, sizeof(void*));
             continue;
         }
