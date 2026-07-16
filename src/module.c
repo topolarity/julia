@@ -634,6 +634,7 @@ static jl_module_t *jl_new_module__(jl_sym_t *name, jl_module_t *parent)
                                                               jl_packageroot_type);
         pr->rootmodule = m;
         pr->deps = jl_nothing;
+        pr->foreign_specificities = jl_nothing;
         m->package = pr;
         jl_gc_wb(m, pr);
         JL_GC_POP();
@@ -1550,9 +1551,12 @@ JL_DLLEXPORT void jl_module_using(jl_module_t *to, jl_module_t *from, size_t fla
             !(jl_core_module && p_from == jl_core_module->package) &&
             !(jl_base_module && p_from == jl_base_module->package) &&
             jl_packageroot_add_dep(p_to, p_from, new_world)) {
-            // a new package-graph edge changes reachability: record the event
-            // world (bounds the validity of negative reachability verdicts at
-            // older worlds)
+            // a new package-graph edge changes reachability:
+            // dependency-blocked specificity relations whose verdict flips
+            // invalidate the code that concluded from their blockedness ...
+            jl_methtable_usings_changed(p_to, p_from, new_world);
+            // ... and the event world bounds the validity of negative
+            // reachability verdicts at older worlds
             jl_atomic_store_relaxed(&jl_last_usings_event_world, new_world);
         }
     }
@@ -2476,6 +2480,31 @@ JL_DLLEXPORT int jl_module_reaches(jl_module_t *from, jl_module_t *to_root, size
 {
     return jl_packageroot_reaches(jl_module_package(from), jl_module_package(to_root),
                                   world, min_valid, max_valid);
+}
+
+// Add `meth` (a loser-method holding a "morespecific but not subtype"
+// interference entry whose winner's moduletype is anchored at package `pr`) to
+// pr->foreign_specificities. Returns 1 if newly added, 0 if already present.
+int jl_packageroot_add_foreign_specificity(jl_packageroot_t *pr, jl_method_t *meth)
+{
+    jl_module_t *lockm = pr->rootmodule;
+    int added = 0;
+    JL_LOCK(&lockm->lock);
+    if (pr->foreign_specificities == jl_nothing) {
+        jl_gc_write(pr, pr->foreign_specificities, jl_value_t, (jl_value_t*)jl_alloc_vec_any(0));
+    }
+    jl_array_t *list = (jl_array_t*)pr->foreign_specificities;
+    size_t i, n = jl_array_nrows(list);
+    for (i = 0; i < n; i++) {
+        if (jl_array_ptr_ref(list, i) == (jl_value_t*)meth)
+            break;
+    }
+    if (i == n) {
+        jl_array_ptr_1d_push(list, (jl_value_t*)meth);
+        added = 1;
+    }
+    JL_UNLOCK(&lockm->lock);
+    return added;
 }
 
 JL_DLLEXPORT jl_sym_t *jl_module_getloc(jl_module_t *m, int32_t *line)
