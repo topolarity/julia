@@ -97,6 +97,7 @@
 #include <llvm/Support/Debug.h>
 #include <llvm/Transforms/Utils/BasicBlockUtils.h>
 #include <llvm/Transforms/Utils/CodeExtractor.h>
+#include <llvm/Transforms/Utils/PromoteMemToReg.h>
 #include <llvm/Transforms/Utils/ValueMapper.h>
 
 #include <chrono>
@@ -223,6 +224,21 @@ static cl::opt<unsigned> SplitOutputSpillMin(
              "at least this many (0 = only with the full wide-interface spill). "
              "Contiguous slots let one pointer replace per-output pointer "
              "arguments and keep the marshalling vectorizable"));
+
+static cl::opt<unsigned> SplitEntryFactor(
+    "julia-split-entry-factor", cl::init(4), cl::Hidden,
+    cl::desc("Outline only when the function exceeds a region cap by this "
+             "factor. Functions between 1x and Kx a cap compile acceptably "
+             "unsplit, while outlining them pays the flat per-region stack "
+             "tax over too little extracted mass; past Kx the caps' "
+             "superlinear compile costs dominate and outlining wins."));
+
+static cl::opt<unsigned> SplitMinCutWindow(
+    "julia-split-mincut-window", cl::init(2), cl::Hidden,
+    cl::desc("When a region cap forces a cut, choose the boundary with the "
+             "narrowest live interface among the grow prefixes whose fill (on "
+             "the axis that triggered the cut) is at least the final fill "
+             "divided by this factor (0 = always cut exactly at the cap)"));
 
 static cl::opt<unsigned> SplitMaxRegionBlocks(
     "julia-split-max-region-blocks", cl::init(4096), cl::Hidden,
@@ -649,7 +665,8 @@ static bool rematerializeDerivedOutputs(Function &F, Region &R, const DominatorT
     SmallVector<Instruction *, RematSpineLimit> HoistSpine, SiteSpine;
     SmallPtrSet<Instruction *, 16> HoistSet, SiteSet;
     for (Instruction *I : Escaping) {
-        if (Pred && collectHoistSpine(I, R, Pred, DT, HoistSpine, HoistSet, ctx))
+        if (!SplitNoHoistRemat && Pred &&
+            collectHoistSpine(I, R, Pred, DT, HoistSpine, HoistSet, ctx))
             continue;
         if (SplitNoSiteRemat || !collectBoundarySpine(I, R, SiteSpine, SiteSet, ctx)) {
             if (SplitDebug)
@@ -703,6 +720,73 @@ static bool rematerializeDerivedOutputs(Function &F, Region &R, const DominatorT
         // over all uses; the originals become dead.
         for (Instruction *I : HoistSpine)
             I->replaceAllUsesWith(cast<Instruction>(VMap[I]));
+    }
+    // Opportunistic tier: tracked/untracked escaping values whose whole
+    // in-region dependency cone is clonable (address computation and
+    // immutable loads) are cheaper to recompute in the preheader than to
+    // route through the interface -- each escaping value costs an interface
+    // slot (for tracked values a caller GC frame slot, pinned for the
+    // buffer's whole live range) plus marshalling at every call. Replace
+    // only their EXTERNAL uses with the preheader recomputation; the region
+    // keeps computing its internal copy, so no new input appears either.
+    // Failures just leave the value to the normal interface.
+    if (Pred && !SplitNoHoistRemat) {
+        SmallVector<Instruction *, 16> OppTops;
+        for (BasicBlock *BB : R.Blocks) {
+            for (Instruction &I : *BB) {
+                ValKind K = classifyType(I.getType());
+                if (K != ValKind::Tracked && K != ValKind::Untracked)
+                    continue;
+                if (HoistSet.count(&I) || SiteSet.count(&I))
+                    continue;
+                for (Use &U : I.uses()) {
+                    if (!R.Set.count(useBlock(U))) {
+                        OppTops.push_back(&I);
+                        break;
+                    }
+                }
+            }
+        }
+        SmallVector<Instruction *, 32> OppSpine;
+        SmallPtrSet<Instruction *, 32> OppSet;
+        SmallPtrSet<Instruction *, 16> OppReplaced;
+        for (Instruction *I : OppTops) {
+            SmallVector<Instruction *, RematSpineLimit> Scratch;
+            if (collectHoistSpine(I, R, Pred, DT, Scratch, OppSet, ctx)) {
+                OppSpine.append(Scratch.begin(), Scratch.end());
+                OppReplaced.insert(I);
+            }
+            else {
+                // collectHoistSpine records exactly the instructions it
+                // appended; scrub them so a later candidate re-validates
+                // (an OppSet entry missing from OppSpine would leave a
+                // clone's operand pointing back into the region).
+                for (Instruction *SI : Scratch)
+                    OppSet.erase(SI);
+            }
+        }
+        if (!OppSpine.empty()) {
+            ValueToValueMapTy VMap;
+            BasicBlock::iterator IP = Pred->getTerminator()->getIterator();
+            for (Instruction *I : OppSpine) {
+                Instruction *Clone = I->clone();
+                Clone->setName(I->getName() + ".remat");
+                Clone->insertBefore(IP);
+                RemapInstruction(Clone, VMap,
+                                 RF_NoModuleLevelChanges | RF_IgnoreMissingLocals);
+                VMap[I] = Clone;
+            }
+            for (Instruction *I : OppSpine) {
+                if (!OppReplaced.count(I))
+                    continue;
+                SmallVector<Use *, 8> ExtUses;
+                for (Use &U : I->uses())
+                    if (!R.Set.count(useBlock(U)))
+                        ExtUses.push_back(&U);
+                for (Use *U : ExtUses)
+                    U->set(VMap[I]);
+            }
+        }
     }
     if (!SiteSpine.empty()) {
         // Route the roots through slots.
@@ -870,10 +954,22 @@ static void DemotePHIToAggregateSlot(PHINode &PN, MaybeAlign A,
 // which turns the crossing phi uses into ordinary external uses served by
 // a reload in the caller-side edge block — no cost is added to the foreign
 // paths, and nothing is left for CodeExtractor to marshal.
+// Tracked INPUT spill slots are dead once their region returns, so sibling
+// regions of one function can share a single buffer (created at the maximum
+// size seen so far; an occasional larger region allocates a bigger one and
+// later regions reuse that). Outputs stay per-region: they remain live from
+// the region's return until their last caller-side reload, which commonly
+// overlaps later regions.
+struct SharedSpillState {
+    AllocaInst *Buf = nullptr;
+    unsigned Cap = 0;
+};
+
 static void spillInterface(Function &F, Region &R, DominatorTree &DT,
                            const SmallPtrSetImpl<BasicBlock *> &Owned,
                            const SetVector<Value *> &Inputs,
-                           const SetVector<Value *> &Outputs) JL_NOTSAFEPOINT
+                           const SetVector<Value *> &Outputs,
+                           SharedSpillState &SS) JL_NOTSAFEPOINT
 {
     BasicBlock *Entry = R.Blocks[0];
     BasicBlock *Boundary = R.Boundary;
@@ -891,6 +987,13 @@ static void spillInterface(Function &F, Region &R, DominatorTree &DT,
                 TIn.push_back(V);
                 break;
             case ValKind::Untracked:
+                // A pointer to a caller alloca (e.g. a sibling region's spill
+                // buffer threading through a group interface) stays a direct
+                // argument: spilling the ADDRESS into the aggregate is an
+                // escape that would defeat alias analysis for the buffer
+                // itself.
+                if (isa<AllocaInst>(V->stripPointerCasts()))
+                    break;
                 if (V->getType()->isFirstClassType() && V->getType()->isSized())
                     UIn.push_back(V);
                 break;
@@ -1030,11 +1133,24 @@ static void spillInterface(Function &F, Region &R, DominatorTree &DT,
     LLVMContext &Ctx = F.getContext();
     Type *T_prjlvalue = PointerType::get(Ctx, AddressSpace::Tracked);
     IRBuilder<> EB(&F.getEntryBlock(), F.getEntryBlock().begin());
-    AllocaInst *TSpill = nullptr;
-    unsigned NT = TIn.size() + TOut.size() + TPhis.size();
-    if (NT) {
-        TSpill = EB.CreateAlloca(T_prjlvalue, EB.getInt32(NT), "gcspill");
-        TSpill->setAlignment(Align(sizeof(void *)));
+    AllocaInst *TSpillIn = nullptr;
+    unsigned NIn = TIn.size();
+    if (NIn) {
+        if (SS.Buf && SS.Cap >= NIn) {
+            TSpillIn = SS.Buf;
+        }
+        else {
+            TSpillIn = EB.CreateAlloca(T_prjlvalue, EB.getInt32(NIn), "gcspill.in");
+            TSpillIn->setAlignment(Align(sizeof(void *)));
+            SS.Buf = TSpillIn;
+            SS.Cap = NIn;
+        }
+    }
+    AllocaInst *TSpillOut = nullptr;
+    unsigned NOut = TOut.size() + TPhis.size();
+    if (NOut) {
+        TSpillOut = EB.CreateAlloca(T_prjlvalue, EB.getInt32(NOut), "gcspill.out");
+        TSpillOut->setAlignment(Align(sizeof(void *)));
     }
     StructType *UTy = nullptr;
     AllocaInst *USpill = nullptr;
@@ -1061,11 +1177,11 @@ static void spillInterface(Function &F, Region &R, DominatorTree &DT,
         DenseMap<Value *, Value *> InputReload;
         for (Value *V : TIn) {
             FB.CreateAlignedStore(
-                V, FB.CreateConstInBoundsGEP1_32(T_prjlvalue, TSpill, TSlot),
+                V, FB.CreateConstInBoundsGEP1_32(T_prjlvalue, TSpillIn, TSlot),
                 Align(sizeof(void *)));
             auto *Reload = RegionFront.CreateAlignedLoad(
                 T_prjlvalue,
-                RegionFront.CreateConstInBoundsGEP1_32(T_prjlvalue, TSpill, TSlot),
+                RegionFront.CreateConstInBoundsGEP1_32(T_prjlvalue, TSpillIn, TSlot),
                 Align(sizeof(void *)), V->getName() + ".in");
             InputReload[V] = Reload;
             TSlot++;
@@ -1107,22 +1223,23 @@ static void spillInterface(Function &F, Region &R, DominatorTree &DT,
     auto isExternalUse = [&](Use &U) JL_NOTSAFEPOINT {
         return !R.Set.count(useBlock(U));
     };
-    if (TSpill) {
+    if (TSpillOut) {
+        unsigned TOutSlot = 0;
         for (Instruction *I : TOut) {
-            unsigned Slot = TSlot++;
+            unsigned Slot = TOutSlot++;
             DemoteRegToAggregateSlot(
                 *I, Align(sizeof(void *)),
                 [&, Slot](IRBuilder<> &B) JL_NOTSAFEPOINT -> Value * {
-                    return B.CreateConstInBoundsGEP1_32(T_prjlvalue, TSpill, Slot);
+                    return B.CreateConstInBoundsGEP1_32(T_prjlvalue, TSpillOut, Slot);
                 },
                 isExternalUse);
         }
         for (PHINode *PN : TPhis) {
-            unsigned Slot = TSlot++;
+            unsigned Slot = TOutSlot++;
             DemotePHIToAggregateSlot(
                 *PN, Align(sizeof(void *)),
                 [&, Slot](IRBuilder<> &B) JL_NOTSAFEPOINT -> Value * {
-                    return B.CreateConstInBoundsGEP1_32(T_prjlvalue, TSpill, Slot);
+                    return B.CreateConstInBoundsGEP1_32(T_prjlvalue, TSpillOut, Slot);
                 });
         }
     }
@@ -1152,7 +1269,7 @@ static int64_t PrepRematMs, PrepCEMs, PrepIOMs, PrepSpillMs;
 // Region-growth outcome counters (reset per function; printed under
 // -julia-split-time). "clamp" cuts and growth failures mean the realized
 // region sizes diverge from the requested target — never silently.
-static int64_t GrowCutTarget, GrowCutSafepoint, GrowCutBlocks, GrowCutClamp, GrowFailBlocks, GrowFailSize, GrowFailNoAdd;
+static int64_t GrowCutTarget, GrowCutSafepoint, GrowCutBlocks, GrowCutClamp, GrowFailBlocks, GrowFailSize, GrowFailNoAdd, GrowMinCutTrim;
 // Interface statistics across a function's extractions (reset per function).
 static int64_t IfaceIn, IfaceOut, IfaceInMax, IfaceOutMax, IfaceExits, IfaceCalls;
 
@@ -1189,6 +1306,54 @@ static void localizeRegionInputs(Region &R,
         PB.Insert(Proxy);
         return Local[V] = Proxy;
     };
+    // Constant-environment duplication (experiment): chains of invariant/
+    // immutable loads and address computation over constant leaves are
+    // recomputed inside the region instead of crossing the interface.
+    auto isConstChain = [&](Value *V, auto &&self, unsigned Depth) JL_NOTSAFEPOINT -> bool {
+        if (isa<Constant>(V))
+            return true;
+        if (Depth >= 4)
+            return false;
+        auto *I = dyn_cast<Instruction>(V);
+        if (!I || R.Set.count(I->getParent()))
+            return false;
+        bool CloneOK = isa<GetElementPtrInst>(I) || isa<BitCastInst>(I) ||
+                       isa<AddrSpaceCastInst>(I);
+        if (!CloneOK)
+            if (auto *LI = dyn_cast<LoadInst>(I))
+                CloneOK = LI->getMetadata(LLVMContext::MD_invariant_load) != nullptr ||
+                          isImmutableManagedLoad(LI);
+        if (!CloneOK)
+            return false;
+        for (Value *Op : I->operands())
+            if (!self(Op, self, Depth + 1))
+                return false;
+        return true;
+    };
+    std::function<Value *(Value *, BasicBlock::iterator)> cloneAt =
+        [&](Value *V, BasicBlock::iterator IP) JL_NOTSAFEPOINT -> Value * {
+        if (isa<Constant>(V))
+            return V;
+        auto *I = cast<Instruction>(V);
+        Instruction *C = I->clone();
+        C->setName(I->getName() + ".remat");
+        C->insertBefore(IP);
+        for (Use &Op : C->operands())
+            if (!isa<Constant>(Op.get()))
+                Op.set(cloneAt(Op.get(), C->getIterator()));
+        return C;
+    };
+    DenseMap<Value *, bool> ChainMemo;
+    auto wantsClone = [&](Value *V) JL_NOTSAFEPOINT {
+        if (isa<Constant>(V) || !isa<Instruction>(V))
+            return false;
+        if (R.Set.count(cast<Instruction>(V)->getParent()))
+            return false;
+        auto It = ChainMemo.find(V);
+        if (It != ChainMemo.end())
+            return It->second;
+        return ChainMemo[V] = isConstChain(V, isConstChain, 0);
+    };
     auto wants = [&](Value *V) JL_NOTSAFEPOINT {
         if (isa<Constant>(V) || isa<BasicBlock>(V) || isa<MetadataAsValue>(V))
             return false;
@@ -1211,14 +1376,22 @@ static void localizeRegionInputs(Region &R,
                     if (!R.Set.count(PN->getIncomingBlock(i)))
                         continue;
                     Value *V = PN->getIncomingValue(i);
-                    if (wants(V))
+                    if (wantsClone(V))
+                        PN->setIncomingValue(
+                            i, cloneAt(V, PN->getIncomingBlock(i)
+                                              ->getTerminator()
+                                              ->getIterator()));
+                    else if (wants(V))
                         PN->setIncomingValue(i, proxyFor(V));
                 }
                 continue;
             }
-            for (Use &U : I.operands())
-                if (wants(U.get()))
+            for (Use &U : I.operands()) {
+                if (wantsClone(U.get()))
+                    U.set(cloneAt(U.get(), I.getIterator()));
+                else if (wants(U.get()))
                     U.set(proxyFor(U.get()));
+            }
         }
     }
 }
@@ -1227,6 +1400,7 @@ static void localizeRegionInputs(Region &R,
 static bool prepareRegion(Function &F, Region &R, DominatorTree &DT,
                           const SmallPtrSetImpl<BasicBlock *> &Owned,
                           DenseMap<Value *, bool> &HighFanout,
+                          SharedSpillState &SS,
                           const JuliaPassContext &ctx) JL_NOTSAFEPOINT
 {
     localizeRegionInputs(R, Owned, HighFanout);
@@ -1281,7 +1455,7 @@ static bool prepareRegion(Function &F, Region &R, DominatorTree &DT,
     }
     auto P5 = now();
     if (Inputs.size() + Outputs.size() > SplitDirectArgLimit) {
-        spillInterface(F, R, DT, Owned, Inputs, Outputs);
+        spillInterface(F, R, DT, Owned, Inputs, Outputs, SS);
     }
     else if (SplitOutputSpillMin && Outputs.size() >= SplitOutputSpillMin) {
         // Narrow interface, but still route the outputs through the aggregate:
@@ -1290,10 +1464,106 @@ static bool prepareRegion(Function &F, Region &R, DominatorTree &DT,
         // vectorized marshalling and bloats the call frame. Inputs stay direct
         // (they ride in registers).
         SetVector<Value *> NoInputs;
-        spillInterface(F, R, DT, Owned, NoInputs, Outputs);
+        spillInterface(F, R, DT, Owned, NoInputs, Outputs, SS);
     }
     PrepSpillMs += msc(P5, now());
     return true;
+}
+
+// Whether this caller alloca's address stays under the pass's control: every
+// transitive user is a plain load, a store *to* it, a GEP, a memset of it, or
+// an argument to a call of an extracted region. Then nothing can write the
+// buffer during a region's activation except that region itself (the caller
+// -- and any sibling region holding the address -- is suspended while it
+// runs).
+static bool isNonEscapingParentAlloca(AllocaInst *AI) JL_NOTSAFEPOINT
+{
+    SmallVector<Value *, 8> Work{AI};
+    SmallPtrSet<Value *, 8> Seen;
+    while (!Work.empty()) {
+        Value *A = Work.pop_back_val();
+        if (!Seen.insert(A).second)
+            continue;
+        for (Use &U : A->uses()) {
+            auto *UI = dyn_cast<Instruction>(U.getUser());
+            if (!UI)
+                return false;
+            if (auto *LI = dyn_cast<LoadInst>(UI)) {
+                if (!LI->isSimple())
+                    return false;
+                continue;
+            }
+            if (auto *SI = dyn_cast<StoreInst>(UI)) {
+                if (!SI->isSimple() || SI->getValueOperand() == A)
+                    return false;
+                continue;
+            }
+            if (isa<GetElementPtrInst>(UI) || isa<BitCastInst>(UI) ||
+                isa<AddrSpaceCastInst>(UI)) {
+                Work.push_back(UI);
+                continue;
+            }
+            if (auto *MS = dyn_cast<MemSetInst>(UI)) {
+                if (MS->getRawDest() != A)
+                    return false;
+                continue;
+            }
+            if (auto *CB = dyn_cast<CallBase>(UI)) {
+                Function *Callee = CB->getCalledFunction();
+                if (!Callee || !CB->isArgOperand(&U) ||
+                    !Callee->hasFnAttribute("julia.split-function"))
+                    return false;
+                continue;
+            }
+            return false;
+        }
+    }
+    return true;
+}
+
+// Classify a region argument's transitive uses: 0 = unknown user or the
+// pointer may be captured, 1 = only reads (simple loads, possibly through
+// GEPs), 2 = reads and writes through the pointer but never captures it.
+static int classifyArgUses(Argument *P) JL_NOTSAFEPOINT
+{
+    bool Writes = false, Reads = false;
+    SmallVector<Value *, 8> Work{P};
+    SmallPtrSet<Value *, 8> Seen;
+    while (!Work.empty()) {
+        Value *A = Work.pop_back_val();
+        if (!Seen.insert(A).second)
+            continue;
+        for (Use &U : A->uses()) {
+            auto *UI = dyn_cast<Instruction>(U.getUser());
+            if (!UI)
+                return 0;
+            if (auto *LI = dyn_cast<LoadInst>(UI)) {
+                if (!LI->isSimple())
+                    return 0;
+                Reads = true;
+                continue;
+            }
+            if (auto *SI = dyn_cast<StoreInst>(UI)) {
+                if (!SI->isSimple() || SI->getValueOperand() == A)
+                    return 0;
+                Writes = true;
+                continue;
+            }
+            if (isa<BitCastInst>(UI) || isa<AddrSpaceCastInst>(UI)) {
+                Work.push_back(UI);
+                continue;
+            }
+            if (auto *G = dyn_cast<GetElementPtrInst>(UI);
+                G && G->getPointerOperand() == A) {
+                Work.push_back(G);
+                continue;
+            }
+            return 0;
+        }
+    }
+    if (!Reads && !Writes)
+        return 0; // dead argument: nothing to mark
+    return Writes ? 2 : 1;
 }
 
 // Conservatively determine whether an outlined function may reach a safepoint
@@ -1382,6 +1652,28 @@ static Function *extractRegion(Function &F, Region &R, const JuliaPassContext &c
     if (CS) {
         IfaceCalls++;
         IfaceExits += CS->getParent()->getTerminator()->getNumSuccessors();
+        // Caller-frame buffers the region only touches through loads and
+        // stores (the gcspill buffers, sibling regions' out-buffers, demoted
+        // value slots) stay valid in the caller's frame for the region's
+        // whole activation: the caller is suspended while the region runs,
+        // and a non-escaping alloca cannot be written by anyone else. Mark
+        // such arguments captures(none) -- and readonly when the region only
+        // reads -- so alias analysis and the lifetime passes can treat the
+        // region call as an ordinary use of the buffer instead of an escape.
+        for (unsigned i = 0; i < CS->arg_size() && i < NewF->arg_size(); i++) {
+            auto *AI = dyn_cast<AllocaInst>(CS->getArgOperand(i)->stripPointerCasts());
+            if (!AI || !isNonEscapingParentAlloca(AI))
+                continue;
+            int K = classifyArgUses(NewF->getArg(i));
+            if (K == 0)
+                continue;
+            CS->addParamAttr(i, Attribute::getWithCaptureInfo(Ctx, CaptureInfo::none()));
+            NewF->addParamAttr(i, Attribute::getWithCaptureInfo(Ctx, CaptureInfo::none()));
+            if (K != 1)
+                continue;
+            CS->addParamAttr(i, Attribute::get(Ctx, Attribute::ReadOnly));
+            NewF->addParamAttr(i, Attribute::get(Ctx, Attribute::ReadOnly));
+        }
     }
     // Give the callee a pgcstack: reuse the caller's if it happened to be a
     // region input, otherwise materialize julia.get_pgcstack in the entry
@@ -2036,9 +2328,10 @@ static void processLevel(Function &F, std::vector<HNode> &Items,
         for (BasicBlock *B : N.R.Blocks)
             Owned.insert(B);
     DenseMap<Value *, bool> HighFanout;
+    SharedSpillState SS;
     SmallPtrSet<HNode *, 16> Prepared;
     for (HNode &N : Items)
-        if (prepareRegion(F, N.R, DT, Owned, HighFanout, ctx))
+        if (prepareRegion(F, N.R, DT, Owned, HighFanout, SS, ctx))
             Prepared.insert(&N);
     // Strip pre-existing lifetime markers: a marker whose block is extracted
     // would apply to a pointer argument rather than an alloca, and markers
@@ -2356,6 +2649,94 @@ static bool chunkBlock(Function &F, BasicBlock &BB, const JuliaPassContext &ctx)
 // Grow a region from Entry by repeatedly adding blocks whose predecessors all
 // lie inside the group. A cut is possible when exactly one escape target has
 // all of its predecessors inside the group; that block becomes the boundary.
+// Interface width of every grow-order prefix of R.Blocks, in one linear
+// pass. Every prefix was the live region at some point during growth, so any
+// of them is a legal place to cut; the width decides which one is cheapest.
+// Each SSA value contributes to a prefix's interface over a contiguous
+// interval of prefix lengths k (blocks are only appended):
+//   input:  def outside the prefix, some use inside  ->  minUse <= k < defPos
+//   output: def inside the prefix, some use outside  ->  defPos <= k < maxUse
+// so one difference-array accumulation over per-value intervals yields the
+// exact width profile in O(instructions + uses) -- no per-candidate rescans.
+// Tracked values weigh more than untracked ones (a tracked interface slot is
+// a GC frame slot in the caller plus rooting traffic; an untracked one is an
+// argument register or spill struct field), and derived values sit between
+// (they force rematerialization spines).
+static void prefixInterfaceProfile(const SmallVectorImpl<BasicBlock *> &Blocks,
+                                   SmallVectorImpl<int> &Width) JL_NOTSAFEPOINT
+{
+    unsigned N = Blocks.size();
+    DenseMap<BasicBlock *, unsigned> Pos;
+    for (unsigned i = 0; i < N; i++)
+        Pos[Blocks[i]] = i;
+    SmallVector<int, 128> D(N + 1, 0);
+    auto weightOf = [](Type *T) JL_NOTSAFEPOINT -> int {
+        switch (classifyType(T)) {
+        case ValKind::Tracked:
+            return 3;
+        case ValKind::Derived:
+            return 2;
+        case ValKind::Untracked:
+            return T->isFirstClassType() && T->isSized() && !T->isVoidTy() ? 1 : 0;
+        default:
+            return 0;
+        }
+    };
+    DenseMap<Value *, unsigned> ExtMinUse; // external def -> first use position
+    for (unsigned pb = 0; pb < N; pb++) {
+        for (Instruction &I : *Blocks[pb]) {
+            // Region-internal defs: input while the prefix has a use but not
+            // the def; output while it has the def but not every use.
+            if (int W = weightOf(I.getType())) {
+                unsigned MinPU = ~0u, MaxPU = 0;
+                for (User *U : I.users()) {
+                    auto It = Pos.find(cast<Instruction>(U)->getParent());
+                    unsigned PU = It == Pos.end() ? N : It->second;
+                    MinPU = std::min(MinPU, PU);
+                    MaxPU = std::max(MaxPU, PU);
+                }
+                if (MinPU != ~0u) {
+                    if (MinPU < pb) { // grow order need not follow dominance
+                        D[MinPU] += W;
+                        D[pb] -= W;
+                    }
+                    if (MaxPU > pb) {
+                        D[pb] += W;
+                        D[std::min(MaxPU, N)] -= W;
+                    }
+                }
+            }
+            // External defs referenced from inside: input from first use on.
+            for (Value *Op : I.operands()) {
+                if (isa<Constant>(Op) || isa<BasicBlock>(Op) ||
+                    isa<MetadataAsValue>(Op))
+                    continue;
+                if (auto *OpI = dyn_cast<Instruction>(Op);
+                    OpI && Pos.count(OpI->getParent()))
+                    continue; // internal def: handled above
+                if (!isa<Instruction>(Op) && !isa<Argument>(Op))
+                    continue;
+                if (int W = weightOf(Op->getType()); W) {
+                    auto [It, New] = ExtMinUse.try_emplace(Op, pb);
+                    if (!New)
+                        It->second = std::min(It->second, pb);
+                }
+            }
+        }
+    }
+    for (auto &KV : ExtMinUse) {
+        int W = weightOf(KV.first->getType());
+        D[KV.second] += W;
+        // an external input stays an input for every longer prefix
+    }
+    Width.assign(N, 0);
+    int Acc = 0;
+    for (unsigned k = 0; k < N; k++) {
+        Acc += D[k];
+        Width[k] = Acc;
+    }
+}
+
 static bool growRegion(BasicBlock *Entry, unsigned Target, BlockInfoCache &Info,
                        const SmallPtrSetImpl<BasicBlock *> &Assigned,
                        const DenseMap<BasicBlock *, unsigned> &RPOIndex,
@@ -2412,6 +2793,47 @@ static bool growRegion(BasicBlock *Entry, unsigned Target, BlockInfoCache &Info,
             FE.first++;
         }
     }
+    // One record per grow step (index = R.Blocks.size()-1 at that step):
+    // whether that prefix was a legal cut, its boundary, and its cap fills.
+    // Consumed by the min-cut selection when a cap forces a cut.
+    struct GrowStep {
+        BasicBlock *Cand;
+        bool CanCut;
+        bool CandFull;
+        unsigned Insts;
+        unsigned Safepoints;
+    };
+    SmallVector<GrowStep, 64> Steps;
+    // Choose the cut among the recorded grow prefixes: the narrowest live
+    // interface among eligible ones, preferring the longest prefix on ties;
+    // trims the region (and its stats) down to the chosen prefix. The final
+    // prefix is always eligible, so this never loses to cutting exactly
+    // where growth stopped, on the width metric.
+    auto minCutSelect = [&](function_ref<bool(const GrowStep &, unsigned)> Eligible)
+        JL_NOTSAFEPOINT -> unsigned {
+        unsigned BestK = Steps.size() - 1;
+        if (SplitMinCutWindow) {
+            SmallVector<int, 128> Width;
+            prefixInterfaceProfile(R.Blocks, Width);
+            for (unsigned k = 0; k + 1 < Steps.size(); k++) {
+                if (!Steps[k].CanCut || !Eligible(Steps[k], k))
+                    continue;
+                if (Width[k] < Width[BestK] ||
+                    (Width[k] == Width[BestK] && k > BestK))
+                    BestK = k;
+            }
+            if (BestK + 1 < R.Blocks.size()) {
+                GrowMinCutTrim += R.Blocks.size() - (BestK + 1);
+                for (unsigned i = BestK + 1; i < R.Blocks.size(); i++)
+                    R.Set.erase(R.Blocks[i]);
+                R.Blocks.truncate(BestK + 1);
+            }
+        }
+        R.Boundary = Steps[BestK].Cand;
+        R.BoundaryDominated = Steps[BestK].CandFull;
+        R.Insts = Steps[BestK].Insts;
+        return BestK;
+    };
     while (true) {
         BasicBlock *Add = nullptr;
         unsigned AddIdx = ~0u;
@@ -2449,6 +2871,8 @@ static bool growRegion(BasicBlock *Entry, unsigned Target, BlockInfoCache &Info,
             }
         }
         bool CanCut = Cand != nullptr && Pending == 0;
+        assert(Steps.size() + 1 == R.Blocks.size());
+        Steps.push_back({Cand, CanCut, CandFull, Insts, Safepoints});
         // Dual cap: cut at the instruction target OR the safepoint budget,
         // whichever fills first. Per-region compile cost on call-dense code
         // is superlinear in the safepoints spanned (MachineCSE, GreedyRA),
@@ -2462,15 +2886,26 @@ static bool growRegion(BasicBlock *Entry, unsigned Target, BlockInfoCache &Info,
         // and branchy block-dense code needs a block bound even at a large inst target.
         bool BlocksFull = SplitRegionBlocks && R.Blocks.size() >= SplitRegionBlocks;
         if (CanCut && (Insts >= Target || SPFull || BlocksFull)) {
-            R.Boundary = Cand;
-            R.BoundaryDominated = CandFull;
-            R.Insts = Insts;
             if (Insts >= Target)
                 GrowCutTarget++;
             else if (SPFull)
                 GrowCutSafepoint++;
             else
                 GrowCutBlocks++;
+            // Eligible prefixes hold at least 1/window of the final fill on
+            // the axis that forced this cut.
+            auto fill = [&](const GrowStep &S, unsigned k) JL_NOTSAFEPOINT {
+                if (Insts >= Target)
+                    return S.Insts;
+                if (SPFull)
+                    return S.Safepoints;
+                return k + 1; // block count
+            };
+            unsigned Floor = fill(Steps.back(), Steps.size() - 1) /
+                             std::max(1u, SplitMinCutWindow.getValue());
+            minCutSelect([&](const GrowStep &S, unsigned k) JL_NOTSAFEPOINT {
+                return fill(S, k) >= Floor;
+            });
             return true;
         }
         bool SPOver = SplitRegionSafepoints &&
@@ -2500,10 +2935,18 @@ static bool growRegion(BasicBlock *Entry, unsigned Target, BlockInfoCache &Info,
             bool Clamped = Insts >= MaxSize || SPOver || BlocksOver ||
                            R.Blocks.size() >= MaxBlocks;
             if (CanCut && (MinProgress || Clamped)) {
-                R.Boundary = Cand;
-                R.BoundaryDominated = CandFull;
-                R.Insts = Insts;
                 GrowCutClamp++;
+                // Same progress floor per prefix; when even the end lacks
+                // it (pure clamp), any legal prefix beats forming nothing.
+                auto stepProgress = [&](const GrowStep &S, unsigned k) JL_NOTSAFEPOINT {
+                    return S.Insts >= std::max(16u, Target / 4) ||
+                           (SplitRegionSafepoints &&
+                            S.Safepoints >= SplitRegionSafepoints / 4) ||
+                           (SplitRegionBlocks && k + 1 >= SplitRegionBlocks / 4);
+                };
+                minCutSelect([&](const GrowStep &S, unsigned k) JL_NOTSAFEPOINT {
+                    return !MinProgress || stepProgress(S, k);
+                });
                 return true;
             }
             // Loop headers can only be entered as debt: admit the candidate
@@ -2689,7 +3132,7 @@ static bool splitFunction(Function &F, const JuliaPassContext &ctx) JL_NOTSAFEPO
         return std::chrono::duration_cast<std::chrono::milliseconds>(b - a).count();
     };
     auto T0 = now();
-    GrowCutTarget = GrowCutSafepoint = GrowCutBlocks = GrowCutClamp = GrowFailBlocks = GrowFailSize = GrowFailNoAdd = 0;
+    GrowCutTarget = GrowCutSafepoint = GrowCutBlocks = GrowCutClamp = GrowFailBlocks = GrowFailSize = GrowFailNoAdd = GrowMinCutTrim = 0;
     IfaceIn = IfaceOut = IfaceInMax = IfaceOutMax = IfaceExits = IfaceCalls = 0;
     if (BigBlocks) {
         bool Chunked = splitOversizedBlocks(F, ctx);
@@ -2711,12 +3154,92 @@ static bool splitFunction(Function &F, const JuliaPassContext &ctx) JL_NOTSAFEPO
     // the pre-chunking scan: chunking only adds ~TotalInsts/BlockInsts seam
     // blocks, which cannot flip a sub-cap function over the block cap unless
     // it already exceeds the instruction cap.)
+    // The entry factor gates only the safepoint and block axes: those caps
+    // (512) trigger on medium functions whose unsplit compilation is still
+    // cheap, where outlining pays the flat per-region stack tax over too
+    // little extracted mass. The instruction target is already sized for
+    // the workloads whose compile time is the point of this pass, so it
+    // gates at 1x regardless.
+    unsigned EF = std::max(1u, SplitEntryFactor.getValue());
     bool ExceedsAnyCap =
         TotalInsts > regionSizeTarget() ||
-        (SplitRegionSafepoints && TotalSafepoints > SplitRegionSafepoints) ||
-        (SplitRegionBlocks && NumBlocks > SplitRegionBlocks);
+        (SplitRegionSafepoints && TotalSafepoints > (uint64_t)EF * SplitRegionSafepoints) ||
+        (SplitRegionBlocks && NumBlocks > (uint64_t)EF * SplitRegionBlocks);
+    if (SplitDebug || SplitTime)
+        errs() << "julia-function-splitting: " << F.getName()
+               << ": totals insts=" << TotalInsts
+               << " safepoints=" << TotalSafepoints << " blocks=" << NumBlocks
+               << (ExceedsAnyCap ? " (outlining)" : " (under entry gate)")
+               << "\n";
     if (!ExceedsAnyCap)
         return Changed;
+    // Codegen zero-initializes its single-slot GC root allocas with a memset,
+    // which SROA cannot rewrite for non-integral pointer types (rebuilding
+    // the value from bytes would need inttoptr), so these slots reach this
+    // pass unpromoted even though mem2reg could otherwise dissolve them.
+    // Left in memory, every slot referenced by more than one region becomes
+    // a pointer argument: escaped for the rest of the pipeline, pinned to a
+    // dedicated GC frame slot in the caller, and re-loaded by every region
+    // that reads it. Promote them here instead -- rewrite each full-cover
+    // zero memset into an equivalent null store (zero bits are null in the
+    // tracked address space) and run mem2reg -- so boundary-crossing values
+    // ride the interface as SSA and everything else stays in registers.
+    {
+        const DataLayout &DL = F.getParent()->getDataLayout();
+        SmallVector<AllocaInst *, 64> Promotable;
+        SmallVector<MemSetInst *, 64> Zeros;
+        for (Instruction &I : F.getEntryBlock()) {
+            auto *AI = dyn_cast<AllocaInst>(&I);
+            if (!AI || AI->isArrayAllocation())
+                continue;
+            Type *ElT = AI->getAllocatedType();
+            if (classifyType(ElT) != ValKind::Tracked)
+                continue;
+            uint64_t Size = DL.getTypeAllocSize(ElT);
+            bool OK = true;
+            SmallVector<MemSetInst *, 2> MSes;
+            for (User *U : AI->users()) {
+                if (auto *LI = dyn_cast<LoadInst>(U);
+                    LI && LI->isSimple() && LI->getType() == ElT)
+                    continue;
+                if (auto *SI = dyn_cast<StoreInst>(U);
+                    SI && SI->isSimple() && SI->getPointerOperand() == AI &&
+                    SI->getValueOperand()->getType() == ElT)
+                    continue;
+                auto *MS = dyn_cast<MemSetInst>(U);
+                if (MS && !MS->isVolatile() && MS->getRawDest() == AI &&
+                    isa<ConstantInt>(MS->getValue()) &&
+                    cast<ConstantInt>(MS->getValue())->isZero() &&
+                    isa<ConstantInt>(MS->getLength()) &&
+                    cast<ConstantInt>(MS->getLength())->getZExtValue() == Size) {
+                    MSes.push_back(MS);
+                    continue;
+                }
+                OK = false;
+                break;
+            }
+            if (!OK)
+                continue;
+            for (MemSetInst *MS : MSes) {
+                IRBuilder<> B(MS);
+                B.CreateAlignedStore(Constant::getNullValue(ElT), AI, AI->getAlign());
+                Zeros.push_back(MS);
+            }
+            Promotable.push_back(AI);
+        }
+        for (MemSetInst *MS : Zeros)
+            MS->eraseFromParent();
+        Promotable.erase(std::remove_if(Promotable.begin(), Promotable.end(),
+                                        [](AllocaInst *AI) JL_NOTSAFEPOINT {
+                                            return !isAllocaPromotable(AI);
+                                        }),
+                         Promotable.end());
+        if (!Promotable.empty()) {
+            DominatorTree DT(F);
+            PromoteMemToReg(Promotable, DT);
+            Info.invalidateSizes();
+        }
+    }
     std::vector<Region> Regions;
     formRegions(F, Info, Regions);
     auto T2 = now();
@@ -2733,7 +3256,8 @@ static bool splitFunction(Function &F, const JuliaPassContext &ctx) JL_NOTSAFEPO
         errs() << " cuts(target/sp/blocks/clamp)=" << GrowCutTarget << "/"
                << GrowCutSafepoint << "/" << GrowCutBlocks << "/" << GrowCutClamp
                << " growfail(blocks/size/stuck)=" << GrowFailBlocks << "/"
-               << GrowFailSize << "/" << GrowFailNoAdd << "\n";
+               << GrowFailSize << "/" << GrowFailNoAdd
+               << " mincut-trimmed-blocks=" << GrowMinCutTrim << "\n";
     }
     if (Regions.empty())
         return Changed;

@@ -1074,3 +1074,68 @@ join:
   %s = fadd double %p, %p2
   ret double %s
 }
+
+; A tracked stack slot whose only obstacle to promotion is codegen's memset
+; zero-init (SROA cannot rewrite a memset for non-integral pointer types) is
+; promoted to SSA before regions are formed, instead of being frozen into the
+; region interface as an escaping pointer argument: the original slot and its
+; memset are gone (a value that still crosses a region boundary may be given a
+; fresh single-value slot by the extraction interface, which is bounded and
+; packable, unlike the frozen original).
+; CALLER-LABEL: define ptr addrspace(10) @promotable_slot(
+; CALLER-NOT: %slot = alloca
+; CALLER-NOT: llvm.memset
+; CALLER: call {{.*}}@promotable_slot.julia_split
+define ptr addrspace(10) @promotable_slot(ptr addrspace(10) %v, i1 %c) {
+top:
+  %pg = call ptr @julia.get_pgcstack()
+  %slot = alloca ptr addrspace(10), align 8
+  call void @llvm.memset.p0.i64(ptr align 8 %slot, i8 0, i64 8, i1 false)
+  br i1 %c, label %a, label %b
+a:
+  store ptr addrspace(10) %v, ptr %slot, align 8
+  br label %b
+b:
+  %s1 = call ptr addrspace(10) @jl_box_int64(i64 1)
+  call void @use2(ptr addrspace(10) %s1, ptr addrspace(10) %s1)
+  %s2 = call ptr addrspace(10) @jl_box_int64(i64 2)
+  call void @use2(ptr addrspace(10) %s2, ptr addrspace(10) %s2)
+  %s3 = call ptr addrspace(10) @jl_box_int64(i64 3)
+  call void @use2(ptr addrspace(10) %s3, ptr addrspace(10) %s3)
+  %s4 = call ptr addrspace(10) @jl_box_int64(i64 4)
+  call void @use2(ptr addrspace(10) %s4, ptr addrspace(10) %s4)
+  %s5 = call ptr addrspace(10) @jl_box_int64(i64 5)
+  call void @use2(ptr addrspace(10) %s5, ptr addrspace(10) %s5)
+  %s6 = call ptr addrspace(10) @jl_box_int64(i64 6)
+  call void @use2(ptr addrspace(10) %s6, ptr addrspace(10) %s6)
+  %s7 = call ptr addrspace(10) @jl_box_int64(i64 7)
+  call void @use2(ptr addrspace(10) %s7, ptr addrspace(10) %s7)
+  %s8 = call ptr addrspace(10) @jl_box_int64(i64 8)
+  call void @use2(ptr addrspace(10) %s8, ptr addrspace(10) %s8)
+  %s9 = call ptr addrspace(10) @jl_box_int64(i64 9)
+  call void @use2(ptr addrspace(10) %s9, ptr addrspace(10) %s9)
+  %s10 = call ptr addrspace(10) @jl_box_int64(i64 10)
+  call void @use2(ptr addrspace(10) %s10, ptr addrspace(10) %s10)
+  %s11 = call ptr addrspace(10) @jl_box_int64(i64 11)
+  call void @use2(ptr addrspace(10) %s11, ptr addrspace(10) %s11)
+  %s12 = call ptr addrspace(10) @jl_box_int64(i64 12)
+  call void @use2(ptr addrspace(10) %s12, ptr addrspace(10) %s12)
+  %s13 = call ptr addrspace(10) @jl_box_int64(i64 13)
+  call void @use2(ptr addrspace(10) %s13, ptr addrspace(10) %s13)
+  %s14 = call ptr addrspace(10) @jl_box_int64(i64 14)
+  call void @use2(ptr addrspace(10) %s14, ptr addrspace(10) %s14)
+  %s15 = call ptr addrspace(10) @jl_box_int64(i64 15)
+  call void @use2(ptr addrspace(10) %s15, ptr addrspace(10) %s15)
+  %s16 = call ptr addrspace(10) @jl_box_int64(i64 16)
+  call void @use2(ptr addrspace(10) %s16, ptr addrspace(10) %s16)
+  %s17 = call ptr addrspace(10) @jl_box_int64(i64 17)
+  call void @use2(ptr addrspace(10) %s17, ptr addrspace(10) %s17)
+  %s18 = call ptr addrspace(10) @jl_box_int64(i64 18)
+  call void @use2(ptr addrspace(10) %s18, ptr addrspace(10) %s18)
+  %s19 = call ptr addrspace(10) @jl_box_int64(i64 19)
+  call void @use2(ptr addrspace(10) %s19, ptr addrspace(10) %s19)
+  %s20 = call ptr addrspace(10) @jl_box_int64(i64 20)
+  call void @use2(ptr addrspace(10) %s20, ptr addrspace(10) %s20)
+  %r = load ptr addrspace(10), ptr %slot, align 8
+  ret ptr addrspace(10) %r
+}
