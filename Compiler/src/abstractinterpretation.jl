@@ -2970,6 +2970,10 @@ function abstract_call_known(interp::AbstractInterpreter, @nospecialize(f),
     elseif isa(f, Core.OpaqueClosure)
         # calling an OpaqueClosure about which we have no information returns no information
         return Future(CallMeta(typeof(f).parameters[2], Any, Effects(), NoCallInfo()))
+    elseif isa(f, Core.TypedCallable)
+        # calling a TypedCallable returns its declared return type `R`, dispatched
+        # in the latest world (see the type-level case in abstract_call_unknown)
+        return Future(CallMeta(typeof(f).parameters[2], Any, Effects(), NoCallInfo()))
     elseif f === UnionAll
         let call = abstract_call_gf_by_type(interp, f, ArgInfo(nothing, Any[Const(UnionAll), Any, Any]), si, Tuple{Type{UnionAll}, Any, Any}, vtypes, sv, max_methods)::Future
             return Future{CallMeta}(call, interp, sv) do call, interp, sv
@@ -3148,6 +3152,15 @@ function abstract_call_unknown(interp::AbstractInterpreter, @nospecialize(ft),
         add_remark!(interp, sv, "Could not identify method table for call")
         return Future(CallMeta(Any, Any, Effects(), NoCallInfo()))
     elseif hasintersect(wft, Core.OpaqueClosure)
+        uft = unwrap_unionall(wft)
+        if isa(uft, DataType)
+            return Future(CallMeta(rewrap_unionall(uft.parameters[2], wft), Any, Effects(), NoCallInfo()))
+        end
+        return Future(CallMeta(Any, Any, Effects(), NoCallInfo()))
+    elseif hasintersect(wft, Core.TypedCallable)
+        # Calling a `TypedCallable{A,R}` dispatches its wrapped callable in the
+        # latest world and returns `R` (the second type parameter), analogous to
+        # an `OpaqueClosure` but without a fixed world.
         uft = unwrap_unionall(wft)
         if isa(uft, DataType)
             return Future(CallMeta(rewrap_unionall(uft.parameters[2], wft), Any, Effects(), NoCallInfo()))

@@ -2433,6 +2433,25 @@ end
     return t
 end
 
+@nospecs function typed_callable_tfunc(𝕃::AbstractLattice, args...)
+    # `Core._typed_callable(f, A, R)` constructs a `Core.TypedCallable{A,R}`; the optimized
+    # 4-arg form `Core._typed_callable(trampoline, f, A, R)` (see the inlining transform)
+    # does the same, with `A`/`R` still the last two arguments. Give the precise parametric
+    # type when `A` (an argument-tuple type) and `R` are statically known; otherwise widen
+    # to `Core.TypedCallable`. This never looks through `f`: a TypedCallable dispatches in
+    # the *latest* world, so only `R` is sound (see the handling in `abstract_call_*`).
+    na = length(args)
+    (na == 3 || na == 4) || return Core.TypedCallable
+    AT, A_exact = instanceof_tfunc(args[na-1])
+    RT, R_exact = instanceof_tfunc(args[na])
+    if A_exact && R_exact && isa(AT, Type) && AT <: Tuple && isa(RT, Type) &&
+            !has_free_typevars(AT) && !has_free_typevars(RT)
+        return Core.TypedCallable{AT, RT}
+    end
+    return Core.TypedCallable
+end
+add_tfunc(Core._typed_callable, 3, 4, typed_callable_tfunc, 10)
+
 # whether getindex for the elements can potentially throw UndefRef
 @nospecs function array_type_undefable(arytype)
     arytype = unwrap_unionall(arytype)
