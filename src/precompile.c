@@ -101,12 +101,16 @@ JL_DLLEXPORT void jl_write_compiler_output(void)
         return;
     }
 
+    uint64_t t_quiesce0 = jl_hrtime();
     jl_task_wait_empty(); // wait for most work to finish (except possibly finalizers)
     jl_gc_collect(JL_GC_FULL);
     jl_gc_collect(JL_GC_INCREMENTAL); // sweep finalizers
     jl_task_t *ct = jl_current_task;
     jl_gc_enable_finalizers(ct, 0); // now disable finalizers, as they could schedule more work or make other unexpected changes to reachability
     jl_task_wait_empty(); // then make sure we are the only thread alive that could be running user code past here
+    if (getenv("JULIA_REUSE_DEBUG"))
+        jl_safe_printf("jl_write_compiler_output timing: quiesce+GC %.1fs\n",
+                       (jl_hrtime() - t_quiesce0) / 1e9);
 
     jl_array_t *worklist = jl_module_init_order;
     if (!worklist) {

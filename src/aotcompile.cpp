@@ -1464,8 +1464,9 @@ static void jl_emit_native_to_output(jl_native_code_desc_t *data, jl_array_t *co
     std::map<std::string, size_t> session_fresh_mods;
     std::vector<std::string> session_fresh_samples;
     size_t n_fresh_shadowing_valid = 0, n_fresh_invalidated = 0, n_fresh_never_imaged = 0;
-    size_t n_emitted_shadow = 0, n_emitted_shadow_code = 0;
-    std::vector<std::string> emitted_shadow_samples;
+    size_t emit_buckets[5] = {0, 0, 0, 0, 0};
+    std::map<std::string, size_t> emit_bucket_mods[5];
+    std::vector<std::string> emit_bucket_samples[5];
     size_t i, l;
     for (i = 0, l = jl_array_nrows(codeinfos); i < l; i++) {
         // each item in this list is either a CodeInstance followed by a CodeInfo indicating something
@@ -1587,26 +1588,41 @@ static void jl_emit_native_to_output(jl_native_code_desc_t *data, jl_array_t *co
                 jl_emit_codeinst(out, codeinst, src);
                 n_ci_emitted++;
                 if (getenv("JULIA_REUSE_DEBUG")) {
+                    // taxonomy of what still gets emitted:
+                    //  0 never-imaged: no image CodeInstance ever existed for this MI
+                    //  1 invalidated: image CI existed but its world was clipped (legit re-derivation)
+                    //  2 cert-shadow: valid image CI without code (JIT minted a twin anyway)
+                    //  3 twin-miss: valid image CI WITH code exists but twin-skip didn't fire
+                    //  4 self-image: the emitted CI itself is image-resident (inference-only entry)
                     jl_method_instance_t *mi = jl_get_ci_mi(codeinst);
-                    int shadow = 0;
-                    jl_code_instance_t *c = jl_atomic_load_relaxed(&mi->cache);
-                    while (c) {
-                        if (c != codeinst && jl_object_in_image((jl_value_t *)c) &&
-                            jl_atomic_load_relaxed(&c->max_world) == ~(size_t)0) {
-                            shadow = jl_atomic_load_relaxed(&c->invoke) != NULL ? 2 : 1;
-                            if (shadow == 2)
-                                break;
+                    int bucket = 0;
+                    if (jl_object_in_image((jl_value_t *)codeinst))
+                        bucket = 4;
+                    else {
+                        jl_code_instance_t *c = jl_atomic_load_relaxed(&mi->cache);
+                        while (c) {
+                            if (c != codeinst && jl_object_in_image((jl_value_t *)c)) {
+                                if (jl_atomic_load_relaxed(&c->max_world) == ~(size_t)0) {
+                                    if (jl_atomic_load_relaxed(&c->invoke) != NULL) {
+                                        bucket = 3;
+                                        break;
+                                    }
+                                    if (bucket < 2)
+                                        bucket = 2;
+                                }
+                                else if (bucket < 1)
+                                    bucket = 1;
+                            }
+                            c = jl_atomic_load_relaxed(&c->next);
                         }
-                        c = jl_atomic_load_relaxed(&c->next);
                     }
-                    if (shadow) {
-                        n_emitted_shadow++;
-                        if (shadow == 2)
-                            n_emitted_shadow_code++;
-                        if (emitted_shadow_samples.size() < 15 && jl_is_method(mi->def.method))
-                            emitted_shadow_samples.push_back(
-                                std::string(jl_symbol_name(mi->def.method->module->name)) + "." +
-                                jl_symbol_name(mi->def.method->name));
+                    emit_buckets[bucket]++;
+                    if (jl_is_method(mi->def.method)) {
+                        std::string name = std::string(jl_symbol_name(mi->def.method->module->name)) + "." +
+                                           jl_symbol_name(mi->def.method->name);
+                        emit_bucket_mods[bucket][name]++;
+                        if (emit_bucket_samples[bucket].size() < 12)
+                            emit_bucket_samples[bucket].push_back(name);
                     }
                 }
             }
@@ -1636,11 +1652,21 @@ static void jl_emit_native_to_output(jl_native_code_desc_t *data, jl_array_t *co
             std::sort(by_count.rbegin(), by_count.rend());
             jl_safe_printf("session-fresh origin: %zu shadowing-valid-image-ci, %zu invalidated-image-ci, %zu never-imaged\n",
                            n_fresh_shadowing_valid, n_fresh_invalidated, n_fresh_never_imaged);
-            std::string sline = "emitted-with-valid-image-twin: " + std::to_string(n_emitted_shadow) +
-                                " (twin has code: " + std::to_string(n_emitted_shadow_code) + ");";
-            for (auto &s3 : emitted_shadow_samples)
-                sline += " " + s3;
-            jl_safe_printf("%s\n", sline.c_str());
+            static const char *bucket_names[5] = {"never-imaged", "invalidated", "cert-shadow",
+                                                  "twin-miss", "self-image"};
+            for (int b = 0; b < 5; b++) {
+                if (!emit_buckets[b])
+                    continue;
+                std::string sline = "emitted[" + std::string(bucket_names[b]) + "]: " +
+                                    std::to_string(emit_buckets[b]) + ";";
+                std::vector<std::pair<size_t, std::string>> top;
+                for (auto &kv : emit_bucket_mods[b])
+                    top.push_back({kv.second, kv.first});
+                std::sort(top.rbegin(), top.rend());
+                for (size_t k = 0; k < top.size() && k < 10; k++)
+                    sline += " " + top[k].second + "=" + std::to_string(top[k].first);
+                jl_safe_printf("%s\n", sline.c_str());
+            }
             std::string line = "session-fresh by root module:";
             for (size_t k = 0; k < by_count.size() && k < 12; k++)
                 line += " " + by_count[k].second + "=" + std::to_string(by_count[k].first);
