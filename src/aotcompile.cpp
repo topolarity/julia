@@ -382,6 +382,68 @@ extern "C" JL_DLLEXPORT_CODEGEN void jl_get_llvm_gv_inits_impl(void *native_code
     memcpy(data, inits.data(), *num_elements * sizeof(void *));
 }
 
+// Like jl_get_llvm_gv_inits, but for --trim: NULLs out gv-init values whose global slot is
+// referenced only by functions emitted for *unreachable* CodeInstances (whose MethodInstance
+// is not in `reachable_mis`, the kept-set walk's reachable set). The over-approximated
+// compilation pass emits globals (string/type constants, etc.) for code the walk proves
+// unreachable; this keeps those Julia objects out of the serialized heap. The slot count is
+// unchanged -- a dead slot just gets a NULL value (a 0 reloc), which is never read because
+// the function referencing it is itself pruned out of the image.
+extern "C" JL_DLLEXPORT_CODEGEN void
+jl_get_reachable_gv_inits_impl(void *native_code, jl_method_instance_t **reachable_mis,
+                               size_t num_reachable, size_t *num_elements, void **data)
+{
+    jl_native_code_desc_t *desc = (jl_native_code_desc_t *)native_code;
+    auto &inits = desc->jl_value_to_llvm;
+    if (data == NULL) {
+        *num_elements = inits.size();
+        return;
+    }
+    assert(*num_elements == inits.size());
+
+    DenseSet<jl_method_instance_t*> reachable;
+    reachable.reserve(num_reachable);
+    for (size_t i = 0; i < num_reachable; i++)
+        reachable.insert(reachable_mis[i]);
+    // The entry-point functions of UNreachable CodeInstances. A slot is dead only if EVERY
+    // function referencing it is one of these: such functions are never executed at runtime
+    // (nothing reachable calls them), so they never read the slot even if they linger in the
+    // module as dead code. Functions not emitted for a CI (thunks/adapters/entry wrappers,
+    // indirectly-called code) and reachable CIs' functions are conservatively treated as
+    // live, so their globals are always kept -- only the over-compiled-but-unreachable
+    // code's private globals are dropped.
+    DenseSet<Function*> unreachable_fns;
+    for (auto &kv : desc->jl_fvar_map) {
+        if (!reachable.count(jl_get_ci_mi(kv.first))) {
+            if (kv.second.invoke) unreachable_fns.insert(kv.second.invoke);
+            if (kv.second.specptr) unreachable_fns.insert(kv.second.specptr);
+        }
+    }
+    for (size_t i = 0; i < inits.size(); i++) {
+        GlobalValue *gv = (GlobalValue*)desc->jl_sysimg_gvars[i];
+        bool has_user = false, has_live_user = false;
+        SmallVector<User*, 8> work(gv->users().begin(), gv->users().end());
+        SmallPtrSet<User*, 16> seen;
+        while (!work.empty()) {
+            User *u = work.pop_back_val();
+            if (!seen.insert(u).second)
+                continue;
+            if (auto *I = dyn_cast<Instruction>(u)) {
+                has_user = true;
+                if (!unreachable_fns.count(I->getFunction())) {
+                    has_live_user = true;
+                    break;
+                }
+            }
+            else {
+                for (User *uu : u->users())
+                    work.push_back(uu);
+            }
+        }
+        data[i] = (has_user && !has_live_user) ? NULL : inits[i];
+    }
+}
+
 extern "C" JL_DLLEXPORT_CODEGEN void jl_get_llvm_external_fns_impl(void *native_code,
                                                                    size_t *num_elements,
                                                                    jl_code_instance_t *data)

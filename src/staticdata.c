@@ -1450,7 +1450,8 @@ static void record_memoryrefs_inside(jl_serializer_state *s, jl_datatype_t *t, s
 static void record_gvars(jl_serializer_state *s, arraylist_t *globals) JL_CANSAFEPOINT JL_GC_DISABLED
 {
     for (size_t i = 0; i < globals->len; i++)
-        jl_queue_for_serialization(s, globals->items[i]);
+        if (globals->items[i]) // NULL == pruned: slot referenced only by unreachable code
+            jl_queue_for_serialization(s, globals->items[i]);
 }
 
 static void record_external_fns(jl_serializer_state *s, arraylist_t *external_fns) JL_NOTSAFEPOINT
@@ -2483,6 +2484,10 @@ static uint32_t write_gvars(jl_serializer_state *s, arraylist_t *globals, arrayl
     ios_ensureroom(s->gvar_record, len * sizeof(reloc_t));
     for (size_t i = 0; i < globals->len; i++) {
         void *g = globals->items[i];
+        if (g == NULL) { // pruned gvar (referenced only by unreachable code): empty slot
+            write_reloc_t(s->gvar_record, 0);
+            continue;
+        }
         uintptr_t item = backref_id(s, g, s->link_ids_gvars);
         uintptr_t reloc = get_reloc_for_item(item, 0);
         write_reloc_t(s->gvar_record, reloc);
@@ -3302,7 +3307,24 @@ static void jl_save_system_image_to_stream(ios_t *f, jl_array_t *mod_array,
                 jl_queue_for_serialization(&s, jl_array_ptr_ref((jl_value_t*)entrypoint_cis, i));
         }
         jl_serialize_reachable(&s);
-        // step 1.2: ensure all gvars are part of the sysimage too
+        // step 1.2: ensure all gvars are part of the sysimage too. For --trim, first prune
+        // the gv-init list: the over-approximated compilation pass emits globals for code
+        // the kept-set walk proves unreachable, and record_gvars would otherwise serialize
+        // those Julia objects into the image even though their code is dropped. The walk's
+        // `edge_visited` is the reachable-MethodInstance oracle; jl_get_reachable_gv_inits
+        // NULLs out gv slots referenced only by unreachable functions (the dead LLVM slot
+        // is pruned separately and never read).
+        if (jl_options.trim && native_functions && gvars.len) {
+            arraylist_t reachable_mis;
+            arraylist_new(&reachable_mis, edge_visited.size / 2);
+            for (size_t vi = 0; vi < edge_visited.size; vi += 2)
+                if (edge_visited.table[vi + 1] != HT_NOTFOUND) // key = reachable MethodInstance
+                    arraylist_push(&reachable_mis, edge_visited.table[vi]);
+            size_t num_gvars = gvars.len;
+            jl_get_reachable_gv_inits(native_functions, (jl_method_instance_t**)reachable_mis.items,
+                                      reachable_mis.len, &num_gvars, gvars.items);
+            arraylist_free(&reachable_mis);
+        }
         record_gvars(&s, &gvars);
         record_external_fns(&s, &external_fns);
         jl_serialize_reachable(&s);

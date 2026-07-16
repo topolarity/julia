@@ -15,6 +15,7 @@ JL_DLLEXPORT void jl_dump_native_fallback(void *native_code,
         ios_t *z, ios_t *s, jl_emission_params_t *params) UNAVAILABLE
 JL_DLLEXPORT void jl_get_llvm_gvs_fallback(void *native_code, size_t *num, void **gvs) UNAVAILABLE
 JL_DLLEXPORT void jl_get_llvm_gv_inits_fallback(void *native_code, size_t *num, void **inits) UNAVAILABLE
+JL_DLLEXPORT void jl_get_reachable_gv_inits_fallback(void *native_code, jl_method_instance_t **reachable_mis, size_t num_reachable, size_t *num, void **inits) UNAVAILABLE
 JL_DLLEXPORT void jl_get_llvm_external_fns_fallback(void *native_code, size_t *num_els, jl_code_instance_t *fns) UNAVAILABLE
 JL_DLLEXPORT void jl_get_llvm_cis_fallback(void *native_code, size_t *num_els, jl_code_instance_t **CIs) UNAVAILABLE
 JL_DLLEXPORT void jl_get_serialized_cis_fallback(void *native_code, size_t *num_els, jl_code_instance_t **CIs) UNAVAILABLE
