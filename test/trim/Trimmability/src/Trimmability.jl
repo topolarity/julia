@@ -112,6 +112,13 @@ tc_add(x::Int)::Int = x + 1
 @noinline make_tc() = Core.TypedCallable{Tuple{Int},Int}(tc_add)
 call_tc(t::Core.TypedCallable{Tuple{Int},Int}, x::Int) = t(x)
 
+# A TypedCallable constructed by top-level *execution* at build time: it reaches the
+# image as a serialized value with no compiled construction site, so its adapter comes
+# from the live-cache sweep in `generate_cfunc_thunks` (and its target from the trim
+# entry's seeding pass).
+tc_mul(x::Int)::Int = x * 2
+const TC_CONST = Core.TypedCallable{Tuple{Int},Int}(tc_mul)
+
 function @main(args::Vector{String})::Cint
     println(Core.stdout, str())
     println(Core.stdout, PROGRAM_FILE)
@@ -119,6 +126,7 @@ function @main(args::Vector{String})::Cint
 
     # TypedCallable dispatched through its image-serialized adapter
     println(Core.stdout, call_tc(make_tc(), 41))
+    println(Core.stdout, call_tc(TC_CONST, 21))
 
     # Register a finalizer and force collection so it runs before exit.
     register_fin()

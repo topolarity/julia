@@ -17,8 +17,9 @@ outdir = ARGS[1]
     @test lines[3] == "arg1"
     @test lines[4] == "arg2"
     @test lines[5] == "42"  # TypedCallable dispatched via its image-serialized adapter
-    @test lines[6] == string(4.0+pi)
-    @test parse(Float64, lines[7]) isa Float64
-    @test lines[8] == "Version: 1.1.0"
-    @test lines[9] == "# preferences: 0"
+    @test lines[6] == "42"  # top-level const TypedCallable, adapter from the live-cache sweep
+    @test lines[7] == string(4.0+pi)
+    @test parse(Float64, lines[8]) isa Float64
+    @test lines[9] == "Version: 1.1.0"
+    @test lines[10] == "# preferences: 0"
 end

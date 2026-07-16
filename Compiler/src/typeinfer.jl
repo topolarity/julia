@@ -1893,6 +1893,20 @@ function typeinf_ext_toplevel(methods::Vector{Any}, worlds::Vector{UInt}, trim_m
                  enqueue_unprepared_invokes = trim_mode != TRIM_NO)
     end
 
+    if trim_mode != TRIM_NO
+        # Seed the dispatch targets of TypedCallable trampolines created by build-time
+        # *execution* (e.g. a top-level `const` TypedCallable). They never appear in
+        # compiled code, so `collectinvokes!` cannot see them; `generate_cfunc_thunks`
+        # (aotcompile.cpp) emits their adapters from the same live-cache snapshot, and
+        # those adapters need the target compiled and shipped.
+        for tr in ccall(:jl_collect_dispatch_trampolines, Any, ())::Vector{Any}
+            tr = tr::Core.DispatchTrampoline
+            getfield(tr, :kind) === 0x02 || continue # JL_ABI_TYPED_CALLABLE
+            mi = compileable_specialization_for_call(invokelatest_queue.interp, getfield(tr, :sigt))
+            mi === nothing && continue
+            push!(invokelatest_queue, mi)
+        end
+    end
     if invokelatest_queue !== nothing
         # This queue is intentionally aliased, to handle e.g. a `finalizer` calling `Core.finalizer`
         # (it will enqueue into itself and immediately drain)

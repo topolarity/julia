@@ -87,6 +87,34 @@ JL_DLLEXPORT jl_dispatch_trampoline_t *jl_get_dispatch_trampoline(jl_value_t *si
     return e;
 }
 
+
+// Walk the whole `sigt` bucket chain: rt/specsig/kind variants share one TypeMap entry,
+// so pushing only the head would miss them. Called under the writelock (relaxed loads).
+static int tramp_collect_visitor(jl_typemap_entry_t *e, void *closure) JL_CANSAFEPOINT
+{
+    jl_dispatch_trampoline_t *tr = (jl_dispatch_trampoline_t*)jl_atomic_load_relaxed((_Atomic(jl_value_t*)*)&e->func.value);
+    for (; tr != NULL; tr = jl_atomic_load_relaxed(&tr->next))
+        jl_array_ptr_1d_push((jl_array_t*)closure, (jl_value_t*)tr);
+    return 1;
+}
+
+// Snapshot every record in the cache (all kinds) into a fresh Vector{Any}. Takes the
+// writelock only for the walk. Used by the --trim build to seed adapter emission for
+// trampolines created by build-time *execution* (e.g. a top-level TypedCallable
+// construction), which never appear in compiled code.
+JL_DLLEXPORT jl_value_t *jl_collect_dispatch_trampolines(void) JL_CANSAFEPOINT
+{
+    jl_array_t *out = jl_alloc_vec_any(0);
+    JL_GC_PUSH1(&out);
+    JL_LOCK(&jl_dispatch_trampolines->writelock);
+    jl_typemap_t *map = jl_atomic_load_relaxed(&jl_dispatch_trampolines->cache);
+    if ((jl_value_t*)map != jl_nothing)
+        jl_typemap_visitor(map, tramp_collect_visitor, (void*)out);
+    JL_UNLOCK(&jl_dispatch_trampolines->writelock);
+    JL_GC_POP();
+    return (jl_value_t*)out;
+}
+
 // Insert `tr` into the running cache if its key is absent and return the canonical record;
 // keep-first, like jl_specializations_get_or_insert (a losing `tr` is left standalone). Used
 // by the load fixup to re-insert image-restored trampolines.

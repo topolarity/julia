@@ -1785,6 +1785,7 @@ JL_DLLEXPORT jl_abi_adapter_t *jl_new_abi_adapter(jl_value_t *sigt, jl_value_t *
         jl_code_instance_t *ci, int specsig, jl_abi_kind_t kind, size_t nargs, void *fptr) JL_CANSAFEPOINT;
 JL_DLLEXPORT jl_dispatch_trampoline_t *jl_get_dispatch_trampoline(jl_value_t *sigt, jl_value_t *rt, int specsig, jl_abi_kind_t kind) JL_CANSAFEPOINT;
 JL_DLLEXPORT jl_dispatch_trampoline_t *jl_insert_dispatch_trampoline(jl_dispatch_trampoline_t *tr) JL_CANSAFEPOINT;
+JL_DLLEXPORT jl_value_t *jl_collect_dispatch_trampolines(void) JL_CANSAFEPOINT;
 // Insert the record if its key is absent and return the canonical record; keep-first, like
 // jl_specializations_get_or_insert.
 JL_DLLEXPORT jl_abi_adapter_t *jl_insert_abi_adapter(jl_abi_adapter_t *e) JL_CANSAFEPOINT;

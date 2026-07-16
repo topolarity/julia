@@ -688,7 +688,7 @@ static void emit_trampoline_adapter(jl_codegen_output_t &out, jl_dispatch_trampo
 // each trampoline yields exactly one adapter record and one unspecialized record.
 static void generate_cfunc_thunks(jl_codegen_output_t &out) JL_CANSAFEPOINT
 {
-    if (out.cfuncs.empty())
+    if (out.cfuncs.empty() && !jl_options.trim)
         return;
     DenseMap<jl_method_instance_t*, jl_code_instance_t*> compiled_mi;
     for (auto &[ci, _] : out.ci_funcs) {
@@ -698,6 +698,33 @@ static void generate_cfunc_thunks(jl_codegen_output_t &out) JL_CANSAFEPOINT
             compiled_mi[mi] = ci;
     }
     size_t latestworld = jl_atomic_load_acquire(&jl_world_counter);
+    // Under --trim, also emit adapters for the live TypedCallable trampolines created by
+    // build-time *execution* (e.g. a top-level `const` TypedCallable): the instance and its
+    // trampoline reach the image as serialized values with no compiled construction site to
+    // register them, and there is no JIT at runtime to build the adapter on first call.
+    // (Their dispatch targets are compiled by the trim entry's seeding pass in typeinfer.jl.)
+    if (jl_options.trim) {
+        jl_task_t *ct = jl_current_task;
+        jl_array_t *live = (jl_array_t*)jl_collect_dispatch_trampolines();
+        JL_GC_PUSH1(&live);
+        jl_array_ptr_1d_push(out.temporary_roots, (jl_value_t*)live);
+        JL_GC_POP();
+        (void)ct;
+        for (size_t i = 0; i < jl_array_dim0(live); i++) {
+            jl_dispatch_trampoline_t *tr = (jl_dispatch_trampoline_t*)jl_array_ptr_ref(live, i);
+            if ((jl_abi_kind_t)tr->kind != JL_ABI_TYPED_CALLABLE)
+                continue;
+            if (out.tramp_invokees.count(tr))
+                continue;
+            jl_value_t *adapter_sigt = jl_typed_callable_adapter_sigt(tr->sigt, tr->rt);
+            JL_GC_PUSH1(&adapter_sigt);
+            jl_array_ptr_1d_push(out.temporary_roots, adapter_sigt);
+            JL_GC_POP();
+            jl_abi_t tc_abi = {adapter_sigt, tr->rt, jl_nparams(adapter_sigt),
+                               /*specsig*/1, JL_ABI_TYPED_CALLABLE};
+            emit_trampoline_adapter(out, tr, tc_abi, compiled_mi, latestworld);
+        }
+    }
     for (cfunc_decl_t &cfunc : out.cfuncs) {
         if (out.tramp_invokees.count(cfunc.tramp))
             continue; // another call site already emitted this trampoline's adapter
