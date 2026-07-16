@@ -421,8 +421,15 @@ function method_in_interferences(method2::Method, method1::Method)
     return false
 end
 
+# Whether a strict specificity win of `winner` over `loser` is visible at `world`
+# (see jl_method_morespecific_visible in gf.c; always true when the mode is off)
+function morespecific_visible(winner::Method, loser::Method, world::UInt)
+    return ccall(:jl_method_morespecific_visible, Cint, (Any, Any, UInt, Ptr{UInt}, Ptr{UInt}),
+                 winner, loser, world, C_NULL, C_NULL) != 0
+end
+
 # Check if method1 is more specific than method2 via the interference graph
-function method_morespecific_via_interferences(method1::Method, method2::Method)
+function method_morespecific_via_interferences(method1::Method, method2::Method, world::UInt)
     if method1 === method2
         return false
     end
@@ -564,7 +571,7 @@ function verify_call(@nospecialize(sig), expecteds::Core.SimpleVector, i::Int, n
                             # try looking for a different expected method that fully covers this interference_method anyways over their intersection
                             for j = 1:n
                                 meth2 = get_method_from_edge(expecteds[i+j-1])
-                                if method_morespecific_via_interferences(meth2, interference_method) && ti <: meth2.sig
+                                if method_morespecific_via_interferences(meth2, interference_method, world) && ti <: meth2.sig
                                     found_in_expecteds = true
                                     break
                                 end
