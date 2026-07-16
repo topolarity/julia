@@ -422,16 +422,37 @@ function method_in_interferences(method2::Method, method1::Method)
 end
 
 # Whether a strict specificity win of `winner` over `loser` is visible at `world`
-# (see jl_method_morespecific_visible in gf.c; always true when the mode is off)
+# (see jl_method_morespecific_visible in gf.c; always true when the mode is off).
+# The 4-argument form narrows `valid = UInt[min_valid, max_valid]` to a world
+# interval containing `world` over which the verdict is known to hold.
 function morespecific_visible(winner::Method, loser::Method, world::UInt)
     return ccall(:jl_method_morespecific_visible, Cint, (Any, Any, UInt, Ptr{UInt}, Ptr{UInt}),
                  winner, loser, world, C_NULL, C_NULL) != 0
 end
+function morespecific_visible(winner::Method, loser::Method, world::UInt, valid::Vector{UInt})
+    GC.@preserve valid begin
+        p = pointer(valid)
+        return ccall(:jl_method_morespecific_visible, Cint, (Any, Any, UInt, Ptr{UInt}, Ptr{UInt}),
+                     winner, loser, world, p, p + Core.sizeof(UInt)) != 0
+    end
+end
 
-# Check if method1 is more specific than method2 via the interference graph
-function method_morespecific_via_interferences(method1::Method, method2::Method, world::UInt)
+# Check if method1 is more specific than method2 via the interference graph.
+# A positive verdict narrows `valid` (when given) to the world interval over
+# which it is known to hold.
+function method_morespecific_via_interferences(method1::Method, method2::Method, world::UInt,
+                                               valid::Union{Nothing, Vector{UInt}}=nothing)
     if method1 === method2
         return false
+    end
+
+    # Any positive conclusion asserts a final win of method1 over method2; the
+    # win's visibility at this world is endpoint-only and path-independent, so
+    # gate it once here. The graph walk below follows pure type edges ungated.
+    if valid === nothing
+        morespecific_visible(method1, method2, world) || return false
+    else
+        morespecific_visible(method1, method2, world, valid) || return false
     end
 
     # Check direct interferences first
@@ -543,6 +564,10 @@ function verify_call(@nospecialize(sig), expecteds::Core.SimpleVector, i::Int, n
         # If it didn't fail yet, then check that all interference methods are either expected, or not applicable.
         if interference_fast_path_success
             local interference_minworld::UInt = 1
+            # validity interval of any visibility-dependent domination verdicts
+            # this fast path relies on (narrowed by morespecific_visible);
+            # allocated lazily on the first such verdict
+            local interference_valid::Union{Nothing, Vector{UInt}} = nothing
             for j = 1:n
                 meth = get_method_from_edge(expecteds[i+j-1])
                 if interference_minworld < meth.primary_world
@@ -569,9 +594,12 @@ function verify_call(@nospecialize(sig), expecteds::Core.SimpleVector, i::Int, n
                         ti = typeintersect(sig, interference_method.sig)
                         if !(ti === Union{})
                             # try looking for a different expected method that fully covers this interference_method anyways over their intersection
+                            if interference_valid === nothing
+                                interference_valid = UInt[1, typemax(UInt)]
+                            end
                             for j = 1:n
                                 meth2 = get_method_from_edge(expecteds[i+j-1])
-                                if method_morespecific_via_interferences(meth2, interference_method, world) && ti <: meth2.sig
+                                if method_morespecific_via_interferences(meth2, interference_method, world, interference_valid) && ti <: meth2.sig
                                     found_in_expecteds = true
                                     break
                                 end
@@ -591,7 +619,15 @@ function verify_call(@nospecialize(sig), expecteds::Core.SimpleVector, i::Int, n
             if interference_fast_path_success
                 # All interference sets are covered by expecteds, can return success
                 @assert interference_minworld ≤ world "expected method not present in verification world"
+                # bound the result by the validity of any visibility-dependent
+                # domination verdicts used above
                 maxworld = typemax(UInt)
+                if interference_valid !== nothing
+                    if interference_minworld < interference_valid[1]
+                        interference_minworld = interference_valid[1]
+                    end
+                    maxworld = interference_valid[2]
+                end
                 return interference_minworld, maxworld
             end
         end
