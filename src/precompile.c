@@ -156,6 +156,11 @@ JL_DLLEXPORT void jl_write_compiler_output(void)
 
     // jl_dump_native writes the clone_targets into `s`
     // We need to postpone the srctext writing after that.
+    // Skip emitting the object if trim verification found a shipped, unresolvable
+    // CodeInstance: the build is going to fail (exit below), so don't waste time
+    // (or write a broken object).
+    if (native_code && jl_trim_verify_failed)
+        native_code = NULL;
     if (native_code) {
         ios_t *targets = outputji ? &f : NULL;
         // jl_dump_native will close and free z when appropriate
@@ -185,7 +190,9 @@ JL_DLLEXPORT void jl_write_compiler_output(void)
         }
     }
     if (jl_options.trim) {
-        exit(0); // Some finalizers need to run and we've blown up the bindings table
+        // Exit non-zero if trim verification flagged a shipped, unresolvable
+        // CodeInstance (errors were already printed during serialization).
+        exit(jl_trim_verify_failed ? 1 : 0); // Some finalizers need to run and we've blown up the bindings table
         // TODO: Is this still needed
     }
     JL_GC_POP();

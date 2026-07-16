@@ -544,51 +544,27 @@ end
 # driver / verifier implemented by juliac-buildscript.jl for the purpose of extensibility.
 # For now, it is part of Base.Compiler, but executed with invokelatest so that packages
 # could provide hooks to change, customize, or tweak its behavior and heuristics.
+# Returns `(cis, warns, bodies)` (or `nothing` if there are no errors): for each error,
+# its originating CodeInstance (`nothing` for a ccallable), its severity, and its fully
+# rendered message. Reporting is deferred to after serialization, because an error is
+# only fatal if its CodeInstance actually ships -- the serialization walk is the
+# authoritative reachability analysis, so code reachable only through a pruned
+# TypedCallable (or otherwise dead) is excluded. The messages are rendered *here*,
+# while the typed IR is intact: serialization may strip slotnames/debuginfo from the
+# CodeInfos in place, and the trim methtable rebuild leaves the live world unable to
+# dispatch or do IO, so the deferred step (jl_create_system_image, after the walk) is
+# pure C over this data -- it reads no IR and calls into no Julia.
 function verify_typeinf_trim(io::IO, codeinfos::Vector{Any}, onlywarn::Bool)
     errors, parents = get_verify_typeinf_trim(codeinfos)
-
-    # count up how many messages we printed, of each severity
-    counts = [0, 0] # errors, warnings
-    io = IOContext{IO}(io)
-    # print all errors afterwards, when the parents map is fully constructed
+    isempty(errors) && return nothing
+    cis = Any[]
+    warns = Bool[]
+    bodies = Any[]
     for desc in errors
-        warn, desc = desc
-        severity = warn ? 2 : 1
-        no = (counts[severity] += 1)
-        printstyled(io, "Error #", no, ": "; color=Base.error_color(), bold=true)     # TODO: should we coalesce any of these stacktraces to minimize spew?
-        verify_print_error(io, desc, parents, warn)
+        warn, exc = desc
+        push!(cis, exc isa CallMissing ? exc.codeinst : nothing)
+        push!(warns, warn)
+        push!(bodies, Base.sprint(verify_print_error, exc, parents, warn; context=io))
     end
-
-    ## TODO: compute and display the minimum and/or full call graph instead of merely the first parent stacktrace?
-    #for i = 1:length(codeinfos)
-    #    item = codeinfos[i]
-    #    if item isa CodeInstance
-    #        println(item, "::", item.rettype)
-    #    end
-    #end
-
-    let severity = 0
-        if counts[1] > 0 || counts[2] > 0
-            print(io, "Trim verify finished with ")
-            if counts[1] > 0
-                printstyled(io, counts[1], counts[1] == 1 ? " error" : " errors"; color=Base.error_color(), bold=true)
-            else
-                print(io, counts[1], counts[1] == 1 ? " error" : " errors")
-            end
-            print(io, ", ")
-            if counts[2] > 0
-                printstyled(io, counts[2], counts[2] == 1 ? " warning" : " warnings"; color=Base.warn_color(), bold=true)
-            else
-                print(io, counts[2], counts[2] == 1 ? " warning" : " warnings")
-            end
-            print(io, ".\n")
-            severity = 2
-        end
-        if counts[1] > 0
-            severity = 1
-        end
-        # messages classified as errors are fatal, warnings are not
-        0 < severity <= 1 && !onlywarn && throw(Core.TrimFailure())
-    end
-    nothing
+    return (cis, warns, bodies)
 end

@@ -2274,7 +2274,10 @@ JL_DLLIMPORT jl_value_t *jl_dump_function_ir(jl_llvmf_dump_t *dump, char strip_i
 JL_DLLIMPORT jl_value_t *jl_dump_function_asm(jl_llvmf_dump_t *dump, char emit_mc, const char* asm_variant, const char *debuginfo, char binary, char raw) JL_CANSAFEPOINT;
 
 typedef jl_value_t *(*jl_codeinstance_lookup_t)(jl_method_instance_t *mi JL_PROPAGATES_ROOT, size_t min_world, size_t max_world);
-JL_DLLIMPORT void *jl_create_native(LLVMOrcThreadSafeModuleRef llvmmod, int trim, int cache, size_t world, jl_array_t *mod_array, jl_array_t *worklist, int all, jl_array_t *module_init_order, jl_array_t *ext_foreign_code) JL_CANSAFEPOINT;
+JL_DLLIMPORT void *jl_create_native(LLVMOrcThreadSafeModuleRef llvmmod, int trim, int cache, size_t world, jl_array_t *mod_array, jl_array_t *worklist, int all, jl_array_t *module_init_order, jl_array_t *ext_foreign_code, jl_value_t **deferred_trim_errors, jl_value_t **entrypoint_cis, jl_value_t **invokelatest_edges) JL_CANSAFEPOINT;
+// Set by the post-serialization trim-verify finalize in jl_create_system_image when a
+// shipped CodeInstance is unresolvable; consumed at the trim exit in jl_write_compiler_output.
+extern JL_DLLEXPORT int jl_trim_verify_failed;
 JL_DLLIMPORT void *jl_emit_native(jl_array_t *codeinfos, jl_array_t *ci_order, LLVMOrcThreadSafeModuleRef llvmmod, const jl_cgparams_t *cgparams, int _external_linkage) JL_CANSAFEPOINT;
 JL_DLLIMPORT void jl_dump_native(void *native_code,
         const char *bc_fname, const char *unopt_bc_fname, const char *obj_fname, const char *asm_fname,
@@ -2292,6 +2295,8 @@ JL_DLLIMPORT void jl_register_fptrs(uint64_t image_base, const struct _jl_image_
                                     jl_code_instance_t **linfos, size_t n);
 JL_DLLIMPORT void jl_get_llvm_cis(void *native_code, size_t *num_els,
                                   jl_code_instance_t **CIs);
+JL_DLLIMPORT void jl_get_serialized_cis(void *native_code, size_t *num_els,
+                                        jl_code_instance_t **CIs);
 JL_DLLIMPORT void jl_get_llvm_mi_cache_order(void *native_code, size_t *num_els,
                                              jl_code_instance_t **CIs);
 JL_DLLIMPORT void jl_init_codegen(void) JL_CANSAFEPOINT;

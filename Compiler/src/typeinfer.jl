@@ -1631,7 +1631,17 @@ end
 # collect a list of all code that is needed along with CodeInstance to codegen it fully
 function collectinvokes!(workqueue::CompilationQueue, ci::CodeInfo, sptypes::Vector{VarState};
                          invokelatest_queue::Union{CompilationQueue,Nothing} = nothing,
-                         enqueue_unprepared_invokes::Bool = false)
+                         enqueue_unprepared_invokes::Bool = false,
+                         # For --trim: accumulate `registrant => target` MethodInstance pairs for
+                         # the dynamic-dispatch ("invokelatest-style") edges discovered below
+                         # (finalizer/invokelatest/cfunction/Function-`new`/TypedCallable). These
+                         # are NOT invalidation edges (they live in neither `ci.edges` nor the
+                         # backedge graph), but they DO keep code alive: the target runs at
+                         # runtime only if `registrant`'s code is itself retained. The serializer
+                         # follows them from each kept CI so the kept set matches the
+                         # TrimVerifier's code graph.
+                         invokelatest_edges::Union{Vector{Any},Nothing} = nothing,
+                         registrant::Union{MethodInstance,Nothing} = nothing)
     src = ci.code
     for i = 1:length(src)
         stmt = src[i]
@@ -1721,6 +1731,10 @@ function collectinvokes!(workqueue::CompilationQueue, ci::CodeInfo, sptypes::Vec
             mi === nothing && continue
 
             push!(workqueue, mi)
+            if invokelatest_edges !== nothing && registrant !== nothing
+                push!(invokelatest_edges, registrant)
+                push!(invokelatest_edges, mi)
+            end
         end
     end
 end
@@ -1792,6 +1806,7 @@ end
 
 function compile!(codeinfos::Vector{Any}, workqueue::CompilationQueue;
     invokelatest_queue::Union{CompilationQueue,Nothing} = nothing,
+    invokelatest_edges::Union{Vector{Any},Nothing} = nothing,
     enqueue_unprepared_invokes::Bool = false,
 )
     interp = workqueue.interp
@@ -1852,7 +1867,7 @@ function compile!(codeinfos::Vector{Any}, workqueue::CompilationQueue;
             if src isa CodeInfo
                 sptypes = sptypes_from_meth_instance(mi)
                 collectinvokes!(workqueue, src, sptypes; invokelatest_queue,
-                                enqueue_unprepared_invokes)
+                                enqueue_unprepared_invokes, invokelatest_edges, registrant=mi)
                 # try to reuse an existing CodeInstance from before to avoid making duplicates in the cache
                 if iszero(ccall(:jl_mi_cache_has_ci, Cint, (Any, Any), mi, callee))
                     cached = ccall(:jl_get_ci_equiv, Any, (Any, UInt), callee, world)::CodeInstance
@@ -1890,6 +1905,9 @@ function typeinf_ext_toplevel(methods::Vector{Any}, worlds::Vector{UInt}, trim_m
     )
 
     codeinfos = []
+    # For --trim: registrant=>target MethodInstance pairs for invokelatest-style
+    # dynamic-dispatch edges (see collectinvokes!), resolved to CodeInstances below.
+    invokelatest_edges = trim_mode != TRIM_NO ? Any[] : nothing
     workqueue = CompilationQueue(; interp = nothing)
     for this_world in reverse!(sort!(worlds))
         workqueue = CompilationQueue(workqueue;
@@ -1897,7 +1915,7 @@ function typeinf_ext_toplevel(methods::Vector{Any}, worlds::Vector{UInt}, trim_m
         )
 
         append!(workqueue, methods)
-        compile!(codeinfos, workqueue; invokelatest_queue,
+        compile!(codeinfos, workqueue; invokelatest_queue, invokelatest_edges,
                  enqueue_unprepared_invokes = trim_mode != TRIM_NO)
     end
 
@@ -1918,12 +1936,17 @@ function typeinf_ext_toplevel(methods::Vector{Any}, worlds::Vector{UInt}, trim_m
     if invokelatest_queue !== nothing
         # This queue is intentionally aliased, to handle e.g. a `finalizer` calling `Core.finalizer`
         # (it will enqueue into itself and immediately drain)
-        compile!(codeinfos, invokelatest_queue; invokelatest_queue,
+        compile!(codeinfos, invokelatest_queue; invokelatest_queue, invokelatest_edges,
                  enqueue_unprepared_invokes = trim_mode != TRIM_NO)
     end
 
+    # `deferred` is `(cis, warns, bodies)` (or nothing) carrying trim-verify errors, to
+    # be finalized once the serializer knows which CodeInstances were shipped: an error
+    # is only fatal if its CodeInstance actually lands in the image (code reachable only
+    # through a pruned TypedCallable, or otherwise dead, is excluded).
+    deferred = nothing
     if trim_mode != TRIM_NO && trim_mode != TRIM_UNSAFE
-        verify_typeinf_trim(codeinfos, trim_mode == TRIM_UNSAFE_WARN)
+        deferred = verify_typeinf_trim(codeinfos, trim_mode == TRIM_UNSAFE_WARN)
     end
 
     # Build the ordered list of CodeInstances to store in the image's method
@@ -1988,7 +2011,50 @@ function typeinf_ext_toplevel(methods::Vector{Any}, worlds::Vector{UInt}, trim_m
             ccall(:jl_get_ci_equiv, Any, (Any, UInt), ci, ci.min_world)::CodeInstance !== ci
     end
 
-    return Core.svec(codeinfos, cis)
+    # Entrypoint root CodeInstances for the trim kept-set walk: the CIs compiled for
+    # `methods` (the entrypoints + ccallables). Serialization seeds its code-graph
+    # reachability from these (then follows invoke edges). The trampoline seed's
+    # over-approximated TypedCallable targets are deliberately *excluded* -- they are
+    # not entrypoints; a TypedCallable target is kept only when its TypedCallable (or
+    # registrant) is reachable. `nothing` for non-trim builds.
+    entrypoint_cis = nothing
+    # Flat [registrant_ci, target_ci, ...] array of invokelatest-style code edges (see
+    # collectinvokes!), for the serializer to follow from each kept CI. `nothing` for non-trim.
+    invokelatest_edge_cis = nothing
+    if trim_mode != TRIM_NO
+        this_world = get_world_counter()
+        caches = IdDict{MethodInstance,CodeInstance}()
+        for i = 1:length(codeinfos)
+            item = codeinfos[i]
+            # Trim inference caches its results under the `:trim` owner (re-stamped to
+            # `nothing` at serialization; see src/staticdata.c), so match that owner here.
+            if item isa CodeInstance && item.owner === :trim && item.min_world <= this_world <= item.max_world
+                mi = get_ci_mi(item)
+                mi === item.def && (caches[mi] = item)
+            end
+        end
+        entrypoint_cis = Any[]
+        for m in methods
+            mi = m isa MethodInstance ? m :
+                 m isa Core.SimpleVector ? ccall(:jl_get_specialization1, Any, (Any, Csize_t, Cint), m[2], this_world, #= mt_cache =# 0) :
+                 nothing
+            mi isa MethodInstance || continue
+            ci = get(caches, mi, nothing)
+            ci isa CodeInstance && push!(entrypoint_cis, ci)
+        end
+        invokelatest_edge_cis = Any[]
+        if invokelatest_edges !== nothing
+            for k = 1:2:length(invokelatest_edges)
+                reg_ci = get(caches, invokelatest_edges[k], nothing)
+                tgt_ci = get(caches, invokelatest_edges[k+1], nothing)
+                if reg_ci isa CodeInstance && tgt_ci isa CodeInstance
+                    push!(invokelatest_edge_cis, reg_ci)
+                    push!(invokelatest_edge_cis, tgt_ci)
+                end
+            end
+        end
+    end
+    return Core.svec(codeinfos, cis, deferred, entrypoint_cis, invokelatest_edge_cis)
 end
 
 const _verify_trim_world_age = RefValue{UInt}(typemax(UInt))

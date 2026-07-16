@@ -169,7 +169,21 @@ typedef struct {
     std::unique_ptr<jl_codegen_output_t> out;
     SmallVector<GlobalValue*, 0> jl_sysimg_fvars;
     SmallVector<GlobalValue*, 0> jl_sysimg_gvars;
-    std::map<jl_code_instance_t*, std::tuple<uint32_t, uint32_t>> jl_fvar_map;
+    // Per-CodeInstance fvar entry. Keyed by every *emitted* CI (so jl_get_llvm_cis
+    // sees the full set), but fvar slots are assigned *lazily* by jl_get_function_id,
+    // which the serializer calls once per *serialized* CI. Under --trim this registers
+    // only the CIs that ship, and jl_dump_native erases the functions of the
+    // unregistered (over-compiled, unreachable) ones -- mirroring the ABIAdapter
+    // pending/lazy registration. Non-trim builds register every CI eagerly.
+    struct jl_ci_fvar_t {
+        Function *invoke;   // SPECSIG entry to register as an fvar, else nullptr
+        Function *specptr;  // specptr entry to register as an fvar, else nullptr
+        jl_invoke_api_t invoke_api;
+        int32_t invoke_id;  // fvar index (>0), or -invoke_api for non-SPECSIG; 0 until registered
+        int32_t specptr_id; // fvar index (>0), or 0
+        bool registered;
+    };
+    std::map<jl_code_instance_t*, jl_ci_fvar_t> jl_fvar_map;
     SmallVector<void*, 0> jl_value_to_llvm;
     SmallVector<jl_code_instance_t*, 0> jl_external_to_llvm;
     // ordered list of CodeInstances emitted for this image, in the order they
@@ -189,18 +203,67 @@ typedef struct {
     std::map<jl_dispatch_trampoline_t*, jl_value_t*> tramp_invokee_map;
 } jl_native_code_desc_t;
 
+// Assign fvar slots to a CodeInstance's entry-point function(s) on first use.
+// Idempotent: a CI registered eagerly (non-trim) is a no-op here.
+static void register_ci_fvars(jl_native_code_desc_t *data, jl_native_code_desc_t::jl_ci_fvar_t &e)
+{
+    if (e.registered)
+        return;
+    if (e.invoke_api == JL_INVOKE_SPECSIG) {
+        data->jl_sysimg_fvars.push_back(e.invoke);
+        e.invoke_id = data->jl_sysimg_fvars.size();
+    }
+    else {
+        e.invoke_id = -e.invoke_api;
+    }
+    if (e.specptr) {
+        data->jl_sysimg_fvars.push_back(e.specptr);
+        e.specptr_id = data->jl_sysimg_fvars.size();
+    }
+    e.registered = true;
+}
+
 extern "C" JL_DLLEXPORT_CODEGEN
 void jl_get_function_id_impl(void *native_code, jl_code_instance_t *codeinst,
         int32_t *func_idx, int32_t *specfunc_idx)
 {
     jl_native_code_desc_t *data = (jl_native_code_desc_t*)native_code;
     if (data) {
-        // get the function index in the fvar lookup table
+        // get the function index in the fvar lookup table, registering it lazily
+        // (under --trim this is what marks the CI as shipped; see jl_ci_fvar_t)
         auto it = data->jl_fvar_map.find(codeinst);
         if (it != data->jl_fvar_map.end()) {
-            std::tie(*func_idx, *specfunc_idx) = it->second;
+            register_ci_fvars(data, it->second);
+            *func_idx = it->second.invoke_id;
+            *specfunc_idx = it->second.specptr_id;
         }
     }
+}
+
+// Like jl_get_llvm_cis, but returns only the CodeInstances whose fvars were
+// registered -- i.e. the ones the serializer reached, which are exactly the ones
+// whose code ships into the image (jl_dump_native prunes the rest). Used after
+// serialization to scope trim-verify errors to shipped code.
+extern "C" JL_DLLEXPORT_CODEGEN void
+jl_get_serialized_cis_impl(void *native_code, size_t *num_elements, jl_code_instance_t **data)
+{
+    jl_native_code_desc_t *desc = (jl_native_code_desc_t *)native_code;
+    auto &map = desc->jl_fvar_map;
+
+    if (data == NULL) {
+        size_t n = 0;
+        for (auto &ci : map)
+            if (ci.second.registered)
+                n++;
+        *num_elements = n;
+        return;
+    }
+
+    size_t i = 0;
+    for (auto &ci : map)
+        if (ci.second.registered)
+            data[i++] = ci.first;
+    assert(i == *num_elements);
 }
 
 // Look up (registering on first use) the fvar index of the compiled adapter behind ABIAdapter
@@ -758,7 +821,8 @@ static bool canPartition(const Function &F)
 // `external_linkage` create linkages between pkgimages.
 extern "C" JL_DLLEXPORT_CODEGEN
 void *jl_create_native_impl(LLVMOrcThreadSafeModuleRef llvmmod, int trim, int external_linkage, size_t world,
-                           jl_array_t *mod_array, jl_array_t *worklist, int all, jl_array_t *module_init_order, jl_array_t *ext_foreign_code)
+                           jl_array_t *mod_array, jl_array_t *worklist, int all, jl_array_t *module_init_order, jl_array_t *ext_foreign_code,
+                           jl_value_t **deferred_trim_errors, jl_value_t **entrypoint_cis, jl_value_t **invokelatest_edges)
 {
     JL_TIMING(INFERENCE, INFERENCE);
     auto ct = jl_current_task;
@@ -801,16 +865,28 @@ void *jl_create_native_impl(LLVMOrcThreadSafeModuleRef llvmmod, int trim, int ex
     fargs[0] = jl_apply(fargs, 9);
     fargs[1] = fargs[2] = fargs[3] = fargs[4] = fargs[5] = fargs[6] = fargs[7] = fargs[8] = NULL;
     ct->world_age = last_age;
-    // the bridge returns svec(codeinfos, ci_order): the interleaved
-    // CodeInstance/CodeInfo work list to emit, and the ordered CodeInstances to
-    // store in the method caches of the output image
+    // the bridge returns svec(codeinfos, ci_order, deferred, entrypoints, invokelatest):
+    // the interleaved CodeInstance/CodeInfo work list to emit, the ordered CodeInstances
+    // to store in the method caches of the output image, and (trim only, else nothing)
+    // the deferred trim-verify errors, the entrypoint root CodeInstances, and the flat
+    // invokelatest-style code-edge array -- the latter three feed the serializer's
+    // kept-set walk and the post-serialization error finalize.
     jl_value_t *result = fargs[0];
-    assert(jl_is_svec(result) && jl_svec_len(result) == 2);
+    assert(jl_is_svec(result) && jl_svec_len(result) == 5);
     jl_value_t *codeinfos = jl_svecref(result, 0);
     jl_value_t *ci_order = jl_svecref(result, 1);
     JL_TYPECHK(jl_create_native, array_any, codeinfos);
     JL_TYPECHK(jl_create_native, array_any, ci_order);
     auto data = (jl_native_code_desc_t *)jl_emit_native((jl_array_t*)codeinfos, (jl_array_t*)ci_order, llvmmod, NULL, external_linkage ? 1 : 0);
+    // Hand the deferred errors + entrypoint root CIs + invokelatest-style code edges
+    // back to the caller (rooted via `result` in fargs until these writes land them in
+    // the caller's GC frame).
+    if (deferred_trim_errors)
+        *deferred_trim_errors = jl_svecref(result, 2);
+    if (entrypoint_cis)
+        *entrypoint_cis = jl_svecref(result, 3);
+    if (invokelatest_edges)
+        *invokelatest_edges = jl_svecref(result, 4);
     // Report each compiled ABI adapter as extra image code (via `ext_foreign_code`, like an
     // external CodeInstance), which roots it through the pre-dump GC and gets it serialized +
     // reinterned on load even when nothing else owns it (in particular the `unspecialized`
@@ -1130,19 +1206,19 @@ static void jl_emit_native_to_output(jl_native_code_desc_t *data, jl_array_t *co
     }
 
     for (auto &[ci, funcs] : out.ci_funcs) {
-        uint32_t invoke_id, specptr_id = 0;
-        if (funcs.invoke_api == JL_INVOKE_SPECSIG) {
+        if (funcs.invoke_api == JL_INVOKE_SPECSIG)
             assert(funcs.invoke);
-            data->jl_sysimg_fvars.push_back(funcs.invoke);
-            invoke_id = data->jl_sysimg_fvars.size();
-        } else {
-            invoke_id = -funcs.invoke_api;
-        }
-        if (funcs.specptr) {
-            data->jl_sysimg_fvars.push_back(funcs.specptr);
-            specptr_id = data->jl_sysimg_fvars.size();
-        }
-        data->jl_fvar_map[ci] = {invoke_id, specptr_id};
+        jl_native_code_desc_t::jl_ci_fvar_t e = {};
+        e.invoke_api = funcs.invoke_api;
+        e.invoke = funcs.invoke_api == JL_INVOKE_SPECSIG ? funcs.invoke : nullptr;
+        e.specptr = funcs.specptr;
+        jl_native_code_desc_t::jl_ci_fvar_t &slot = (data->jl_fvar_map[ci] = e);
+        // Non-trim builds register every emitted CI up front (original behavior).
+        // Under --trim, registration is deferred to jl_get_function_id so that CIs
+        // never reached by the serializer (e.g. the trampoline seed's unreachable
+        // targets) stay unregistered and get pruned in jl_dump_native.
+        if (!jl_options.trim)
+            register_ci_fvars(data, slot);
     }
     // Record the emitted ABIAdapter records as *pending* (registered as fvars lazily by
     // jl_get_adapter_id when the serializer reaches each record). Reporting them to
@@ -2754,6 +2830,32 @@ void jl_dump_native_impl(void *native_code,
     }
 
     data->TSM_ref->withModuleDo([&](Module &dataM) {
+        // Under --trim, prune the native code of everything the serializer never
+        // reached: adapter thunks whose ABIAdapter record was not registered
+        // (jl_get_adapter_id never called -- their trampoline was pruned), and the
+        // entry-point functions of CodeInstances that were never registered
+        // (jl_get_function_id never called -- the trampoline seed's over-compiled
+        // targets and other unreachable code). use_empty() guards against removing
+        // anything still referenced by retained code; adapters are erased first,
+        // releasing their uses of targets.
+        if (jl_options.trim) {
+            SmallPtrSet<Function*, 16> erased;
+            for (auto &[rec, F] : data->pending_adapters) {
+                if (data->adapter_fvar_map.count(rec))
+                    continue;
+                if (F && erased.insert(F).second && F->use_empty())
+                    F->eraseFromParent();
+            }
+            for (auto &[ci, e] : data->jl_fvar_map) {
+                (void)ci;
+                if (e.registered)
+                    continue;
+                for (Function *F : {e.invoke, e.specptr}) {
+                    if (F && erased.insert(F).second && F->use_empty())
+                        F->eraseFromParent();
+                }
+            }
+        }
         jl_dump_native_locked(data, bc_fname, unopt_bc_fname, obj_fname, asm_fname, z, s,
                               params, dataM);
     });

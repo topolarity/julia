@@ -119,6 +119,16 @@ call_tc(t::Core.TypedCallable{Tuple{Int},Int}, x::Int) = t(x)
 tc_mul(x::Int)::Int = x * 2
 const TC_CONST = Core.TypedCallable{Tuple{Int},Int}(tc_mul)
 
+# A TypedCallable that `@main` never reaches, over a deliberately untrimmable target
+# (the callee is hidden by `inferencebarrier`). Constructing it at top level enters
+# its trampoline in the cache, so the build-time seed compiles `untrimmable_target`
+# (the verifier flags its unresolved call), but nothing reachable from `@main` holds
+# it, so the kept-set walk never reaches it: its trampoline, adapter, and target are
+# pruned, the verifier error is dropped, and no `untrimmable_target` code ships. The
+# build succeeding tests that unreachable TypedCallables are pruned coherently.
+untrimmable_target(x::Int)::Int = Base.inferencebarrier(tc_add)(x)::Int
+Core.TypedCallable{Tuple{Int},Int}(untrimmable_target)
+
 # An OpaqueClosure stored into an Array and called after extraction. An OC's body is
 # fixed: the optimizer resolves the body CodeInstance into the construction
 # (`handle_new_opaque_closure_call!`), `collectinvokes!` keeps that CI like an `:invoke`

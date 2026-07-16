@@ -186,6 +186,14 @@ static void *to_seroder_entry(size_t idx) JL_NOTSAFEPOINT
 }
 
 static htable_t new_methtables;
+// --trim kept-set walk state: MethodInstances whose live code edges were traversed
+// (jl_queue_code_edges), and the registrant-MI -> [target CIs] index of
+// invokelatest-style dynamic-dispatch edges (from Compiler's collectinvokes!).
+static htable_t edge_visited;
+static htable_t invokelatest_adj;
+// Set by the post-serialization trim-verify finalize in jl_create_system_image when a
+// shipped CodeInstance is unresolvable; consumed at the trim exit in jl_write_compiler_output.
+JL_DLLEXPORT int jl_trim_verify_failed = 0;
 //static size_t precompilation_world;
 
 // Query if a Julia object is in a permalloc region (due to part of a sys- pkg-image)
@@ -582,6 +590,64 @@ static int codeinst_may_be_runnable(jl_code_instance_t *ci, int incremental) {
     return jl_atomic_load_relaxed(&ci->min_world) <= jl_typeinf_world && jl_typeinf_world <= max_world;
 }
 
+static void jl_queue_for_serialization_(jl_serializer_state *s, jl_value_t *v, int recursive, int immediate) JL_GC_DISABLED;
+// Traverse the code graph reachable from `ci` to discover invokelatest-style dynamic
+// edges -- WITHOUT serializing the statically-reachable callees. Statically-dispatched
+// code ships via LLVM-level use from the (serialized) entry points, so its CodeInstance
+// heap object isn't needed; only dynamic-dispatch targets (finalizer/invokelatest/
+// cfunction/new/TypedCallable), which have no static caller, must be serialized to ship
+// and dispatch. CI objects in `ci->edges` are equivalent-but-distinct from emitted CIs
+// (jl_get_ci_equiv dedup) and some are inlined-away (no emitted CI); we don't care which
+// -- the traversal is dedup'd by MethodInstance and never serializes the callee, so it
+// is cheap and identity-agnostic. A dynamic target is thus kept iff its registrant is
+// reached here. The `edges` svec encoding follows ForwardToBackedgeIterator
+// (Compiler/src/typeinfer.jl): an `Int` is query info (2 slots); a `Method`/
+// `MethodInstance` is an edge with no shipped CI; a `Core.Binding` is a global the code
+// depends on; a `CodeInstance` is a direct invoke target; anything else is an
+// `invokesig::Type` whose callee is the next slot.
+static void jl_queue_code_edges(jl_serializer_state *s, jl_code_instance_t *ci) JL_GC_DISABLED
+{
+    jl_method_instance_t *mi = jl_get_ci_mi(ci);
+    if (ptrhash_get(&edge_visited, mi) != HT_NOTFOUND)
+        return;
+    ptrhash_put(&edge_visited, mi, mi);
+    // Dynamic-dispatch targets registered by this code (from collectinvokes!): serialize
+    // them (no static caller -> must be kept to ship + be dispatchable).
+    arraylist_t *il = (arraylist_t*)ptrhash_get(&invokelatest_adj, mi);
+    if (il != HT_NOTFOUND)
+        for (size_t k = 0; k < il->len; k++)
+            jl_queue_for_serialization(s, (jl_value_t*)il->items[k]);
+    jl_value_t *edges = (jl_value_t*)jl_atomic_load_relaxed(&ci->edges);
+    if (edges == NULL || !jl_is_svec(edges))
+        return;
+    size_t i = 0, l = jl_svec_len(edges);
+    while (i < l) {
+        jl_value_t *e = jl_svecref(edges, i);
+        if (jl_is_long(e))                  // query info (Int + following slot)
+            i += 2;
+        else if (jl_is_method(e))           // failed abstract_call_method edge
+            i += 1;
+        else if (jl_is_binding(e)) {        // binding edge: keep the referenced global
+            jl_queue_for_serialization(s, e);
+            i += 1;
+        }
+        else if (jl_is_code_instance(e)) {  // static invoke target: traverse, don't keep
+            jl_queue_code_edges(s, (jl_code_instance_t*)e);
+            i += 1;
+        }
+        else if (jl_is_method_instance(e))  // regular dispatch, no concrete CI
+            i += 1;
+        else {                              // (invokesig::Type, callee)
+            if (i + 1 < l) {
+                jl_value_t *callee = jl_svecref(edges, i + 1);
+                if (jl_is_code_instance(callee))
+                    jl_queue_code_edges(s, (jl_code_instance_t*)callee);
+            }
+            i += 2;
+        }
+    }
+}
+
 // Anything that requires uniquing or fixing during deserialization needs to be "toplevel"
 // in serialization (i.e., have its own entry in `serialization_order`). Consequently,
 // objects that act as containers for other potentially-"problematic" objects must add such "children"
@@ -781,6 +847,12 @@ static void jl_insert_into_serialization_queue(jl_serializer_state *s, jl_value_
     if (jl_is_code_instance(v)) {
         jl_code_instance_t *ci = (jl_code_instance_t*)v;
         jl_method_instance_t *mi = jl_get_ci_mi(ci);
+        // For --trim, follow the code graph: this CI's invoke targets (and the
+        // globals it binds) must be kept. The serialized `edges` are emptied, so
+        // read the live ones. This is what closes the kept set over entrypoints
+        // and TypedCallable targets in place of rooting the whole emitted set.
+        if (jl_options.trim)
+            jl_queue_code_edges(s, ci);
         if (jl_options.strip_ir)
             record_field_change((jl_value_t**)&ci->edges, (jl_value_t*)jl_emptysvec);
         if (jl_options.strip_metadata)
@@ -964,6 +1036,14 @@ static void jl_insert_into_serialization_queue(jl_serializer_state *s, jl_value_
             size_t offset = jl_ptr_offset(t, i) * sizeof(jl_value_t*);
             while (offset >= (fldidx == layout->nfields ? jl_datatype_size(t) : jl_field_offset(t, fldidx)))
                 fldidx++;
+            // For --trim, don't recursively walk a Method's `specializations`: the
+            // SimpleVector case is serialized via the recursive=0 pre-queue above,
+            // and a single (bare-MethodInstance) specialization must not be dragged
+            // in via mi->cache, which would root an otherwise-unreachable
+            // CodeInstance (e.g. a pruned TypedCallable's seeded target). Either way
+            // jl_prune_method_specializations keeps only the genuinely reached ones.
+            if (jl_options.trim && jl_is_method(v) && offset == offsetof(jl_method_t, specializations))
+                continue;
             int mutabl = !jl_field_isconst(t, fldidx - 1);
             jl_value_t *fld = get_replaceable_field(&((jl_value_t**)data)[ptr], mutabl);
             jl_queue_for_serialization_(s, fld, 1, immediate);
@@ -2583,11 +2663,19 @@ static void jl_prune_idset(_Atomic(jl_svec_t*) *pkeys, _Atomic(jl_genericmemory_
     jl_genericmemory_t *keyset = jl_atomic_load_relaxed(pkeyset);
     _Atomic(jl_genericmemory_t*)keyset2;
     jl_atomic_store_relaxed(&keyset2, (jl_genericmemory_t*)jl_an_empty_memory_any);
+    // If the original keyset is the shared empty-singleton memory, the parent uses a
+    // linear scan over `keys` rather than the smallintset index, so keep `keyset2`
+    // empty too (a linear scan over the pruned `keys2` still works). Materializing a
+    // fresh non-empty index here would make the surgery below overwrite the *shared*
+    // singleton's serialization slot, corrupting it for every other parent whose keyset
+    // is that same singleton.
+    int rebuild_keyset = keyset != (jl_genericmemory_t*)jl_an_empty_memory_any;
     jl_svec_t *keys2 = jl_alloc_svec_uninit(keys_list.len);
     for (i = 0; i < keys_list.len; i++) {
         jl_binding_t *ref = (jl_binding_t*)keys_list.items[i];
         jl_svecset(keys2, i, ref);
-        jl_smallintset_insert(&keyset2, parent, key_hash, i, (jl_value_t*)keys2);
+        if (rebuild_keyset)
+            jl_smallintset_insert(&keyset2, parent, key_hash, i, (jl_value_t*)keys2);
     }
     void *idx = ptrhash_get(&serialization_order, keys);
     assert(idx != HT_NOTFOUND && idx != (void*)(uintptr_t)-1);
@@ -2962,7 +3050,8 @@ static int jl_prune_internal_mtable(jl_methtable_t *mt, void *env)
 // In addition to the system image (where `worklist = NULL`), this can also save incremental images with external linkage
 static void jl_save_system_image_to_stream(ios_t *f, jl_array_t *mod_array,
                                            jl_array_t *module_init_order, jl_array_t *worklist, jl_array_t *extext_methods,
-                                           jl_array_t *new_ext, jl_query_cache *query_cache) JL_CANSAFEPOINT
+                                           jl_array_t *new_ext, jl_query_cache *query_cache,
+                                           jl_array_t *entrypoint_cis, jl_array_t *invokelatest_edges) JL_CANSAFEPOINT
 {
     htable_new(&field_replace, 0);
     htable_new(&bits_replace, 0);
@@ -3043,16 +3132,12 @@ static void jl_save_system_image_to_stream(ios_t *f, jl_array_t *mod_array,
         jl_get_llvm_external_fns(native_functions, &num_external_fns,
                                  (jl_code_instance_t *)external_fns.items);
         if (jl_options.trim) {
-            size_t num_mis;
-            jl_get_llvm_cis(native_functions, &num_mis, NULL);
-            arraylist_grow(&MIs, num_mis);
-
-            // Record MethodInstances for user-provided code (as reported by codegen)
-            jl_get_llvm_cis(native_functions, &num_mis, (jl_code_instance_t**)MIs.items);
-            for (size_t i = 0; i < num_mis; i++) {
-                jl_code_instance_t *ci = (jl_code_instance_t*)MIs.items[i];
-                MIs.items[i] = (void*)jl_get_ci_mi(ci);
-            }
+            // `MIs` seeds the method-table rebuild. The user-provided code's
+            // MethodInstances are NOT added from the whole emitted set here: the
+            // rebuild is deferred to a post-walk fix-up that uses only the *shipped*
+            // (reachable) CodeInstances' MethodInstances (see below), so unreachable
+            // methods never enter the method tables. Only the built-in MethodInstances
+            // (which are not discovered by the walk) are recorded up front.
 
             // Record MethodInstances for built-ins (used when dynamically dispatching to a
             // built-in, e.g., in the Core._apply_iterate implementation)
@@ -3065,9 +3150,12 @@ static void jl_save_system_image_to_stream(ios_t *f, jl_array_t *mod_array,
             }
         }
     }
-    if (jl_options.trim) {
-        jl_rebuild_methtables(&MIs, &new_methtables);
-    }
+    // NB (--trim): the method tables are rebuilt *after* the kept-set walk (a
+    // post-walk fix-up below), from the shipped CodeInstances + the builtins
+    // recorded above -- not here. So `new_methtables` stays empty during the walk
+    // and methods are never rooted through the method tables (their `defs` get a
+    // `jl_nothing` placeholder in the mtable queue handler), which is what lets
+    // the kept set prune unreachable methods coherently.
 
     nsym_tag = 0;
     htable_new(&symbol_table, 0);
@@ -3077,6 +3165,28 @@ static void jl_save_system_image_to_stream(ios_t *f, jl_array_t *mod_array,
         ptrhash_put(&fptr_to_id, (void*)(uintptr_t)jl_builtin_f_addrs[i], (void*)(i + 2));
     }
     htable_new(&serialization_order, 25000);
+    htable_new(&edge_visited, 0);
+    htable_new(&invokelatest_adj, 0);
+    if (jl_options.trim && invokelatest_edges != NULL && (jl_value_t*)invokelatest_edges != jl_nothing) {
+        // Index the flat [registrant_ci, target_ci, ...] edge array by registrant for
+        // O(1) lookup during the walk (jl_queue_code_edges).
+        size_t n = jl_array_nrows(invokelatest_edges);
+        for (size_t k = 0; k + 1 < n; k += 2) {
+            jl_value_t *reg_ci = jl_array_ptr_ref((jl_value_t*)invokelatest_edges, k);
+            void *tgt = jl_array_ptr_ref((jl_value_t*)invokelatest_edges, k + 1);
+            // Key by the registrant's MethodInstance, not the CI: the CI object reached
+            // by the walk (via ci->edges) can be a different equivalent CI for the same
+            // MI (jl_get_ci_equiv dedup), so CI-identity keying misses.
+            void *key = (void*)jl_get_ci_mi((jl_code_instance_t*)reg_ci);
+            arraylist_t *lst = (arraylist_t*)ptrhash_get(&invokelatest_adj, key);
+            if (lst == HT_NOTFOUND) {
+                lst = (arraylist_t*)malloc_s(sizeof(arraylist_t));
+                arraylist_new(lst, 0);
+                ptrhash_put(&invokelatest_adj, key, lst);
+            }
+            arraylist_push(lst, tgt);
+        }
+    }
     htable_new(&nullptrs, 0);
     arraylist_new(&object_worklist, 0);
     arraylist_new(&deferred_supers, 0);
@@ -3179,13 +3289,55 @@ static void jl_save_system_image_to_stream(ios_t *f, jl_array_t *mod_array,
                 for (size_t i = 0; i < jl_array_nrows(new_ext); i++)
                     jl_queue_for_serialization(&s, jl_array_ptr_ref(new_ext, i));
         }
+        // step 1.1b: for --trim, seed the kept-set walk with the entrypoint root
+        // CodeInstances. The walk is fused: it follows heap references *and* (for
+        // CIs) live invoke edges via jl_queue_code_edges, *and* reachable
+        // TypedCallables' trampolines root their target/adapter via `last_invokee`.
+        // So the reachable code set closes from {normal roots + entrypoints +
+        // reachable-TC targets} without rooting the whole emitted set -- which is
+        // why record_gvars over the emitted MethodInstances is gone.
+        if (jl_options.trim && entrypoint_cis != NULL && (jl_value_t*)entrypoint_cis != jl_nothing) {
+            size_t ne = jl_array_nrows(entrypoint_cis);
+            for (size_t i = 0; i < ne; i++)
+                jl_queue_for_serialization(&s, jl_array_ptr_ref((jl_value_t*)entrypoint_cis, i));
+        }
         jl_serialize_reachable(&s);
         // step 1.2: ensure all gvars are part of the sysimage too
         record_gvars(&s, &gvars);
         record_external_fns(&s, &external_fns);
-        if (jl_options.trim)
-            record_gvars(&s, &MIs);
         jl_serialize_reachable(&s);
+        // step 1.2b (trim): rebuild the method tables now that the kept set is final,
+        // from the *shipped* CodeInstances' MethodInstances (plus the builtins recorded
+        // earlier). The rebuild was deferred past the walk so methods were never rooted
+        // through the method tables (their `defs` got a `jl_nothing` placeholder in the
+        // mtable queue handler), which is what lets the kept set prune unreachable
+        // methods. Graft each rebuilt typemap onto its source table via
+        // record_field_change (overriding the placeholder; no in-place mutation of a
+        // live table) and serialize the new typemaps. This keeps the tables consistent
+        // with the kept set, so the specializations prune below never sees an
+        // unreachable method.
+        if (jl_options.trim) {
+            for (size_t qi = 0; qi < serialization_queue.len; qi++) {
+                jl_value_t *v = (jl_value_t*)serialization_queue.items[qi];
+                if (jl_is_code_instance(v)) {
+                    jl_method_instance_t *mi = jl_get_ci_mi((jl_code_instance_t*)v);
+                    if (jl_is_method(mi->def.value))
+                        arraylist_push(&MIs, (void*)mi);
+                }
+            }
+            jl_rebuild_methtables(&MIs, &new_methtables);
+            void **mttable = new_methtables.table;
+            for (size_t mti = 0; mti < new_methtables.size; mti += 2) {
+                if (mttable[mti + 1] == HT_NOTFOUND)
+                    continue;
+                jl_methtable_t *old_mt = (jl_methtable_t*)mttable[mti];
+                jl_methtable_t *newmt = (jl_methtable_t*)mttable[mti + 1];
+                jl_value_t *newdefs = (jl_value_t*)jl_atomic_load_relaxed(&newmt->defs);
+                record_field_change((jl_value_t**)&old_mt->defs, newdefs);
+                jl_queue_for_serialization(&s, newdefs);
+            }
+            jl_serialize_reachable(&s);
+        }
         // Beyond this point, all content should already have been visited, so now we can prune
         // the rest and add some internal root arrays.
         // step 1.3: include some other special roots
@@ -3402,6 +3554,15 @@ static void jl_save_system_image_to_stream(ios_t *f, jl_array_t *mod_array,
     htable_free(&field_replace);
     htable_free(&bits_replace);
     htable_free(&serialization_order);
+    htable_free(&edge_visited);
+    for (size_t adj_i = 0; adj_i < invokelatest_adj.size; adj_i += 2) {
+        arraylist_t *lst = (arraylist_t*)invokelatest_adj.table[adj_i + 1];
+        if (lst != HT_NOTFOUND) {
+            arraylist_free(lst);
+            free(lst);
+        }
+    }
+    htable_free(&invokelatest_adj);
     htable_free(&nullptrs);
     htable_free(&symbol_table);
     htable_free(&fptr_to_id);
@@ -3471,10 +3632,17 @@ JL_DLLEXPORT void jl_create_system_image(void **_native_data, jl_array_t *workli
     }
 
     jl_array_t *mod_array = NULL, *extext_methods = NULL, *new_ext = NULL, *ext_foreign_code = NULL;
+    // Trim-verify errors, deferred from jl_create_native until after serialization
+    // (when the set of shipped CodeInstances is known); entrypoint root CodeInstances
+    // and invokelatest-style code edges for the trim kept-set walk. All kept rooted
+    // across the pre-serialization GC below.
+    jl_value_t *deferred_trim_errors = NULL;
+    jl_value_t *entrypoint_cis = NULL;
+    jl_value_t *invokelatest_edges = NULL;
     int64_t checksumpos = 0;
     int64_t checksumpos_ff = 0;
     int64_t datastartpos = 0;
-    JL_GC_PUSH4(&mod_array, &extext_methods, &new_ext, &ext_foreign_code);
+    JL_GC_PUSH7(&mod_array, &extext_methods, &new_ext, &ext_foreign_code, &deferred_trim_errors, &entrypoint_cis, &invokelatest_edges);
 
     ext_foreign_code = jl_alloc_vec_any(0);
 
@@ -3483,7 +3651,7 @@ JL_DLLEXPORT void jl_create_system_image(void **_native_data, jl_array_t *workli
         if (_native_data != NULL) {
             if (suppress_precompile)
                 newly_inferred = NULL;
-            *_native_data = jl_create_native(NULL, 0, 1, jl_atomic_load_acquire(&jl_world_counter), NULL, suppress_precompile ? (jl_array_t*)jl_an_empty_vec_any : worklist, 0, module_init_order, ext_foreign_code);
+            *_native_data = jl_create_native(NULL, 0, 1, jl_atomic_load_acquire(&jl_world_counter), NULL, suppress_precompile ? (jl_array_t*)jl_an_empty_vec_any : worklist, 0, module_init_order, ext_foreign_code, &deferred_trim_errors, &entrypoint_cis, &invokelatest_edges);
         }
         jl_write_header_for_incremental(f, worklist, mod_array, udeps, srctextpos, &checksumpos);
         if (emit_split) {
@@ -3497,7 +3665,7 @@ JL_DLLEXPORT void jl_create_system_image(void **_native_data, jl_array_t *workli
         }
     }
     else if (_native_data != NULL) {
-        *_native_data = jl_create_native(NULL, jl_options.trim, 0, jl_atomic_load_acquire(&jl_world_counter), mod_array, NULL, jl_options.compile_enabled == JL_OPTIONS_COMPILE_ALL, module_init_order, ext_foreign_code);
+        *_native_data = jl_create_native(NULL, jl_options.trim, 0, jl_atomic_load_acquire(&jl_world_counter), mod_array, NULL, jl_options.compile_enabled == JL_OPTIONS_COMPILE_ALL, module_init_order, ext_foreign_code, &deferred_trim_errors, &entrypoint_cis, &invokelatest_edges);
     }
     if (_native_data != NULL)
         native_functions = *_native_data;
@@ -3552,7 +3720,7 @@ JL_DLLEXPORT void jl_create_system_image(void **_native_data, jl_array_t *workli
         }
         datastartpos = ios_pos(ff);
     }
-    else if (ext_foreign_code != NULL && jl_array_nrows(ext_foreign_code) > 0) {
+    else if (ext_foreign_code != NULL && jl_array_nrows(ext_foreign_code) > 0 && !jl_options.trim) {
         // Non-worklist (full / AOT / --trim) image: the incremental `new_ext` machinery above is
         // skipped, so report the compiled ABI adapters here as extra image code. They have no
         // trampoline/code owner of their own, so this is what roots them through the pre-dump GC
@@ -3563,18 +3731,74 @@ JL_DLLEXPORT void jl_create_system_image(void **_native_data, jl_array_t *workli
         for (size_t i = 0; i < n_ext; i++)
             jl_array_ptr_1d_push(new_ext, jl_array_ptr_ref(ext_foreign_code, i));
     }
-    ext_foreign_code = NULL; // consumed
+    // Under --trim, `ext_foreign_code` is deliberately NOT reported as image code: a
+    // reachable trampoline roots its adapter via `last_invokee`, and adapters of pruned
+    // trampolines must stay unrooted so the kept-set walk drops them. The array itself
+    // stays in this GC frame, keeping the records alive through the pre-save GC (the
+    // codegen desc holds only raw pointers to them).
+    if (!jl_options.trim)
+        ext_foreign_code = NULL; // consumed
 
     jl_query_cache query_cache;
     init_query_cache(&query_cache);
     jl_finalize_precompile_inferred(worklist != NULL && _native_data != NULL && jl_options.outputo != NULL);
-    jl_save_system_image_to_stream(ff, mod_array, module_init_order, worklist, extext_methods, new_ext, &query_cache);
+    jl_save_system_image_to_stream(ff, mod_array, module_init_order, worklist, extext_methods, new_ext, &query_cache, (jl_array_t*)entrypoint_cis, (jl_array_t*)invokelatest_edges);
     if (_native_data != NULL)
         native_functions = NULL;
     // make sure we don't run any Julia code concurrently before this point
     // Re-enable running julia code for postoutput hooks, atexit, etc.
     jl_gc_enable_finalizers(ct, 1);
     ct->reentrant_timing &= ~0b1000u;
+
+    // Finalize deferred trim-verify errors now that the set of shipped
+    // CodeInstances is known. `deferred_trim_errors` is `(cis, warns, bodies)`:
+    // for each error, its originating CodeInstance (or `nothing`), its severity,
+    // and a message already rendered to a String (before serialization, while the
+    // typed IR was intact). The trim methtable rebuild has left the live world
+    // unable to dispatch or do Julia IO, so this is done in pure C: filter to
+    // errors whose CodeInstance actually shipped, print them raw to stderr, and
+    // record whether the build must fail. The exit itself is deferred to the
+    // sanctioned trim exit point in jl_write_compiler_output (here the image is
+    // mid-write and running finalizers/exits is unsafe).
+    if (deferred_trim_errors != NULL && deferred_trim_errors != jl_nothing) {
+        // The shipped CodeInstances are exactly those the codegen desc registered
+        // an fvar for during the walk (jl_dump_native prunes the rest); read them
+        // back to scope the deferred errors. *_native_data outlives `native_functions`.
+        arraylist_t cis;
+        arraylist_new(&cis, 0);
+        size_t num_cis = 0;
+        jl_get_serialized_cis(*_native_data, &num_cis, NULL);
+        arraylist_grow(&cis, num_cis);
+        jl_get_serialized_cis(*_native_data, &num_cis, (jl_code_instance_t**)cis.items);
+        htable_t shipped;
+        htable_new(&shipped, num_cis * 2 + 1);
+        for (size_t i = 0; i < num_cis; i++)
+            ptrhash_put(&shipped, cis.items[i], cis.items[i]);
+        arraylist_free(&cis);
+
+        jl_value_t *errcis = jl_fieldref(deferred_trim_errors, 0);
+        jl_value_t *warns = jl_fieldref(deferred_trim_errors, 1);
+        jl_value_t *bodies = jl_fieldref(deferred_trim_errors, 2);
+        uint8_t *warnp = jl_array_data((jl_array_t*)warns, uint8_t);
+        size_t n = jl_array_nrows((jl_array_t*)errcis);
+        int onlywarn = (jl_options.trim == JL_TRIM_UNSAFE_WARN);
+        int nerr = 0, nwarn = 0;
+        for (size_t i = 0; i < n; i++) {
+            jl_value_t *ci = jl_array_ptr_ref(errcis, i);
+            // A ccallable error has no CodeInstance (`nothing`): always required.
+            if (ci != jl_nothing && !ptrhash_has(&shipped, ci))
+                continue;
+            int no = warnp[i] ? (++nwarn) : (++nerr);
+            jl_printf(JL_STDERR, "Error #%d: %s", no, jl_string_ptr(jl_array_ptr_ref(bodies, i)));
+        }
+        htable_free(&shipped);
+        if (nerr > 0 || nwarn > 0)
+            jl_printf(JL_STDERR, "Trim verify finished with %d %s, %d %s.\n",
+                      nerr, nerr == 1 ? "error" : "errors",
+                      nwarn, nwarn == 1 ? "warning" : "warnings");
+        if (nerr > 0 && !onlywarn)
+            jl_trim_verify_failed = 1;
+    }
 
     if (worklist) {
         // Go back and update the checksum in the header

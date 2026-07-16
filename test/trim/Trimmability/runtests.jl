@@ -24,4 +24,12 @@ outdir = ARGS[1]
     @test parse(Float64, lines[10]) isa Float64
     @test lines[11] == "Version: 1.1.0"
     @test lines[12] == "# preferences: 0"
+
+    # An unreachable TypedCallable (see Trimmability.jl) over an untrimmable target:
+    # the build above succeeding proves the trim-verify error was filtered, and the
+    # kept-set walk must keep its target code out of the image (no symbol ships).
+    if Sys.which("nm") !== nothing
+        nm_out = try; read(`nm $trimmability_exe`, String); catch; ""; end
+        @test !occursin("untrimmable_target", nm_out)
+    end
 end
