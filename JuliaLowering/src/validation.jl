@@ -213,7 +213,20 @@ vst1(vcx::Validation1Context, st::SyntaxTree)::ValidationResult = @stm st begin
     [K"flatten" g] -> vst1_gen_chain(vcx, g, true)
     [K"generator" _...] -> vst1_generator(vcx, st)
     [K"comprehension" [K"flatten" g]] -> vst1_gen_chain(vcx, g, true)
-    [K"comprehension" g] -> vst1_generator(vcx, g)
+    # A single-child comprehension lowers to `collect(child)` for any compound
+    # child, not just a `generator` node -- flisp keeps this permissive for
+    # back-compat with macros that hand-build `:comprehension` exprs whose child
+    # is a pre-desugared iterable (e.g. RuntimeGeneratedFunctions rewrites the
+    # generator into a `Base.Generator(f, iter)` call).  A generator child is
+    # still validated with the generator-specific rules; any other compound
+    # child is an ordinary expression.  A bare leaf child (`5`, `y`) is rejected:
+    # flisp also errors on those (by accident, while destructuring the child),
+    # and accepting them would silently turn a malformed macro output into
+    # `collect(5)`.
+    [K"comprehension" g] ->
+        kind(g) == K"generator" ? vst1_generator(vcx, g) :
+        is_leaf(g) ? @fail(g, "expected a generator or iterable expression inside `comprehension`") :
+        vst1(vcx, g)
     [K"comprehension" xs...] ->
         # HACK: We shouldn't be creating trees here, but this is extremely rare
         # (deprecated even in 2016)
@@ -221,7 +234,10 @@ vst1(vcx::Validation1Context, st::SyntaxTree)::ValidationResult = @stm st begin
     [K"typed_comprehension" t [K"flatten" g]] ->
         vst1(vcx, t) & vst1_gen_chain(vcx, g, true)
     [K"typed_comprehension" t g] ->
-        vst1(vcx, t) & vst1_generator(vcx, g)
+        vst1(vcx, t) &
+        (kind(g) == K"generator" ? vst1_generator(vcx, g) :
+         is_leaf(g) ? @fail(g, "expected a generator or iterable expression inside `typed_comprehension`") :
+         vst1(vcx, g))
     [K"comparison" xs...] ->
         length(xs) < 3 || iseven(length(xs)) ?
         @fail(st, "`comparison` expects n>=3 args and odd n") :

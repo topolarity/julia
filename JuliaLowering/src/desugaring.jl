@@ -4631,19 +4631,26 @@ function expand_forms_2(ctx::DesugaringContext, ex::SyntaxTree, docs=nothing)
         expand_forms_2(ctx, expand_for(ctx, ex))
     elseif k == K"comprehension"
         @jl_assert numchildren(ex) == 1 ex
-        @jl_assert kind(ex[1]) == K"generator" ex
+        # A single-child `(comprehension X)` lowers to `collect(X)` for any
+        # compound X, not only a literal `generator` node.  flisp keeps this
+        # permissive for back-compat with macros that hand-build
+        # `:comprehension` exprs whose child is a pre-desugared iterable
+        # (e.g. RuntimeGeneratedFunctions rewrites the generator into a
+        # `Base.Generator(f, iter)` call).  See `'comprehension` in
+        # julia-syntax.scm.  Leaf children are rejected during validation.
         @ast ctx ex [K"call"
             "collect"::K"top"
             expand_forms_2(ctx, ex[1])
         ]
     elseif k == K"typed_comprehension"
         @jl_assert numchildren(ex) == 2 ex
-        @jl_assert kind(ex[2]) == K"generator" ex
-        if numchildren(ex[2]) == 2 && kind(ex[2][2]) == K"iteration"
+        if kind(ex[2]) == K"generator" && numchildren(ex[2]) == 2 && kind(ex[2][2]) == K"iteration"
             # Hack to lower simple typed comprehensions to loops very early,
             # greatly reducing the number of functions and load on the compiler
             expand_forms_2(ctx, expand_comprehension_to_loops(ctx, ex))
         else
+            # As with `comprehension`, the element expression need not be a
+            # literal `generator`; `collect(T, X)` accepts any iterable X.
             @ast ctx ex [K"call"
                 "collect"::K"top"
                 expand_forms_2(ctx, ex[1])

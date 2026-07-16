@@ -399,3 +399,59 @@ end
     @test_throws LoweringError jeval("[sq(_) for _ in 1:3 if _ > 1]")   # `_` read in filter
     @test_throws LoweringError jeval("collect(sq(_) for _ in 1:2, _ in 1:2)")  # product
 end
+
+@testset "(AI) comprehension with non-generator child" begin
+    # flisp lowers a single-child `(comprehension X)` to `collect(X)` for ANY X,
+    # not just a literal `generator` node -- intentional back-compat for macros
+    # that hand-build `:comprehension` exprs whose child is a pre-desugared
+    # iterable (julia-syntax.scm `'comprehension`).  RuntimeGeneratedFunctions
+    # rewrites the generator into a `Base.Generator(f, iter)` call and relies on
+    # this; JuliaLowering previously hard-asserted a `generator` child and
+    # threw `LoweringError: expected `generator``.
+    m = Module(); Core.eval(m, :(using Base))
+
+    # The exact RuntimeGeneratedFunctions shape (`x -> [2i for i in 1:x]` after
+    # its `closures_to_opaque` rewrite): child is `Base.Generator(f, iter)`.
+    rgf = Expr(:comprehension,
+               Expr(:call, GlobalRef(Base, :Generator),
+                    Expr(:->, :i, :(2i)),
+                    Expr(:call, :(:), 1, 3)))
+    @test jl_eval(m, rgf) == [2, 4, 6]
+
+    # Any single expression as the sole child just becomes `collect(child)`.
+    @test jl_eval(m, Expr(:comprehension, :([10, 20, 30]))) == [10, 20, 30]
+    @test jl_eval(m, Expr(:comprehension, Expr(:call, :(:), 1, 3))) == [1, 2, 3]
+
+    # A literal `generator` child still takes the normal path unchanged.
+    gen = Expr(:comprehension,
+               Expr(:generator, :(2i), Expr(:(=), :i, Expr(:call, :(:), 1, 3))))
+    @test jl_eval(m, gen) == [2, 4, 6]
+
+    # Legacy multi-child `(comprehension body (= i r)...)` form (deprecated since
+    # 2016) is rewrapped as a generator during Expr->SyntaxTree conversion.
+    @test jl_eval(m, Expr(:comprehension, :(2i),
+                          Expr(:(=), :i, Expr(:call, :(:), 1, 3)))) == [2, 4, 6]
+    @test jl_eval(m, Expr(:comprehension, :(i * j),
+                          Expr(:(=), :i, Expr(:call, :(:), 1, 3)),
+                          Expr(:(=), :j, Expr(:call, :(:), 1, 2)))) ==
+        [1 2; 2 4; 3 6]
+
+    # Typed comprehension has the analogous relaxation: a non-generator child
+    # lowers to `collect(T, child)`.
+    trgf = Expr(:typed_comprehension, :Float64,
+                Expr(:call, GlobalRef(Base, :Generator),
+                     Expr(:->, :i, :(2i)),
+                     Expr(:call, :(:), 1, 3)))
+    r = jl_eval(m, trgf)
+    @test r == [2.0, 4.0, 6.0]
+    @test eltype(r) === Float64
+    tarr = jl_eval(m, Expr(:typed_comprehension, :Float64, :([10, 20, 30])))
+    @test tarr == [10.0, 20.0, 30.0]
+    @test eltype(tarr) === Float64
+
+    # A bare leaf child (literal or identifier) stays an error, as in flisp:
+    # accepting it would silently lower a malformed macro output to `collect(5)`.
+    @test_throws LoweringError jl_eval(m, Expr(:comprehension, 5))
+    @test_throws LoweringError jl_eval(m, Expr(:comprehension, :y))
+    @test_throws LoweringError jl_eval(m, Expr(:typed_comprehension, :Float64, 5))
+end
