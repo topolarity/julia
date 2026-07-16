@@ -3718,6 +3718,14 @@ void jl_init_types(void) JL_GC_DISABLED
     jl_globalref_type->name->mayinlinealloc = 0; // not at all worthwhile, since the only constructor returns a boxed object
     XX(globalref);
 
+    jl_packageroot_type =
+        jl_new_datatype(jl_symbol("PackageRoot"), core, jl_any_type, jl_emptysvec,
+                        jl_perm_symsvec(2, "rootmodule", "deps"),
+                        jl_svec(2, jl_module_type, jl_any_type),
+                        jl_emptysvec, 0, 1, 1);
+    const static uint32_t packageroot_constfields[] = { 0b001 }; // rootmodule
+    jl_packageroot_type->name->constfields = packageroot_constfields;
+
     jl_core_module = jl_new_module(jl_symbol("Core"), NULL);
 
     tv = jl_svec1(tvar("Backend"));
