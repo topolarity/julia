@@ -872,7 +872,7 @@ typedef struct {
 } jl_uuid_t;
 
 // Reading or writing requires `lock`:
-//   scanned_methods, usings
+//   scanned_methods, foreign_specificities, usings
 // Reading or writing requires `Base.require_lock`:
 //   uuid
 // Reading or writing requires `world_counter_lock`:
@@ -890,6 +890,10 @@ typedef struct _jl_module_t {
     int32_t line;
     jl_value_t *usings_backedges;
     jl_value_t *scanned_methods;
+    // the package this module belongs to (shared by every module of a package
+    // tree; Main's children and parentless top-level modules are roots of
+    // their own). Assigned at creation; NULL only during early bootstrap.
+    struct _jl_packageroot_t *package;
     // hidden fields:
     arraylist_t usings; /* arraylist of struct jl_module_using */  // modules with all bindings potentially imported
     jl_uuid_t build_id;
@@ -908,6 +912,20 @@ typedef struct _jl_module_t {
     jl_mutex_t lock;
     intptr_t hash;
 } jl_module_t;
+
+// The identity of a package in the explicit package graph (Core.PackageRoot):
+// shared by every module of a package tree, reachable via jl_module_t.package.
+// Nodes of the graph on which specificity-visibility reachability is defined:
+// `using` any submodule of a package is equivalent to `using` the package.
+typedef struct _jl_packageroot_t {
+    JL_DATA_TYPE
+    jl_module_t *rootmodule;  // the package's root module (identity/diagnostics)
+    // world-ranged package-graph dependency edges: flat triples
+    // [target::PackageRoot, min_world, max_world] (worlds boxed); guarded by
+    // rootmodule->lock for mutation. Edges into Base/Core are not recorded
+    // (universal-reachability decree).
+    jl_value_t *deps;
+} jl_packageroot_t;
 
 struct _jl_module_using {
     jl_module_t *mod;
@@ -1674,6 +1692,7 @@ static inline int jl_field_isconst(jl_datatype_t *st, int i) JL_NOTSAFEPOINT
 #define jl_is_expr(v)        jl_typetagis(v,jl_expr_type)
 #define jl_is_binding(v)     jl_typetagis(v,jl_binding_type)
 #define jl_is_binding_partition(v) jl_typetagis(v,jl_binding_partition_type)
+#define jl_is_packageroot(v) jl_typetagis(v,jl_packageroot_type)
 #define jl_is_globalref(v)   jl_typetagis(v,jl_globalref_tag<<4)
 #define jl_is_gotonode(v)    jl_typetagis(v,jl_gotonode_tag<<4)
 #define jl_is_gotoifnot(v)   jl_typetagis(v,jl_gotoifnot_tag<<4)

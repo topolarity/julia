@@ -2758,6 +2758,7 @@ void jl_init_primitives(void) JL_GC_DISABLED
     add_builtin("Binding", (jl_value_t*)jl_binding_type);
     add_builtin("BindingPartition", (jl_value_t*)jl_binding_partition_type);
     add_builtin("GlobalRef", (jl_value_t*)jl_globalref_type);
+    add_builtin("PackageRoot", (jl_value_t*)jl_packageroot_type);
     add_builtin("NamedTuple", (jl_value_t*)jl_namedtuple_type);
 
     add_builtin("Bool", (jl_value_t*)jl_bool_type);

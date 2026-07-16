@@ -12,6 +12,14 @@
 extern "C" {
 #endif
 
+// The world of the most recent `usings`-edge change, for bounding the validity
+// of negative reachability verdicts. Written under world_counter_lock before
+// the corresponding world-counter store; 0 when no edge has ever been added at
+// runtime. (A coarse, O(1) record: a negative verdict at a world older than the
+// last event is capped at its query world. Refinable to a monotone list of
+// event worlds if the over-narrowing ever matters.)
+static _Atomic(size_t) jl_last_usings_event_world = 0;
+
 static jl_binding_partition_t *new_binding_partition(void)
 {
     jl_binding_partition_t *bpart = (jl_binding_partition_t*)jl_gc_alloc(jl_current_task->ptls, sizeof(jl_binding_partition_t), jl_binding_partition_type);
@@ -597,6 +605,7 @@ static jl_module_t *jl_new_module__(jl_sym_t *name, jl_module_t *parent)
     jl_atomic_store_relaxed(&m->counter, 1);
     m->usings_backedges = jl_nothing;
     m->scanned_methods = jl_nothing;
+    m->package = NULL;
     m->nospecialize = 0;
     m->optlevel = -1;
     m->compile = -1;
@@ -612,6 +621,25 @@ static jl_module_t *jl_new_module__(jl_sym_t *name, jl_module_t *parent)
     jl_atomic_store_relaxed(&m->bindings, jl_emptysvec);
     jl_atomic_store_relaxed(&m->bindingkeyset, (jl_genericmemory_t*)jl_an_empty_memory_any);
     arraylist_new(&m->usings, 0);
+    // Assign the package identity: modules inherit their parent's package;
+    // Main's children and parentless (top-level package / anonymous) modules
+    // are package roots of their own.
+    if (parent != NULL && parent != m && parent != jl_main_module && parent->package != NULL) {
+        m->package = parent->package;
+        jl_gc_wb(m, m->package);
+    }
+    else if (jl_packageroot_type != NULL) {
+        JL_GC_PUSH1(&m);
+        jl_packageroot_t *pr = (jl_packageroot_t*)jl_gc_alloc(ct->ptls, sizeof(jl_packageroot_t),
+                                                              jl_packageroot_type);
+        pr->rootmodule = m;
+        pr->deps = jl_nothing;
+        m->package = pr;
+        jl_gc_wb(m, pr);
+        JL_GC_POP();
+    }
+    // else: early bootstrap (before jl_packageroot_type exists); Core is
+    // created after the type, so this only leaves hypothetical earlier modules
     return m;
 }
 
@@ -1510,6 +1538,25 @@ JL_DLLEXPORT void jl_module_using(jl_module_t *to, jl_module_t *from, size_t fla
 
     jl_add_usings_backedge(from, to);
 
+    if (existing_idx == (size_t)-1) {
+        // project the module edge onto the package graph (intra-package edges
+        // are self-loops there and change nothing; edges into Base/Core are
+        // covered by the universal-reachability decree and paths through them
+        // lead only to universal vocabulary, so recording them would only
+        // over-cap negative verdict validity)
+        jl_packageroot_t *p_to = jl_module_package(to);
+        jl_packageroot_t *p_from = jl_module_package(from);
+        if (p_to != NULL && p_from != NULL && p_to != p_from &&
+            !(jl_core_module && p_from == jl_core_module->package) &&
+            !(jl_base_module && p_from == jl_base_module->package) &&
+            jl_packageroot_add_dep(p_to, p_from, new_world)) {
+            // a new package-graph edge changes reachability: record the event
+            // world (bounds the validity of negative reachability verdicts at
+            // older worlds)
+            jl_atomic_store_relaxed(&jl_last_usings_event_world, new_world);
+        }
+    }
+
     jl_atomic_store_release(&jl_world_counter, new_world);
     JL_UNLOCK(&world_counter_lock);
 }
@@ -2274,6 +2321,161 @@ jl_module_t *jl_module_root(jl_module_t *m)
             return m;
         m = m->parent;
     }
+}
+
+// The package a module belongs to (see jl_module_t.package). Modules created
+// before jl_packageroot_type existed (early bootstrap) fall back to walking the
+// parent chain to a module that has one.
+JL_DLLEXPORT jl_packageroot_t *jl_module_package(jl_module_t *m) JL_NOTSAFEPOINT
+{
+    while (m->package == NULL && m->parent != NULL && m->parent != m)
+        m = m->parent;
+    return m->package;
+}
+
+// The root module of the package containing `m`. Distinct children of Main are
+// distinct packages, so interactively-defined modules are separate "packages"
+// for the purposes of specificity visibility.
+JL_DLLEXPORT jl_module_t *jl_module_pkgroot(jl_module_t *m) JL_NOTSAFEPOINT
+{
+    jl_packageroot_t *pr = jl_module_package(m);
+    if (pr != NULL)
+        return pr->rootmodule;
+    while (m->parent != NULL && m->parent != m && m->parent != jl_main_module)
+        m = m->parent;
+    return m;
+}
+
+// Record the package-graph edge `pr -> dep` at `new_world` (any module of
+// package A using any module of package B projects to the edge A -> B). No-op
+// if a live entry already exists. Returns 1 if a new edge was added. Callers
+// hold world_counter_lock.
+int jl_packageroot_add_dep(jl_packageroot_t *pr, jl_packageroot_t *dep, size_t new_world)
+{
+    assert(pr != dep); // self-loops are not represented
+    jl_module_t *lockm = pr->rootmodule;
+    int added = 0;
+    JL_LOCK(&lockm->lock);
+    if (pr->deps == jl_nothing) {
+        jl_gc_write(pr, pr->deps, jl_value_t, (jl_value_t*)jl_alloc_vec_any(0));
+    }
+    jl_array_t *list = (jl_array_t*)pr->deps;
+    size_t n = jl_array_nrows(list);
+    int found = 0;
+    for (size_t i = 0; i + 2 < n; i += 3) {
+        if (jl_array_ptr_ref(list, i) == (jl_value_t*)dep &&
+            jl_unbox_ulong(jl_array_ptr_ref(list, i + 2)) == ~(size_t)0) {
+            found = 1; // live entry
+            break;
+        }
+    }
+    if (!found) {
+        jl_value_t *bmin = NULL, *bmax = NULL;
+        JL_GC_PUSH2(&bmin, &bmax);
+        bmin = jl_box_ulong(new_world);
+        bmax = jl_box_ulong(~(size_t)0);
+        jl_array_ptr_1d_push(list, (jl_value_t*)dep);
+        jl_array_ptr_1d_push(list, bmin);
+        jl_array_ptr_1d_push(list, bmax);
+        JL_GC_POP();
+        added = 1;
+    }
+    JL_UNLOCK(&lockm->lock);
+    return added;
+}
+
+// Returns 1 if package `to` is reachable from package `from` over the package
+// graph at `world` (`using` any submodule of a package is equivalent to
+// `using` the package itself). Core and Base are reachable from everywhere;
+// Main (the interactive toplevel) reaches everything.
+//
+// If `min_valid`/`max_valid` are non-NULL, they are narrowed (intersected) to a
+// world interval containing `world` over which the returned verdict is known to
+// hold: for a positive verdict, the witness path's edge-interval intersection;
+// for a negative verdict, [1, hi] where hi is the query world if any edge event
+// occurred after `world` and unbounded otherwise (edges are only added, so
+// non-reachability extends backward unconditionally).
+JL_DLLEXPORT int jl_packageroot_reaches(jl_packageroot_t *from, jl_packageroot_t *to, size_t world,
+                                        size_t *min_valid, size_t *max_valid)
+{
+    // permanent decrees: no narrowing
+    if (from == NULL || to == NULL) // early bootstrap: everything is Core-ish
+        return 1;
+    if (from == to || (jl_main_module && from == jl_main_module->package))
+        return 1;
+    if ((jl_core_module && to == jl_core_module->package) ||
+        (jl_base_module && to == jl_base_module->package))
+        return 1;
+    arraylist_t seen, workqueue, wq_min, wq_max;
+    arraylist_new(&seen, 16);
+    arraylist_new(&workqueue, 16);
+    arraylist_new(&wq_min, 16);
+    arraylist_new(&wq_max, 16);
+    arraylist_push(&seen, from);
+    arraylist_push(&workqueue, from);
+    arraylist_push(&wq_min, (void*)(size_t)1);
+    arraylist_push(&wq_max, (void*)~(size_t)0);
+    int result = 0;
+    while (workqueue.len > 0) {
+        jl_packageroot_t *cur = (jl_packageroot_t*)arraylist_pop(&workqueue);
+        size_t cur_min = (size_t)arraylist_pop(&wq_min);
+        size_t cur_max = (size_t)arraylist_pop(&wq_max);
+        if (cur == to) {
+            // positive verdict, valid over the witness path's intersection
+            if (min_valid && *min_valid < cur_min)
+                *min_valid = cur_min;
+            if (max_valid && *max_valid > cur_max)
+                *max_valid = cur_max;
+            result = 1;
+            break;
+        }
+        jl_module_t *lockm = cur->rootmodule;
+        JL_LOCK(&lockm->lock);
+        jl_value_t *list = cur->deps;
+        size_t n = (list == jl_nothing || list == NULL) ? 0 : jl_array_nrows(list);
+        for (size_t i = 0; i + 2 < n; i += 3) {
+            jl_packageroot_t *target = (jl_packageroot_t*)jl_array_ptr_ref(list, i);
+            size_t minw = jl_unbox_ulong(jl_array_ptr_ref(list, i + 1));
+            size_t maxw = jl_unbox_ulong(jl_array_ptr_ref(list, i + 2));
+            if (minw > world || maxw < world)
+                continue;
+            int already_seen = 0;
+            for (size_t j = 0; j < seen.len; j++) {
+                if (seen.items[j] == (void*)target) {
+                    already_seen = 1;
+                    break;
+                }
+            }
+            if (already_seen)
+                continue;
+            arraylist_push(&seen, target);
+            arraylist_push(&workqueue, target);
+            arraylist_push(&wq_min, (void*)(minw > cur_min ? minw : cur_min));
+            arraylist_push(&wq_max, (void*)(maxw < cur_max ? maxw : cur_max));
+        }
+        JL_UNLOCK(&lockm->lock);
+    }
+    if (!result && max_valid) {
+        // negative verdict: unbounded below (edges are only added), bounded
+        // above by the next edge event; approximate "first event > world" by
+        // the query world itself whenever any event postdates `world`
+        if (jl_atomic_load_relaxed(&jl_last_usings_event_world) > world && *max_valid > world)
+            *max_valid = world;
+    }
+    arraylist_free(&wq_max);
+    arraylist_free(&wq_min);
+    arraylist_free(&workqueue);
+    arraylist_free(&seen);
+    return result;
+}
+
+// Module-flavored convenience wrapper over jl_packageroot_reaches (tests,
+// diagnostics): `to_root` is a module of the target package.
+JL_DLLEXPORT int jl_module_reaches(jl_module_t *from, jl_module_t *to_root, size_t world,
+                                   size_t *min_valid, size_t *max_valid)
+{
+    return jl_packageroot_reaches(jl_module_package(from), jl_module_package(to_root),
+                                  world, min_valid, max_valid);
 }
 
 JL_DLLEXPORT jl_sym_t *jl_module_getloc(jl_module_t *m, int32_t *line)
