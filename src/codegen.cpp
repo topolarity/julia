@@ -4436,6 +4436,30 @@ static bool emit_builtin_call(jl_codectx_t &ctx, jl_cgval_t *ret, jl_value_t *f,
 // returns true if the call has been handled
 {
     ++EmittedBuiltinCalls;
+    if (f == BUILTIN(_typed_callable) && nargs == 4) {
+        // Optimized construction of the 4-arg form `Core._typed_callable(tr, f, A, R)`:
+        // the optimizer resolved the dispatch trampoline `tr` (see the inlining
+        // transform), so we build the `TypedCallable{A,R}` struct {f, tr} directly in IR
+        // instead of calling the `jl_f__typed_callable` builtin.  The trampoline's fptr
+        // is resolved lazily at the call site (`emit_specsig_typed_callable_call`), so no
+        // adapter is needed here -- only the struct.
+        const jl_cgval_t &tr = argv[1];
+        const jl_cgval_t &fval = argv[2];
+        const jl_cgval_t &Aarg = argv[3];
+        const jl_cgval_t &Rarg = argv[4];
+        if (tr.constant && jl_typetagis(tr.constant, jl_dispatch_trampoline_type) &&
+                Aarg.constant && Rarg.constant &&
+                jl_is_tuple_type(Aarg.constant) && jl_is_type(Rarg.constant)) {
+            jl_value_t *tc_type = jl_apply_type2((jl_value_t*)jl_typed_callable_type, Aarg.constant, Rarg.constant);
+            if (jl_is_concrete_type(tc_type)) {
+                JL_GC_PUSH1(&tc_type);
+                jl_cgval_t fields[2] = { fval, tr };
+                *ret = emit_new_struct(ctx, tc_type, 2, fields);
+                JL_GC_POP();
+                return true;
+            }
+        }
+    }
     if (f == BUILTIN(is) && nargs == 2) {
         // emit comparison test
         Value *ans = emit_f_is(ctx, argv[1], argv[2]);
@@ -6773,6 +6797,45 @@ static void emit_latestworld(jl_codectx_t &ctx)
     (void)store_world;
 }
 
+// Emit an ABI adapter Function that bridges `from_abi` to body CodeInstance `ci`, for
+// inline OpaqueClosure construction.  This mirrors `jl_get_abi_adapter`'s target
+// resolution, but emits the adapter into the *current* codegen module using
+// `get_call_target` prototypes -- so it works whether or not `ci` is compiled yet,
+// and the resulting Function is JIT-compiled lazily (runtime) or compiled into the
+// image (--trim).  Each construction site emits its own Function (uniquely named);
+// identical adapters within a module are left to LLVM to merge.
+static Function *emit_inline_abi_adapter(jl_codectx_t &ctx, jl_abi_t from_abi, jl_code_instance_t *ci) JL_CANSAFEPOINT
+{
+    jl_codegen_output_t &out = ctx.emission_context;
+    std::string name;
+    if (ci == NULL) {
+        name = emit_abi_dispatcher(out, from_abi, NULL, NULL);
+    }
+    else {
+        jl_callptr_t invoke = jl_atomic_load_acquire(&ci->invoke);
+        if (invoke == jl_fptr_const_return_addr) {
+            name = emit_abi_constreturn(out, from_abi, ci->rettype_const);
+        }
+        else {
+            bool specsig, needsparams;
+            std::tie(specsig, needsparams) = uses_specsig(get_ci_abi(ci), jl_get_ci_mi(ci),
+                                                          ci->rettype, ctx.params->prefer_specsig);
+            if (needsparams) {
+                // No specptr prototype to call; route through jl_invoke via the dispatcher.
+                name = emit_abi_dispatcher(out, from_abi, ci, NULL);
+            }
+            else {
+                StringRef proto = out.get_call_target(ci, specsig, false);
+                Value *target = out.get_module().getFunction(proto);
+                name = emit_abi_converter(out, from_abi, ci, target, specsig);
+            }
+        }
+    }
+    Function *F = out.get_module().getFunction(name);
+    assert(F);
+    return F;
+}
+
 // `expr` is not actually clobbered in JL_TRY
 JL_GCC_IGNORE_START("-Wclobbered")
 static jl_cgval_t emit_expr(jl_codectx_t &ctx, jl_value_t *expr, ssize_t ssaidx_0based)
@@ -7002,17 +7065,67 @@ static jl_cgval_t emit_expr(jl_codectx_t &ctx, jl_value_t *expr, ssize_t ssaidx_
             emit_error(ctx, "(INTERNAL ERROR - IR Validity): opaque closure source must be constant");
             return jl_cgval_t();
         }
-        (void)argt; (void)lb; (void)ub; (void)source;
-        // Previously this branch had an inline-construction shortcut that
-        // computed `(F, specF)` per concrete env type and built the OC struct
-        // in IR. That shortcut hardcoded `body_ci->{invoke,specptr}` into the
-        // OC fields, which was compatible with the pre-Stage-4 "slippery" body
-        // ABI but is wrong now that `oc->invoke` / `oc->specptr` must be
-        // intern-table adapters (see `new_opaque_closure` in `opaque_closure.c`).
-        // Re-introducing inline construction would require emitting a call to
-        // `jl_jit_abi_converter` at codegen time to fetch adapter pointers;
-        // left as a follow-up if profiling shows the runtime allocator path
-        // is hot.
+        // Optimized inline construction.  When the optimizer resolved a body
+        // `CodeInstance` into the source slot (see `handle_new_opaque_closure_call!`)
+        // and the captured env types are all concrete, build the `OpaqueClosure`
+        // struct directly in IR instead of calling `jl_new_opaque_closure_jlcall`.
+        // `oc->{invoke,specptr}` are `JL_ABI_OPAQUE_CLOSURE` adapters emitted inline
+        // (the same Functions compiled into a --trim image, which is what makes
+        // OpaqueClosure construction AOT-correct -- or JIT-compiled lazily otherwise).
+        // This mirrors the runtime `new_opaque_closure` `if (ci != NULL)` path.
+        if (jl_is_code_instance(source.constant) && argt.constant != NULL &&
+                lb.constant != NULL && ub.constant != NULL &&
+                jl_is_tuple_type(argt.constant)) {
+            jl_code_instance_t *ci = (jl_code_instance_t*)source.constant;
+            size_t ncapture = nargs - 5;
+            bool env_concrete = true;
+            SmallVector<jl_value_t*, 0> env_ts(ncapture);
+            for (size_t i = 0; i < ncapture; ++i) {
+                jl_value_t *typ = argv[5+i].typ;
+                if (typ == jl_bottom_type)
+                    return jl_cgval_t();
+                if (!jl_is_concrete_type(typ)) { env_concrete = false; break; }
+                env_ts[i] = typ;
+            }
+            if (env_concrete) {
+                jl_value_t *env_t = NULL, *oc_type = NULL, *selected_rt = NULL, *adapter_sigt = NULL;
+                JL_GC_PUSH4(&env_t, &oc_type, &selected_rt, &adapter_sigt);
+                // Replicate `new_opaque_closure`'s rettype selection from the body CI,
+                // clamping `ci->rettype` to [lb, ub], so we build the same OC type.
+                selected_rt = ci->rettype;
+                if (!jl_subtype(lb.constant, selected_rt)) {
+                    jl_value_t *ts[2] = {lb.constant, ci->rettype};
+                    selected_rt = jl_type_union(ts, 2);
+                }
+                if (!jl_subtype(ci->rettype, ub.constant)) {
+                    selected_rt = jl_type_intersection(ub.constant, selected_rt);
+                }
+                oc_type = jl_apply_type2((jl_value_t*)jl_opaque_closure_type, argt.constant, selected_rt);
+                if (jl_is_concrete_type(oc_type)) {
+                    adapter_sigt = jl_argtype_with_function_type(oc_type, argt.constant);
+                    size_t adapter_nargs = jl_nparams(adapter_sigt);
+                    jl_abi_t specsig_abi = { adapter_sigt, selected_rt, adapter_nargs, /*specsig*/1, JL_ABI_OPAQUE_CLOSURE };
+                    jl_abi_t jlcall_abi  = { adapter_sigt, selected_rt, adapter_nargs, /*specsig*/0, JL_ABI_OPAQUE_CLOSURE };
+                    Function *specF = emit_inline_abi_adapter(ctx, specsig_abi, ci);
+                    Function *jlcallF = emit_inline_abi_adapter(ctx, jlcall_abi, ci);
+                    env_t = jl_apply_tuple_type_v(env_ts.data(), ncapture);
+                    jl_cgval_t env = emit_new_struct(ctx, env_t, ncapture, ArrayRef<jl_cgval_t>(argv).drop_front(5));
+                    jl_cgval_t world_age = mark_julia_type(ctx, get_tls_world_age(ctx), false, (jl_value_t*)jl_long_type);
+                    // The OC's `source` field is the body Method (the CI is the
+                    // resolution detail, not stored).
+                    jl_cgval_t source_meth = mark_julia_const(ctx, (jl_value_t*)jl_get_ci_mi(ci)->def.method);
+                    jl_cgval_t invoke_ptr = mark_julia_type(ctx, jlcallF, false, (jl_value_t*)jl_voidpointer_type);
+                    jl_cgval_t specptr = mark_julia_type(ctx, specF, false, (jl_value_t*)jl_voidpointer_type);
+                    jl_cgval_t closure_fields[5] = { env, world_age, source_meth, invoke_ptr, specptr };
+                    jl_cgval_t ret = emit_new_struct(ctx, oc_type, 5, closure_fields);
+                    JL_GC_POP();
+                    return ret;
+                }
+                JL_GC_POP();
+            }
+        }
+        // Fallback: runtime construction (resolves adapters + allocates).  Reached for
+        // an unresolved `Method` source, a non-concrete env, or a non-leaf OC type.
         return mark_julia_type(ctx,
                 emit_jlcall(ctx, jl_new_opaque_closure_jlcall_func, Constant::getNullValue(ctx.types().T_prjlvalue), argv, nargs, julia_call),
                 true, jl_any_type);
