@@ -38,6 +38,11 @@ struct GCInvariantVerifierPass : PassInfoMixin<GCInvariantVerifierPass> {
     static bool isRequired() { return true; }
 };
 
+struct MCInvariantVerifierPass : PassInfoMixin<MCInvariantVerifierPass> {
+    PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM) JL_NOTSAFEPOINT;
+    static bool isRequired() { return true; }
+};
+
 struct FinalLowerGCPass : PassInfoMixin<FinalLowerGCPass> {
     PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM) JL_NOTSAFEPOINT;
     static bool isRequired() { return true; }

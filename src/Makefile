@@ -75,7 +75,7 @@ CG_LLVMLINK :=
 
 ifeq ($(JULIACODEGEN),LLVM)
 # Currently these files are used by both GCs. But we should make the list specific to stock, and MMTk should have its own implementation.
-GC_CODEGEN_SRCS := llvm-final-gc-lowering llvm-late-gc-lowering llvm-gc-invariant-verifier
+GC_CODEGEN_SRCS := llvm-final-gc-lowering llvm-late-gc-lowering llvm-gc-invariant-verifier llvm-mc-invariant-verifier
 # paths of the GC codegen sources relative to $(SRCDIR), for CODEGEN_SRCS_HASH
 GC_CODEGEN_SRCS_HASH := $(GC_CODEGEN_SRCS:%=%.cpp)
 ifeq (${USE_THIRD_PARTY_GC},mmtk)

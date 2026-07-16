@@ -622,6 +622,16 @@ static void buildIntrinsicLoweringPipeline(ModulePassManager &MPM, PassBuilder *
     else if (!options.remove_ni) {
         JULIA_PASS(MPM.addPass(RemoveNIPass()));
     }
+#ifdef JL_VERIFY_PASSES
+    // The lowering passes above (LateLowerGCFrame, FinalLowerGC, LowerPTLS)
+    // run after the pre-lowering GC-invariant verifier, so nothing checks
+    // their output -- e.g. an entry-block split that silently demotes
+    // static allocas to dynamic ones. Verify the machine-lowering contract
+    // (entry-static allocas, no unlowered julia intrinsics) at the end of
+    // the section.
+    if (!options.llvm_only)
+        MPM.addPass(createModuleToFunctionPassAdaptor(MCInvariantVerifierPass()));
+#endif
     MPM.addPass(AfterIntrinsicLoweringMarkerPass());
 }
 
