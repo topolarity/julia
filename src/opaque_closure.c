@@ -102,11 +102,11 @@ static jl_opaque_closure_t *new_opaque_closure(jl_tupletype_t *argt, jl_value_t 
         size_t adapter_nargs = jl_nparams(adapter_sigt);
         jl_abi_t specsig_abi = {
             adapter_sigt, selected_rt, adapter_nargs,
-            /* specsig */ 1, /* kind */ JL_ABI_OPAQUE_CLOSURE,
+            /* specsig */ 1, /* kind */ JL_ADAPTER_OPAQUE_CLOSURE,
         };
         jl_abi_t jlcall_abi = {
             adapter_sigt, selected_rt, adapter_nargs,
-            /* specsig */ 0, /* kind */ JL_ABI_OPAQUE_CLOSURE,
+            /* specsig */ 0, /* kind */ JL_ADAPTER_OPAQUE_CLOSURE,
         };
         specptr = jl_jit_abi_converter(ct, specsig_abi, ci, NULL);
         callptr = (jl_fptr_args_t)jl_jit_abi_converter(ct, jlcall_abi, ci, NULL);
@@ -118,11 +118,11 @@ static jl_opaque_closure_t *new_opaque_closure(jl_tupletype_t *argt, jl_value_t 
         // and calls `oc->invoke` (= `jl_interpret_opaque_closure` here, which
         // already installs `oc->world` itself).
         //
-        // Kind is `JL_ABI_STD` (not `JL_ABI_OPAQUE_CLOSURE`): the adapter is a
+        // Kind is `JL_ADAPTER_STD` (not `JL_ADAPTER_OPAQUE_CLOSURE`): the adapter is a
         // pure ABI repackaging (specsig -> jlcall, boxing args), not an
         // OC->STD conversion.  The OC->STD conversion -- world-age switch and
         // captures unpack -- is the job of `oc->invoke`
-        // (= `jl_interpret_opaque_closure`).  Using `JL_ABI_OPAQUE_CLOSURE`
+        // (= `jl_interpret_opaque_closure`).  Using `JL_ADAPTER_OPAQUE_CLOSURE`
         // here would do the conversion in the adapter too, loading and
         // installing `oc->world` twice in a row.
         //
@@ -134,7 +134,7 @@ static jl_opaque_closure_t *new_opaque_closure(jl_tupletype_t *argt, jl_value_t 
         size_t adapter_nargs = jl_nparams(adapter_sigt);
         jl_abi_t specsig_abi = {
             adapter_sigt, selected_rt, adapter_nargs,
-            /* specsig */ 1, /* kind */ JL_ABI_STD,
+            /* specsig */ 1, /* kind */ JL_ADAPTER_STD,
         };
         specptr = jl_jit_abi_converter(ct, specsig_abi, /*codeinst*/NULL, NULL);
         // callptr stays as jl_interpret_opaque_closure

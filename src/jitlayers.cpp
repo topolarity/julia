@@ -282,7 +282,7 @@ StringRef jl_codegen_output_t::get_call_target(jl_code_instance_t *ci, bool spec
                || jl_get_ci_mi(ci)->def.method != jl_opaque_closure_method);
         jl_returninfo_t info =
             get_specsig_function(*this, &get_module(), nullptr, protoname, get_ci_abi(ci),
-                                 ci->rettype, JL_ABI_STD);
+                                 ci->rettype);
         target.decl = cast<Function>(info.decl.getCallee());
     }
     else {

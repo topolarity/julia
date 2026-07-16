@@ -13,7 +13,7 @@
 // (rt, specsig, kind).
 
 static jl_dispatch_trampoline_t *tramp_alloc_entry(jl_task_t *ct, jl_value_t *sigt, jl_value_t *rt,
-                                          int specsig, jl_abi_kind_t kind) JL_CANSAFEPOINT
+                                          int specsig, jl_adapter_kind_t kind) JL_CANSAFEPOINT
 {
     jl_dispatch_trampoline_t *e = (jl_dispatch_trampoline_t*)jl_gc_alloc(ct->ptls, sizeof(jl_dispatch_trampoline_t), jl_dispatch_trampoline_type);
     e->sigt = sigt;
@@ -31,7 +31,7 @@ static jl_dispatch_trampoline_t *tramp_alloc_entry(jl_task_t *ct, jl_value_t *si
 typedef struct {
     jl_value_t *rt;
     int specsig;
-    jl_abi_kind_t kind;
+    jl_adapter_kind_t kind;
 } tramp_key_t;
 
 // `rt` is compared by *type equality* (jl_types_equal), matching how the TypeMap matches
@@ -44,13 +44,13 @@ static int tramp_match(jl_value_t *rec, void *keyv) JL_CANSAFEPOINT
     jl_dispatch_trampoline_t *e = (jl_dispatch_trampoline_t*)rec;
     tramp_key_t *k = (tramp_key_t*)keyv;
     return (int)e->specsig == (k->specsig ? 1 : 0)
-        && (jl_abi_kind_t)e->kind == k->kind
+        && (jl_adapter_kind_t)e->kind == k->kind
         && (e->rt == k->rt || jl_types_equal(e->rt, k->rt));
 }
 
 // Lock-free lookup of the trampoline for (sigt, rt, specsig, kind); NULL if absent. Safe to
 // call with or without the writelock held.
-static jl_dispatch_trampoline_t *tramp_map_lookup(jl_value_t *sigt, jl_value_t *rt, int specsig, jl_abi_kind_t kind) JL_CANSAFEPOINT
+static jl_dispatch_trampoline_t *tramp_map_lookup(jl_value_t *sigt, jl_value_t *rt, int specsig, jl_adapter_kind_t kind) JL_CANSAFEPOINT
 {
     tramp_key_t key = { rt, specsig, kind };
     return (jl_dispatch_trampoline_t*)jl_typemap_list_lookup(&jl_dispatch_trampolines->cache,
@@ -69,7 +69,7 @@ static void tramp_map_insert(jl_value_t *sigt, jl_dispatch_trampoline_t *tr) JL_
 // Get (or create) the canonical @cfunction/@ccallable dispatch trampoline for
 // (sigt, rt, specsig, kind); call sites with the same key share one trampoline. Caller must
 // root `sigt`/`rt`.
-JL_DLLEXPORT jl_dispatch_trampoline_t *jl_get_dispatch_trampoline(jl_value_t *sigt, jl_value_t *rt, int specsig, jl_abi_kind_t kind) JL_CANSAFEPOINT
+JL_DLLEXPORT jl_dispatch_trampoline_t *jl_get_dispatch_trampoline(jl_value_t *sigt, jl_value_t *rt, int specsig, jl_adapter_kind_t kind) JL_CANSAFEPOINT
 {
     jl_dispatch_trampoline_t *e = NULL;
     JL_GC_PUSH1(&e);
@@ -123,7 +123,7 @@ JL_DLLEXPORT jl_dispatch_trampoline_t *jl_insert_dispatch_trampoline(jl_dispatch
     jl_dispatch_trampoline_t *e = NULL;
     JL_GC_PUSH2(&tr, &e);
     JL_LOCK(&jl_dispatch_trampolines->writelock);
-    e = tramp_map_lookup(tr->sigt, tr->rt, tr->specsig, (jl_abi_kind_t)tr->kind);
+    e = tramp_map_lookup(tr->sigt, tr->rt, tr->specsig, (jl_adapter_kind_t)tr->kind);
     if (e == NULL) {
         tramp_map_insert(tr->sigt, tr);
         e = tr;

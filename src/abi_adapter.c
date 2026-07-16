@@ -32,7 +32,7 @@ typedef struct {
     jl_value_t *rt;
     jl_code_instance_t *ci;
     int specsig;
-    jl_abi_kind_t kind;
+    jl_adapter_kind_t kind;
     size_t nargs;
 } abi_adapter_key_t;
 
@@ -44,7 +44,7 @@ static int abi_adapter_match(jl_value_t *rec, void *keyv) JL_CANSAFEPOINT
     abi_adapter_key_t *k = (abi_adapter_key_t*)keyv;
     return e->ci == k->ci
         && (int)e->specsig == (k->specsig ? 1 : 0)
-        && (jl_abi_kind_t)e->kind == k->kind
+        && (jl_adapter_kind_t)e->kind == k->kind
         && e->nargs == k->nargs
         && (e->rt == k->rt || jl_types_equal(e->rt, k->rt)); // rt lives in the bucket (key is sigt alone)
 }
@@ -79,7 +79,7 @@ JL_DLLEXPORT int jl_abi_matches_invoke_api(jl_abi_t from_abi, jl_invoke_api_t ap
     // A non-STD caller ABI can never be satisfied by the target's own entry point:
     // the kind obliges the adapter to perform a call-frame conversion (e.g. OC->STD
     // world switch + captures unpack) that the raw target does not do.
-    if (from_abi.kind != JL_ABI_STD)
+    if (from_abi.kind != JL_ADAPTER_STD)
         return 0;
     if (api == JL_INVOKE_ARGS)
         return !from_abi.specsig && jl_subtype(rettype, from_abi.rt);
@@ -145,7 +145,7 @@ JL_DLLEXPORT void *jl_abi_matching_specptr(jl_abi_t from_abi, jl_code_instance_t
 // Lock-free lookup of the adapter record for (sigt, rt, ci, specsig, kind,
 // nargs). Returns the record or NULL. Safe to call with or without the writelock held.
 JL_DLLEXPORT jl_abi_adapter_t *jl_lookup_abi_adapter(jl_value_t *sigt, jl_value_t *rt,
-        jl_code_instance_t *ci, int specsig, jl_abi_kind_t kind, size_t nargs) JL_CANSAFEPOINT
+        jl_code_instance_t *ci, int specsig, jl_adapter_kind_t kind, size_t nargs) JL_CANSAFEPOINT
 {
     // Key on `sigt` alone (its slot 0 is the function type, never Union{}); the remaining
     // fields are disambiguated in the bucket (abi_adapter_match).
@@ -270,7 +270,7 @@ static void abi_adapter_insert(jl_abi_adapter_t *entry) JL_CANSAFEPOINT
 // Allocate an ABI-adapter cache record. Caller keeps the key fields (`sigt`/`rt`/`ci`)
 // rooted. `next` starts as the chain tail.
 JL_DLLEXPORT jl_abi_adapter_t *jl_new_abi_adapter(jl_value_t *sigt, jl_value_t *rt,
-        jl_code_instance_t *ci, int specsig, jl_abi_kind_t kind, size_t nargs, void *fptr) JL_CANSAFEPOINT
+        jl_code_instance_t *ci, int specsig, jl_adapter_kind_t kind, size_t nargs, void *fptr) JL_CANSAFEPOINT
 {
     jl_task_t *ct = jl_current_task;
     jl_abi_adapter_t *e = (jl_abi_adapter_t*)jl_gc_alloc(ct->ptls, sizeof(jl_abi_adapter_t), jl_abi_adapter_type);
@@ -295,7 +295,7 @@ JL_DLLEXPORT jl_abi_adapter_t *jl_insert_abi_adapter(jl_abi_adapter_t *e) JL_CAN
     jl_abi_adapter_t *canonical = NULL;
     JL_GC_PUSH2(&e, &canonical);
     JL_LOCK(&jl_abi_adapters->writelock);
-    canonical = jl_lookup_abi_adapter(e->sigt, e->rt, e->ci, e->specsig, (jl_abi_kind_t)e->kind, e->nargs);
+    canonical = jl_lookup_abi_adapter(e->sigt, e->rt, e->ci, e->specsig, (jl_adapter_kind_t)e->kind, e->nargs);
     if (canonical == NULL) {
         abi_adapter_insert(e);
         canonical = e;

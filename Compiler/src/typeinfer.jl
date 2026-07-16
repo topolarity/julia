@@ -1901,7 +1901,7 @@ function typeinf_ext_toplevel(methods::Vector{Any}, worlds::Vector{UInt}, trim_m
         # those adapters need the target compiled and shipped.
         for tr in ccall(:jl_collect_dispatch_trampolines, Any, ())::Vector{Any}
             tr = tr::Core.DispatchTrampoline
-            getfield(tr, :kind) === 0x02 || continue # JL_ABI_TYPED_CALLABLE
+            getfield(tr, :kind) === 0x02 || continue # JL_ADAPTER_TYPED_CALLABLE
             mi = compileable_specialization_for_call(invokelatest_queue.interp, getfield(tr, :sigt))
             mi === nothing && continue
             push!(invokelatest_queue, mi)

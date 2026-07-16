@@ -614,7 +614,7 @@ static void emit_trampoline_adapter(jl_codegen_output_t &out, jl_dispatch_trampo
     JL_GC_PROMISE_ROOTED(declrt);
     // Resolve the dispatch target from the trampoline's *resolution* sig. For STD
     // (@cfunction/@ccallable) it equals the adapter sig `from_abi.sigt`; for
-    // `JL_ABI_TYPED_CALLABLE` the adapter sig has the type-erased wrapper at slot 0
+    // `JL_ADAPTER_TYPED_CALLABLE` the adapter sig has the type-erased wrapper at slot 0
     // and only `tr->sigt` names the target.
     jl_method_instance_t *mi = (jl_method_instance_t*)jl_get_specialization1((jl_tupletype_t*)tr->sigt, latestworld);
     jl_code_instance_t *codeinst = nullptr;
@@ -627,7 +627,7 @@ static void emit_trampoline_adapter(jl_codegen_output_t &out, jl_dispatch_trampo
     if (codeinst) {
         JL_GC_PROMISE_ROOTED(codeinst);
         jl_value_t *astrt = codeinst->rettype;
-        if (from_abi.kind == JL_ABI_STD && astrt != (jl_value_t*)jl_bottom_type &&
+        if (from_abi.kind == JL_ADAPTER_STD && astrt != (jl_value_t*)jl_bottom_type &&
             jl_type_intersection(astrt, declrt) == jl_bottom_type) {
             // Do not warn if the function never returns since it is occasionally required by
             // the C API (typically error callbacks) even though we're likely to encounter
@@ -712,7 +712,7 @@ static void generate_cfunc_thunks(jl_codegen_output_t &out) JL_CANSAFEPOINT
         (void)ct;
         for (size_t i = 0; i < jl_array_dim0(live); i++) {
             jl_dispatch_trampoline_t *tr = (jl_dispatch_trampoline_t*)jl_array_ptr_ref(live, i);
-            if ((jl_abi_kind_t)tr->kind != JL_ABI_TYPED_CALLABLE)
+            if ((jl_adapter_kind_t)tr->kind != JL_ADAPTER_TYPED_CALLABLE)
                 continue;
             if (out.tramp_invokees.count(tr))
                 continue;
@@ -721,7 +721,7 @@ static void generate_cfunc_thunks(jl_codegen_output_t &out) JL_CANSAFEPOINT
             jl_array_ptr_1d_push(out.temporary_roots, adapter_sigt);
             JL_GC_POP();
             jl_abi_t tc_abi = {adapter_sigt, tr->rt, jl_nparams(adapter_sigt),
-                               /*specsig*/1, JL_ABI_TYPED_CALLABLE};
+                               /*specsig*/1, JL_ADAPTER_TYPED_CALLABLE};
             emit_trampoline_adapter(out, tr, tc_abi, compiled_mi, latestworld);
         }
     }

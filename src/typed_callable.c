@@ -11,7 +11,7 @@
 //
 // Each instance holds a shared dispatch trampoline record (`tc->trampoline`,
 // from the `Core.dispatch_trampolines` cache, keyed on (sigt, rt, specsig=1,
-// kind=JL_ABI_TYPED_CALLABLE)). The record caches, per latest world, the
+// kind=JL_ADAPTER_TYPED_CALLABLE)). The record caches, per latest world, the
 // resolved target and a specsig adapter for the erased-slot-0 call ABI, for
 // use by the inline specsig call site (jl_update_dispatch_trampoline in
 // runtime_ccall.c). The jlcall builtin below is the boxed slow path and
@@ -53,7 +53,7 @@ JL_DLLEXPORT jl_dispatch_trampoline_t *jl_get_typed_callable_trampoline(jl_value
     jl_value_t *sigt = NULL;
     JL_GC_PUSH1(&sigt);
     sigt = jl_argtype_with_function_type(ftype, argt);
-    jl_dispatch_trampoline_t *tr = jl_get_dispatch_trampoline(sigt, rt, /*specsig*/1, JL_ABI_TYPED_CALLABLE);
+    jl_dispatch_trampoline_t *tr = jl_get_dispatch_trampoline(sigt, rt, /*specsig*/1, JL_ADAPTER_TYPED_CALLABLE);
     JL_GC_POP();
     return tr;
 }
@@ -71,7 +71,7 @@ static jl_typed_callable_t *typed_callable_construct(jl_task_t *ct, jl_value_t *
     JL_GC_PUSH3(&sigt, &tc_type, &tr);
     if (tr == NULL) {
         sigt = jl_argtype_with_function(f, (jl_value_t*)argt); // Tuple{typeof(f), A...}
-        tr = jl_get_dispatch_trampoline(sigt, rt, /*specsig*/1, JL_ABI_TYPED_CALLABLE);
+        tr = jl_get_dispatch_trampoline(sigt, rt, /*specsig*/1, JL_ADAPTER_TYPED_CALLABLE);
     }
     tc_type = jl_apply_type2((jl_value_t*)jl_typed_callable_type, (jl_value_t*)argt, rt);
     jl_typed_callable_t *tc = (jl_typed_callable_t*)jl_gc_alloc(ct->ptls, sizeof(jl_typed_callable_t), tc_type);

@@ -384,12 +384,12 @@ void *jl_update_dispatch_trampoline(jl_task_t *ct, jl_dispatch_trampoline_t *tr)
     jl_value_t *rt = tr->rt;
     JL_GC_PROMISE_ROOTED(rt);
     size_t nargs = jl_nparams(sigt);
-    // The caller ABI signature: for `JL_ABI_TYPED_CALLABLE` the adapter is entered with the
+    // The caller ABI signature: for `JL_ADAPTER_TYPED_CALLABLE` the adapter is entered with the
     // `TypedCallable{A,R}` wrapper (not `typeof(f)`) at slot 0, so its sig differs from the
     // resolution sig `tr->sigt`; it is derived at the adapter-resolution site below. This
     // resolution-sig `from_abi` only feeds the bare-CodeInstance restore shortcut, which
     // `jl_abi_matches_invoke_api` already rejects for any non-STD kind.
-    jl_abi_t from_abi = { sigt, rt, nargs, tr->specsig, (jl_abi_kind_t)tr->kind };
+    jl_abi_t from_abi = { sigt, rt, nargs, tr->specsig, (jl_adapter_kind_t)tr->kind };
     jl_value_t *mi;
     jl_code_instance_t *codeinst;
     size_t world;
@@ -462,7 +462,7 @@ void *jl_update_dispatch_trampoline(jl_task_t *ct, jl_dispatch_trampoline_t *tr)
     // rettype (skip must-not-return targets, occasionally required by the C API for error
     // callbacks even though memory errors are then likely). A TypedCallable instead enforces
     // `R` with a typeassert in its adapter, so no warning applies.
-    if ((jl_abi_kind_t)tr->kind == JL_ABI_STD && codeinst != NULL) {
+    if ((jl_adapter_kind_t)tr->kind == JL_ADAPTER_STD && codeinst != NULL) {
         jl_value_t *astrt = codeinst->rettype;
         if (astrt != (jl_value_t*)jl_bottom_type &&
             jl_type_intersection(astrt, rt) == jl_bottom_type)
@@ -474,12 +474,12 @@ void *jl_update_dispatch_trampoline(jl_task_t *ct, jl_dispatch_trampoline_t *tr)
     // cached ABIAdapter record (a NULL codeinst yields the shared dynamic-dispatch adapter).
     // A later re-validation restores `fptr` straight from it.
     jl_value_t *new_invokee = NULL;
-    jl_value_t *adapter_sigt = (jl_abi_kind_t)tr->kind == JL_ABI_TYPED_CALLABLE
+    jl_value_t *adapter_sigt = (jl_adapter_kind_t)tr->kind == JL_ADAPTER_TYPED_CALLABLE
             ? jl_typed_callable_adapter_sigt(sigt, rt)
             : sigt;
     JL_GC_PUSH1(&adapter_sigt);
     jl_abi_t adapter_abi = { adapter_sigt, rt, jl_nparams(adapter_sigt), tr->specsig,
-                             (jl_abi_kind_t)tr->kind };
+                             (jl_adapter_kind_t)tr->kind };
     f = jl_jit_abi_converter(ct, adapter_abi, codeinst, &new_invokee);
     JL_GC_POP();
     // published before fptr/last_world; roots the target

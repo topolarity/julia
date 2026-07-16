@@ -1074,7 +1074,7 @@ typedef struct _jl_abi_adapter_t {
     jl_value_t *sigt;            // hash-consed Julia type (Tuple type)
     jl_value_t *rt;              // hash-consed Julia type (return type)
     size_t specsig : 1;          // whether the caller passes args in specsig (vs. boxed) form
-    size_t kind : 8;             // jl_abi_kind_t -- bundles type-erased-arg layout + world-age policy
+    size_t kind : 8;             // jl_adapter_kind_t -- bundles type-erased-arg layout + world-age policy
     size_t nargs : 8 * sizeof(size_t) - 9; // number of arguments in `sigt`
 
     // callee target
@@ -1104,7 +1104,7 @@ typedef struct _jl_dispatch_trampoline_t {
     _Atomic(void*) fptr;         // redundant cached fptr (== last_invokee's specptr/adapter fptr) for the hot-path poll
     _Atomic(size_t) last_world;  // world for which `fptr`/`last_invokee` are valid (0 = unresolved)
     uint8_t specsig;             // key: 1 if `fptr` is a specsig adapter, 0 if jlcall (cgparams-dependent)
-    uint8_t kind;                // key: jl_abi_kind_t of the caller ABI `fptr` is emitted for
+    uint8_t kind;                // key: jl_adapter_kind_t of the caller ABI `fptr` is emitted for
     // Bucket chain: the trampolines cache is a TypeMap keyed on `sigt`; records sharing one
     // `sigt` entry are chained here and disambiguated by (rt, specsig, kind). Append-only,
     // safe to walk lock-free. NULL = tail.

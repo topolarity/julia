@@ -3765,7 +3765,7 @@ void jl_init_types(void) JL_GC_DISABLED
                             "fptr", // ABI adapter
                             "last_world",
                             "specsig", // 1 if fptr is a specsig adapter
-                            "kind", // jl_abi_kind_t of the caller ABI
+                            "kind", // jl_adapter_kind_t of the caller ABI
                             "next"), // next record in the `sigt` bucket chain (may be NULL)
                         jl_svec(8,
                             jl_any_type,   // hash-consed Tuple type

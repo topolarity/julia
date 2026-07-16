@@ -560,7 +560,7 @@ std::string emit_abi_constreturn(jl_codegen_output_t &out, jl_abi_t from_abi, jl
 Function *emit_tojlinvoke(jl_code_instance_t *codeinst, StringRef theFptrName, jl_codegen_output_t &out) JL_CANSAFEPOINT;
 void emit_specsig_to_fptr1(
         Function *gf_thunk, jl_returninfo_t::CallingConv cc, unsigned return_roots,
-        jl_value_t *calltype, jl_value_t *rettype, jl_abi_kind_t kind,
+        jl_value_t *calltype, jl_value_t *rettype, jl_adapter_kind_t kind,
         size_t nargs,
         jl_codegen_output_t &out,
         Value *target) JL_CANSAFEPOINT;
@@ -571,7 +571,6 @@ void jl_init_function(Function *F, const jl_codegen_output_t &params) JL_NOTSAFE
 
 jl_returninfo_t get_specsig_function(jl_codegen_output_t &ctx, Module *M, Value *fval,
                                      StringRef name, jl_value_t *sig, jl_value_t *jlrettype,
-                                     jl_abi_kind_t kind,
                                      ArrayRef<const char *> ArgNames = {},
                                      unsigned nreq = 0) JL_CANSAFEPOINT;
 
