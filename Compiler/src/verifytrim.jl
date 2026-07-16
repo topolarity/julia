@@ -450,9 +450,29 @@ function verify_codeinstance!(interp::NativeInterpreter, codeinst::CodeInstance,
                 end
             end
         elseif isexpr(stmt, :new_opaque_closure)
+            # An OpaqueClosure construction carries its resolved body `CodeInstance` in
+            # args[5] (see `handle_new_opaque_closure_call!`). Codegen then emits the OC's
+            # ABI adapter inline at the construction site (`emit_inline_abi_adapter`), so --
+            # unlike a TypedCallable, whose adapter is emitted by a separate post-pass -- the
+            # only requirement here is that the body CI is compiled and shipped, exactly as
+            # for `Expr(:invoke, ci, ...)` (the adapter is emitted whenever that CI is). A
+            # `Method` source means the body could not be resolved statically; there is no
+            # JIT under --trim to recover it, so it is an error.
             error = "unresolved opaque closure"
-            # TODO: check that this opaque closure has a valid signature for possible codegen and code defined for it
-            warn = true
+            source = length(stmt.args) >= 5 ? stmt.args[5] : nothing
+            if source isa CodeInstance
+                haskey(parents, source) || (parents[source] = (codeinst, i))
+                if source in inspected
+                    continue
+                end
+                source_mi = get_ci_mi(source)
+                if source_mi === source.def
+                    ci = get(caches, source_mi, nothing)
+                    ci isa CodeInstance && continue
+                end
+                error = "unresolved opaque closure target"
+            end
+            # TODO: check that this opaque closure has a valid signature for possible codegen
         end
         if !isempty(error)
             push!(errors, warn => CallMissing(codeinst, codeinfo, sptypes, i, error))

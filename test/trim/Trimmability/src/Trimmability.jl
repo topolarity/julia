@@ -119,6 +119,27 @@ call_tc(t::Core.TypedCallable{Tuple{Int},Int}, x::Int) = t(x)
 tc_mul(x::Int)::Int = x * 2
 const TC_CONST = Core.TypedCallable{Tuple{Int},Int}(tc_mul)
 
+# An OpaqueClosure stored into an Array and called after extraction. An OC's body is
+# fixed: the optimizer resolves the body CodeInstance into the construction
+# (`handle_new_opaque_closure_call!`), `collectinvokes!` keeps that CI like an `:invoke`
+# edge, and codegen emits the OC's `JL_ADAPTER_OPAQUE_CLOSURE` adapter inline at the
+# construction site (`emit_inline_abi_adapter`), so the no-JIT image resolves nothing at
+# runtime. Routing the OC through an Array forces a real heap construction -- the
+# PartialOpaque transform cannot inline the call away or elide the construction -- so this
+# genuinely exercises the construction codegen and the call through the compiled specsig
+# adapter. Captures `c` (a non-empty env).
+@noinline function array_oc_roundtrip(c::Int, x::Int)
+    ocs = Core.OpaqueClosure{Tuple{Int},Int}[]
+    push!(ocs, Base.Experimental.@opaque (y::Int) -> y + c)
+    return ocs[1](x)
+end
+
+# A capture-free OpaqueClosure with a `Float64` return type (a different adapter `rt`
+# and an empty env tuple), returned from one `@noinline` function and called from another --
+# so it escapes as a real OC value and dispatches through the adapter rather than inlining.
+@noinline make_scaler() = Base.Experimental.@opaque (y::Int) -> y * 2.0
+@noinline apply_oc_f(oc, x::Int) = oc(x)::Float64
+
 function @main(args::Vector{String})::Cint
     println(Core.stdout, str())
     println(Core.stdout, PROGRAM_FILE)
@@ -127,6 +148,14 @@ function @main(args::Vector{String})::Cint
     # TypedCallable dispatched through its image-serialized adapter
     println(Core.stdout, call_tc(make_tc(), 41))
     println(Core.stdout, call_tc(TC_CONST, 21))
+
+    # An OpaqueClosure routed through an Array (see array_oc_roundtrip): a real OC object
+    # is constructed (not inlined away), its body CI kept by collectinvokes!, and its
+    # adapter emitted inline at the construction site. 23 + 100 -> 123.
+    println(Core.stdout, array_oc_roundtrip(100, 23))
+    # A capture-free OpaqueClosure with a Float64 rt, returned and called across a
+    # @noinline boundary (see make_scaler / apply_oc_f). 21 * 2.0 -> 42.0.
+    println(Core.stdout, apply_oc_f(make_scaler(), 21))
 
     # Register a finalizer and force collection so it runs before exit.
     register_fin()

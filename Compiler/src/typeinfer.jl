@@ -1636,7 +1636,15 @@ function collectinvokes!(workqueue::CompilationQueue, ci::CodeInfo, sptypes::Vec
     for i = 1:length(src)
         stmt = src[i]
         isexpr(stmt, :(=)) && (stmt = stmt.args[2])
-        if isexpr(stmt, :invoke) || isexpr(stmt, :invoke_modify)
+        if isexpr(stmt, :new_opaque_closure)
+            # The optimizer resolves the OpaqueClosure's body CodeInstance into
+            # args[5] (see `handle_new_opaque_closure_call!`). Treat it like an `:invoke`
+            # edge: the body must be compiled (and shipped, under --trim) so codegen can
+            # emit the OC's ABI adapter inline at the construction site
+            # (`emit_inline_abi_adapter`; verified by `verifytrim.jl`).
+            source = length(stmt.args) >= 5 ? stmt.args[5] : nothing
+            source isa CodeInstance && isdefined(source, :inferred) && push!(workqueue, source)
+        elseif isexpr(stmt, :invoke) || isexpr(stmt, :invoke_modify)
             edge = stmt.args[1]
             if edge isa CodeInstance && has_valid_abi_sparams(get_ci_mi(edge)) &&
                     (enqueue_unprepared_invokes ||

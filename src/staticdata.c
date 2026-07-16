@@ -658,8 +658,16 @@ static void jl_insert_into_serialization_queue(jl_serializer_state *s, jl_value_
             record_field_change((jl_value_t**)&mi->cache, NULL);
         // don't recurse into all backedges memory (yet)
         jl_value_t *backedges = get_replaceable_field((jl_value_t**)&mi->backedges, 1);
+        if (backedges && (jl_options.trim || jl_options.strip_ir)) {
+            // Live-runtime MethodInstances can be reachable here through
+            // dispatch-trampoline resolution sigs and inline-constructed
+            // OpaqueClosure method constants. Their backedges are invalidation
+            // state, which a trimmed / IR-stripped image never uses; drop them
+            // rather than dragging live runtime state into the image.
+            record_field_change((jl_value_t**)&mi->backedges, NULL);
+            backedges = NULL;
+        }
         if (backedges) {
-            assert(!jl_options.trim && !jl_options.strip_ir);
             jl_queue_for_serialization_(s, (jl_value_t*)((jl_array_t*)backedges)->ref.mem, 0, 1);
             size_t i = 0, n = jl_array_nrows(backedges);
             while (i < n) {

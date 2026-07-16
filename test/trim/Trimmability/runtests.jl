@@ -18,8 +18,10 @@ outdir = ARGS[1]
     @test lines[4] == "arg2"
     @test lines[5] == "42"  # TypedCallable dispatched via its image-serialized adapter
     @test lines[6] == "42"  # top-level const TypedCallable, adapter from the live-cache sweep
-    @test lines[7] == string(4.0+pi)
-    @test parse(Float64, lines[8]) isa Float64
-    @test lines[9] == "Version: 1.1.0"
-    @test lines[10] == "# preferences: 0"
+    @test lines[7] == "123"  # OpaqueClosure built in reachable code: body CI kept, adapter emitted inline
+    @test lines[8] == "42.0" # capture-free OpaqueClosure with a Float64 rt (different adapter)
+    @test lines[9] == string(4.0+pi)
+    @test parse(Float64, lines[10]) isa Float64
+    @test lines[11] == "Version: 1.1.0"
+    @test lines[12] == "# preferences: 0"
 end
