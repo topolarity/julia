@@ -91,6 +91,61 @@ end
         Expr(:quote, Expr(:$, 1, 2, 3, [4])))
 end
 
+# A quote whose *entire* content is a bare interpolated splat (`:($(xs...))`)
+# dissolves into a `...` node in the enclosing position, mirroring flisp's
+# `julia-bq-expand-` (`src/macroexpand.scm`). In a call/tuple/vect/curly/ref
+# argument list it splices in as ordinary splat semantics; used standalone it
+# is rejected later as a `...` in an invalid position, exactly as an unquoted
+# `x...` would be. This is the idiom PrePostCall.jl uses to build a call to a
+# renamed function with a runtime-computed argument list.
+@testset "(AI) bare interpolated splat quote dissolves (flisp parity)" begin
+    @testset for run in [
+        (x::String)->fl_eval(test_mod, Expr(:block, JuliaSyntax.parsestmt(Expr, x))),
+        (x::String)->jl_eval(test_mod, JuliaSyntax.parsestmt(SyntaxTree, x); expr_compat_mode=true),
+        (x::String)->jl_eval(test_mod, JuliaSyntax.parsestmt(SyntaxTree, x); expr_compat_mode=false),
+        ]
+        # Bare splat quote as a separate sibling in an argument list (note this
+        # is *not* the same code path as `:(f($(xs...)))`, where the splat is a
+        # child of the call being quoted).
+        @test run(raw"let xs=[10,20,30]; Expr(:call, :f, :($(xs...))); end") == :(f(10,20,30))
+        # Mixing with ordinary siblings, before and after.
+        @test run(raw"let xs=[10,20,30]; Expr(:call, :g, :($(xs...)), :extra); end") == :(g(10,20,30,extra))
+        @test run(raw"let xs=[10,20,30]; Expr(:call, :h, :a, :($(xs...)), :b); end") == :(h(a,10,20,30,b))
+        # Multiple bare splat quotes in one call.
+        @test run(raw"let xs=[10,20,30], ys=[1,2]; Expr(:call, :f, :($(xs...)), :($(ys...))); end") == :(f(10,20,30,1,2))
+        # Other argument-list positions: tuple, vect, curly, ref.
+        @test run(raw"let xs=[10,20,30]; Expr(:tuple, :($(xs...))); end") == :((10,20,30))
+        @test run(raw"let xs=[10,20,30]; Expr(:vect, :($(xs...))); end") == :([10,20,30])
+        @test run(raw"let xs=[10,20,30]; Expr(:curly, :T, :($(xs...))); end") == :(T{10,20,30})
+        @test run(raw"let xs=[10,20,30]; Expr(:ref, :A, :($(xs...))); end") == :(A[10,20,30])
+        # Nested quote: dissolve only happens at interpolation depth 0, so the
+        # inner splat stays quoted.
+        @test run(raw"let xs=[10,20,30]; :(:($(xs...))); end") == Expr(:quote, Expr(:$, Expr(:..., :xs)))
+    end
+end
+
+@testset "(AI) standalone bare splat quote is rejected" begin
+    # Nothing to splice into: rejected as a `...` in an invalid position, the
+    # same error an unquoted `x...` would produce there (flisp: `"..."
+    # expression outside call`).
+    @test_throws LoweringError jl_eval(
+        test_mod, JuliaSyntax.parsestmt(SyntaxTree, raw"let xs=[1,2,3]; y = :($(xs...)); y; end");
+        expr_compat_mode=true)
+    @test_throws LoweringError jl_eval(
+        test_mod, JuliaSyntax.parsestmt(SyntaxTree, raw"let xs=[1,2,3]; y = :($(xs...)); y; end");
+        expr_compat_mode=false)
+    @test_throws "syntax" fl_eval(
+        test_mod, JuliaSyntax.parsestmt(Expr, raw"let xs=[1,2,3]; y = :($(xs...)); y; end"))
+    err = try
+        jl_eval(test_mod, JuliaSyntax.parsestmt(SyntaxTree, raw"let xs=[1,2,3]; y = :($(xs...)); y; end"))
+        nothing
+    catch exc
+        @test exc isa LoweringError
+        sprint(io->Base.showerror(io, exc, show_detail=false))
+    end
+    @test contains(err, "splatting can only be done")
+end
+
 @testset "@legacy_quote_to_syntax" begin
     @test JuliaLowering.include_string(
         test_mod, raw"@legacy_quote_to_syntax :x") isa SyntaxTree

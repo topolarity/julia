@@ -42,9 +42,19 @@ function expand_quote(ctx, st)
     elseif kind(st) === K"$"
         numchildren(st) != 1 && throw(LoweringError(
             st, raw"More than one value in bare `$` expression"))
-        kind(st[1]) === K"..." && throw(LoweringError(
-            st, raw"unexpected `...` in bare `$` expression"))
-        @ast ctx st st[1]
+        if kind(st[1]) === K"..."
+            # A quote whose entire content is a bare interpolated splat,
+            # e.g. `:($(xs...))`, dissolves into a `...` node handed back to
+            # the enclosing position, mirroring flisp's `julia-bq-expand-`
+            # (`src/macroexpand.scm`). As one of several arguments in a
+            # call/tuple/vect/... it splices in as ordinary splat semantics;
+            # as a standalone expression there is nothing to splice into, so
+            # it is rejected later by desugaring as `... expression outside
+            # call` (exactly as an unquoted `x...` would be in that position).
+            @ast ctx st [K"..." st[1][1]]
+        else
+            @ast ctx st st[1]
+        end
     elseif kind(st) === K"Identifier" && !hasattr(st, :mod)
         @jl_assert isempty(unquoted) st
         @ast ctx st [K"inert" st]
