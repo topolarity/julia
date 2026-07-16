@@ -791,7 +791,7 @@ static bool rematerializeDerivedOutputs(Function &F, Region &R, const DominatorT
     }
     if (!SiteSpine.empty()) {
         // Route the roots through slots.
-        IRBuilder<> EB(&F.getEntryBlock(), F.getEntryBlock().begin());
+        IRBuilder<> EB(&F.getEntryBlock(), entryAllocaPrefixEnd(F.getEntryBlock()));
         DenseMap<Instruction *, AllocaInst *> Slot;
         for (Instruction *OpI : RoutedOps) {
             bool Tracked = classifyType(OpI->getType()) == ValKind::Tracked;
@@ -1144,7 +1144,7 @@ static void spillInterface(Function &F, Region &R, DominatorTree &DT,
 
     LLVMContext &Ctx = F.getContext();
     Type *T_prjlvalue = PointerType::get(Ctx, AddressSpace::Tracked);
-    IRBuilder<> EB(&F.getEntryBlock(), F.getEntryBlock().begin());
+    IRBuilder<> EB(&F.getEntryBlock(), entryAllocaPrefixEnd(F.getEntryBlock()));
     AllocaInst *TSpillIn = nullptr;
     unsigned NIn = TIn.size();
     if (NIn) {
@@ -1653,8 +1653,9 @@ static Function *extractRegion(Function &F, Region &R, const JuliaPassContext &c
                 for (Instruction &I : BB)
                     if (auto *AI = dyn_cast<AllocaInst>(&I))
                         ToHoist.push_back(AI);
+        BasicBlock::iterator HIP = entryAllocaPrefixEnd(NE);
         for (AllocaInst *AI : ToHoist)
-            AI->moveBefore(NE.getFirstInsertionPt());
+            AI->moveBefore(HIP);
     }
 
     NewF->setLinkage(GlobalValue::InternalLinkage);
@@ -1730,10 +1731,7 @@ static Function *extractRegion(Function &F, Region &R, const JuliaPassContext &c
             Getter = Function::Create(FunctionType::get(PointerType::get(Ctx, 0), false),
                                       GlobalValue::ExternalLinkage, "julia.get_pgcstack", M);
         BasicBlock &NE = NewF->getEntryBlock();
-        BasicBlock::iterator IP = NE.getFirstInsertionPt();
-        while (isa<AllocaInst>(*IP))
-            ++IP;
-        IRBuilder<> EB(&NE, IP);
+        IRBuilder<> EB(&NE, entryAllocaPrefixEnd(NE));
         EB.CreateCall(Getter, {}, "pgcstack");
     }
     // The pgcstack marker freeze (see prepareRegion) has served its purpose.
@@ -3366,14 +3364,18 @@ static bool splitFunction(Function &F, const JuliaPassContext &ctx) JL_NOTSAFEPO
     // extractRegion). Reverse iteration with insertion at the entry's front
     // restores the original recorded order (allocas ahead of the address
     // computations rooted at them).
-    for (WeakTrackingVH &VH : llvm::reverse(SunkAllocas)) {
+    for (WeakTrackingVH &VH : SunkAllocas) {
         auto *I = dyn_cast_or_null<Instruction>((Value *)VH);
         if (!I)
             continue;
         BasicBlock *BB = I->getParent();
         if (BB->isEntryBlock())
             continue;
-        I->moveBefore(BB->getParent()->getEntryBlock().getFirstInsertionPt());
+        // Appending each record at the current prefix end keeps every
+        // address computation after the alloca it derives from (records are
+        // grouped alloca-first).
+        BasicBlock &Entry = BB->getParent()->getEntryBlock();
+        I->moveBefore(entryAllocaPrefixEnd(Entry));
     }
     auto T5 = now();
     if (SplitDebug || SplitTime)

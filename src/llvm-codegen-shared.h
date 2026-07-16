@@ -164,6 +164,21 @@ static inline llvm::Instruction *tbaa_decorate(llvm::MDNode *md, llvm::Instructi
     return inst;
 }
 
+// The entry block keeps a contiguous leading run of allocas (codegen anchors
+// it by inserting every static alloca before the julia.get_pgcstack call).
+// New allocas append at this iterator so the prefix stays contiguous and in
+// creation order; prologue setup code must insert at or after it -- never at
+// begin(), which would displace the prefix. An alloca that drifts below any
+// non-alloca instruction risks losing staticness when a later pass splits
+// the entry block (LLVM's staticness test is purely positional).
+static inline llvm::BasicBlock::iterator entryAllocaPrefixEnd(llvm::BasicBlock &Entry)
+{
+    llvm::BasicBlock::iterator It = Entry.begin();
+    while (It != Entry.end() && llvm::isa<llvm::AllocaInst>(*It))
+        ++It;
+    return It;
+}
+
 // Get PTLS through current task.
 static inline llvm::Value *get_current_task_from_pgcstack(llvm::IRBuilder<> &builder, llvm::Value *pgcstack)
 {

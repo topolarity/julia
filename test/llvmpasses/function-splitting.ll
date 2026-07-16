@@ -1149,8 +1149,9 @@ b:
 ; %slot must be hoisted back into the entry block (the plain arithmetic
 ; regions still split).
 ; REJECT-LABEL: define i64 @rejected_region_restores_alloca(
-; REJECT-NEXT: top:
-; REJECT-NEXT: %slot = alloca [2 x i64]
+; REJECT: top:
+; REJECT-NOT: {{^[a-zA-Z0-9_.]+:}}
+; REJECT: %slot = alloca [2 x i64]
 
 define i64 @rejected_region_restores_alloca(double %x, ptr addrspace(10) %obj) {
 top:
