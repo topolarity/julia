@@ -292,6 +292,7 @@ extern jl_call_t jl_fptr_interpret_call JL_CANSAFEPOINT;
 JL_DLLEXPORT extern const jl_callptr_t jl_fptr_interpret_call_addr;
 
 JL_DLLEXPORT extern const jl_callptr_t jl_f_opaque_closure_call_addr;
+JL_DLLEXPORT extern const jl_callptr_t jl_f_typed_callable_call_addr;
 
 JL_DLLEXPORT extern const jl_callptr_t jl_fptr_wait_for_compiled_addr;
 
@@ -523,6 +524,22 @@ typedef struct _jl_opaque_closure_t {
     jl_fptr_args_t invoke; // n.b. despite the similar name, this is not an invoke ABI (jl_call_t / julia.call2), but rather the fptr1 (jl_fptr_args_t / julia.call) ABI
     void *specptr; // n.b. despite the similarity in field name, this is not arbitrary private data for jlcall, but rather the codegen ABI for specsig, and is mandatory if specsig is valid
 } jl_opaque_closure_t;
+
+// TypedCallable: a concretely-typed callable that dispatches its wrapped
+// callable `f` in the *latest* world (contrast OpaqueClosure's frozen world).
+// `TypedCallable{A,R}` erases `typeof(f)`: calls type-check the arguments
+// against `A` and the result against `R`. The boxed (jlcall) call path
+// goes through `jl_f_typed_callable_call`, which dispatches `f` in the latest
+// world via `jl_apply_generic`; the specsig call site instead reaches the
+// target through the trampoline's polled adapter `fptr`.
+typedef struct _jl_typed_callable_t {
+    JL_DATA_TYPE
+    jl_value_t *f;
+    jl_value_t *trampoline; // hidden: the shared jl_dispatch_trampoline_t record (GC-tracked, so
+                            // it roots its target CodeInstance/ABIAdapter). Holds the latest-world
+                            // polling state and the resolved specsig adapter -- both the specsig
+                            // call site and the jlcall builtin share one record per (sigt, rt).
+} jl_typed_callable_t;
 
 // This type represents an executable operation
 //
@@ -1952,6 +1969,18 @@ STATIC_INLINE int jl_is_opaque_closure(void *v) JL_NOTSAFEPOINT
 {
     jl_value_t *t = jl_typeof(v);
     return jl_is_opaque_closure_type(t);
+}
+
+STATIC_INLINE int jl_is_typed_callable_type(void *t) JL_NOTSAFEPOINT
+{
+    return (jl_is_datatype(t) &&
+            ((jl_datatype_t*)(t))->name == jl_typed_callable_typename);
+}
+
+STATIC_INLINE int jl_is_typed_callable(void *v) JL_NOTSAFEPOINT
+{
+    jl_value_t *t = jl_typeof(v);
+    return jl_is_typed_callable_type(t);
 }
 
 STATIC_INLINE int jl_is_cpointer_type(jl_value_t *t) JL_NOTSAFEPOINT

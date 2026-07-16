@@ -264,6 +264,9 @@ include("irrationals.jl")
 include("mathconstants.jl")
 using .MathConstants: ℯ, π, pi
 
+# TypedCallable: concretely-typed, latest-world callable
+include("typed_callable.jl")
+
 # experimental API's
 include("experimental.jl")
 

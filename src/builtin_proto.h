@@ -22,6 +22,7 @@ extern "C" {
     XX(_svec_len,"_svec_len") \
     XX(_svec_ref,"_svec_ref") \
     XX(_typebody,"_typebody!") \
+    XX(_typed_callable,"_typed_callable") \
     XX(_typevar,"_typevar") \
     XX(_using, "_using") \
     XX(applicable,"applicable") \
@@ -75,6 +76,7 @@ extern "C" {
     XX(throw_methoderror,"throw_methoderror") \
     XX(tuple,"tuple") \
     XX(typeassert,"typeassert") \
+    XX(typed_callable_call,"typed_callable_call") \
     XX(typeof,"typeof") \
     XX(has_free_typevars,"has_free_typevars")
 

@@ -441,6 +441,10 @@ typedef enum {
     JL_ABI_STD = 0,                 // standard ABI: no type-erased argv slot, no world switch
     JL_ABI_OPAQUE_CLOSURE = 1,      // argv[0] is an OpaqueClosure (type-erased);
                                     // install `oc->world` into `task->world_age` around the call
+    JL_ABI_TYPED_CALLABLE = 2,      // argv[0] is a TypedCallable (type-erased); substitute
+                                    // `tc->f` for it around the call. No world switch: the
+                                    // TypedCallable call site itself polls and installs the
+                                    // latest world (see emit_specsig_typed_callable_call)
 } jl_abi_kind_t;
 
 // Returns 1 iff the `i`th argv slot is passed as a single derived-address-space
@@ -448,7 +452,7 @@ typedef enum {
 // type-erased slot today places it at argv[0].
 STATIC_INLINE int jl_abi_kind_erases_slot(jl_abi_kind_t kind, size_t i) JL_NOTSAFEPOINT
 {
-    return kind == JL_ABI_OPAQUE_CLOSURE && i == 0;
+    return (kind == JL_ABI_OPAQUE_CLOSURE || kind == JL_ABI_TYPED_CALLABLE) && i == 0;
 }
 
 // data structures for runtime codegen
@@ -2020,6 +2024,9 @@ JL_DLLEXPORT int jl_tupletype_length_compat(jl_value_t *v, size_t nargs) JL_NOTS
 JL_DLLEXPORT jl_value_t *jl_argtype_with_function(jl_value_t *f, jl_value_t *types0) JL_CANSAFEPOINT;
 JL_DLLEXPORT jl_value_t *jl_argtype_with_function_type(jl_value_t *ft JL_MAYBE_UNROOTED, jl_value_t *types0) JL_CANSAFEPOINT;
 JL_DLLEXPORT jl_value_t *jl_argtype_without_function(jl_value_t *ftypes) JL_CANSAFEPOINT;
+JL_DLLEXPORT jl_typed_callable_t *jl_new_typed_callable(jl_value_t *f, jl_tupletype_t *argt, jl_value_t *rt) JL_CANSAFEPOINT;
+JL_DLLEXPORT jl_typed_callable_t *jl_new_typed_callable_resolved(jl_dispatch_trampoline_t *tr, jl_value_t *f, jl_tupletype_t *argt, jl_value_t *rt) JL_CANSAFEPOINT;
+JL_DLLEXPORT jl_value_t *jl_typed_callable_adapter_sigt(jl_value_t *tramp_sigt, jl_value_t *rt) JL_CANSAFEPOINT;
 
 JL_DLLEXPORT unsigned jl_special_vector_alignment(size_t nfields, jl_value_t *field_type) JL_CANSAFEPOINT;
 
@@ -2174,6 +2181,7 @@ void post_boot_hooks(void) JL_CANSAFEPOINT;
 JL_DLLEXPORT jl_genericmemory_t *jl_genericmemory_copy_slice(jl_genericmemory_t *mem, void *data, size_t len) JL_CANSAFEPOINT;
 int obviously_disjoint(jl_value_t *a, jl_value_t *b, int specificity) JL_NOTSAFEPOINT;
 JL_CALLABLE(jl_f_opaque_closure_call) JL_CANSAFEPOINT;
+JL_CALLABLE(jl_f_typed_callable_call) JL_CANSAFEPOINT;
 uint_t bindingkey_hash(size_t idx, jl_value_t *data);
 uint_t speccache_hash(size_t idx, jl_value_t *data);
 void JL_NORETURN jl_finish_task(jl_task_t *ct) JL_CANSAFEPOINT;
