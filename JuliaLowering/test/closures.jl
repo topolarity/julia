@@ -1776,3 +1776,92 @@ end
     end
     """) == true
 end
+
+@testset "(AI) hoist top-level closure definitions out of loops" begin
+    # A closure type/method defined textually inside a top-level loop body must
+    # be *defined once*, before the loop -- exactly as flisp does -- not
+    # re-defined on every iteration.  Re-defining it each iteration replaces the
+    # closure *type* (a fresh `DataType` bound to the same name), so every method
+    # specialized on it (e.g. `collect(::Generator{_, ThatClosure})` for a
+    # comprehension) is invalidated and recompiled on the next iteration: an O(N)
+    # recompilation storm.  Regression: this was reintroduced when the rebase
+    # onto upstream's static-parameter capture redesign (JuliaLang/julia#62374)
+    # collapsed `is_toplevel_seq_point`/`toplevel_preserving` into a single
+    # `toplevel` flag that stayed `true` inside loop bodies, so the definitions
+    # were emitted inline.  Reproduces ReverseDiff's 9.7x precompile regression
+    # (`derivatives/arrays.jl`: comprehension inside a ~200-iteration `@eval`
+    # loop).  See bugs/reversediff-precompile-9x.
+    m = Module()
+
+    # DIRECT OBSERVABLE: the closure type is created exactly once, so the closure
+    # value has the *same* type on every iteration (each iteration still builds a
+    # fresh *instance* capturing that iteration's variable).  Under the bug the
+    # type was redefined each iteration, giving a distinct type per iteration.
+    @test JuliaLowering.include_string(m, """
+    ts = DataType[]
+    fns = Function[]
+    for i in 1:5
+        g() = i
+        push!(ts, typeof(g))
+        push!(fns, g)
+    end
+    (length(unique(ts)), [f() for f in fns])
+    """) == (1, [1, 2, 3, 4, 5])
+
+    # Same, for the comprehension-in-a-loop shape that drives the storm: the
+    # anonymous generator closure type is created once for the whole loop.
+    @test JuliaLowering.include_string(m, """
+    ts = DataType[]
+    acc = Vector{Int}[]
+    for j in 1:5
+        v = [x * j for x in (1, 2, 3)]
+        push!(ts, typeof(v))     # concrete result type, stable
+        push!(acc, v)
+    end
+    (allunique(acc), acc[1], acc[5])
+    """) == (true, [1, 2, 3], [5, 10, 15])
+
+    # `while` loops (which `for` desugars to) get the same treatment.
+    @test JuliaLowering.include_string(m, """
+    tset = Base.IdSet{DataType}()
+    k = 0
+    while k < 4
+        global k += 1
+        h() = k
+        push!(tset, typeof(h))
+    end
+    length(tset)
+    """) == 1
+
+    # A closure inside a top-level `if`/`block` is sequencing-preserving and
+    # stays inline (it runs once, in order): still lowers and evaluates.
+    @test JuliaLowering.include_string(m, """
+    r = 0
+    if true
+        p() = 41
+        r = p() + 1
+    end
+    r
+    """) == 42
+
+    # Nested loops: the closure captures both loop variables; the type is still
+    # defined once while each (a,b) instance captures the right values.
+    @test JuliaLowering.include_string(m, """
+    ts = DataType[]
+    out = Tuple{Int,Int}[]
+    for a in 1:2, b in 1:2
+        q() = (a, b)
+        push!(ts, typeof(q))
+        push!(out, q())
+    end
+    (length(unique(ts)), out)
+    """) == (1, [(1, 1), (1, 2), (2, 1), (2, 2)])
+
+    # Independent lowering invocations of the *same* source still mint distinct
+    # closure types (flisp's per-lowering gensym freshness), so re-evaluating a
+    # source does not redefine/invalidate the previous evaluation's closure.
+    let src = "(() -> 0) |> typeof"
+        @test JuliaLowering.include_string(m, src) !==
+              JuliaLowering.include_string(m, src)
+    end
+end

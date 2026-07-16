@@ -474,13 +474,25 @@ end
 
 # Map the children of `ex` through _convert_closures, lifting any toplevel
 # closure definition statements to occur before the other content of `ex`.
-function map_cl_convert(ctx::ClosureConversionCtx, ex)
+#
+# `toplevel_preserving` records whether `ex` preserves top-level sequencing for
+# the code it contains: its children still run exactly once, in order, at the
+# enclosing top-level sequence point (`if`/`block`/`try...` — see the default
+# case of `_convert_closures`).  Control flow that does *not* preserve
+# sequencing (e.g. `_while`/`_do_while` loops) resets `toplevel` to `false` for
+# its children, so any closure type/method definitions they contain are lifted
+# out into `toplevel_stmts` and emitted once *before* the construct rather than
+# re-defined on every iteration (which would redefine the closure type and
+# invalidate every method specialized on it -- an O(N) recompilation storm).
+# This mirrors flisp, which hoists such definitions to the enclosing sequence
+# point.
+function map_cl_convert(ctx::ClosureConversionCtx, ex, toplevel_preserving::Bool=true)
     if ctx.toplevel
         toplevel_stmts = SyntaxList(ctx)
         ctx2 = ClosureConversionCtx(
             ctx.graph, ctx.bindings, ctx.mod,
             ctx.closure_bindings, ctx.capture_rewriting, ctx.top_bindings,
-            ctx.lambda_bindings, ctx.sp_typevars, true, ctx.lifted,
+            ctx.lambda_bindings, ctx.sp_typevars, toplevel_preserving, ctx.lifted,
             ctx.toplevel_pure, toplevel_stmts, ctx.closure_infos,
             ctx.pending_closure_inits)
         res = map_children_cl(ctx2, ex)
@@ -694,7 +706,16 @@ function _convert_closures(ctx::ClosureConversionCtx, ex)
             ctx.toplevel, true, ctx.toplevel_pure, ctx.toplevel_stmts,
             ctx.closure_infos, ctx.pending_closure_inits)
         tvs = map_cl_convert(ctx2, ex[2])
-        if !ctx.toplevel
+        # Only a *local closure*'s definition is lifted to the enclosing top-level
+        # sequence point (so it is emitted once, before an enclosing loop); its
+        # captured-sparam typevar setup (`tvs`) must travel with it.  A *global*
+        # method group is an ordinary sequenced top-level statement: it stays
+        # inline and runs where it is written (e.g. once per loop iteration, as
+        # for methods defined in an `@eval`/`for` loop), so its `tvs` must stay
+        # inline too -- notably when a signature typevar bound references a
+        # loop-local (`f(y::T) where {T<:x} = ...` inside `for x in ...`), which
+        # would be undefined if hoisted above the loop.
+        if is_closure && !ctx.toplevel
             push!(ctx2.toplevel_stmts, tvs)
             tvs = @ast ctx ex[2] (::K"TOMBSTONE")
         end
@@ -751,7 +772,18 @@ function _convert_closures(ctx::ClosureConversionCtx, ex)
             init_closure_args...
         ]
     else
-        map_cl_convert(ctx, ex)
+        # Only a few construct kinds preserve top-level sequencing: their
+        # children run once, in order, at the enclosing top-level sequence
+        # point, so a closure type/method defined directly inside stays inline.
+        # Everything else -- notably `_while`/`_do_while` loops (and `for`,
+        # which desugars to `_while`) -- does not: a closure definition textually
+        # inside a loop body must be lifted to run once before the loop, or it
+        # is redefined every iteration (redefining the closure type and
+        # invalidating each method specialized on it).  Mark the preserving kinds
+        # so `map_cl_convert` hoists definitions out of the rest, matching flisp.
+        toplevel_seq_preserving = k == K"if" || k == K"elseif" || k == K"block" ||
+                                  k == K"tryfinally" || k == K"trycatchelse"
+        map_cl_convert(ctx, ex, toplevel_seq_preserving)
     end
 end
 
