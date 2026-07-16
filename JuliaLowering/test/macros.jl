@@ -488,6 +488,60 @@ Base.eval(test_mod, :(
     end""") === (123, 456)
 end
 
+# Old-style macros that leave an escaped `LineNumberNode` in tail/value position,
+# mimicking OhMyThreads' `@tasks` (whose `tasks_macro` esc-wraps every for-body
+# statement, including the trailing parser linenode). flisp strips the `escape`
+# during hygiene and treats the line node as transparent metadata; JuliaLowering
+# must do the same so the block does not *return* the line node.
+fl_eval(test_mod, :(macro esc_tail(x)
+    Expr(:block, esc(x), esc(LineNumberNode(99, Symbol("esc_tail"))))
+end))
+fl_eval(test_mod, :(macro esc_tail2(x)
+    Expr(:block, esc(x), esc(LineNumberNode(1, Symbol("esc_tail2"))),
+                         esc(LineNumberNode(2, Symbol("esc_tail2"))))
+end))
+fl_eval(test_mod, :(macro esc_tail_val(x)  # trailing escaped NON-linenode (control)
+    Expr(:block, esc(x), esc(99))
+end))
+fl_eval(test_mod, :(macro mini_tasks(forex)
+    itvar  = forex.args[1].args[1]
+    itrng  = forex.args[1].args[2]
+    body   = forex.args[2]
+    fbody  = Expr(:block, esc(body), esc(LineNumberNode(4242, Symbol("mini_tasks"))))
+    quote
+        local function mapping_function($(esc(itvar)),)
+            $fbody
+        end
+        map(mapping_function, $(esc(itrng)))
+    end
+end))
+
+@testset "(AI) escaped trailing LineNumberNode is transparent (OhMyThreads @tasks)" for run in [
+    (x::String)->Base.include_string(
+        test_mod, "#=FLISP SANITY-CHECK=# "*x),
+    (x::String)->JuliaLowering.include_string(
+        test_mod, "#=JL COMPAT=# "*x; expr_compat_mode=true),
+    (x::String)->JuliaLowering.include_string(
+        test_mod, "#=JL=# "*x; expr_compat_mode=false)]
+
+    # A function body ending in an escaped linenode returns the real value, not
+    # the linenode (the reported `MethodError: +(::LineNumberNode, ...)` bug).
+    @test run("(function _et1(); @esc_tail(41 + 1); end; _et1())") === 42
+    @test run("(function _et2(); @esc_tail2(41 + 1); end; _et2())") === 42
+    # A block ending in an escaped linenode, used as a call argument (value
+    # position), yields the real value in every lane.
+    @test run("1 + @esc_tail(10)") === 11
+    # A trailing escaped NON-linenode is a genuine value and is preserved.
+    @test run("(function _ev(); @esc_tail_val(41 + 1); end; _ev())") === 99
+    # End-to-end OhMyThreads shape: each mapped element yields the loop-body
+    # value, never a LineNumberNode.
+    let r = run("@mini_tasks(for i in 1:3; i; end)")
+        @test r == [1, 2, 3]
+        @test eltype(r) !== LineNumberNode
+    end
+    @test run("@mini_tasks(for i in 1:4; i * i; end)") == [1, 4, 9, 16]
+end
+
 @testset "apply_expansion_layer mutation testing" begin
     local test_mod = @newmod(apply_expansion_layer)
     # recursion can't stop at module/toplevel/inert without tweaks, because a

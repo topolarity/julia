@@ -131,6 +131,48 @@ end
             QuoteNode(QuoteNode(Expr(:call, 1)))
     end
 
+    @testset "(AI) escaped trailing LineNumberNode absorbed like a bare one" begin
+        # OhMyThreads' `@tasks` esc-wraps every for-body statement -- including the
+        # trailing parser LineNumberNode -- leaving `Expr(:escape, LineNumberNode)`
+        # in tail position of the generated function body. flisp strips the
+        # `escape` during hygiene (src/macroexpand.scm) and then treats the bare
+        # line node as transparent metadata, so JuliaLowering must absorb it here
+        # at `Expr` ingestion rather than leave a value-producing
+        # `K"Value"(LineNumberNode)` behind (which the block would then *return*).
+        LNN = LineNumberNode(999, :probe)
+
+        # A single esc / hygienic-scope wrapper around a linenode is absorbed into
+        # provenance (dropped as a statement), exactly like a bare block child.
+        for wrap in (x->Expr(:escape, x),
+                     x->Expr(Symbol("hygienic-scope"), x, @__MODULE__))
+            st = JuliaLowering.expr_to_est(Expr(:block, :a, wrap(LNN)))
+            @test kind(st) === K"block"
+            @test numchildren(st) == 1
+            @test kind(st[1]) === K"Identifier" && st[1].name_val == "a"
+        end
+        # ... including in leading position (block is not the `(a; b)` shape).
+        st = JuliaLowering.expr_to_est(Expr(:block, Expr(:escape, LNN), :a))
+        @test numchildren(st) == 1 && st[1].name_val == "a"
+
+        # NON-linenode escaped payloads stay values and must NOT be absorbed:
+        #   esc(99)                   -> a real value
+        #   esc(QuoteNode(LNN))       -> a real (quoted) value
+        #   esc(Expr(:meta, :inline)) -> a meta statement (flisp's `only-meta?`
+        #                                does not skip `meta`, so it is kept)
+        for payload in (99, QuoteNode(LNN), Expr(:meta, :inline))
+            st = JuliaLowering.expr_to_est(Expr(:block, :a, Expr(:escape, payload)))
+            @test numchildren(st) == 2
+            @test kind(st[2]) === K"escape"
+        end
+
+        # Only ONE wrapper layer is peeled, matching flisp's single hygiene pop:
+        # a doubly-escaped linenode is an over-escape (rejected by both lowerers),
+        # so the inner escape must survive as a node for macro expansion to reject.
+        st = JuliaLowering.expr_to_est(Expr(:block, :a, Expr(:escape, Expr(:escape, LNN))))
+        @test numchildren(st) == 2
+        @test kind(st[2]) === K"escape" && kind(st[2][1]) === K"escape"
+    end
+
     @testset "provenance via scavenging for LineNumberNodes" begin
         # Provenance of a node should generally be the last seen
         # LineNumberNode in the depth-first traversal of the Expr, or the

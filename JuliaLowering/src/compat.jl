@@ -46,6 +46,30 @@ function _get_inner_lnn(e::Expr, default::LineNumberNode)
     return b_lnn isa LineNumberNode ? b_lnn : default
 end
 
+# flisp resolves hygiene -- stripping `escape`/`hygienic-scope` wrappers (see
+# `resolve-expansion-vars-` in src/macroexpand.scm) -- *before* block value
+# position is decided, so an inert `LineNumberNode` sitting under a single such
+# wrapper is still line metadata, exactly as if it were a bare block child.
+# JuliaLowering absorbs bare block-child linenodes into provenance here at `Expr`
+# ingestion, but the wrapper (only removed later, during macro expansion) would
+# otherwise defeat that and leave a `K"Value"(LineNumberNode)` in value/tail
+# position -- so the block would wrongly *return* the line node.  This is exactly
+# OhMyThreads' `@tasks`, whose `tasks_macro` `esc`-wraps every for-body statement
+# (including the trailing linenode) and then deletes the consumed `@set`
+# macrocalls, leaving `Expr(:escape, LineNumberNode)` in tail position.
+#
+# Peel exactly one wrapper layer, matching flisp's single hygiene pop: `esc(esc(l))`
+# is an over-escape error in both lowerers (so it must stay unabsorbed and reach
+# that error), and `esc(QuoteNode(l))` is a genuine value (a `QuoteNode`, not a
+# `LineNumberNode`, so it is not absorbed).
+function _unescaped_linenode(@nospecialize(e))
+    e isa Expr || return nothing
+    (e.head === :escape || e.head === Symbol("hygienic-scope")) || return nothing
+    length(e.args) >= 1 || return nothing
+    payload = e.args[1]
+    return payload isa LineNumberNode ? payload : nothing
+end
+
 # List of Expr-AST forms that are always converted to some SyntaxTree form and
 # never inserted as an opaque `K"Value"`. Note no LineNumberNode, which appears
 # unwrapped in a macrocall (possibly generated functions too, TODO check)
@@ -143,8 +167,13 @@ function _expr_to_est(graph::SyntaxGraph, @nospecialize(e), src::SourceAttrType,
         cs = NodeId[]
         rm_linenodes = e.head in (:block, :toplevel) && quote_depth == 0
         for arg in e.args
+            esc_lnn = rm_linenodes ? _unescaped_linenode(arg) : nothing
             if rm_linenodes && arg isa LineNumberNode
                 src isa LineNumberNode && (src = arg)
+            elseif !isnothing(esc_lnn)
+                # A linenode hidden under a single esc/hygienic-scope wrapper is
+                # absorbed like a bare block-child linenode (see helper above).
+                src isa LineNumberNode && (src = esc_lnn)
             else
                 cid, src = _expr_to_est(graph, arg, src, child_depth)
                 push!(cs, cid)
@@ -159,7 +188,10 @@ function _expr_to_est(graph::SyntaxGraph, @nospecialize(e), src::SourceAttrType,
         # `(a; b)` shape (or macro-generated with the same layout); record that
         # so `est_to_expr` does not synthesize a leading linenode when this
         # tree is materialized again (see the `no_lead` rule there).
-        if rm_linenodes && !(!isempty(e.args) && e.args[1] isa LineNumberNode)
+        first_is_linenode = !isempty(e.args) &&
+            (e.args[1] isa LineNumberNode ||
+             (rm_linenodes && !isnothing(_unescaped_linenode(e.args[1]))))
+        if rm_linenodes && !first_is_linenode
             setmeta!(st_e, :no_leading_lnn, true)
         end
         st_e
