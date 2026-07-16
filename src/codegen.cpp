@@ -5972,6 +5972,20 @@ static jl_cgval_t emit_call(jl_codectx_t &ctx, jl_expr_t *ex, jl_value_t *rt, bo
         return mark_julia_type(ctx, ret, true, rt);
     }
     else if (f.constant && jl_isa(f.constant, (jl_value_t*)jl_builtin_type)) {
+        // A TypedCallable construction that the optimizer resolved to the 4-arg form
+        // carries its dispatch trampoline as a constant. Register it for AOT adapter
+        // emission (same pipeline as @cfunction trampolines: generate_cfunc_thunks);
+        // the construction itself still goes through the builtin call below.
+        if (f.constant == BUILTIN(_typed_callable) && nargs == 5 && argv[1].constant &&
+            jl_typetagis(argv[1].constant, jl_dispatch_trampoline_type)) {
+            jl_dispatch_trampoline_t *tr = (jl_dispatch_trampoline_t*)argv[1].constant;
+            jl_value_t *adapter_sigt = jl_typed_callable_adapter_sigt(tr->sigt, tr->rt);
+            jl_temporary_root(ctx, adapter_sigt);
+            jl_temporary_root(ctx, (jl_value_t*)tr); // keep alive through codegen + serialization
+            jl_abi_t tc_abi = {adapter_sigt, tr->rt, jl_nparams(adapter_sigt),
+                               /*specsig*/1, JL_ABI_TYPED_CALLABLE};
+            ctx.emission_context.cfuncs.push_back({tc_abi, tr});
+        }
         jl_cgval_t result;
         bool handled = emit_builtin_call(ctx, &result, f.constant, argv, nargs - 1, rt, ex, is_promotable);
         if (handled)

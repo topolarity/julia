@@ -612,7 +612,11 @@ static void emit_trampoline_adapter(jl_codegen_output_t &out, jl_dispatch_trampo
     JL_GC_PROMISE_ROOTED(sigt);
     jl_value_t *declrt = from_abi.rt;
     JL_GC_PROMISE_ROOTED(declrt);
-    jl_method_instance_t *mi = (jl_method_instance_t*)jl_get_specialization1((jl_tupletype_t*)sigt, latestworld);
+    // Resolve the dispatch target from the trampoline's *resolution* sig. For STD
+    // (@cfunction/@ccallable) it equals the adapter sig `from_abi.sigt`; for
+    // `JL_ABI_TYPED_CALLABLE` the adapter sig has the type-erased wrapper at slot 0
+    // and only `tr->sigt` names the target.
+    jl_method_instance_t *mi = (jl_method_instance_t*)jl_get_specialization1((jl_tupletype_t*)tr->sigt, latestworld);
     jl_code_instance_t *codeinst = nullptr;
     if ((jl_value_t*)mi != jl_nothing) {
         auto it = compiled_mi.find(mi);
@@ -623,11 +627,12 @@ static void emit_trampoline_adapter(jl_codegen_output_t &out, jl_dispatch_trampo
     if (codeinst) {
         JL_GC_PROMISE_ROOTED(codeinst);
         jl_value_t *astrt = codeinst->rettype;
-        if (astrt != (jl_value_t*)jl_bottom_type &&
+        if (from_abi.kind == JL_ABI_STD && astrt != (jl_value_t*)jl_bottom_type &&
             jl_type_intersection(astrt, declrt) == jl_bottom_type) {
             // Do not warn if the function never returns since it is occasionally required by
             // the C API (typically error callbacks) even though we're likely to encounter
-            // memory errors in that case.
+            // memory errors in that case. (A TypedCallable enforces `R` with a typeassert
+            // in its adapter instead.)
             jl_printf(JL_STDERR, "WARNING: cfunction: return type of %s does not match\n", name_from_method_instance(mi));
         }
         const auto &decls = out.ci_funcs.find(codeinst)->second;
@@ -674,9 +679,11 @@ static void emit_trampoline_adapter(jl_codegen_output_t &out, jl_dispatch_trampo
     out.adapter_funcs.push_back({rec, F});
 }
 
-// Emit the adapter for each @cfunction/@ccallable dispatch trampoline (kind=STD, so the
-// adapter sig is the call sig as-is). Replaces the old cfuncdata-array fill; the serializer
-// wires the adapter into the image trampoline's `last_invokee` (jl_get_trampoline_invokee).
+// Emit the adapter for each dispatch trampoline registered during codegen: @cfunction/
+// @ccallable call sites (kind=STD, adapter sig = call sig as-is) and resolved TypedCallable
+// construction sites (kind=TYPED_CALLABLE, adapter sig has the wrapper at slot 0). The
+// serializer wires the adapter into the image trampoline's `last_invokee`
+// (jl_get_trampoline_invokee).
 // Call sites sharing one trampoline (same sigt/rt/specsig) are deduplicated here, so
 // each trampoline yields exactly one adapter record and one unspecialized record.
 static void generate_cfunc_thunks(jl_codegen_output_t &out) JL_CANSAFEPOINT
