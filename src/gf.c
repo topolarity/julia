@@ -3094,6 +3094,168 @@ static int has_key(jl_genericmemory_t *keys, jl_value_t *key)
     return 0;
 }
 
+// === world-dependent specificity visibility (scaffolding) ===
+//
+// A strict type-specificity win of `winner` over `loser` (when winner.sig is not
+// a subtype of loser.sig) is only respected when
+//     moduletype(winner.sig) <: moduletype(loser.sig)
+// over the `using` graph at `world`: every package root required to spell the
+// loser's signature must be in the using-closure of some root required to spell
+// the winner's signature (a root reaches itself). Subtype-backed wins are exempt:
+// they are implied by the immutable type hierarchy. Wins without visibility are
+// treated as pairwise ambiguity by the interference-resolution queries at query
+// time; the interference sets themselves always record the pure type relation.
+//
+// Modes: 0 = off (every win is visible; current dispatch semantics),
+//        1 = measure (log would-be demotions, then treat as visible anyway),
+//        2 = enforce.
+static _Atomic(int) specificity_visibility_mode = 0;
+
+JL_DLLEXPORT void jl_set_specificity_visibility_mode(int mode)
+{
+    jl_atomic_store_relaxed(&specificity_visibility_mode, mode);
+}
+
+JL_DLLEXPORT int jl_get_specificity_visibility_mode(void)
+{
+    return jl_atomic_load_relaxed(&specificity_visibility_mode);
+}
+
+// moduletype(t): the distinct package roots required to spell the type `t`,
+// approximated by walking every TypeName reachable in it (parameters, typevar
+// bounds, and value-parameters via typeof). PLACEHOLDER for the eventual
+// "roots required to spell any non-Union{} subtype of t" operator (which e.g.
+// would charge only one arm of a Union); the walk over-approximates, which errs
+// toward blocking (treating wins as ambiguous). Core and Base are omitted: they
+// are in every module's closure at every world. Depth-capped: pathological types
+// under-approximate their moduletype, which errs toward visibility (i.e. current
+// behavior).
+static void collect_sig_moduletype(jl_value_t *t, arraylist_t *roots, int depth)
+{
+    if (t == NULL || depth > 100)
+        return;
+    if (jl_is_uniontype(t)) {
+        collect_sig_moduletype(((jl_uniontype_t*)t)->a, roots, depth + 1);
+        collect_sig_moduletype(((jl_uniontype_t*)t)->b, roots, depth + 1);
+        return;
+    }
+    if (jl_is_unionall(t)) {
+        collect_sig_moduletype((jl_value_t*)((jl_unionall_t*)t)->var, roots, depth + 1);
+        collect_sig_moduletype(((jl_unionall_t*)t)->body, roots, depth + 1);
+        return;
+    }
+    if (jl_is_typevar(t)) {
+        collect_sig_moduletype(((jl_tvar_t*)t)->lb, roots, depth + 1);
+        collect_sig_moduletype(((jl_tvar_t*)t)->ub, roots, depth + 1);
+        return;
+    }
+    if (jl_is_vararg(t)) {
+        jl_vararg_t *v = (jl_vararg_t*)t;
+        if (v->T)
+            collect_sig_moduletype(v->T, roots, depth + 1);
+        if (v->N)
+            collect_sig_moduletype(v->N, roots, depth + 1);
+        return;
+    }
+    if (jl_is_datatype(t)) {
+        jl_datatype_t *dt = (jl_datatype_t*)t;
+        jl_packageroot_t *root = jl_module_package(dt->name->module);
+        if (root != NULL &&
+            !(jl_core_module && root == jl_core_module->package) &&
+            !(jl_base_module && root == jl_base_module->package)) {
+            int present = 0;
+            for (size_t i = 0; i < roots->len; i++) {
+                if (roots->items[i] == (void*)root) {
+                    present = 1;
+                    break;
+                }
+            }
+            if (!present)
+                arraylist_push(roots, root);
+        }
+        for (size_t i = 0; i < jl_nparams(dt); i++)
+            collect_sig_moduletype(jl_tparam(dt, i), roots, depth + 1);
+        return;
+    }
+    // a value-parameter: attribute it to the package of its type
+    if (!jl_is_type(t))
+        collect_sig_moduletype(jl_typeof(t), roots, depth + 1);
+}
+
+// If `min_valid`/`max_valid` are non-NULL, they are narrowed (intersected) to a
+// world interval containing `world` over which the returned verdict is known to
+// hold. The directional verdict is a conjunction of per-loser-root reach
+// witnesses: a positive verdict is valid over the intersection of its witness
+// intervals; a negative verdict is justified by its failing root alone, valid
+// over the intersection of that root's per-winner-root failure intervals.
+JL_DLLEXPORT int jl_method_morespecific_visible(jl_method_t *winner, jl_method_t *loser, size_t world,
+                                                size_t *min_valid, size_t *max_valid)
+{
+    int mode = jl_atomic_load_relaxed(&specificity_visibility_mode);
+    if (mode == 0)
+        return 1; // scaffolding: mode changes are not world-tracked, no narrowing
+    // subtype-backed wins are implied by the (immutable) type hierarchy
+    if (jl_subtype((jl_value_t*)winner->sig, (jl_value_t*)loser->sig))
+        return 1;
+    arraylist_t lmt, wmt;
+    arraylist_new(&lmt, 8);
+    arraylist_new(&wmt, 8);
+    collect_sig_moduletype((jl_value_t*)loser->sig, &lmt, 0);
+    collect_sig_moduletype((jl_value_t*)winner->sig, &wmt, 0);
+    // moduletype(winner.sig) <: moduletype(loser.sig) over the `using` graph:
+    // every loser root must be in the using-closure of some winner root
+    int ok = 1;
+    size_t vmin = 1, vmax = ~(size_t)0;
+    for (size_t i = 0; i < lmt.len; i++) {
+        jl_packageroot_t *r = (jl_packageroot_t*)lmt.items[i];
+        int found = 0;
+        size_t neg_min = 1, neg_max = ~(size_t)0;
+        for (size_t j = 0; j < wmt.len; j++) {
+            jl_packageroot_t *wr = (jl_packageroot_t*)wmt.items[j];
+            if (wr == r) {
+                found = 1; // permanent witness (a package reaches itself)
+                break;
+            }
+            size_t pmin = 1, pmax = ~(size_t)0;
+            if (jl_packageroot_reaches(wr, r, world, &pmin, &pmax)) {
+                // the verdict holds while this witness holds
+                if (vmin < pmin)
+                    vmin = pmin;
+                if (vmax > pmax)
+                    vmax = pmax;
+                found = 1;
+                break;
+            }
+            // a failed disjunct constrains only the negative verdict
+            if (neg_min < pmin)
+                neg_min = pmin;
+            if (neg_max > pmax)
+                neg_max = pmax;
+        }
+        if (!found) {
+            // the failing root alone justifies the negative verdict
+            ok = 0;
+            vmin = neg_min;
+            vmax = neg_max;
+            break;
+        }
+    }
+    arraylist_free(&wmt);
+    arraylist_free(&lmt);
+    if (!ok && mode == 1) {
+        jl_safe_printf("SPECIFICITY VISIBILITY: would demote win of %s.%s over %s.%s at world %zu\n",
+                       jl_symbol_name(jl_module_pkgroot(winner->module)->name), jl_symbol_name(winner->name),
+                       jl_symbol_name(jl_module_pkgroot(loser->module)->name), jl_symbol_name(loser->name),
+                       world);
+        return 1; // measure mode: unjustified verdict, no narrowing
+    }
+    if (min_valid && *min_valid < vmin)
+        *min_valid = vmin;
+    if (max_valid && *max_valid > vmax)
+        *max_valid = vmax;
+    return ok;
+}
+
 // Check if m2 is in m1's interferences set, which means !morespecific(m1, m2)
 static int method_in_interferences(jl_method_t *m2, jl_method_t *m1)
 {
@@ -3113,7 +3275,8 @@ static int find_method_in_matches(jl_array_t *t, jl_method_t *method)
 }
 
 // Recursively check if any method in interferences covers the given type signature
-static int check_interferences_covers(jl_method_t *m, jl_value_t *ti, jl_array_t *t, arraylist_t *visited, arraylist_t *seen)
+static int check_interferences_covers(jl_method_t *m, jl_value_t *ti, jl_array_t *t, size_t world,
+                                      arraylist_t *visited, arraylist_t *seen)
 {
     arraylist_t workqueue;
     arraylist_new(&workqueue, 0);
@@ -3160,7 +3323,8 @@ cleanup:
     return result;
 }
 
-static int check_fully_ambiguous(jl_method_t *m, jl_value_t *ti, jl_array_t *t, int include_ambiguous, int *has_ambiguity)
+static int check_fully_ambiguous(jl_method_t *m, jl_value_t *ti, jl_array_t *t, size_t world,
+                                 int include_ambiguous, int *has_ambiguity)
 {
     jl_genericmemory_t *interferences = jl_atomic_load_relaxed(&m->interferences);
     for (size_t i = 0; i < interferences->length; i++) {
@@ -3180,7 +3344,7 @@ static int check_fully_ambiguous(jl_method_t *m, jl_value_t *ti, jl_array_t *t, 
 }
 
 // Recursively check if target_method is in the interferences of (morespecific than) start_method, but not the reverse
-static int method_morespecific_via_interferences(jl_method_t *target_method, jl_method_t *start_method)
+static int method_morespecific_via_interferences(jl_method_t *target_method, jl_method_t *start_method, size_t world)
 {
     if (target_method == start_method)
         return 0;
@@ -5296,7 +5460,7 @@ typedef struct {
 //  * -1: too many matches for lim, other outputs are undefined
 //  *  0: the child(ren) have been added to the output
 //  * 1+: the children are part of this SCC (up to this depth)
-static int sort_mlmatches(jl_array_t *t, size_t idx, arraylist_t *visited, arraylist_t *stack, arraylist_t *result, arraylist_t *recursion_stack, int lim, int include_ambiguous, int *has_ambiguity, int *found_minmax)
+static int sort_mlmatches(jl_array_t *t, size_t idx, arraylist_t *visited, arraylist_t *stack, arraylist_t *result, arraylist_t *recursion_stack, int lim, int include_ambiguous, size_t world, int *has_ambiguity, int *found_minmax)
 {
     // Use arraylist_t for explicit stack of processing frames
     arraylist_t frame_stack;
@@ -5426,10 +5590,10 @@ static int sort_mlmatches(jl_array_t *t, size_t idx, arraylist_t *visited, array
                     if (*found_minmax == 2)
                         visited->items[current->idx] = (void*)1;
                 }
-                else if (check_interferences_covers(current->m, current->ti, t, visited, recursion_stack)) {
+                else if (check_interferences_covers(current->m, current->ti, t, world, visited, recursion_stack)) {
                     visited->items[current->idx] = (void*)1;
                 }
-                else if (check_fully_ambiguous(current->m, current->ti, t, include_ambiguous, has_ambiguity)) {
+                else if (check_fully_ambiguous(current->m, current->ti, t, world, include_ambiguous, has_ambiguity)) {
                     visited->items[current->idx] = (void*)1;
                 }
 
@@ -5694,7 +5858,7 @@ static jl_value_t *ml_matches(jl_methtable_t *mt, jl_methcache_t *mc,
                     jl_method_match_t *matc2 = (jl_method_match_t*)jl_array_ptr_ref(env.t, j);
                     if (matc2->fully_covers == FULLY_COVERS) {
                         jl_method_t *m2 = matc2->method;
-                        if (!method_morespecific_via_interferences(m, m2))
+                        if (!method_morespecific_via_interferences(m, m2, world))
                             break;
                     }
                 }
@@ -5726,7 +5890,7 @@ static jl_value_t *ml_matches(jl_methtable_t *mt, jl_methcache_t *mc,
                 if (matc->fully_covers != FULLY_COVERS) {
                     jl_method_t *m = matc->method;
                     if (minmaxm) {
-                        if (method_morespecific_via_interferences(minmaxm, m)) {
+                        if (method_morespecific_via_interferences(minmaxm, m, world)) {
                             matc->fully_covers = SENTINEL; // put a sentinel value here for sorting
                             continue;
                         }
@@ -5795,7 +5959,7 @@ static jl_value_t *ml_matches(jl_methtable_t *mt, jl_methcache_t *mc,
                 // by visiting it and it might be a bit costly
                 continue;
             }
-            int child_cycle = sort_mlmatches((jl_array_t*)env.t, i, &visited, &stack, &result, &recursion_stack, lim == -1 || minmax == NULL ? lim : lim - 1, include_ambiguous, &has_ambiguity, &found_minmax);
+            int child_cycle = sort_mlmatches((jl_array_t*)env.t, i, &visited, &stack, &result, &recursion_stack, lim == -1 || minmax == NULL ? lim : lim - 1, include_ambiguous, world, &has_ambiguity, &found_minmax);
             if (child_cycle == -1) {
                 arraylist_free(&recursion_stack);
                 arraylist_free(&visited);
