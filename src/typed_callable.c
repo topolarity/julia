@@ -37,6 +37,27 @@ JL_DLLEXPORT jl_value_t *jl_typed_callable_adapter_sigt(jl_value_t *tramp_sigt, 
     return adapter_sigt;
 }
 
+// Get (or create) the shared dispatch trampoline for a callable of type `ftype`
+// invoked as `f(args::A...)` returning `rt`, without constructing a TypedCallable.
+// Used by the optimizer's construction-site transform (`handle_typed_callable_call!`):
+// it resolves the trampoline at compile time and rewrites the construction to the
+// 4-arg builtin form, so the runtime cache lookup is skipped (and, for images, the
+// serialized record is the one the construction will use -- no runtime JIT). `ftype`
+// is the *type* of the callable (e.g. `typeof(f)`), matching the key
+// `jl_new_typed_callable` derives via `jl_argtype_with_function`.
+JL_DLLEXPORT jl_dispatch_trampoline_t *jl_get_typed_callable_trampoline(jl_value_t *ftype, jl_value_t *argt, jl_value_t *rt) JL_CANSAFEPOINT
+{
+    if (!jl_is_tuple_type(argt))
+        jl_error("TypedCallable argument tuple must be a tuple type");
+    JL_TYPECHK(TypedCallable, type, rt);
+    jl_value_t *sigt = NULL;
+    JL_GC_PUSH1(&sigt);
+    sigt = jl_argtype_with_function_type(ftype, argt);
+    jl_dispatch_trampoline_t *tr = jl_get_dispatch_trampoline(sigt, rt, /*specsig*/1, JL_ABI_TYPED_CALLABLE);
+    JL_GC_POP();
+    return tr;
+}
+
 // Construct a `TypedCallable{argt,rt}` wrapping `f`. If `tr != NULL` it is used as
 // the dispatch trampoline directly (the optimized 4-arg builtin form: the optimizer
 // resolved it at compile time, so the runtime cache lookup is skipped); otherwise

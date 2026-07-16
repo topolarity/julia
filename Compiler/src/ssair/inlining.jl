@@ -1270,6 +1270,14 @@ function process_simple!(todo::Vector{Pair{Int,Any}}, ir::IRCode, idx::Int, flag
 
     if is_builtin(optimizer_lattice(state.interp), sig)
         let f = sig.f
+            if f === Core._typed_callable
+                # Resolve the dispatch trampoline of a statically-resolvable TypedCallable
+                # construction (the 3-arg -> 4-arg rewrite; see handle_typed_callable_call!).
+                # `_typed_callable` is a plain builtin (NoCallInfo), so it must be handled
+                # here rather than in the method-call dispatch of `assemble_inline_todo!`.
+                handle_typed_callable_call!(ir, idx, stmt, sig)
+                return nothing
+            end
             if (f !== Core.invoke &&
                 f !== Core.finalizer &&
                 f !== modifyfield! &&
@@ -1532,6 +1540,31 @@ function handle_modifyop!_call!(ir::IRCode, idx::Int, stmt::Expr, info::ModifyOp
     stmt.head = :invoke_modify
     pushfirst!(stmt.args, case.invoke)
     ir[SSAValue(idx)][:stmt] = stmt
+    return nothing
+end
+
+# Resolve the dispatch trampoline for a `Core._typed_callable(f, A, R)` construction when
+# it is statically resolvable, rewriting it to the optimized 4-arg form
+# `Core._typed_callable(trampoline, f, A, R)`. The constructed `TypedCallable` then stores
+# the supplied trampoline directly instead of looking it up in the runtime trampoline
+# cache (analogous to the `:call` -> `:invoke` devirtualization). Sound for any world: the
+# trampoline dispatches `f(::A...)` in the *latest* world via its own polling, so unlike an
+# `:invoke` CodeInstance it needs no backedge. Applicable exactly when the type is a
+# dispatch leaf with a concrete argument tuple and return type (the same gate
+# `collectinvokes!` uses for --trim).
+function handle_typed_callable_call!(ir::IRCode, idx::Int, stmt::Expr, sig::Signature)
+    argtypes = sig.argtypes
+    length(argtypes) == 4 || return nothing # not the 3-arg form (already resolved, or malformed)
+    ft = widenconst(argtypes[2])
+    isdispatchelem(ft) || return nothing
+    AT, A_exact = instanceof_tfunc(argtypes[3])
+    RT, R_exact = instanceof_tfunc(argtypes[4])
+    (A_exact && R_exact && isa(AT, DataType) && AT <: Tuple && isa(RT, Type)) || return nothing
+    (has_free_typevars(AT) || has_free_typevars(RT)) && return nothing
+    # Get the canonical trampoline for (Tuple{ft, AT...}, RT) and store it as a constant
+    # leading argument. `ft` matches the runtime's `jl_argtype_with_function` key.
+    tr = ccall(:jl_get_typed_callable_trampoline, Any, (Any, Any, Any), ft, AT, RT)
+    insert!(stmt.args, 2, tr) # _typed_callable(f, A, R) -> _typed_callable(tr, f, A, R)
     return nothing
 end
 
