@@ -91,10 +91,38 @@ function _test_cat()
 end
 
 
+# A finalizer registered from reachable code. Its target is reached only via the
+# finalizer/invokelatest edge (not a static invoke), so the kept set must include it or
+# it MethodErrors at GC time -- a regression test for that soundness hole.
+mutable struct FinResource; id::Int; end
+function fin_cleanup(r::FinResource)
+    println(Core.stdout, "finalized resource ", r.id)
+    return nothing
+end
+@noinline function register_fin()
+    r = FinResource(99)
+    finalizer(fin_cleanup, r)
+    return nothing
+end
+
+# A TypedCallable constructed in reachable code: the optimizer resolves its dispatch
+# trampoline, codegen emits the trampoline's adapter into the image, and
+# `collectinvokes!` ships the dispatched target -- so calling it needs no runtime JIT.
+tc_add(x::Int)::Int = x + 1
+@noinline make_tc() = Core.TypedCallable{Tuple{Int},Int}(tc_add)
+call_tc(t::Core.TypedCallable{Tuple{Int},Int}, x::Int) = t(x)
+
 function @main(args::Vector{String})::Cint
     println(Core.stdout, str())
     println(Core.stdout, PROGRAM_FILE)
     foreach(x->println(Core.stdout, x), args)
+
+    # TypedCallable dispatched through its image-serialized adapter
+    println(Core.stdout, call_tc(make_tc(), 41))
+
+    # Register a finalizer and force collection so it runs before exit.
+    register_fin()
+    GC.gc(true); GC.gc(true)
 
     # test map/mapreduce; should work but relies on inlining and other optimizations
     # test that you can dispatch to some number of concrete cases

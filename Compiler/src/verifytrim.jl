@@ -279,6 +279,7 @@ function may_dispatch(@nospecialize ftyp)
                Core.invoke_in_world isa ftyp ||
                Core.invokelatest isa ftyp ||
                Core.finalizer isa ftyp ||
+               Core._typed_callable isa ftyp ||
                Core.modifyfield! isa ftyp ||
                Core.modifyglobal! isa ftyp ||
                Core.memoryrefmodify! isa ftyp
@@ -356,6 +357,27 @@ function verify_codeinstance!(interp::NativeInterpreter, codeinst::CodeInstance,
 
                         error = "unresolved finalizer registered"
                     end
+                elseif Core._typed_callable isa ftyp
+                    # A TypedCallable dispatches `f(::A...)` in the *latest* world through
+                    # its trampoline's adapter, which codegen emits at the construction
+                    # site of the optimizer-resolved 4-arg form
+                    # `Core._typed_callable(tr, f, A, R)` -- we rely on that form here just
+                    # as we rely on the CodeInstance in `Expr(:invoke, ci, ...)` for static
+                    # dispatch. The dispatched target must be compiled and shipped so the
+                    # adapter reaches it without JIT. A 3-arg construction means the
+                    # trampoline could not be resolved statically (an unresolved dynamic
+                    # dispatch); there is no JIT under --trim to recover it.
+                    tr = length(stmt.args) == 5 ? stmt.args[2] : nothing
+                    if tr isa Core.DispatchTrampoline
+                        mi = compileable_specialization_for_call(interp, getfield(tr, :sigt))
+                        if mi !== nothing
+                            ci = get(caches, mi, nothing)
+                            ci isa CodeInstance && continue
+                        end
+                        error = "unresolved TypedCallable target"
+                    else
+                        error = "unresolved TypedCallable construction"
+                    end
                 elseif Core._apply isa ftyp
                     error = "trim verification not yet implemented for builtin `Core._apply`"
                 elseif Core._call_in_world_total isa ftyp
@@ -373,6 +395,16 @@ function verify_codeinstance!(interp::NativeInterpreter, codeinst::CodeInstance,
                 elseif Core.memoryrefmodify! isa ftyp
                     error = "trim verification not yet implemented for builtin `Core.memoryrefmodify!`"
                 else @assert false "unexpected builtin" end
+            elseif ftyp <: Core.OpaqueClosure
+                # Invoking an OpaqueClosure jumps through its `invoke` pointer (or the
+                # fixed builtin method) -- no call-site method resolution; the body is
+                # accounted for where the OC was created.
+                continue
+            elseif ftyp <: Core.TypedCallable
+                # Likewise a TypedCallable jumps through its trampoline's adapter (or the
+                # fixed builtin method); the adapter and target are verified at the
+                # `Core._typed_callable` construction site above.
+                continue
             else
                 error = "unresolved call"
             end

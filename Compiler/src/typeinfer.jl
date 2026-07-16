@@ -1669,6 +1669,17 @@ function collectinvokes!(workqueue::CompilationQueue, ci::CodeInfo, sptypes::Vec
                 finalizer = argextype(stmt.args[2], ci, sptypes)
                 obj = argextype(stmt.args[3], ci, sptypes)
                 atype = argtypes_to_type(Any[finalizer, obj])
+            elseif ftyp === typeof(Core._typed_callable) && length(stmt.args) == 5
+                # A statically-resolved TypedCallable construction (the 4-arg form
+                # `_typed_callable(tr, f, A, R)`; see the inlining transform) carries its
+                # dispatch trampoline directly. Enqueue the trampoline's latest-world
+                # dispatch target so it is compiled into the image: codegen emits the
+                # trampoline's adapter at this construction site, and that adapter calls
+                # the target's compiled entry point (no JIT under --trim). An unresolved
+                # 3-arg construction is flagged by the TrimVerifier instead.
+                tr = stmt.args[2]
+                tr isa Core.DispatchTrampoline || continue
+                atype = getfield(tr, :sigt)
             else
                 # No dynamic dispatch to resolve / enqueue
                 continue

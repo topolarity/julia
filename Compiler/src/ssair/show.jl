@@ -171,6 +171,12 @@ function print_stmt(io::IO, idx::Int, @nospecialize(stmt), code::Union{IRCode,Co
             else
                 printstyled(io, "  builtin "; color = :light_black)
             end
+        elseif widenconst(ft) <: Core.OpaqueClosure
+            # Invoking an OpaqueClosure (not constructing one) is not a dynamic dispatch
+            printstyled(io, "  builtin "; color = :light_black)
+        elseif widenconst(ft) <: Core.TypedCallable
+            # Likewise, invoking a TypedCallable jumps through its trampoline, not dispatch
+            printstyled(io, "  builtin "; color = :light_black)
         elseif ft === nothing
             # This should only happen when, e.g., printing a call that targets
             # an out-of-bounds SSAValue or similar
