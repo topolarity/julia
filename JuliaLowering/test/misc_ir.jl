@@ -145,7 +145,7 @@ _ + 1
 #---------------------
 LoweringError:
 (; a=1, bs..., c=3, a=2)
-#                   ╙ ── Repeated named tuple field name
+#                   ╙ ── field name "a" repeated in named tuple
 
 ########################################
 # Error: Named tuple frankentuple
@@ -170,7 +170,7 @@ splatting can only be done into a `call`, `tuple`, `curly`, or array-like expres
 #---------------------
 LoweringError:
 (; a[]=1)
-#  └─┘ ── expected identifier
+#  └─┘ ── invalid named tuple field name "a[]"
 
 ########################################
 # Error: Named tuple element with weird dot syntax
@@ -186,7 +186,7 @@ LoweringError:
 #---------------------
 LoweringError:
 (; a=1, f())
-#       └─┘ ── expected identifier, `=`, or `...` after semicolon
+#       └─┘ ── invalid named tuple element "f()"
 
 ########################################
 # Error: Modules not allowed inside blocks

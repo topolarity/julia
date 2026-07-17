@@ -1728,7 +1728,9 @@ function _merge_named_tuple(ctx, srcref, old, new)
 end
 
 function expand_named_tuple(ctx, ex, kws; field_name="named tuple field",
-                            element_name="named tuple element")
+                            element_name="named tuple element",
+                            repeated_field_message=name_str ->
+                                "field name \"$name_str\" repeated in named tuple")
     name_strs = Set{String}()
     names = SyntaxList(ctx)
     values = SyntaxList(ctx)
@@ -1779,7 +1781,7 @@ function expand_named_tuple(ctx, ex, kws; field_name="named tuple field",
             if kind(name) == K"Symbol"
                 name_str = name.name_val
                 if name_str in name_strs
-                    throw(LoweringError(name, "Repeated $field_name name"))
+                    throw(LoweringError(name, repeated_field_message(name_str)))
                 end
                 push!(name_strs, name_str)
             end
@@ -1858,7 +1860,9 @@ function expand_kw_call(ctx, srcref, farg, all_args)
         stmts...
         kw_container := expand_named_tuple(ctx, srcref, kws;
                                            field_name="keyword argument",
-                                           element_name="keyword argument")
+                                           element_name="keyword argument",
+                                           repeated_field_message=_ ->
+                                               "Repeated keyword argument name")
         if all(kind(kw) == K"..." for kw in kws)
             # In this case need to check kws nonempty at runtime
             [K"if"

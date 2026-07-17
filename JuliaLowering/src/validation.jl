@@ -468,7 +468,7 @@ function vst1_importpath(vcx, st; dots_ok)
 end
 
 vst1_tuple(vcx, st) = @stm st begin
-    [K"tuple" [K"parameters" kws...]] -> all(vst1_call_kwarg, vcx, kws)
+    [K"tuple" [K"parameters" kws...]] -> all(vst1_nt_element, vcx, kws)
     [K"tuple" [K"parameters" _ _...] _ _...] -> @fail(
         st[1], "cannot mix tuple `(a,b,c)` and named tuple `(;a,b,c)` syntax")
     ([K"tuple" args...], when=any(x->kind(x)===K"=", args)) ->
@@ -634,6 +634,37 @@ vst1_call_kwarg(vcx, st) = @stm st begin
     ([K"call" [K"Identifier"] symval v], when=(st[1].name_val==="=>")) ->
         vst1(vcx, symval) & vst1(vcx, v)
     _ -> @fail(st, "expected identifier, `=`, or `...` after semicolon")
+end
+
+# Deparse a pre-desugaring subtree to Julia source text for interpolation into
+# error messages, mirroring flisp's `deparse` (flisp interpolates the offending
+# element into `invalid named tuple element "..."`-style diagnostics). Uses the
+# AST, not the source, so it works on programmatically-constructed input too
+# (e.g. macro output with no source text).
+_deparse_for_msg(st::SyntaxTree) = string(est_to_expr(st))
+
+# Element of a named tuple `(; ...)` (post-semicolon).  Accepts exactly what
+# `vst1_call_kwarg` does, but reports failures with flisp's named-tuple wording
+# -- `invalid named tuple element "..."` for a bare non-field element and
+# `invalid named tuple field name "..."` for an `x = v`/`x kw v` with an invalid
+# field name -- interpolating the deparsed offending subtree as flisp does.
+# (Keyword-argument calls keep `vst1_call_kwarg`, whose wording flisp words
+# differently and which is intentionally left unchanged.)
+vst1_nt_element(vcx, st) = @stm st begin
+    [K"Identifier"] -> pass()
+    [K"kw" id val] -> vst1_nt_field_name(vcx, id) & vst1(vcx, val)
+    [K"=" id val] -> vst1_nt_field_name(vcx, id) & vst1(vcx, val)
+    [K"..." x] -> vst1(vcx, x)
+    [K"." x [K"inert" id]] -> vst1(vcx, x) & vst1_ident(vcx, id; lhs=true)
+    [K"." x [K"syntaxinert" id]] -> vst1(vcx, x) & vst1_ident(vcx, id; lhs=true)
+    ([K"call" [K"Identifier"] symval v], when=(st[1].name_val==="=>")) ->
+        vst1(vcx, symval) & vst1(vcx, v)
+    _ -> @fail(st, "invalid named tuple element \"$(_deparse_for_msg(st))\"")
+end
+
+vst1_nt_field_name(vcx, st) = @stm st begin
+    [K"Identifier"] -> vst1_ident(vcx, st; lhs=true)
+    _ -> @fail(st, "invalid named tuple field name \"$(_deparse_for_msg(st))\"")
 end
 
 vst1_lam(vcx, st) = let

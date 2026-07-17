@@ -402,4 +402,52 @@ end
         broken_convert = (e, fb) -> error("conversion machinery broke")
         @test JL._macroexpansion_loaderror_total(exc, lnn, broken_convert) === exc
     end
+
+    @testset "(AI) named-tuple message parity + `syntax:` prefix" begin
+        # Found via AtBackslash v0.1.0 in a PkgEval comparison against flisp
+        # lowering. Its `@\` macro emits a named tuple with a call element
+        # (`Expr(:tuple, Expr(:parameters, :(f(x))))`), and its test asserts
+        # flisp's exact message `syntax: invalid named tuple element "f(x)"` is a
+        # substring of `sprint(showerror, err)`. JuliaLowering both rejected the
+        # shape (behavioral parity held) *and* worded it differently
+        # ("expected identifier, `=`, or `...` after semicolon", no `syntax:`
+        # prefix), so only the message diverged.
+        #
+        # flisp surfaces every lowering error's `Expr(:error, msg)` sentinel as
+        # `syntax: <msg>` (`src/toplevel.c`); the flisp-compat boundaries
+        # (`eval_flisp_compat` / `core_lowering_hook`) mirror that prefix, and the
+        # named-tuple element/field-name/duplicate messages are worded like flisp
+        # with the offending subtree deparsed and interpolated.
+
+        # The exact AtBackslash reproduction: the `@\` macro's `Expr` output.
+        atbackslash_shape = Expr(:tuple, Expr(:parameters, :(f(x))))
+        err = try; JL.eval_flisp_compat(test_mod, atbackslash_shape); catch e; e; end
+        @test err isa ErrorException
+        @test occursin("syntax: invalid named tuple element \"f(x)\"", err.msg)
+
+        # Named-tuple message family (surface syntax; via the flisp-compat
+        # boundary, so the `syntax:` prefix is included), each matching flisp.
+        nt_cases = [
+            "(; f(x))"     => "syntax: invalid named tuple element \"f(x)\"",
+            "(; 1)"        => "syntax: invalid named tuple element \"1\"",
+            "(; f(x)=1)"   => "syntax: invalid named tuple field name \"f(x)\"",
+            "(; a[]=1)"    => "syntax: invalid named tuple field name \"a[]\"",
+            "(; a=1, a=2)" => "syntax: field name \"a\" repeated in named tuple",
+        ]
+        for (src, msg) in nt_cases
+            e = try; JL.eval_flisp_compat(test_mod, parsestmt(JL.SyntaxTree, src)); catch e; e; end
+            @test e isa ErrorException
+            @test e.msg == msg
+        end
+
+        # Regression guard: keyword-argument calls share the underlying
+        # validation/desugaring but flisp words them differently; those messages
+        # are intentionally left unchanged (only the `syntax:` prefix is added).
+        # They must NOT pick up the named-tuple wording.
+        for src in ("f(; g(x))", "f(; a=1, a=2)")
+            e = try; JL.eval_flisp_compat(test_mod, parsestmt(JL.SyntaxTree, src)); catch e; e; end
+            @test e isa ErrorException
+            @test !occursin("named tuple", e.msg)
+        end
+    end
 end

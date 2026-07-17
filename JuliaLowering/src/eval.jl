@@ -1119,6 +1119,12 @@ end
 # (" around file:line") when available.
 function _lowering_error_message(exc::LoweringError)
     io = IOBuffer()
+    # flisp surfaces every lowering error's `Expr(:error, msg)` sentinel through
+    # `jl_toplevel_eval_flex`, which throws it as `syntax: <msg>` (see
+    # `src/toplevel.c`). Mirror that prefix here so packages asserting flisp's
+    # exact `syntax: ...` text keep matching (found via AtBackslash's
+    # `invalid named tuple element` check in a PkgEval comparison against flisp).
+    print(io, "syntax: ")
     for i in eachindex(exc.msgs)
         i > 1 && print(io, '\n')
         print(io, exc.msgs[i])
