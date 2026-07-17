@@ -173,7 +173,16 @@ function _eval_dot(world::UInt, mod, ex::SyntaxTree)
     if k === K"Value"
         return ex.value
     elseif k === K"Identifier"
-        return _invoke_in_world(world, getproperty, mod, Symbol(ex.name_val))
+        # Honor the identifier's own `:mod` attribute if it carries one (e.g. a
+        # `GlobalRef` splatted into the name by an `Expr`-manipulating macro,
+        # ingested by `expr_to_est` as a `K"Identifier"` with `:mod`), matching
+        # `eval_macro_name`'s top-level `K"Identifier"` case. `syntax_module`
+        # falls back to the node's layer module when there is no `:mod`; for any
+        # surface-syntax input that equals the ambient `mod` (a dot-macro-name's
+        # leftmost leaf can only differ in hygiene layer from its dot node via
+        # `Expr` surgery that splits an `esc` across them, which flisp rejects
+        # outright), so plainly-parsed names are unaffected.
+        return _invoke_in_world(world, getproperty, syntax_module(ex), Symbol(ex.name_val))
     elseif k === K"." && numchildren(ex) == 2
         lhs = _eval_dot(world, mod, ex[1])
         lhs isa NotAName && return lhs

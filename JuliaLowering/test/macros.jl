@@ -3451,3 +3451,89 @@ end
     Core.@latestworld
     @test mjl2.results() == false
 end
+
+@testset "(AI) `.`-qualified macro name honors a GlobalRef qualifier's own module" begin
+    # A `.`-qualified macro name whose leftmost qualifier is an already-resolved
+    # `GlobalRef` value (spliced in by ordinary `Expr`-manipulating code, not
+    # written as source syntax) must resolve that qualifier in the GlobalRef's
+    # *own* module, exactly as flisp does -- even when the macrocall is emitted
+    # inside a freshly-created `Expr(:module, ...)` whose body evaluates in a
+    # different ambient module.  `expr_to_est` ingests such a GlobalRef as a
+    # `K"Identifier"` carrying a `:mod` attribute; before the fix, the qualified
+    # (`A.@mac`) path in `eval_macro_name`/`_eval_dot` ignored that `:mod` and
+    # re-looked-up the name in the ambient eval module, throwing a
+    # `MacroExpansionError`/`UndefVarError` (e.g. `Sub`/`Markdown` "not defined
+    # in" the new module) where flisp succeeds.
+    #
+    # Found via Moshi v0.3.12 in a PkgEval comparison against flisp lowering:
+    # its `@data` macro rewrites a captured docstring's bare `Markdown`
+    # qualifier to a `GlobalRef` and re-emits `Markdown.@doc_str` inside a
+    # generated `module DocTest`.
+    src = raw"""
+        module T
+            module Sub
+                macro tag_str(s); "TAG:" * s; end
+                macro tag(s);     "MTAG:" * s; end
+                module Inner
+                    macro deep_str(s); "DEEP:" * s; end
+                end
+                greet(x) = "GREET:" * x
+            end
+
+            # GlobalRef-qualified string macro emitted at T's top level: the
+            # ambient module already coincides with the GlobalRef's module, so
+            # this resolved even before the fix (regression guard).
+            macro w1()
+                mn = Expr(:., GlobalRef(@__MODULE__, :Sub), QuoteNode(Symbol("@tag_str")))
+                esc(Expr(:macrocall, mn, __source__, "s1"))
+            end
+            const R1 = @w1
+
+            # The bug: the same macrocall emitted inside a macro-created module.
+            # Ambient is `Main.<...>.T.M2`, but the GlobalRef points at `T`.
+            macro w2()
+                mn = Expr(:., GlobalRef(@__MODULE__, :Sub), QuoteNode(Symbol("@tag_str")))
+                c  = Expr(:macrocall, mn, __source__, "s2")
+                esc(Expr(:toplevel, Expr(:module, false, :M2, Expr(:block, :(const R = $c)))))
+            end
+            @w2
+
+            # A.B.C chain whose leftmost qualifier is the GlobalRef, in a
+            # macro-created module (exercises `_eval_dot`'s recursion).
+            macro w3()
+                a  = GlobalRef(@__MODULE__, :Sub)
+                mn = Expr(:., Expr(:., a, QuoteNode(:Inner)), QuoteNode(Symbol("@deep_str")))
+                c  = Expr(:macrocall, mn, __source__, "s3")
+                esc(Expr(:toplevel, Expr(:module, false, :M3, Expr(:block, :(const R = $c)))))
+            end
+            @w3
+
+            # GlobalRef-qualified *non-string* macro in a macro-created module.
+            macro w3b()
+                mn = Expr(:., GlobalRef(@__MODULE__, :Sub), QuoteNode(Symbol("@tag")))
+                c  = Expr(:macrocall, mn, __source__, "s3b")
+                esc(Expr(:toplevel, Expr(:module, false, :M3b, Expr(:block, :(const R = $c)))))
+            end
+            @w3b
+
+            # GlobalRef-qualified *non-macro* call in the same position: resolved
+            # by desugaring, not `eval_macro_name`, so it was already correct;
+            # included to lock that it stays correct.
+            macro w4()
+                fc = Expr(:call, Expr(:., GlobalRef(@__MODULE__, :Sub), QuoteNode(:greet)), "s4")
+                esc(Expr(:toplevel, Expr(:module, false, :M4, Expr(:block, :(const R = $fc)))))
+            end
+            @w4
+
+            # Plain source-level qualified string macro (no GlobalRef): must keep
+            # resolving in the ambient module (both lanes agreed before the fix).
+            const R5 = Sub.tag"s5"
+        end
+        results() = (T.R1, T.M2.R, T.M3.R, T.M3b.R, T.M4.R, T.R5)
+    """
+    mfl = Module(); Base.include_string(mfl, src); Core.@latestworld
+    mjl = Module(); JuliaLowering.include_string(mjl, src; expr_compat_mode=true)
+    Core.@latestworld
+    @test mfl.results() == ("TAG:s1", "TAG:s2", "DEEP:s3", "MTAG:s3b", "GREET:s4", "TAG:s5")
+    @test mjl.results() == mfl.results()
+end
