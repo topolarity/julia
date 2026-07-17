@@ -415,10 +415,19 @@ _is_false(st::SyntaxTree) = kind(st) === K"Value" && st.value === false
 
 function _expand_literal_pow(st::SyntaxTree)
     k = kind(st)
+    # The literal exponent must be a native machine integer (`Int`), matching
+    # flisp's `integer?` predicate in `julia-syntax.scm`.  flisp only rewrites
+    # `x^n` to `literal_pow` when `n` is representable as a native flisp
+    # integer, which (via `julia_to_scm`/`jl_is_long` in `src/ast.c`) is
+    # exactly a Julia `Int`.  A previous `isa Integer` test here was too broad:
+    # it also matched other `Integer` subtypes (e.g. `Int8`, `UInt64`,
+    # `BigInt`, `Bool`, and user structs `<: Integer`) that a macro can embed
+    # as literal *values* in the AST, wrongly bypassing their own `^` methods
+    # (and, for `Val`-illegal values, throwing a `TypeError`).
     (k in KSet"call dotcall" &&
         numchildren(st) === 3 &&
         get(st[1], :name_val, "") === "^" &&
-        get(st[3], :value, nothing) isa Integer) || return st
+        get(st[3], :value, nothing) isa Int) || return st
     @ast st._graph st [k
         "literal_pow"::K"top"
         st[1] st[2]

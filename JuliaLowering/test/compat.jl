@@ -837,3 +837,89 @@ end
     @test_throws JuliaLowering.LoweringError jl_eval(test_mod,
         gen(:(2i), Expr(:+=, :i, :(1:3))); expr_compat_mode=true)
 end
+
+# Found via RomanNumerals v0.3.3 in a PkgEval comparison against flisp lowering.
+#
+# `x ^ n` is rewritten to `Base.literal_pow(^, x, Val(n))` only when `n` is a
+# literal integer.  flisp's `julia-syntax.scm` gates this on the scheme-level
+# `integer?` predicate, which (via `julia_to_scm`/`jl_is_long` in `src/ast.c`)
+# is true for exactly a native Julia `Int` and nothing else.  A macro that
+# returns a *value* embeds it as a literal in the AST, so any `Integer`-subtyped
+# value (`Int8`, `UInt64`, `Int128`, `BigInt`, `Bool`, or a user struct such as
+# RomanNumerals' `RomanNumeral <: Integer`) can appear as the exponent.  The
+# compat layer previously tested `isa Integer`, which matched all of these and
+# wrongly bypassed the value's own `^` method (and for `Val`-illegal values such
+# as `BigInt`/`RomanNumeral`, threw a `TypeError` in `Core.apply_type`).  The
+# predicate must instead be `isa Int`, matching flisp's accept set exactly.
+module LitPowProbe
+    # `P` observes which `^` path lowering picked.
+    struct P end
+    Base.:^(::P, n) = (:direct, n)
+    Base.literal_pow(::typeof(^), ::P, ::Val{n}) where {n} = (:litpow, n)
+    # `RN` mirrors RomanNumerals' `RomanNumeral <: Integer` with a value-returning
+    # string macro; `rn"..." ^ rn"..."` must dispatch to the vararg `^` below.
+    struct RN <: Integer
+        val::Int
+    end
+    Base.:^(a::RN, b::RN...) = RN(99)
+    Base.:(==)(a::RN, b::RN) = a.val == b.val
+    macro rn_str(s); RN(parse(Int, s)); end
+end
+
+@testset "(AI) literal_pow rewrite matches flisp's `integer?` (Int only)" begin
+    P = LitPowProbe.P
+    mkpow(v) = Expr(:call, :^, P(), v)
+
+    # (shape => whether flisp/JL should take the literal_pow path).  The exponent
+    # is embedded as a literal *value* of each Integer subtype, exactly as a
+    # value-returning macro would produce it.  Only a native `Int` is rewritten.
+    battery = [
+        (Int64(2),              true),
+        (Int32(2),              false),
+        (Int16(2),              false),
+        (Int8(2),               false),
+        (UInt64(2),             false),
+        (UInt32(2),             false),
+        (UInt16(2),             false),
+        (UInt8(2),              false),
+        (Int128(2),             false),
+        (UInt128(2),            false),
+        (BigInt(2),             false),
+        (true,                  false),   # Bool <: Integer, but flisp says no
+        (false,                 false),
+    ]
+    for (v, is_litpow) in battery
+        ex = mkpow(v)
+        expected = is_litpow ? (:litpow, v) : (:direct, v)
+        # Direct assertion of the chosen path...
+        @test jl_eval(test_mod, ex) == expected
+        # ...and parity with flisp as the oracle.
+        @test jl_eval(test_mod, ex) == fl_eval(test_mod, ex)
+    end
+
+    # Source-level integer literals (including a negative literal) are native
+    # `Int`s and are rewritten in both lowerers.
+    Core.eval(test_mod, :(pp = $(P())))
+    for src in ("pp ^ 2", "pp ^ -2", "pp ^ 0")
+        ex = Meta.parse(src)
+        @test jl_eval(test_mod, ex) == fl_eval(test_mod, ex)
+        @test first(jl_eval(test_mod, ex)) === :litpow
+    end
+
+    # A `Float64` exponent is never rewritten (regression guard on the shape
+    # neighbouring the fix).
+    let ex = mkpow(2.0)
+        @test jl_eval(test_mod, ex) == (:direct, 2.0) == fl_eval(test_mod, ex)
+    end
+
+    # The original RomanNumerals reproduction.  `@rn_str` returns a
+    # `RomanNumeral <: Integer` *value*, so macro expansion embeds it directly as
+    # a literal exponent -- reproduced here by embedding `RN` values into the AST
+    # (the macro is not required for the defect).  With the fix this reaches the
+    # package's own vararg `^` in both lowerers; before it, JL applied `Val` to a
+    # non-`Int` and threw `TypeError`.
+    RN = LitPowProbe.RN
+    rn_expr = Expr(:call, :(==), Expr(:call, :^, RN(20), RN(2)), RN(99))
+    @test jl_eval(test_mod, rn_expr) === true
+    @test fl_eval(test_mod, rn_expr) === true
+end
