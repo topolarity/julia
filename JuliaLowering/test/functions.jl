@@ -2564,6 +2564,60 @@ end
     end
 end
 
+@testset "(AI) @generated preserves the definition head" begin
+    # Found via Compat v4.18.1 in a PkgEval comparison against flisp lowering.
+    #
+    # flisp's `@generated` (base/expr.jl) builds its output with
+    # `Expr(f.head, ...)`, so a short-form definition (`f() = body`, head `=`)
+    # stays short-form and a long-form definition (`function f() ... end`, head
+    # `function`) stays long-form.  JuliaLowering's reimplementation
+    # (src/syntax_macros.jl) used to unconditionally emit a `function`-headed
+    # node, which is fine at top level but breaks in `let`-binding position:
+    # `let`-binding validation only accepts an identifier or a `=` assignment
+    # (matching flisp's `expand-let`, which likewise rejects `function`-headed
+    # bindings), so a short-form `@generated` in a `let` binding lowered to a
+    # `function` node and was rejected with "expected identifier or assignment"
+    # even though flisp accepts it.
+    for expr_compat_mode in (false, true)
+        # The reported MWE: short-form `@generated` in `let`-binding position.
+        @test JuliaLowering.include_string(test_mod,
+            "let @generated f() = :(1); f() end"; expr_compat_mode) === 1
+
+        # Short-form with a return-type annotation on the signature (`::Int`,
+        # part of the `=`'s eventually-call LHS) -- flisp keeps this short-form.
+        @test JuliaLowering.include_string(test_mod,
+            "let @generated f()::Int = :(1); f() end"; expr_compat_mode) === 1
+
+        # Short-form with a `where` clause on the signature.
+        @test JuliaLowering.include_string(test_mod,
+            "let @generated f(x::T) where T = :(x); f(5) end"; expr_compat_mode) === 5
+
+        # A `let` with multiple bindings routes the short-form `@generated`
+        # output through the same assignment case.
+        @test JuliaLowering.include_string(test_mod,
+            "let y = 4, @generated f() = :(1); f() + y end"; expr_compat_mode) === 5
+
+        # Plain top-level short-form still works (the common case).
+        @test JuliaLowering.include_string(test_mod, """
+            begin
+                @generated g_ai_tl() = :(7)
+                g_ai_tl()
+            end"""; expr_compat_mode) === 7
+
+        # Long-form `@generated` in a `let` binding must still be rejected --
+        # flisp rejects it too ("invalid let syntax"), because a
+        # `function`-headed binding is not valid `let` syntax from any source.
+        @test_throws LoweringError JuliaLowering.include_string(test_mod,
+            "let @generated function f() :(1) end; f() end"; expr_compat_mode)
+
+        # `@generated` on a non-definition (anonymous function form) is rejected
+        # by the macro itself (surfaced as a macro-expansion error), matching
+        # flisp's "must be used with a function definition".
+        @test_throws JuliaLowering.MacroExpansionError JuliaLowering.include_string(
+            test_mod, "@generated () -> :(1)"; expr_compat_mode)
+    end
+end
+
     genfunc_quote_s = """
     begin
         function f_gen_quote_1(::Tuple{T}) where {T}

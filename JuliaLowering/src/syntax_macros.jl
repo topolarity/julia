@@ -93,7 +93,15 @@ function Base.var"@generated"(__context__::MacroContext, ex)
             push!(prologue, c)
         end
     end
-    @ast __context__ __context__.macrocall [K"function"
+    # Mirror the input definition's head in the output (`=` for short-form,
+    # `function` for long-form), matching flisp's `@generated`, which builds
+    # `Expr(f.head, ...)` (base/expr.jl).  A short-form definition stays
+    # short-form so that, e.g., `let @generated f() = :(1); f() end` produces a
+    # `=` binding that `let`-binding validation accepts -- rather than a
+    # `function`-headed binding that neither flisp nor JL allows in that
+    # position.
+    outhead = kind(ex) === K"function" ? K"function" : K"="
+    @ast __context__ __context__.macrocall [outhead
         ex[1]
         [K"block"
             prologue...
