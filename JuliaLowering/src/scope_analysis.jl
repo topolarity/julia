@@ -754,6 +754,17 @@ function enter_scope!(ctx, ex)
                 # top-level assignments in no scope and no expansion
                 push!(ctx.soft_assignable_globals, vk)
                 declare_in_scope!(ctx, top_scope(ctx), ex, :global)
+            elseif is_toplevel_thunk && hygienic_toplevel && is_flisp_compat(sc) &&
+                    getmeta(ex, :escaped_method_root, false)
+                # An `esc`ed method-def name (e.g. `@doc`'s `esc(def)`, reached
+                # when a macro's expansion is a nested `@doc str def` macrocall)
+                # is not macro-introduced: flisp resolves it in the escape
+                # target's env, which at top level -- no capturing scope -- is a
+                # plain global of the name's home module under its real name, not
+                # a mangled hidden binding.  Bind it so the method defines that
+                # global; `mark_escaped_method_root!` tagged it during expansion.
+                push!(ctx.soft_assignable_globals, vk)
+                declare_in_scope!(ctx, scope, ex, :global)
             elseif is_toplevel_thunk && hygienic_toplevel && is_flisp_compat(sc)
                 # flisp gensym-renames an unescaped top-level assignment target
                 # in a hygienic expansion and binds a hidden (name-mangled)

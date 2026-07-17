@@ -3360,3 +3360,94 @@ end
     @test mfl.results() == (101, 2, 2, true, false, false, false)
     @test mjl.results() == mfl.results()
 end
+
+@testset "(AI) macro-authored `@doc` def defines the wrapped definition (flisp compat)" begin
+    # A macro whose *expansion result* is a nested `@doc str def` macrocall (the
+    # idiom for generating a documented helper) must still define `def`, not just
+    # attach the docstring.  `Base.Docs.objectdoc` returns `esc(def)`, so the
+    # def name arrives on the outer macro's expansion layer; flisp resolves an
+    # `esc`ed method name in the escape target's env -- at top level a plain
+    # global of the name's home module -- rather than gensym-renaming it.  Before
+    # the fix JL silently bound a mangled hidden global and left the real name
+    # undefined (docstring attached, function missing).
+    #
+    # Found via FBCModelTests v0.3.0 (COBREXA v1.5.1 macro-generated functions)
+    # in a PkgEval comparison against flisp lowering.
+    src = raw"""
+        module T
+            # bare funcdef, where-method, and block-wrapped funcdef: all define
+            macro mfn();   Expr(:macrocall, Symbol("@doc"), __source__, "d", :(dfn(x) = x)); end
+            macro mwhere(); Expr(:macrocall, Symbol("@doc"), __source__, "d", :(dwhere(x::A) where A = x)); end
+            macro mblk();  Expr(:macrocall, Symbol("@doc"), __source__, "d", quote; dblk(x) = x; end); end
+            # struct / const / bare-name targets (regression: unchanged by the fix)
+            macro mstr();  Expr(:macrocall, Symbol("@doc"), __source__, "d", :(struct DS; a; end)); end
+            macro mconst(); Expr(:macrocall, Symbol("@doc"), __source__, "d", :(const DC = 42)); end
+            existing() = 1
+            macro mname(); Expr(:macrocall, Symbol("@doc"), __source__, "d", :existing); end
+            @mfn
+            @mwhere
+            @mblk
+            @mstr
+            @mconst
+            @mname
+        end
+        docd(n) = haskey(Base.Docs.meta(T), Base.Docs.Binding(T, n))
+        results() = (isdefined(T, :dfn), isdefined(T, :dwhere), isdefined(T, :dblk),
+                     isdefined(T, :DS), isdefined(T, :DC), isdefined(T, :existing),
+                     T.dfn(3), T.dwhere(4), T.dblk(5),
+                     docd(:dfn), docd(:dwhere), docd(:dblk))
+    """
+    mfl = Module(); Base.include_string(mfl, src); Core.@latestworld
+    mjl = Module(); JuliaLowering.include_string(mjl, src; expr_compat_mode=true)
+    Core.@latestworld
+    # All three method defs are defined and callable; struct is defined; a
+    # `@doc`'d `const` binding and a bare-name target keep flisp's behavior; the
+    # docstring metadata is attached for each documented method.
+    @test mfl.results() == (true, true, true, true, false, true, 3, 4, 5, true, true, true)
+    @test mjl.results() == mfl.results()
+end
+
+@testset "(AI) escaped defs in local scope stay local (toplevel gate)" begin
+    # The escaped-method-name handling above must only apply to top-level
+    # thunks: a decorator-style macro (`esc` around a def, like `@inline`) used
+    # inside a function or `let` keeps defining a *local* function, exactly as
+    # flisp does.
+    src = raw"""
+        macro id(defex); esc(defex); end
+        function outer()
+            @id inner() = 41
+            inner()
+        end
+        function outer2()
+            @id @id inner2() = 42   # 2-level self-nesting
+            inner2()
+        end
+        results() = (outer(), isdefined(@__MODULE__, :inner),
+                     outer2(), isdefined(@__MODULE__, :inner2))
+    """
+    mfl = Module(); Base.include_string(mfl, src); Core.@latestworld
+    mjl = Module(); JuliaLowering.include_string(mjl, src; expr_compat_mode=true)
+    Core.@latestworld
+    @test mfl.results() == (41, false, 42, false)
+    @test mjl.results() == mfl.results()
+
+    # Known residual divergence (pre-existing, tracked in the campaign's
+    # hygiene-discrepancies ledger): a macro-authored `@doc` def inside a
+    # function body is a loud flisp error ("Global method definition ... needs
+    # to be placed at the top level") but is silently skipped by JuliaLowering
+    # -- the name is left undefined and no global is created.  Lock the current
+    # JL behavior so any change here is deliberate.
+    src2 = raw"""
+        macro mfn(); Expr(:macrocall, Symbol("@doc"), __source__, "d", :(hidden() = 1)); end
+        function trigger()
+            @mfn
+            nothing
+        end
+        trigger()
+        results() = isdefined(@__MODULE__, :hidden)
+    """
+    mjl2 = Module()
+    JuliaLowering.include_string(mjl2, src2; expr_compat_mode=true)
+    Core.@latestworld
+    @test mjl2.results() == false
+end

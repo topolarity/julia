@@ -376,7 +376,9 @@ end
 # `let`-local `f` as a home-module global and, once such a def is nested inside
 # a real enclosing function (self-recursive macro use), raising a spurious
 # "Global method definition needs to be placed at the top level" error.
-function mark_expansion_root_method!(st, expansion_layer)
+# The bare name Identifier a method definition `st` binds, or `nothing` if `st`
+# is not a plain method def (peeling `where`/return-type/`curly` wrappers).
+function _method_def_name(st)
     k = kind(st)
     if k === K"function" && numchildren(st) == 1
         name = st[1] # `function f end` forward declaration
@@ -384,17 +386,42 @@ function mark_expansion_root_method!(st, expansion_layer)
         sig = st[1]
         while kind(sig) === K"where"; sig = sig[1]; end
         kind(sig) === K"::" && numchildren(sig) == 2 && (sig = sig[1])
-        kind(sig) === K"call" || return
+        kind(sig) === K"call" || return nothing
         name = sig[1]
         kind(name) === K"curly" && (name = name[1])
     else
-        return
+        return nothing
     end
-    if kind(name) === K"Identifier" && !hasattr(name, :mod)
-        nsc = get(name, :context, nothing)::Union{Nothing, SyntaxContext}
-        nsc !== nothing && nsc.layer === expansion_layer &&
-            setmeta!(name, :expansion_root_method, true)
-    end
+    (kind(name) === K"Identifier" && !hasattr(name, :mod)) ? name : nothing
+end
+
+function mark_expansion_root_method!(st, expansion_layer)
+    name = _method_def_name(st)
+    isnothing(name) && return nothing
+    nsc = get(name, :context, nothing)::Union{Nothing, SyntaxContext}
+    nsc !== nothing && nsc.layer === expansion_layer &&
+        setmeta!(name, :expansion_root_method, true)
+    nothing
+end
+
+# flisp resolves an `esc`ed method-def name in the escape target's environment
+# rather than renaming it: `resolve-expansion-vars-` treats the escaped fragment
+# fresh, so a bare method name that is not a local there becomes a plain global
+# of its home module (`(globalref m f)`), at any nesting depth within the
+# expansion.  `Core.@doc` relies on this -- `Base.Docs.objectdoc` returns
+# `esc(def)` for the documented definition -- so a macro whose expansion is a
+# nested `@doc str def` macrocall must still define `def`'s function.  We absorb
+# `escape` eagerly (unlike flisp, which keeps the node until resolution), so tag
+# the escaped method name here; `enter_scope!` keeps it as a real global at top
+# level (see the `:escaped_method_root` handling) instead of a hygienic rename.
+# A def only escaped as part of a larger fragment (e.g. inside a `block`) is not
+# the escape's own payload and stays hygienic, matching flisp's env capture.
+function mark_escaped_method_root!(st, target_layer)
+    name = _method_def_name(st)
+    isnothing(name) && return nothing
+    nsc = get(name, :context, nothing)::Union{Nothing, SyntaxContext}
+    nsc !== nothing && nsc.layer === target_layer &&
+        setmeta!(name, :escaped_method_root, true)
     nothing
 end
 
@@ -449,8 +476,10 @@ function apply_expansion_layer(ctx, st::SyntaxTree, sc_in::SyntaxContext, done,
             throw(LoweringError(st, "new macros should not use `escape`"))
         end
         st1 = isnothing(sc0) ? st[1] : remove_context(st[1])
-        apply_expansion_layer(
-            ctx, st1, escape_layer(sc, false), true, qdepth, sqdepth)
+        target_sc = escape_layer(sc, false)
+        out = apply_expansion_layer(ctx, st1, target_sc, true, qdepth, sqdepth)
+        mark_escaped_method_root!(out, target_sc.layer)
+        out
     elseif k === K"hygienic-scope" && absorb_esc
         if !(2 <= numchildren(st) <= 3)
             throw(LoweringError(st, "`hygienic-scope` requires 2-3 children"))
