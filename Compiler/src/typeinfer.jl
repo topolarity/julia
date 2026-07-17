@@ -823,7 +823,15 @@ function compute_edges!(sv::InferenceState)
     for i in 1:length(sv.stmt_info)
         add_edges!(edges, sv.stmt_info[i])
     end
-    user_edges = sv.src.edges::Union{Nothing, SimpleVector, Vector{Any}}
+    # A generated function may attach `CodeInfo.edges` as a concretely-typed
+    # vector (e.g. Zygote and IRTools build `Core.MethodInstance[]`), which the
+    # `Vector{Any}` assert rejected, crashing inference with an internal
+    # typeassert error. Convert such vectors instead of erroring.
+    user_edges = sv.src.edges
+    if user_edges isa Vector && !(user_edges isa Vector{Any})
+        user_edges = Vector{Any}(user_edges)
+    end
+    user_edges = user_edges::Union{Nothing, SimpleVector, Vector{Any}}
     if user_edges !== nothing && user_edges !== empty_edges
         append!(edges, user_edges)
     end
