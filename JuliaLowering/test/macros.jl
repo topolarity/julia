@@ -1892,8 +1892,12 @@ end
             @test occursin("Cols", result)
         end
 
-        # Should not access arg-map for local variables
-        # TODO: worth the special case?
+        # Should not access arg-map for local variables: `@__FUNCTION__` in a
+        # callable-object method whose self name is shadowed (and reassigned) by
+        # a body local still resolves to the incoming self, matching flisp (which
+        # references the original self argument directly, ahead of its arg-map
+        # rename).  See `resolve_thisfunction` and the `:thisfunction_ref`
+        # argmap-bypass in linear IR.
         JuliaLowering.include_string(test_mod, raw"""
             function f_thisfunction_argmap end
             function (f_thisfunction_argmap::typeof(f_thisfunction_argmap))()
@@ -1901,7 +1905,7 @@ end
                 @__FUNCTION__
             end
         """; expr_compat_mode=true)
-        @test_broken test_mod.f_thisfunction_argmap() ===
+        @test test_mod.f_thisfunction_argmap() ===
             test_mod.f_thisfunction_argmap
     end
 
@@ -1973,6 +1977,72 @@ end
         @generated tf_gen_const() = :(const zz = 1)
         tf_gen_const()
         """; expr_compat_mode=true)
+end
+
+@testset "(AI) @__FUNCTION__ arg-map self and guard messages" begin
+    # Found via Compat v4.18.1 in a PkgEval comparison against flisp lowering.
+    #
+    # Three residuals of Compat's `@__FUNCTION__` testset:
+    #
+    # (A) In a callable-object method whose self *name* is shadowed -- and
+    #     reassigned -- by a body local, `@__FUNCTION__` must still resolve to
+    #     the incoming self (the method's own function object), not the local.
+    #     flisp replaces `(thisfunction)` with the lambda's first argument and
+    #     emits a direct reference to that argument, ahead of the assigned-arg
+    #     `arg-map` rename, so the reassignment does not divert it.  We match by
+    #     taking the self's binding straight from the lambda's `param_bindings`
+    #     (bypassing name resolution) and tagging the reference so linear IR
+    #     reads the original argument slot rather than the arg-map copy.
+    #
+    # (B, C) The two misuse guards must reproduce flisp's user-facing wording,
+    #     which quotes the macro name -- Compat asserts these substrings.
+
+    # (A) callable-object self shadowed and reassigned by a local.
+    JuliaLowering.include_string(test_mod, raw"""
+        function ai_tf_argmap end
+        function (ai_tf_argmap::typeof(ai_tf_argmap))()
+            ai_tf_argmap = 1
+            @__FUNCTION__
+        end
+    """; expr_compat_mode=true)
+    @test test_mod.ai_tf_argmap() === test_mod.ai_tf_argmap
+    # The reassignment still takes effect for ordinary reads of the name.
+    JuliaLowering.include_string(test_mod, raw"""
+        function ai_tf_argmap_val end
+        function (ai_tf_argmap_val::typeof(ai_tf_argmap_val))()
+            ai_tf_argmap_val = 7
+            (ai_tf_argmap_val, (@__FUNCTION__) === ai_tf_argmap_val)
+        end
+    """; expr_compat_mode=true)
+    @test test_mod.ai_tf_argmap_val() === (7, false)
+
+    # (B) `@__FUNCTION__` outside any function.
+    @test_throws "\"@__FUNCTION__\" can only be used inside a function" JuliaLowering.include_string(
+        test_mod, "@__FUNCTION__"; expr_compat_mode=true)
+
+    # (C) `@__FUNCTION__` inside a comprehension/generator.
+    @test_throws "\"@__FUNCTION__\" not allowed inside comprehension or generator" JuliaLowering.include_string(
+        test_mod, "[(@__FUNCTION__) for _ in 1:2]"; expr_compat_mode=true)
+    @test_throws "\"@__FUNCTION__\" not allowed inside comprehension or generator" JuliaLowering.include_string(
+        test_mod, "f((@__FUNCTION__) for _ in 1:2)"; expr_compat_mode=true)
+
+    # Known divergence: when the self is reassigned AND captured, it is boxed,
+    # and the box lives on the arg-map copy slot -- the argument-slot bypass
+    # above cannot apply (the raw slot behind the box is never initialized), so
+    # `@__FUNCTION__` falls back to the boxed copy and reads the reassigned
+    # value.  flisp reads the raw argument even then.  Non-crashing, tracked:
+    JuliaLowering.include_string(test_mod, raw"""
+        function ai_tf_boxed end
+        function (ai_tf_boxed::typeof(ai_tf_boxed))()
+            g = () -> ai_tf_boxed
+            ai_tf_boxed = 1
+            (g(), ai_tf_boxed, @__FUNCTION__)
+        end
+    """; expr_compat_mode=true)
+    let r = test_mod.ai_tf_boxed()
+        @test (r[1], r[2]) === (1, 1)
+        @test_broken r[3] isa Function   # flisp: the function; JL: boxed copy (1)
+    end
 end
 
 @testset "var\"#self#\" flisp-compat leak" begin

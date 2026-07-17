@@ -637,7 +637,17 @@ function compile(ctx::LinearIRContext, ex, needs_value, in_tail_pos)
         ex1 = ex
         if kind(ex1) == K"BindingId"
             binfo = get_binding(ctx, ex1)
-            if haskey(ctx.argmap, binfo.id)
+            # `@__FUNCTION__`/`(thisfunction)` references the original incoming
+            # self argument, bypassing the assigned-argument copy that `argmap`
+            # would otherwise redirect it to (matching flisp, which emits a
+            # direct reference to the arg name ahead of its arg-map rename).
+            # A boxed self (reassigned AND captured) cannot take the bypass:
+            # the box lives on the copy slot, so the original arg slot behind
+            # it is never initialized -- fall back to the boxed copy read.
+            # (Divergent from flisp for that exotic shape, which reads the raw
+            # arg; unpatched JL read the reassigned value there too.)
+            if haskey(ctx.argmap, binfo.id) &&
+                    !(getmeta(ex1, :thisfunction_ref, false) && !is_boxed(binfo))
                 ex1 = setattr!(newleaf(ctx, ex1, K"BindingId"), :var_id, ctx.argmap[binfo.id])
             end
         end

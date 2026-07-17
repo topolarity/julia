@@ -277,7 +277,7 @@ end
 #---------------------
 LoweringError:
 [@__FUNCTION__() for x in 1:2]
-#└─────────────┘ ── current function not defined in comprehension or generator
+#└─────────────┘ ── "@__FUNCTION__" not allowed inside comprehension or generator
 
 ########################################
 # Error: thisfunction disallowed in comprehension/generator
@@ -285,7 +285,7 @@ f(@__FUNCTION__() for x in 1:2)
 #---------------------
 LoweringError:
 f(@__FUNCTION__() for x in 1:2)
-# └─────────────┘ ── current function not defined in comprehension or generator
+# └─────────────┘ ── "@__FUNCTION__" not allowed inside comprehension or generator
 
 ########################################
 # Error: thisfunction disallowed outside of function
@@ -296,5 +296,5 @@ end
 LoweringError:
 let
     @__FUNCTION__()
-#   └─────────────┘ ── can only be used inside a function
+#   └─────────────┘ ── "@__FUNCTION__" can only be used inside a function
 end

@@ -336,9 +336,9 @@ vst1(vcx::Validation1Context, st::SyntaxTree)::ValidationResult = @stm st begin
     [K"new" t args...] -> vst1(vcx, t) & all(vst1, vcx, args)
     [K"splatnew" t arg] -> vst1(vcx, t) & vst1(vcx, arg)
     [K"thisfunction"] -> vcx.toplevel ?
-        @fail(st, "can only be used inside a function") :
+        @fail(st, "\"@__FUNCTION__\" can only be used inside a function") :
         !vcx.return_ok ?
-        @fail(st, "current function not defined in comprehension or generator") : pass()
+        @fail(st, "\"@__FUNCTION__\" not allowed inside comprehension or generator") : pass()
     [K"unknown_head"] -> let head = st.name_val
         head === "latestworld-if-toplevel" ? pass() :
             @fail(st, string("unknown expr head: ", head))

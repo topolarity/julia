@@ -539,6 +539,32 @@ function thisfunction_self_arg(ctx, ex, scope::ScopeInfo)
     return self_arg
 end
 
+# Resolve `@__FUNCTION__` (K"thisfunction") to the enclosing lambda's self.
+# flisp (julia-syntax.scm ~5451) replaces `(thisfunction)` with `(car (lam:args
+# lam))` -- the self ARGUMENT itself -- and emits a direct reference to that
+# argument, never routing through name resolution nor through the assigned-arg
+# copy (`arg-map`).  So a body local that shadows the self's name (e.g. a
+# callable `function (f::typeof(f))(); f = 1; @__FUNCTION__; end`) does not
+# divert it, and a body reassignment of that name does not change what
+# `@__FUNCTION__` returns -- it still yields the incoming function.
+#
+# Mirror that here: take the self parameter's own binding straight from the
+# enclosing lambda's `param_bindings` (the same authoritative per-node map
+# `resolve_lambda_params` and the lambda's `self_id` use), bypassing
+# `resolve_name`, and tag the reference `:thisfunction_ref` so linear IR reads
+# the original argument slot rather than the assigned-argument copy (see the
+# `argmap` handling in `compile`).  Fall back to name resolution only when the
+# self arg carries no recorded param binding (e.g. the implicit hygienic
+# `#self#`, which no user local can shadow or reassign anyway).
+function resolve_thisfunction(ctx, ex, scope::ScopeInfo)
+    self_arg = thisfunction_self_arg(ctx, ex, scope)
+    lam_scope = enclosing_lambda(ctx, scope)
+    bid = kind(self_arg) === K"Identifier" ?
+        get(lam_scope.param_bindings, self_arg._id, nothing) : nothing
+    isnothing(bid) && return _resolve_scopes(ctx, self_arg, scope)
+    return setmeta(newleaf(ctx, self_arg, K"BindingId", bid), :thisfunction_ref, true)
+end
+
 # flisp-compat: flisp names a method's implicit self argument with the literal,
 # unhygienic symbol `#self#` (julia-syntax.scm), so user source that writes
 # `var"#self#"` resolves to the enclosing method's own function object -- a
@@ -861,7 +887,7 @@ function _resolve_scopes(ctx, ex::SyntaxTree,
         # flisp-compat: a bare `#self#` that resolves to nothing is the leaked
         # implicit-self idiom; redirect it to the enclosing function's self.
         if isnothing(b) && is_self_hash_leak(ctx, ex, scope)
-            return _resolve_scopes(ctx, thisfunction_self_arg(ctx, ex, scope), scope)
+            return resolve_thisfunction(ctx, ex, scope)
         end
         # Unresolved names are assumed global
         if isnothing(b)
@@ -1041,7 +1067,7 @@ function _resolve_scopes(ctx, ex::SyntaxTree,
         push!(stmts, locals_dict)
         newnode(ctx, ex, K"block", stmts)
     elseif k == K"thisfunction"
-        return _resolve_scopes(ctx, thisfunction_self_arg(ctx, ex, scope), scope)
+        return resolve_thisfunction(ctx, ex, scope)
     elseif k == K"assert"
         etype = extension_type(ex)
         if etype == "require_existing_locals"
