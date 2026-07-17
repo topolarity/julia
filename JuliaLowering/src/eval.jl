@@ -575,6 +575,27 @@ function _macro_edge_groups(c::SyntaxTree, topfile::Symbol)
     root = topfile === :none ? (isempty(groups) ? nothing : lastindex(groups)) :
                                findlast(g -> g[1] === topfile, groups)
     (root === nothing || root == 1) && return Tuple{Symbol,Int32}[]
+    # Transparent round-trip: the statement's own text (`groups[1]`, the deepest
+    # level) sits at the exact `(file, line)` of the outermost macrocall anchor
+    # (`groups[root]`), with only foreign levels in between. That happens when an
+    # old (Expr-returning) macro's expansion carries a synthesized macrocall
+    # whose source was inherited from an unrelated nested line node -- e.g. a
+    # `quote` block's line node surviving a shallow `MacroTools.rmlines`, which
+    # stamps the enclosing `Base.@__doc__` (or similar) with a foreign line the
+    # user content never actually crossed into. flisp emits no macro-expansion
+    # frame for that shape (no real line node was emitted for the content), and
+    # unguarded we fabricated one, misnaming the innermost frame "macro
+    # expansion". The old-macro provenance can't distinguish macro-body from
+    # argument content (see `flattened_provenance`), so key on the position
+    # round-trip: equal innermost and outermost anchors -> no edges. Known
+    # limitation: a GENUINE foreign boundary whose user content happens to sit
+    # on the same (file, line) as the outermost macrocall (e.g. a one-line
+    # `@testset "x" begin @test ... end`) has the identical signature, so its
+    # user-content frame is also dropped where flisp keeps it. That loses one
+    # intermediate frame only -- func/line attribution of the remaining frames
+    # and Test.jl failure reporting (which uses `__source__`) are unaffected --
+    # and the two cases are provably indistinguishable from this signal.
+    groups[root] === groups[1] && return Tuple{Symbol,Int32}[]
     return [groups[i] for i in (root-1):-1:1]
 end
 

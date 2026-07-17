@@ -281,3 +281,69 @@ end
     # The spliced `error(...)`'s own foreign line is emitted as a frame.
     @test ("inner.jl", 4) in deepest
 end
+
+@testset "(AI) transparent-macrocall round-trip emits no spurious edge" begin
+    # Found via SimpleTraits v0.9.6 in a PkgEval comparison against flisp
+    # lowering. A macro (SimpleTraits' `@traitfn`) co-emits, through a *shallow*
+    # `MacroTools.rmlines`, a nested `quote` redirect plus the user's method
+    # wrapped in a transparent macrocall (`Base.@__doc__`). The shallow rmlines
+    # strips the outer block's line nodes but leaves the nested quote's, whose
+    # foreign line then gets inherited by the adjacent `@__doc__` macrocall. The
+    # user method's body (its own text in the usage file) therefore acquires a
+    # macro-provenance chain that leaves the usage file, touches that foreign
+    # line, and returns to the *same* usage line -- a transparent round-trip the
+    # content never really crossed. flisp reports the body flat at its own line;
+    # JuliaLowering used to emit a bogus `usage -> foreign -> usage` macro-
+    # expansion edge, so the innermost backtrace frame was named `"macro
+    # expansion"` instead of the method, and rendered a fabricated
+    # (foreign-file, usage-line) pair. See `_macro_edge_groups` in eval.jl.
+    m = Module(:RoundTripMod)
+    Core.eval(m, :(using Base))
+    # A transparent macro (re-emits its argument), like `Base.@__doc__`.
+    Core.eval(m, :(macro passthrough(x); esc(x); end))
+    # rmlines that only strips the *direct* block children (like MacroTools').
+    Core.eval(m, :(_rmshallow(ex::Expr) =
+        Expr(ex.head, filter(a -> !(a isa LineNumberNode), ex.args)...)))
+    Core.eval(m, :(_rmshallow(x) = x))
+    # A generator macro whose expansion is a shallow-rmlined block of a nested
+    # `quote` (its line node in *this* file, foreign to usage.jl) followed by
+    # `@passthrough <userdef>`.
+    Core.eval(m, :(macro gen(fdef)
+        dispatch = quote
+            _gen_redirect_dummy() = nothing
+        end
+        esc(_rmshallow(quote
+            $dispatch
+            @passthrough $fdef
+        end))
+    end))
+    usage = join([
+        "gl = 0",                                                  # 1
+        "@gen gfn() = throw(ErrorException(\"x\"))",               # 2  <- gfn body
+        "try",                                                     # 3
+        "    gfn()",                                               # 4
+        "catch e",                                                 # 5
+        "    global gl = stacktrace(catch_backtrace())",           # 6
+        "end",                                                     # 7
+    ], "\n") * "\n"
+    JuliaLowering.include_string(m, usage, "usage.jl")
+
+    # The generated method's DebugInfo is flat: the round-trip through the
+    # foreign file emits no "macro expansion" edge.
+    gfn = Core.eval(m, :gfn)
+    di = only(methods(gfn)).debuginfo
+    @test di.def === Symbol("usage.jl")
+    nstmts = length(Base._uncompressed_ir(only(methods(gfn))).code)
+    for pc in 1:nstmts
+        loc = ccall(:jl_uncompress1_codeloc, NTuple{3,Int32}, (Any, Int), di, pc)
+        @test loc[2] == 0  # no edge index
+    end
+
+    # The innermost backtrace frame names the method (not "macro expansion")
+    # and reports its own usage-file location -- no fabricated foreign pair.
+    frames = Core.eval(m, :gl)::Vector{<:Base.StackTraces.StackFrame}
+    l1 = frames[1]
+    @test l1.func === :gfn
+    @test occursin("usage.jl", string(l1.file))
+    @test l1.line == 2
+end
