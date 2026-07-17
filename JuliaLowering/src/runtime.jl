@@ -361,8 +361,11 @@ function _lower_generated_code(g::GeneratedFunctionStub, source::Method, graph,
     ex0 = JuliaSyntax.fill_context!(ex0, sc)
     ctx1 = MacroExpansionContext(ex0, world, true)
     ex1 = expand_forms_1(ctx1, ex0)
-    # Desugaring
-    ctx2, ex2 = expand_forms_2(ex1, world)
+    # Desugaring. The generated body becomes the method body (wrapped in the
+    # lambda below), so validate it as a function body rather than top level:
+    # this is where `@__FUNCTION__`/`(thisfunction)` in the returned expression
+    # resolves to the method's own function object, matching flisp.
+    ctx2, ex2 = expand_forms_2(ex1, world; toplevel=false)
 
     # Wrap expansion in a non-toplevel lambda and run scope resolution
     ex2 = @ast ctx2 ex0 [K"lambda"(is_toplevel_thunk=false, toplevel_pure=true)

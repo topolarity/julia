@@ -135,9 +135,14 @@ We don't check some other things:
 - Checking that certain forms don't appear in value position is also handled
   later in lowering.
 """
-function valid_st1(st::SyntaxTree)
+function valid_st1(st::SyntaxTree; toplevel::Bool=true)
     DEBUG && assert_syntaxtree(st)
-    vr = vst1(Validation1Context(), st)
+    # `toplevel=false` validates `st` as a function body (e.g. the body a
+    # `@generated` function returns, which is later wrapped in a lambda and
+    # spliced in as the method body). Such a body may legitimately use
+    # `@__FUNCTION__`/`return`, but not top-level-only forms like `const`,
+    # matching how flisp lowers a generator's output inside the method lambda.
+    vr = vst1(Validation1Context(toplevel=toplevel, in_gscope=toplevel), st)
     @jl_assert is_known(vr) st
     return vr
 end

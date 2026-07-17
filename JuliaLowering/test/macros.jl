@@ -1910,6 +1910,71 @@ end
     """; expr_compat_mode=true)
 end
 
+@testset "(AI) @__FUNCTION__ in @generated output" begin
+    # Found via Compat v4.18.1 in a PkgEval comparison against flisp lowering.
+    #
+    # The body a `@generated` function *returns* becomes that method's body: it
+    # is wrapped in a lambda and lowered as a function body (see
+    # `_lower_generated_code` in src/runtime.jl).  JuliaLowering used to validate
+    # that returned body as if it were top-level code, so a `(thisfunction)`
+    # (from `@__FUNCTION__`) sitting directly in the generated output tripped the
+    # "can only be used inside a function" guard even though it is inside the
+    # method.  flisp lowers the generator's output inside the method lambda, so
+    # `@__FUNCTION__` there resolves to the method's own function object; the fix
+    # validates/desugars the generated body with `toplevel=false` to match.
+    #
+    # Note: the exact Compat shape puts the `@generated` def in `let`-binding
+    # position (`let @generated foo2() = :(@__FUNCTION__); ...; end`), which
+    # additionally requires the short-form head-preservation fix; here the def is
+    # a top-level / let-*body* statement, which this fix handles on its own.
+
+    # `@__FUNCTION__` returned directly from a short-form generator resolves to
+    # the generated function itself (the reported MWE).
+    JuliaLowering.include_string(test_mod, raw"""
+        @generated tf_gen_short() = :(@__FUNCTION__)
+    """; expr_compat_mode=true)
+    @test test_mod.tf_gen_short() === test_mod.tf_gen_short
+
+    # Same, long-form generator returning a quoted `@__FUNCTION__`.
+    JuliaLowering.include_string(test_mod, raw"""
+        @generated function tf_gen_long()
+            return :(@__FUNCTION__)
+        end
+    """; expr_compat_mode=true)
+    @test test_mod.tf_gen_long() === test_mod.tf_gen_long
+
+    # A `@generated` def written as a `let`-*body* statement (not a binding).
+    @test JuliaLowering.include_string(test_mod, raw"""
+        let
+            @generated tf_gen_inlet() = :(@__FUNCTION__)
+            tf_gen_inlet() === tf_gen_inlet
+        end
+    """; expr_compat_mode=true)
+
+    # `@__FUNCTION__` used through the recursive-call idiom inside generated
+    # output still resolves to the method (factorial via self-reference).
+    JuliaLowering.include_string(test_mod, raw"""
+        @generated function tf_gen_fac(n)
+            :(n <= 1 ? 1 : n * (@__FUNCTION__)(n - 1))
+        end
+    """; expr_compat_mode=true)
+    @test test_mod.tf_gen_fac(5) == 120
+
+    # `return` in generated output is a function-body return, allowed as before.
+    JuliaLowering.include_string(test_mod, raw"""
+        @generated tf_gen_ret() = :(return 42)
+    """; expr_compat_mode=true)
+    @test test_mod.tf_gen_ret() == 42
+
+    # A `const` in generated output is a function-body `const` and is rejected,
+    # matching flisp ("unsupported `const` declaration on local variable").
+    @test_throws JuliaLowering.LoweringError JuliaLowering.include_string(test_mod,
+        raw"""
+        @generated tf_gen_const() = :(const zz = 1)
+        tf_gen_const()
+        """; expr_compat_mode=true)
+end
+
 @testset "var\"#self#\" flisp-compat leak" begin
     # flisp names a method's implicit self argument with the literal, unhygienic
     # symbol `#self#`, so old code grabs the enclosing function via `var"#self#"`
