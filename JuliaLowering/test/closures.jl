@@ -1336,7 +1336,12 @@ f_sp_in_sig_in_lam_in_optarg(1.)(2)
     end
     f_capt_sp_in_ccall_argtype([1, 2])
     """) == true
-    @test_throws LoweringError JuliaLowering.include_string(test_mod, """
+    # A plain local captured into a ccall type inside a closure defers to
+    # codegen's static evaluation (the type expression is spliced as a
+    # `captured_local` template), which rejects it at method-definition time
+    # with flisp's exact error -- same type, message and timing as flisp,
+    # rather than an eager LoweringError.
+    @test_throws "could not evaluate ccall return type" JuliaLowering.include_string(test_mod, """
     function f_local_in_ccall_in_closure(v)
         T = typeof(v)
         g = () -> ccall(:memset, Ptr{T}, (Ptr{Cvoid}, Cint, Csize_t), v, 0, 0)

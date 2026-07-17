@@ -2185,11 +2185,11 @@ end
 11  SourceLocation::1:1
 12  (call core.svec %₉ %₁₀ %₁₁)
 13  --- method TestMod.#f_destructured_gen@generator#0 %₁₂
-    slots: [slot₁/#self#(!read) slot₂/__context__(!read) slot₃/#self#(nospecialize,!read) slot₄/x(nospecialize,!read) slot₅/destructured(nospecialize,!read)]
-    1   (meta :nospecialize slot₃/#self# slot₄/x slot₅/destructured)
+    slots: [slot₁/#self#(!read) slot₂/__context__(!read) slot₃/#self#(nospecialize,!read) slot₄/x(nospecialize,!read) slot₅/destructured#3(nospecialize,!read)]
+    1   (meta :nospecialize slot₃/#self# slot₄/x slot₅/destructured#3)
     2   (call JuliaLowering.interpolate_expr (inert (block (call-i + a b))))
     3   (call core.tuple %₂)
-    4   (call JuliaLowering.interpolate_syntax (syntaxinert (block (block (local (= (tuple a b) destructured))) (block (syntaxunquote (block (call JuliaLowering.interpolate_expr (inert (block (call-i + a b))))))))) %₃)
+    4   (call JuliaLowering.interpolate_syntax (syntaxinert (block (block (local (= (tuple a b) destructured#3))) (block (syntaxunquote (block (call JuliaLowering.interpolate_expr (inert (block (call-i + a b))))))))) %₃)
     5   (return %₄)
 14  latestworld
 15  TestMod.f_destructured_gen
@@ -2199,13 +2199,13 @@ end
 19  SourceLocation::1:1
 20  (call core.svec %₁₇ %₁₈ %₁₉)
 21  --- method TestMod.f_destructured_gen %₂₀
-    slots: [slot₁/#self#(!read) slot₂/x(!read) slot₃/destructured slot₄/iterstate(single_assign) slot₅/a(!read,single_assign) slot₆/b(!read,single_assign)]
-    1   (meta :generated (new JuliaLowering.GeneratedFunctionStub SyntaxContext(#=omitted=#) TestMod.#f_destructured_gen@generator#0 SourceRef::1:1 (call core.svec :#self# :x :destructured) (call core.svec)))
-    2   (call top.indexed_iterate slot₃/destructured 1)
+    slots: [slot₁/#self#(!read) slot₂/x(!read) slot₃/destructured#3 slot₄/iterstate(single_assign) slot₅/a(!read,single_assign) slot₆/b(!read,single_assign)]
+    1   (meta :generated (new JuliaLowering.GeneratedFunctionStub SyntaxContext(#=omitted=#) TestMod.#f_destructured_gen@generator#0 SourceRef::1:1 (call core.svec :#self# :x :destructured#3) (call core.svec)))
+    2   (call top.indexed_iterate slot₃/destructured#3 1)
     3   (= slot₅/a (call core.getfield %₂ 1))
     4   (= slot₄/iterstate (call core.getfield %₂ 2))
     5   slot₄/iterstate
-    6   (call top.indexed_iterate slot₃/destructured 2 %₅)
+    6   (call top.indexed_iterate slot₃/destructured#3 2 %₅)
     7   (= slot₆/b (call core.getfield %₆ 1))
     8   (meta :generated_only)
     9   (return core.nothing)

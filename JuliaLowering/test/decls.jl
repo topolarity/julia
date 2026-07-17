@@ -1257,6 +1257,8 @@ end
         end
         """) isa Function
     @test !isdefined(m, :no_method_f)
+end
+
 @testset "(AI) global/local method def on a qualified name" begin
     # `global Mod.f(::Int) = 1` (extend another module's method from a local
     # scope) routes its LHS through `make_lhs_decls`, which recurses into the

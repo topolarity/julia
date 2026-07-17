@@ -1270,9 +1270,6 @@ end
     end
 end
 
-@testset "@isdefined sees imported globals" begin
-    # implicit Core/Base visibility and `using`-provided names count as defined
-    # at module scope
 # An unhygienic `global` declaration exempts its name from hygiene renaming in
 # flisp: sibling bare occurrences of the same raw symbol classify as global in
 # the declaring scope and resolve in the macro's *home* module (while the

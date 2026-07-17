@@ -2250,12 +2250,10 @@ end
             @generated function fds_kw((a, b); k=0); quote a + b + k end; end
             fds_kw((2, 3); k=10)
         """; expr_compat_mode) == 15
-        # Known separate divergence (NOT this fix): with two destructured
-        # arguments the generator stub's `argnames` svec carries two identical
-        # `destructured` placeholders, so staging fails with "function argument
-        # name not unique" (flisp accepts it).  Distinct root cause in the stub
-        # argname reconstruction, orthogonal to the dropped-prologue bug above.
-        @test_broken JL.include_string(test_mod, raw"""
+        # Two destructured arguments: fixed upstream by the per-position
+        # `destructured#i` argname mangling (JuliaLang/julia#62412), which
+        # keeps the generator stub's `argnames` svec unique.
+        @test JL.include_string(test_mod, raw"""
             @generated function fds_multi((a, b), (c, d)); quote a + b + c + d end; end
             fds_multi((1, 2), (3, 4))
         """; expr_compat_mode) == 10
@@ -2474,6 +2472,8 @@ end
             end
             nif_uses_sparam(1, Int)
         end"""; expr_compat_mode) === Int
+    end
+
     @testset "prologue meta forwarded to specializations" begin
         # A "prologue" annotation macro (`@inline`, `@noinline`,
         # `Base.@propagate_inbounds`, `Base.@constprop`, `Base.@assume_effects`)
