@@ -1964,3 +1964,182 @@ end
               JuliaLowering.include_string(m, src)
     end
 end
+
+@testset "(AI) local function shadowing a captured argument" begin
+    # Found via SPHtoGrid v0.5.3 in a PkgEval comparison against flisp lowering.
+    #
+    # The "Cannot add method to a function argument" check must be scoped to the
+    # *immediately enclosing* lambda, mirroring flisp's `(memq name (lam:args
+    # lam))` in `cl-convert` (src/julia-syntax.scm).  A nested closure that only
+    # *captures* an outer lambda's argument may shadow it with a same-named local
+    # function: flisp lowers this to a fresh local generic function of the
+    # defining lambda that rebinds the (boxed, captured) slot -- it does NOT add a
+    # method to the argument's value.  SPHtoGrid's `analytic_synchrotron` uses
+    # exactly this shape: a `spectrum::Union{Nothing,Function}=nothing` keyword
+    # argument given a same-named fallback definition inside a `@threads for`
+    # loop-body closure.  JuliaLowering previously rejected any `function_decl`
+    # whose name resolved to an `:argument` binding, regardless of which lambda
+    # declared it, so it wrongly errored on the captured (cross-lambda) case.
+    m = Module()
+
+    # The reduced SPHtoGrid shape: a kwarg captured by a nested closure defined in
+    # a loop, given a fallback method when the caller passed `nothing`.  Matches
+    # flisp's runtime result [2.0, 3.0, 4.0].
+    @test JuliaLowering.include_string(m, """
+    function outer(; spectrum::Union{Nothing,Function}=nothing)
+        results = Float64[]
+        for i in 1:3
+            f = () -> begin
+                if isnothing(spectrum)
+                    spectrum(E::Real) = E + 1.0
+                end
+                push!(results, spectrum(Float64(i)))
+            end
+            f()
+        end
+        results
+    end
+    outer()
+    """) == [2.0, 3.0, 4.0]
+
+    # When the caller *does* supply a function, the fallback branch is not taken
+    # and the passed-in function is not mutated (no method added to it): matches
+    # flisp.  `g` still has a single method and returns `10x`.
+    @test JuliaLowering.include_string(m, """
+    function outer2(; spectrum::Union{Nothing,Function}=nothing)
+        results = Float64[]
+        for i in 1:3
+            f = () -> begin
+                if isnothing(spectrum)
+                    spectrum(E::Real) = E + 1.0
+                end
+                push!(results, spectrum(Float64(i)))
+            end
+            f()
+        end
+        results
+    end
+    g(x) = x * 10.0
+    (outer2(spectrum=g), length(methods(g)))
+    """) == ([10.0, 20.0, 30.0], 1)
+
+    # flisp shares the captured slot: the shadow rebinds the *same* variable, so
+    # the enclosing lambda observes the fresh generic function (=== nothing is
+    # false) -- it is not a distinct inner-only local.  A `:local` (non-argument)
+    # captured variable already behaved this way; the argument case now matches.
+    @test JuliaLowering.include_string(m, """
+    function outer3(spectrum=nothing)
+        r = () -> (spectrum(E::Real) = E + 1.0; spectrum(2.0))
+        v = r()
+        (v, spectrum === nothing)
+    end
+    outer3()
+    """) == (3.0, false)
+
+    # do-block and generator bodies are lambdas too: shadowing a captured argument
+    # inside them is allowed and produces flisp's values.
+    @test JuliaLowering.include_string(m, """
+    function outerdo(; spectrum::Union{Nothing,Function}=nothing)
+        res = Float64[]
+        map([1.0, 2.0]) do x
+            if isnothing(spectrum)
+                spectrum(E::Real) = E + 7.0
+            end
+            push!(res, spectrum(x))
+        end
+        res
+    end
+    outerdo()
+    """) == [8.0, 9.0]
+
+    @test JuliaLowering.include_string(m, """
+    function outergen(; spectrum::Union{Nothing,Function}=nothing)
+        collect(begin
+            if isnothing(spectrum)
+                spectrum(E::Real) = E + 9.0
+            end
+            spectrum(Float64(i))
+        end for i in 1:3)
+    end
+    outergen()
+    """) == [10.0, 11.0, 12.0]
+
+    # Deeper nesting: a closure-in-closure may shadow the outermost argument, and
+    # the innermost closure may shadow a *middle* lambda's argument -- both are
+    # non-arguments of the innermost lambda, so both are allowed (flisp).
+    @test JuliaLowering.include_string(m, """
+    function outer4(; spectrum::Union{Nothing,Function}=nothing)
+        res = Float64[]
+        mid = () -> begin
+            inner = () -> begin
+                if isnothing(spectrum)
+                    spectrum(E::Real) = E + 100.0
+                end
+                push!(res, spectrum(1.0))
+            end
+            inner()
+        end
+        mid()
+        res
+    end
+    outer4()
+    """) == [101.0]
+
+    @test JuliaLowering.include_string(m, """
+    function top5()
+        res = Float64[]
+        mid = (spectrum) -> begin
+            inner = () -> begin
+                if isnothing(spectrum)
+                    spectrum(E::Real) = E + 5.0
+                end
+                push!(res, spectrum(1.0))
+            end
+            inner()
+        end
+        mid(nothing)
+        res
+    end
+    top5()
+    """) == [6.0]
+
+    # Still an error (matches flisp): adding a method to an argument of the
+    # *same* lambda the definition appears in -- both the positional-argument and
+    # reassigned-then-redefined forms.
+    @test_throws LoweringError JuliaLowering.include_string(m, """
+    function samefunc(spectrum=nothing)
+        if isnothing(spectrum)
+            spectrum(E::Real) = E + 1.0
+        end
+        spectrum(1.0)
+    end
+    """)
+
+    @test_throws LoweringError JuliaLowering.include_string(m, """
+    function reassigned(spectrum=1)
+        spectrum = nothing
+        if isnothing(spectrum)
+            spectrum(E::Real) = E + 1.0
+        end
+        spectrum(1.0)
+    end
+    """)
+
+    # The same shape through the actual package path: a `Threads.@threads for`
+    # loop body is a closure that captures the kwarg and defines the fallback.
+    @test JuliaLowering.include_string(m, """
+    using Base.Threads
+    function analytic(P; spectrum::Union{Nothing,Function}=nothing)
+        j = zeros(Float64, length(P))
+        @threads for i = 1:length(P)
+            if isnothing(spectrum)
+                s = Float64(i)
+                spectrum(E::Real) = E + s
+            end
+            j[i] = spectrum(10.0)
+        end
+        j
+    end
+    analytic([1, 2, 3])
+    """) == [11.0, 11.0, 11.0]
+end

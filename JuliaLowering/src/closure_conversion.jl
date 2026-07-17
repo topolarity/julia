@@ -678,7 +678,7 @@ function _convert_closures(ctx::ClosureConversionCtx, ex)
         ]
     elseif k == K"function_type"
         func_name = ex[1]
-        if kind(func_name) == K"BindingId" && get_binding(ctx, func_name).kind === :local
+        if kind(func_name) == K"BindingId" && is_local_closure_fname(get_binding(ctx, func_name))
             ck = closure_key(ctx, ex[1])
             @jl_assert(haskey(ctx.closure_infos, ck),
                        (ex, "function_type of local without known closure type"))
@@ -697,7 +697,7 @@ function _convert_closures(ctx::ClosureConversionCtx, ex)
         end
     elseif k == K"method_defs"
         name = ex[1]
-        is_closure = kind(name) == K"BindingId" && get_binding(ctx, name).kind === :local
+        is_closure = kind(name) == K"BindingId" && is_local_closure_fname(get_binding(ctx, name))
         cap_rewrite = is_closure ? ctx.closure_infos[closure_key(ctx, name)] : nothing
         ctx2 = ClosureConversionCtx(
             ctx.graph, ctx.bindings, ctx.mod,

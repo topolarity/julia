@@ -1103,8 +1103,16 @@ function _resolve_scopes(ctx, ex::SyntaxTree,
         resolved = mapchildren(e->_resolve_scopes(ctx, e, scope), ctx, ex)
         name = resolved[1]
         if kind(name) == K"BindingId"
-            bk = get_binding(ctx, name).kind
-            if bk == :argument
+            b = get_binding(ctx, name)
+            bk = b.kind
+            # Mirror flisp's per-lambda scoping (julia-syntax.scm, `cl-convert`'s
+            # `method` case: `(memq name (lam:args lam))`): reject adding a method
+            # only when the name is an argument of the *immediately enclosing*
+            # lambda.  A nested closure that merely captures an outer lambda's
+            # argument and shadows it with a same-named local function is allowed
+            # -- comparing the argument's declaring lambda against the enclosing
+            # lambda of this `function_decl`.
+            if bk == :argument && b.lambda_id == scope.lambda_id
                 throw(LoweringError(name, "Cannot add method to a function argument"))
             elseif bk == :global && !is_top_scope(enclosing_lambda(ctx, scope))
                 throw(LoweringError(name, """
@@ -1206,7 +1214,7 @@ end
 function init_closure_bindings!(ctx, fname)
     bid = fname.var_id::IdTag
     ck = closure_key(ctx, fname)
-    @jl_assert get_binding(ctx, bid).kind === :local fname
+    @jl_assert is_local_closure_fname(get_binding(ctx, bid)) fname
     get!(ctx.closure_bindings, ck) do
         name_stack = Vector{String}()
         for parentname in ctx.method_def_stack
@@ -1318,6 +1326,21 @@ function closure_key(ctx, ex)
     @jl_assert kind(ex) === K"BindingId" ex
     ClosureKey(ex.var_id::IdTag, ctx.lambda_bindings.scope_id)
 end
+
+# Does a `function_decl`/`method_defs`/`function_type` name denote a *local
+# generic function* (a closure), to be routed through the local-closure
+# machinery (`closure_bindings`, `convert_local_function_decl`)?  True for a
+# plain local, and also for an argument captured from an enclosing lambda.
+#
+# A method definition on an argument of the *immediately enclosing* lambda is
+# rejected upstream by the "Cannot add method to a function argument" check in
+# `_resolve_scopes` (which runs to completion before variable analysis and
+# closure conversion, per `resolve_scopes`), so any `:argument`-kind name that
+# reaches these passes is necessarily captured from an outer lambda.  flisp
+# lowers such a shadowing definition to a fresh local generic function of the
+# defining lambda, rebinding the (boxed, captured) slot -- routing captured
+# arguments through the same machinery as locals mirrors that.
+is_local_closure_fname(b::BindingInfo) = b.kind === :local || b.kind === :argument
 function current_closure_bindings(ctx)
     isempty(ctx.closure_key_stack) && return nothing
     get(ctx.closure_bindings, ctx.closure_key_stack[end], nothing)
@@ -1395,12 +1418,12 @@ function analyze_variables!(ctx, ex)
     elseif k == K"function_decl"
         name = ex[1]
         b = get_binding(ctx, name)
-        if b.kind === :local
+        if is_local_closure_fname(b)
             init_closure_bindings!(ctx, name)
         end
         add_assign!(b)
     elseif k == K"function_type"
-        if kind(ex[1]) != K"BindingId" || get_binding(ctx, ex[1]).kind !== :local
+        if kind(ex[1]) != K"BindingId" || !is_local_closure_fname(get_binding(ctx, ex[1]))
             analyze_variables!(ctx, ex[1])
         end
     elseif k == K"constdecl"
@@ -1431,7 +1454,7 @@ function analyze_variables!(ctx, ex)
     elseif k == K"method_defs"
         push!(ctx.method_def_stack, ex[1])
         is_closure = kind(ex[1]) == K"BindingId" &&
-            get_binding(ctx, ex[1]).kind === :local
+            is_local_closure_fname(get_binding(ctx, ex[1]))
         ctx2 = VariableAnalysisContext(
             ctx.graph, ctx.layer, ctx.bindings, ctx.scopes,
             ctx.lambda_bindings, true, ctx.method_def_stack,
@@ -1467,7 +1490,7 @@ function analyze_variables!(ctx, ex)
         if !ex.is_toplevel_thunk && !isempty(ctx.closure_key_stack)
             # Record all lambdas for the same closure type in one place
             ck = last(ctx.closure_key_stack)
-            if get_binding(ctx, ck.binding).kind === :local
+            if is_local_closure_fname(get_binding(ctx, ck.binding))
                 push!(ctx.closure_bindings[ck].lambdas, lambda_bindings)
             end
         end
