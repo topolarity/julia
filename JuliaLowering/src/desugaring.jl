@@ -2930,7 +2930,7 @@ function propagate_method_meta(ctx, body)
 end
 
 function keywords_method_def_expr(ctx, src, mtable, sparams, argl, body, rett,
-                                  overlay=false)
+                                  overlay=false, ret_value=mtable)
     kws = argl[end]
     pargl = argl[1:end-1]
     @jl_assert kind(kws) === K"parameters" src
@@ -3128,7 +3128,7 @@ function keywords_method_def_expr(ctx, src, mtable, sparams, argl, body, rett,
         [K"method_defs" m1_name method_def_sparams(ctx, src, sparams) mdefs1]
         [K"method_defs" mdefs23_id method_def_sparams(ctx, src, pos_sparams) mdefs2]
         [K"method_defs" mdefs23_id method_def_sparams(ctx, src, pos_sparams) mdefs3]
-        mtable
+        ret_value
     ]
 end
 
@@ -3238,7 +3238,22 @@ function expand_function_def(ctx, src, raw_args, wheres, body, rett)
             body = prepend_function_body(ctx, body, blk)
         end
     end
-    (overlay, mtable, a1) = expand_function_arg1(ctx, raw_args[1])
+    # An all-underscore function name (`_(...) = body`) binds no global and
+    # belongs to no visible method table.  flisp lowers it exactly like a normal
+    # named function but on a *fresh throwaway* function (a gensym'd type), while
+    # the definition's value stays a write-only read of `_`.  Mirror that:
+    # substitute a hidden throwaway name for the method-table/binding machinery,
+    # and keep the placeholder as the definition's trailing value so a discarded
+    # definition is a silent no-op (struct body, local block) while a used value
+    # is a clean write-only error (e.g. at top level, where every statement's
+    # value is read).
+    name_arg = raw_args[1]
+    placeholder_name = nothing
+    if kind(name_arg) === K"Placeholder"
+        placeholder_name = name_arg
+        name_arg = newsym(ctx, name_arg, "_")
+    end
+    (overlay, mtable, a1) = expand_function_arg1(ctx, name_arg)
     # The `@overlay` method table may be any expression yielding a MethodTable
     # (flisp: `sym-ref-or-overlay?`); evaluate it to a temporary so the method
     # slots below only carry a simple value reference.
@@ -3261,7 +3276,8 @@ function expand_function_def(ctx, src, raw_args, wheres, body, rett)
     sparams = mapsyntax(typevar_bounds, wheres)
     if has_kws
         result = keywords_method_def_expr(ctx, src, mtable, sparams, argl, body,
-                                          rett, overlay)
+                                          rett, overlay,
+                                          isnothing(placeholder_name) ? mtable : placeholder_name)
         overlay ? @ast(ctx, src, [K"block" overlay_prelude... result]) : result
     else
         # The table temporary is a value, not a function binding: no
@@ -3274,7 +3290,7 @@ function expand_function_def(ctx, src, raw_args, wheres, body, rett)
                 method_def_sparams(ctx, src, sparams)
                 [K"block" method_def_expr(ctx, src, mtable, sparams, argl, body, rett)]]
                 # TODO: overlay should return the method
-                [K"removable" mtable]]
+                [K"removable" (isnothing(placeholder_name) ? mtable : placeholder_name)]]
     end
 end
 

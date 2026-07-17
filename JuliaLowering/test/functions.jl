@@ -2891,3 +2891,73 @@ end
     @test !any(s -> (s isa Expr && s.head === :invoke &&
                      occursin("bigkw", string(s.args[1]))), ci.code)
 end
+
+@testset "(AI) all-underscore function/method names" begin
+    # Found via CompositeStructs v0.1.5 in a PkgEval comparison against flisp
+    # lowering.  A method whose name is the all-underscore placeholder
+    # (`_(...) = body`) used to reach `expand_function_arg1` and pass the bare
+    # `K"Placeholder"` node through as the method-table target, which then flowed
+    # into `function_decl`/`method_defs`/`removable` and tripped validation with
+    # an "internal lowering bug: expected identifier or BindingId" ICE.
+    #
+    # flisp lowers `_(...) = body` like any named definition but on a fresh
+    # throwaway function (a gensym'd type), binding no global and adding nothing
+    # to a visible method table; the definition's *value* stays a write-only read
+    # of `_`.  So it is a silent no-op wherever the value is discarded (struct
+    # body, local block) and a clean write-only error wherever the value is read
+    # (e.g. at top level, where every statement's value is returned).  The fix
+    # mirrors that: substitute a hidden throwaway name for the binding/method
+    # machinery and keep the placeholder as the trailing value.
+
+    # Struct-body filler (the CompositeStructs idiom): any inner-constructor-
+    # shaped statement suppresses the default positional constructor, and `_` is
+    # the throwaway name.  Lowers silently, binds no `_`, adds no method, and the
+    # default constructor is suppressed -- exactly as under flisp.
+    m = Module()
+    @test JuliaLowering.include_string(m, """
+        struct UnderscoreFiller
+            x
+            y
+            z
+            _() = nothing
+        end
+        UnderscoreFiller
+        """) === Core.eval(m, :UnderscoreFiller)
+    @test !isdefined(m, :_)
+    @test length(methods(Core.eval(m, :UnderscoreFiller))) == 0
+    @test_throws MethodError Core.eval(m, :(UnderscoreFiller(1, 2, 3)))
+    @test fieldnames(Core.eval(m, :UnderscoreFiller)) == (:x, :y, :z)
+
+    # A struct with no such filler keeps its default positional constructor.
+    m = Module()
+    JuliaLowering.include_string(m, "struct NoFiller; a; b; end")
+    @test Core.eval(m, :(NoFiller(1, 2))) isa Core.eval(m, :NoFiller)
+
+    # Discarded in local (non-tail) positions: also a silent no-op, no `_` bound.
+    m = Module()
+    @test JuliaLowering.include_string(m, """
+        function underscore_in_body()
+            _() = nothing
+            7
+        end
+        underscore_in_body()
+        """) === 7
+    @test !isdefined(m, :_)
+    @test JuliaLowering.include_string(Module(), "let; _() = nothing; 5; end") === 5
+
+    # Read in value position (top level, where the statement's value is used):
+    # a clean write-only error with flisp's wording, never an ICE.
+    for code in ("_() = nothing",
+                 "_(x::Int) = x",
+                 "_(; a=1) = a",
+                 "function _(x)\n    x + 1\nend")
+        err = try
+            JuliaLowering.include_string(Module(), code)
+            nothing
+        catch e
+            e
+        end
+        @test err isa LoweringError
+        @test occursin("all-underscore identifiers are write-only", sprint(showerror, err))
+    end
+end
