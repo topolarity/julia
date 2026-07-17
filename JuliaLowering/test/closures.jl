@@ -1876,6 +1876,153 @@ end
     """) == true
 end
 
+@testset "(AI) bodyless function decl before a local method" begin
+    # A bodyless `function Name end` forward-declaration followed by a real
+    # method for the same name, in *local* scope, must instantiate the local
+    # closure value *before* the `method_defs` group that reads it to attach the
+    # method.  Both the stub and the first real method auto-emit their own
+    # auxiliary `K"function_decl"` node for the same closure key; scope analysis
+    # used to count both as assignments, clearing `is_assigned_once`, which made
+    # `convert_local_function_decl` defer the `Name = %new(...)` rebind past the
+    # `method_defs` -- so the method-add read an undefined local
+    # (`UndefVarError: f not defined in local scope`).  flisp keys the same
+    # decision off a `defined` table that a bodyless stub never populates, so it
+    # instantiates exactly once, inline.  Found via ConfigurationsENV v0.1.1
+    # (Continuables v1.0.3) in a PkgEval comparison against flisp lowering; the
+    # `@match` macro of SimpleMatch expands to exactly this idiom.
+    m = Module()
+
+    # The core MWE: stub, then one method, then a call.
+    @test JuliaLowering.include_string(m, """
+    function outer()
+        function f end
+        f(x) = x + 1
+        f(1)
+    end
+    outer()
+    """) == 2
+
+    # Multiple methods after the stub all attach to the one closure value.
+    @test JuliaLowering.include_string(m, """
+    function outer()
+        function f end
+        f(x::Int) = x + 1
+        f(x::Float64) = x + 2.0
+        (f(1), f(2.0))
+    end
+    outer()
+    """) == (2, 4.0)
+
+    # Same shape inside a `let` block.
+    @test JuliaLowering.include_string(m, """
+    let
+        function f end
+        f(x) = x + 1
+        f(1)
+    end
+    """) == 2
+
+    # The stub appearing *after* the first method (the name is already a fresh
+    # closure by then) keeps working.
+    @test JuliaLowering.include_string(m, """
+    function outer()
+        f(x) = x + 1
+        function f end
+        f(1)
+    end
+    outer()
+    """) == 2
+
+    # Two stubs for the same name, then a method.
+    @test JuliaLowering.include_string(m, """
+    function outer()
+        function f end
+        function f end
+        f(x) = x + 1
+        f(1)
+    end
+    outer()
+    """) == 2
+
+    # A `where`-parameterized method after the stub.
+    @test JuliaLowering.include_string(m, """
+    function outer()
+        function f end
+        f(x::T) where {T<:Number} = x + one(T)
+        f(1)
+    end
+    outer()
+    """) == 2
+
+    # A `@nospecialize`-annotated method after the stub.
+    @test JuliaLowering.include_string(m, """
+    function outer()
+        function f end
+        f(@nospecialize(x)) = x + 1
+        f(1)
+    end
+    outer()
+    """) == 2
+
+    # A nested closure that captures the stubbed-then-defined `f`.
+    @test JuliaLowering.include_string(m, """
+    function outer()
+        function f end
+        f(x) = x + 1
+        g = () -> f(10)
+        g()
+    end
+    outer()
+    """) == 11
+
+    # ...with multiple methods and a capturing closure.
+    @test JuliaLowering.include_string(m, """
+    function outer()
+        function f end
+        f(x::Int) = x + 1
+        f(x::Float64) = x + 2.0
+        g = () -> f(1) + Int(f(2.0))
+        g()
+    end
+    outer()
+    """) == 6
+
+    # A stub with no method ever added still binds a callable closure value
+    # (calling it with no matching method is a `MethodError`, as in flisp).
+    @test JuliaLowering.include_string(m, """
+    function outer()
+        function f end
+        f
+    end
+    outer()
+    """) isa Function
+    @test_throws MethodError JuliaLowering.include_string(m, """
+    function outer()
+        function f end
+        f(1)
+    end
+    outer()
+    """)
+
+    # Control: the same code without the stub already worked, and still does.
+    @test JuliaLowering.include_string(m, """
+    function outer()
+        f(x) = x + 1
+        f(x, y) = x + y
+        f(1)
+    end
+    outer()
+    """) == 2
+
+    # A toplevel bodyless decl followed by a method is a plain global generic
+    # function and must stay unaffected (the bug was local-scope only).
+    @test JuliaLowering.include_string(m, """
+    function g_toplevel end
+    g_toplevel(x) = x + 1
+    g_toplevel(1)
+    """) == 2
+end
+
 @testset "(AI) hoist top-level closure definitions out of loops" begin
     # A closure type/method defined textually inside a top-level loop body must
     # be *defined once*, before the loop -- exactly as flisp does -- not

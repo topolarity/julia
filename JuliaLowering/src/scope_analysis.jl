@@ -1419,9 +1419,22 @@ function analyze_variables!(ctx, ex)
         name = ex[1]
         b = get_binding(ctx, name)
         if is_local_closure_fname(b)
+            # Every `function_decl` for the same local closure key refers to the
+            # *same* generic-function value: a bodyless `function Name end` stub
+            # emits one (`desugaring.jl`, `:bodyless_decl`), and the first real
+            # method def auto-emits another ahead of its `method_defs`.  They must
+            # count as a *single* assignment, or `is_assigned_once` is wrongly
+            # cleared and `convert_local_function_decl` defers the
+            # `Name = %new(...)` instantiate past the `method_defs` that read it
+            # (UndefVarError).  Genuine name reuse (a prior `K"="`, e.g. a type
+            # alias redefined as a closure) still clears `is_assigned_once`, since
+            # that assignment is not a `function_decl` and precedes the first one.
+            already_declared = haskey(ctx.closure_bindings, closure_key(ctx, name))
             init_closure_bindings!(ctx, name)
+            already_declared || add_assign!(b)
+        else
+            add_assign!(b)
         end
-        add_assign!(b)
     elseif k == K"function_type"
         if kind(ex[1]) != K"BindingId" || !is_local_closure_fname(get_binding(ctx, ex[1]))
             analyze_variables!(ctx, ex[1])
