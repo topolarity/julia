@@ -282,22 +282,34 @@ function _at_eval_code(mc::MacroContext, mod_st::SyntaxTree, ex)
     val = remove_context(@ast mc mc.macrocall ("eval_result"::K"Identifier"))
     q = _legacy_quote_to_syntax((@ast mc mc.macrocall [K"quote" ex]), 0, true)
     new_sc = SyntaxContext(base_layer(sc).mod, sc.version)
-    @ast mc mc.macrocall [K"block"
-        [K"local"
-            [K"="
-                val
-                [K"call"
-                    # `eval_flisp_compat` mirrors flisp's `@eval` == `Core.eval`:
-                    # a user-facing lowering error surfaces as an `ErrorException`
-                    # rather than a raw `LoweringError`. See its definition.
-                    JuliaLowering.eval_flisp_compat::K"Value"
-                    mod_st
-                    [K"call" JuliaSyntax.fill_context::K"Value" q new_sc::K"Value"]
+    # Wrap the expansion in a `let` so the whole `@eval` is a single, opaque
+    # statement rather than a bare `block` ending in a value identifier.
+    # `@eval` strips hygiene from `eval_result` (`remove_context` above), so if
+    # this expansion were spliced (as a `block`) into a `struct` body, its
+    # trailing value identifier would be mis-collected by `_collect_struct_fields`
+    # as an untyped, unhygienic — and hence duplicable — struct field.  flisp's
+    # `@eval` expands to a bare `Core.eval` call and so never contributes a
+    # phantom field; the `let` gives us the same inertness in field position
+    # while still yielding the eval result as the `@eval` expression's value.
+    @ast mc mc.macrocall [K"let"
+        [K"block"]
+        [K"block"
+            [K"local"
+                [K"="
+                    val
+                    [K"call"
+                        # `eval_flisp_compat` mirrors flisp's `@eval` == `Core.eval`:
+                        # a user-facing lowering error surfaces as an `ErrorException`
+                        # rather than a raw `LoweringError`. See its definition.
+                        JuliaLowering.eval_flisp_compat::K"Value"
+                        mod_st
+                        [K"call" JuliaSyntax.fill_context::K"Value" q new_sc::K"Value"]
+                    ]
                 ]
             ]
+            [K"unknown_head"(name_val="latestworld-if-toplevel")]
+            val
         ]
-        [K"unknown_head"(name_val="latestworld-if-toplevel")]
-        val
     ]
 end
 function Base.var"@eval"(__context__::MacroContext, ex)

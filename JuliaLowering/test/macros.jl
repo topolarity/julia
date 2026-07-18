@@ -542,6 +542,49 @@ end))
     @test run("@mini_tasks(for i in 1:4; i * i; end)") == [1, 4, 9, 16]
 end
 
+@testset "(AI) @eval inside a struct body leaks no phantom field" for run in [
+    (x::String)->Base.include_string(
+        test_mod, "#=FLISP SANITY-CHECK=# "*x),
+    (x::String)->JuliaLowering.include_string(
+        test_mod, "#=JL COMPAT=# "*x; expr_compat_mode=true),
+    (x::String)->JuliaLowering.include_string(
+        test_mod, "#=JL=# "*x; expr_compat_mode=false)]
+
+    # Found via Cadnip v0.13.0 in a PkgEval comparison against flisp lowering.
+    # `@eval`'s expansion is a block whose trailing value is a bare, hygiene-
+    # stripped `eval_result` identifier.  Spliced into a `struct` body it was
+    # mis-collected by `_collect_struct_fields` as an untyped field, so a single
+    # `@eval` grew a phantom `eval_result` field and two `@eval`s collided with
+    # `LoweringError: duplicate field name`.  flisp's `@eval` expands to a bare
+    # `Core.eval` call and contributes no field; the fix makes JL match — every
+    # lane below agrees on the field set and the `new`-based constructors work.
+
+    # A single `@eval` defining a `new`-based factory adds no phantom field.
+    @test run(raw"""
+        struct SingleEvalStruct{T}
+            val::T
+            @eval sesfactory(t::T) where {T} = $(Expr(:new, :(SingleEvalStruct{T}), :t))
+        end
+        (fieldnames(SingleEvalStruct), nfields(sesfactory(5)), sesfactory(5).val)
+        """) == ((:val,), 1, 5)
+
+    # The original Cadnip `DefaultOr` shape: two `@eval`s in one struct body,
+    # each defining a `new{T}`-based constructor/factory.  No collision, no
+    # phantom fields, and both constructors build a 2-field value.
+    @test run(raw"""
+        struct DefOrTest{T}
+            val::T
+            is_default::Bool
+            DefOrTest{T}(val::T, is_default::Bool) where {T} = new{T}(val, is_default)
+            global mkdeftest
+            @eval DefOrTest(val::T, is_default::Bool) where {T} = $(Expr(:new, :(DefOrTest{T}), :val, :is_default))
+            @eval mkdeftest(t::T) where {T} = $(Expr(:new, :(DefOrTest{T}), :t, true))
+        end
+        d = mkdeftest(3)
+        (fieldnames(DefOrTest), nfields(d), d.val, d.is_default, DefOrTest(7, false).val)
+        """) == ((:val, :is_default), 2, 3, true, 7)
+end
+
 @testset "apply_expansion_layer mutation testing" begin
     local test_mod = @newmod(apply_expansion_layer)
     # recursion can't stop at module/toplevel/inert without tweaks, because a
