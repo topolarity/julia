@@ -81,6 +81,57 @@ pub static WORLD_HAS_STOPPED: AtomicBool = AtomicBool::new(false);
 #[no_mangle]
 pub static DISABLED_GC: AtomicBool = AtomicBool::new(false);
 
+// Diagnostic counters: how many GCs ran, and how many were emergency GCs.
+pub static GC_COUNT_TOTAL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub static GC_COUNT_EMERGENCY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub static GC_COUNT_FULL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub static GC_COUNT_INITIAL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub static GC_COUNT_FINAL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+// Timing: STW pause (world stopped -> resumed) vs mutator blocked time in block_for_gc.
+pub static STW_START_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static STW_MAX_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static STW_TOTAL_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static STW_KIND: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0); // 1=Full 2=Initial 3=Final
+pub static STW_KIND_NS: [std::sync::atomic::AtomicU64; 4] = [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+pub static STW_KIND_MAX: [std::sync::atomic::AtomicU64; 4] = [
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+];
+/// GC ordinal (per kind) at which the max was set -- discriminates
+/// first-cycle cold effects from recurring tails.
+pub static STW_KIND_MAX_AT: [std::sync::atomic::AtomicU64; 4] = [
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+];
+pub static STW_KIND_N: [std::sync::atomic::AtomicU64; 4] = [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+pub static BLOCK_MAX_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Longest wait inside jl_mmtk_gc_stw_begin (bringing mutators to the safepoint).
+pub static STOP_WAIT_MAX_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static BLOCK_TOTAL_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static BLOCK_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static LAST_BLOCK_START_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static TRIG_MAX_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static TRIG_TOTAL_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static TRIG_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+lazy_static! {
+    pub static ref CLOCK_ORIGIN: std::time::Instant = std::time::Instant::now();
+}
+pub fn now_ns() -> u64 {
+    CLOCK_ORIGIN.elapsed().as_nanos() as u64
+}
+pub fn record_max(slot: &std::sync::atomic::AtomicU64, v: u64) {
+    let mut cur = slot.load(std::sync::atomic::Ordering::Relaxed);
+    while v > cur {
+        match slot.compare_exchange_weak(cur, v, std::sync::atomic::Ordering::Relaxed,
+                                         std::sync::atomic::Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(x) => cur = x,
+        }
+    }
+}
+
 #[no_mangle]
 pub static USER_TRIGGERED_GC: AtomicIsize = AtomicIsize::new(0);
 
@@ -119,6 +170,8 @@ extern "C" {
     pub fn jl_gc_scan_vm_specific_roots(closure: *mut crate::slots::RootsWorkClosure);
     pub fn jl_gc_update_inlined_array(to: Address, from: Address);
     pub fn jl_gc_prepare_to_collect();
+    pub fn jl_mmtk_gc_stw_begin();
+    pub fn jl_mmtk_gc_stw_end();
     pub fn jl_gc_get_owner_address_to_mmtk(m: Address) -> Address;
     pub fn jl_gc_genericmemory_how(m: Address) -> usize;
     pub fn jl_gc_get_max_memory() -> usize;

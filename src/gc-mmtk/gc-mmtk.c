@@ -311,6 +311,37 @@ JL_DLLEXPORT void jl_gc_collect(jl_gc_collection_t collection) {
 
 // Based on jl_gc_collect from gc-stock.c
 // called when stopping the thread in `mmtk_block_for_gc`
+// FIX D: stop/resume the world from a GC worker thread. mmtk-core's
+// `Collection::stop_all_mutators` contract says the pause begins when that
+// method returns -- i.e. the *collector* decides when the world stops, once it
+// is ready to run pause work immediately. Requesting mutators merely park (see
+// jl_gc_prepare_to_collect below), so every scheduling/drain delay is borne by
+// the GC while mutators keep running.
+JL_DLLEXPORT void jl_mmtk_gc_stw_begin(void)
+{
+    uint64_t t0 = jl_hrtime();
+    jl_safepoint_stw_begin();
+    jl_fence();
+    gc_n_threads = jl_atomic_load_acquire(&jl_n_threads);
+    gc_all_tls_states = jl_atomic_load_relaxed(&jl_all_tls_states);
+    jl_gc_wait_for_the_world(gc_all_tls_states, gc_n_threads);
+    JL_PROBE_GC_STOP_THE_WORLD();
+    uint64_t duration = jl_hrtime() - t0;
+    if (duration > gc_num.max_time_to_safepoint)
+        gc_num.max_time_to_safepoint = duration;
+    gc_num.time_to_safepoint = duration;
+    gc_num.total_time_to_safepoint += duration;
+    JL_LOCK_NOGC(&finalizers_lock);
+}
+
+JL_DLLEXPORT void jl_mmtk_gc_stw_end(void)
+{
+    JL_UNLOCK_NOGC(&finalizers_lock);
+    gc_n_threads = 0;
+    gc_all_tls_states = NULL;
+    jl_safepoint_end_gc();
+}
+
 JL_DLLEXPORT void jl_gc_prepare_to_collect(void)
 {
     // FIXME: set to JL_GC_AUTO since we're calling it from mmtk
@@ -329,14 +360,6 @@ JL_DLLEXPORT void jl_gc_prepare_to_collect(void)
 
     int8_t old_state = jl_atomic_load_relaxed(&ptls->gc_state);
     jl_atomic_store_release(&ptls->gc_state, JL_GC_STATE_WAITING);
-    // `jl_safepoint_start_gc()` makes sure only one thread can run the GC.
-    uint64_t t0 = jl_hrtime();
-    if (!jl_safepoint_start_gc(ct)) {
-        jl_gc_state_set(ptls, old_state, JL_GC_STATE_WAITING);
-        jl_safepoint_wait_thread_resume(ct); // block in thread-suspend now if requested, after clearing the gc_state
-        jl_gc_notify_task_resume(ct);
-        return;
-    }
 
     JL_TIMING_SUSPEND_TASK(GC, ct);
     JL_TIMING(GC, GC);
@@ -345,41 +368,13 @@ JL_DLLEXPORT void jl_gc_prepare_to_collect(void)
 #ifdef _OS_WINDOWS_
     DWORD last_error = GetLastError();
 #endif
-    // Now we are ready to wait for other threads to hit the safepoint,
-    // we can do a few things that doesn't require synchronization.
-    //
-    // We must sync here with the tls_lock operations, so that we have a
-    // seq-cst order between these events now we know that either the new
-    // thread must run into our safepoint flag or we must observe the
-    // existence of the thread in the jl_n_threads count.
-    //
-    // TODO: concurrently queue objects
-    jl_fence();
-    gc_n_threads = jl_atomic_load_acquire(&jl_n_threads);
-    gc_all_tls_states = jl_atomic_load_relaxed(&jl_all_tls_states);
-    jl_gc_wait_for_the_world(gc_all_tls_states, gc_n_threads);
-    JL_PROBE_GC_STOP_THE_WORLD();
-
-    uint64_t t1 = jl_hrtime();
-    uint64_t duration = t1 - t0;
-    if (duration > gc_num.max_time_to_safepoint)
-        gc_num.max_time_to_safepoint = duration;
-    gc_num.time_to_safepoint = duration;
-    gc_num.total_time_to_safepoint += duration;
-
-    if (!jl_atomic_load_acquire(&jl_gc_disable_counter)) {
-        JL_LOCK_NOGC(&finalizers_lock); // all the other threads are stopped, so this does not make sense, right? otherwise, failing that, this seems like plausibly a deadlock
+    // FIX D: only *request* the pause and park. The WAITING state above lets
+    // the worker's stop-the-world (jl_mmtk_gc_stw_begin) count this thread as
+    // already yielded; the world is not stopped here.
 #ifndef __clang_gcanalyzer__
-        mmtk_block_thread_for_gc();
+    mmtk_block_thread_for_gc();
 #endif
-        JL_UNLOCK_NOGC(&finalizers_lock);
-    }
-
     jl_gc_notify_task_resume(ct);
-
-    gc_n_threads = 0;
-    gc_all_tls_states = NULL;
-    jl_safepoint_end_gc();
     jl_gc_state_set(ptls, old_state, JL_GC_STATE_WAITING);
     JL_PROBE_GC_END();
     jl_safepoint_wait_thread_resume(ct); // block in thread-suspend now if requested, after clearing the gc_state

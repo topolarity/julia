@@ -217,6 +217,22 @@ int jl_safepoint_start_gc(jl_task_t *ct)
     return 1;
 }
 
+// Arm the GC safepoint from a thread that is not a Julia mutator (a GC
+// worker). Pairs with jl_safepoint_end_gc(). Unlike jl_safepoint_start_gc,
+// the caller cannot be suspended, and the GC scheduler admits only one
+// collection at a time, so there is no race for jl_gc_running to lose.
+void jl_safepoint_stw_begin(void)
+{
+    uv_mutex_lock(&safepoint_lock);
+    uv_cond_broadcast(&safepoint_cond_begin);
+    uint32_t running = 0;
+    if (!jl_atomic_cmpswap(&jl_gc_running, &running, 1))
+        abort(); // stop_all_mutators while a collection is already running
+    jl_safepoint_enable(1);
+    jl_safepoint_enable(2);
+    uv_mutex_unlock(&safepoint_lock);
+}
+
 void jl_safepoint_end_gc(void)
 {
     assert(jl_atomic_load_relaxed(&jl_gc_running));
@@ -231,8 +247,36 @@ void jl_safepoint_end_gc(void)
     uv_cond_broadcast(&safepoint_cond_end);
 }
 
+// Mutator-side GC stall instrumentation: the full stall a mutator observes
+// for a collector-initiated pause (safepoint handler entry -> running
+// again), which exceeds the collector-side pause window by the safepoint
+// entry and wakeup costs.  This is the application-visible number.
+static _Atomic(uint64_t) mutator_stall_max_ns = 0;
+static _Atomic(uint64_t) mutator_stall_total_ns = 0;
+static _Atomic(uint64_t) mutator_stall_count = 0;
+
+JL_DLLEXPORT uint64_t jl_gc_mutator_stall_max_ns(void)
+{
+    return jl_atomic_load_relaxed(&mutator_stall_max_ns);
+}
+JL_DLLEXPORT uint64_t jl_gc_mutator_stall_total_ns(void)
+{
+    return jl_atomic_load_relaxed(&mutator_stall_total_ns);
+}
+JL_DLLEXPORT uint64_t jl_gc_mutator_stall_count(void)
+{
+    return jl_atomic_load_relaxed(&mutator_stall_count);
+}
+JL_DLLEXPORT void jl_gc_reset_mutator_stall(void)
+{
+    jl_atomic_store_relaxed(&mutator_stall_max_ns, 0);
+    jl_atomic_store_relaxed(&mutator_stall_total_ns, 0);
+    jl_atomic_store_relaxed(&mutator_stall_count, 0);
+}
+
 void jl_set_gc_and_wait(jl_task_t *ct)
 {
+    uint64_t stall_t0 = jl_hrtime();
     // reading own gc state doesn't need atomic ops since no one else
     // should store to it.
     int8_t state = jl_atomic_load_relaxed(&ct->ptls->gc_state);
@@ -244,6 +288,14 @@ void jl_set_gc_and_wait(jl_task_t *ct)
     jl_gc_notify_task_resume(ct);
     jl_atomic_store_release(&ct->ptls->gc_state, state);
     jl_safepoint_wait_thread_resume(ct); // block in thread-suspend now if requested, after clearing the gc_state
+    uint64_t stall = jl_hrtime() - stall_t0;
+    jl_atomic_fetch_add_relaxed(&mutator_stall_total_ns, stall);
+    jl_atomic_fetch_add_relaxed(&mutator_stall_count, 1);
+    uint64_t prev = jl_atomic_load_relaxed(&mutator_stall_max_ns);
+    while (stall > prev) {
+        if (jl_atomic_cmpswap_relaxed(&mutator_stall_max_ns, &prev, stall))
+            break;
+    }
 }
 
 // this is the core of jl_set_gc_and_wait
@@ -253,6 +305,20 @@ void jl_safepoint_wait_gc(jl_task_t *ct) JL_NOTSAFEPOINT
         JL_TIMING_SUSPEND_TASK(GC_SAFEPOINT, ct);
         // The thread should have set this already
         assert(jl_atomic_load_relaxed(&ct->ptls->gc_state) != JL_GC_STATE_UNSAFE);
+    }
+    // LATENCY: spin briefly before sleeping.  Concurrent-GC pauses are
+    // typically well under a millisecond, and a condvar sleep prices the
+    // wakeup at OS scheduling latency (tens of microseconds to a CFS
+    // timeslice) -- often more than the pause itself.  A single mutator
+    // spinning on one scalar is cheap; the bounded deadline preserves the
+    // rr-friendly sleeping behavior for long (full) collections.
+    if (jl_atomic_load_relaxed(&jl_gc_running)) {
+        uint64_t spin_deadline = jl_hrtime() + 600000; // 600us
+        while (jl_atomic_load_relaxed(&jl_gc_running)) {
+            if (jl_hrtime() > spin_deadline)
+                break;
+            jl_cpu_pause();
+        }
     }
     // Use normal volatile load in the loop for speed until GC finishes.
     // Then use an acquire load to make sure the GC result is visible on this thread.

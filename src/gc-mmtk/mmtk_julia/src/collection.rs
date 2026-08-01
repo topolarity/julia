@@ -47,13 +47,56 @@ impl Collection<JuliaVM> for VMCollection {
     where
         F: FnMut(&'static mut Mutator<JuliaVM>),
     {
-        // Wait for all mutators to stop and all finalizers to run
-        while !AtomicBool::load(&WORLD_HAS_STOPPED, Ordering::SeqCst) {
-            // Stay here while the world has not stopped
-            // FIXME add wait var
-        }
+        // FIX D: stop the world from the collector side, per the Collection
+        // contract ("when the method returns, MMTk assumes the pause starts").
+        // Requesting mutators have merely parked in block_for_gc.
+        let sw0 = crate::now_ns();
+        unsafe { crate::jl_mmtk_gc_stw_begin() };
+        crate::record_max(
+            &crate::STOP_WAIT_MAX_NS,
+            crate::now_ns().saturating_sub(sw0),
+        );
+        AtomicBool::store(&WORLD_HAS_STOPPED, true, Ordering::SeqCst);
 
         trace!("Stopped the world!");
+
+        mmtk::diag::PAUSE_PKT_SUM_NS.store(0, Ordering::SeqCst);
+        mmtk::diag::PAUSE_PKT_N.store(0, Ordering::SeqCst);
+        mmtk::diag::PAUSE_PKT_MAX_NS.store(0, Ordering::SeqCst);
+        mmtk::diag::LAST_PKT_END_NS.store(0, Ordering::SeqCst);
+        mmtk::diag::TRANS_GAP_SUM_NS.store(0, Ordering::SeqCst);
+        mmtk::diag::TRANS_GAP_MAX_NS.store(0, Ordering::SeqCst);
+        mmtk::diag::TRANS_N.store(0, Ordering::SeqCst);
+        mmtk::diag::CHURN_N.store(0, Ordering::SeqCst);
+        mmtk::diag::LAST_SEEN_PKT_N.store(u64::MAX, Ordering::SeqCst);
+        mmtk::diag::PAUSE_ACTIVE.store(true, Ordering::SeqCst);
+        {
+            let now = crate::now_ns();
+            crate::STW_START_NS.store(now, Ordering::SeqCst);
+            let bs = crate::LAST_BLOCK_START_NS.swap(0, Ordering::SeqCst);
+            if bs != 0 {
+                let d = now.saturating_sub(bs);
+                crate::record_max(&crate::TRIG_MAX_NS, d);
+                crate::TRIG_TOTAL_NS.fetch_add(d, Ordering::SeqCst);
+                crate::TRIG_COUNT.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        crate::GC_COUNT_TOTAL.fetch_add(1, Ordering::SeqCst);
+        #[cfg(feature = "concurrentimmix")]
+        if let Some(cp) = SINGLETON.get_plan().concurrent() {
+            if let Some(p) = cp.current_pause() {
+                // `Pause` is public API but lives in a private module, so match on Debug
+                match format!("{:?}", p).as_str() {
+                    "Full" => { crate::STW_KIND.store(1, Ordering::SeqCst); crate::GC_COUNT_FULL.fetch_add(1, Ordering::SeqCst) },
+                    "InitialMark" => { crate::STW_KIND.store(2, Ordering::SeqCst); crate::GC_COUNT_INITIAL.fetch_add(1, Ordering::SeqCst) },
+                    "FinalMark" => { crate::STW_KIND.store(3, Ordering::SeqCst); crate::GC_COUNT_FINAL.fetch_add(1, Ordering::SeqCst) },
+                    _ => 0,
+                };
+            }
+        }
+        if SINGLETON.is_emergency_collection() {
+            crate::GC_COUNT_EMERGENCY.fetch_add(1, Ordering::SeqCst);
+        }
 
         // STW -- concurrent marking is not active.
         #[cfg(feature = "concurrentimmix")]
@@ -107,6 +150,48 @@ impl Collection<JuliaVM> for VMCollection {
             log::info!("Set CONCURRENT_MARKING_ACTIVE to {concurrent_marking_active}");
         }
 
+        {
+            let s = crate::STW_START_NS.load(Ordering::SeqCst);
+            if s != 0 {
+                let d = crate::now_ns().saturating_sub(s);
+                crate::record_max(&crate::STW_MAX_NS, d);
+                crate::STW_TOTAL_NS.fetch_add(d, Ordering::SeqCst);
+                let k = crate::STW_KIND.swap(0, Ordering::SeqCst) as usize;
+                crate::STW_KIND_NS[k.min(3)].fetch_add(d, Ordering::SeqCst);
+                crate::STW_KIND_N[k.min(3)].fetch_add(1, Ordering::SeqCst);
+                if d > crate::STW_KIND_MAX[k.min(3)].load(Ordering::SeqCst) {
+                    crate::STW_KIND_MAX[k.min(3)].store(d, Ordering::SeqCst);
+                    crate::STW_KIND_MAX_AT[k.min(3)]
+                        .store(crate::GC_COUNT_TOTAL.load(Ordering::SeqCst) as u64, Ordering::SeqCst);
+                }
+                // Pause anatomy: for slow pauses, report whether the time is
+                // packet work (sum ~ d x workers) or barrier/idle time.
+                if d > 1_500_000 {
+                    let fin = mmtk::diag::GC_FINISHED_ENTRY_NS.load(Ordering::SeqCst);
+                    let epi = mmtk::diag::now_ns().saturating_sub(fin);
+                    eprintln!(
+                        "[pause-anatomy] kind={} dur={}us pkt_sum={}us pkt_n={} pkt_max={}us epilogue={}us gaps={}us/{} gap_max={}us",
+                        k,
+                        d / 1000,
+                        mmtk::diag::PAUSE_PKT_SUM_NS.load(Ordering::SeqCst) / 1000,
+                        mmtk::diag::PAUSE_PKT_N.load(Ordering::SeqCst),
+                        mmtk::diag::PAUSE_PKT_MAX_NS.load(Ordering::SeqCst) / 1000,
+                        epi / 1000,
+                        mmtk::diag::TRANS_GAP_SUM_NS.load(Ordering::SeqCst) / 1000,
+                        mmtk::diag::TRANS_N.load(Ordering::SeqCst),
+                        mmtk::diag::TRANS_GAP_MAX_NS.load(Ordering::SeqCst) / 1000
+                    );
+                    eprintln!(
+                        "[pause-churn] churn={} of {} parked-events",
+                        mmtk::diag::CHURN_N.load(Ordering::SeqCst),
+                        mmtk::diag::TRANS_N.load(Ordering::SeqCst)
+                    );
+                }
+            }
+        }
+        mmtk::diag::PAUSE_ACTIVE.store(false, Ordering::SeqCst);
+        // FIX D: disarm the safepoint before releasing parked requesters.
+        unsafe { crate::jl_mmtk_gc_stw_end() };
         AtomicBool::store(&BLOCK_FOR_GC, false, Ordering::SeqCst);
         AtomicBool::store(&WORLD_HAS_STOPPED, false, Ordering::SeqCst);
         cvar.notify_all();
@@ -124,7 +209,13 @@ impl Collection<JuliaVM> for VMCollection {
     fn block_for_gc(_tls: VMMutatorThread) {
         info!("Triggered GC!");
 
+        let t0 = crate::now_ns();
+        crate::LAST_BLOCK_START_NS.store(t0, Ordering::SeqCst);
         unsafe { jl_gc_prepare_to_collect() };
+        let d = crate::now_ns().saturating_sub(t0);
+        crate::record_max(&crate::BLOCK_MAX_NS, d);
+        crate::BLOCK_TOTAL_NS.fetch_add(d, Ordering::SeqCst);
+        crate::BLOCK_COUNT.fetch_add(1, Ordering::SeqCst);
 
         info!("Finished blocking mutator for GC!");
     }
@@ -192,7 +283,7 @@ pub extern "C" fn mmtk_block_thread_for_gc() {
 
     info!("Blocking for GC!");
 
-    AtomicBool::store(&WORLD_HAS_STOPPED, true, Ordering::SeqCst);
+    // FIX D: WORLD_HAS_STOPPED is now set by the GC worker in stop_all_mutators.
 
     while AtomicBool::load(&BLOCK_FOR_GC, Ordering::SeqCst) {
         count = cvar.wait(count).unwrap();

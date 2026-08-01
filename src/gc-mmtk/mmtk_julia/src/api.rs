@@ -604,3 +604,140 @@ pub extern "C" fn get_mmtk_version() -> *const c_char {
         .as_c_str()
         .as_ptr() as _
 }
+
+
+#[no_mangle]
+pub extern "C" fn mmtk_gc_count_total() -> usize {
+    crate::GC_COUNT_TOTAL.load(Ordering::SeqCst)
+}
+
+#[no_mangle]
+pub extern "C" fn mmtk_gc_count_emergency() -> usize {
+    crate::GC_COUNT_EMERGENCY.load(Ordering::SeqCst)
+}
+
+#[no_mangle]
+pub extern "C" fn mmtk_gc_count_full() -> usize { crate::GC_COUNT_FULL.load(Ordering::SeqCst) }
+#[no_mangle]
+pub extern "C" fn mmtk_gc_count_initial() -> usize { crate::GC_COUNT_INITIAL.load(Ordering::SeqCst) }
+#[no_mangle]
+pub extern "C" fn mmtk_gc_count_final() -> usize { crate::GC_COUNT_FINAL.load(Ordering::SeqCst) }
+
+#[no_mangle]
+pub extern "C" fn mmtk_stw_max_ns() -> u64 { crate::STW_MAX_NS.load(Ordering::SeqCst) }
+#[no_mangle]
+pub extern "C" fn mmtk_stw_total_ns() -> u64 { crate::STW_TOTAL_NS.load(Ordering::SeqCst) }
+#[no_mangle]
+pub extern "C" fn mmtk_block_max_ns() -> u64 { crate::BLOCK_MAX_NS.load(Ordering::SeqCst) }
+#[no_mangle]
+pub extern "C" fn mmtk_block_total_ns() -> u64 { crate::BLOCK_TOTAL_NS.load(Ordering::SeqCst) }
+#[no_mangle]
+pub extern "C" fn mmtk_block_count() -> u64 { crate::BLOCK_COUNT.load(Ordering::SeqCst) }
+
+#[no_mangle]
+pub extern "C" fn mmtk_reset_gc_stats() {
+    crate::STW_MAX_NS.store(0, Ordering::SeqCst);
+    crate::STW_TOTAL_NS.store(0, Ordering::SeqCst);
+    crate::BLOCK_MAX_NS.store(0, Ordering::SeqCst);
+    crate::BLOCK_TOTAL_NS.store(0, Ordering::SeqCst);
+    crate::BLOCK_COUNT.store(0, Ordering::SeqCst);
+    crate::TRIG_MAX_NS.store(0, Ordering::SeqCst);
+    crate::TRIG_TOTAL_NS.store(0, Ordering::SeqCst);
+    crate::TRIG_COUNT.store(0, Ordering::SeqCst);
+    crate::GC_COUNT_TOTAL.store(0, Ordering::SeqCst);
+    crate::GC_COUNT_FULL.store(0, Ordering::SeqCst);
+    crate::GC_COUNT_INITIAL.store(0, Ordering::SeqCst);
+    crate::GC_COUNT_FINAL.store(0, Ordering::SeqCst);
+}
+
+#[no_mangle]
+pub extern "C" fn mmtk_trig_max_ns() -> u64 { crate::TRIG_MAX_NS.load(Ordering::SeqCst) }
+#[no_mangle]
+pub extern "C" fn mmtk_trig_total_ns() -> u64 { crate::TRIG_TOTAL_NS.load(Ordering::SeqCst) }
+#[no_mangle]
+pub extern "C" fn mmtk_trig_count() -> u64 { crate::TRIG_COUNT.load(Ordering::SeqCst) }
+
+#[no_mangle]
+pub extern "C" fn mmtk_diag_lat_total_ns() -> u64 { mmtk::diag::LAT_TOTAL_NS.load(Ordering::SeqCst) }
+#[no_mangle]
+pub extern "C" fn mmtk_diag_lat_max_ns() -> u64 { mmtk::diag::LAT_MAX_NS.load(Ordering::SeqCst) }
+#[no_mangle]
+pub extern "C" fn mmtk_diag_lat_count() -> u64 { mmtk::diag::LAT_COUNT.load(Ordering::SeqCst) }
+#[no_mangle]
+pub extern "C" fn mmtk_diag_pkts_total() -> u64 { mmtk::diag::PKTS_TOTAL.load(Ordering::SeqCst) }
+#[no_mangle]
+pub extern "C" fn mmtk_diag_pkt_ns_total() -> u64 { mmtk::diag::PKT_NS_TOTAL.load(Ordering::SeqCst) }
+#[no_mangle]
+pub extern "C" fn mmtk_diag_park_events() -> u64 { mmtk::diag::PARK_EVENTS.load(Ordering::SeqCst) }
+#[no_mangle]
+pub extern "C" fn mmtk_diag_busy_at_req() -> u64 { mmtk::diag::BUSY_AT_REQ_TOTAL.load(Ordering::SeqCst) }
+#[no_mangle]
+pub extern "C" fn mmtk_diag_reset() { mmtk::diag::reset() }
+
+#[no_mangle]
+pub extern "C" fn mmtk_diag_pkt_max_in_win_ns() -> u64 { mmtk::diag::PKT_MAX_IN_WIN_NS.load(Ordering::SeqCst) }
+#[no_mangle]
+pub extern "C" fn mmtk_diag_pkt_sum_in_win_ns() -> u64 { mmtk::diag::PKT_SUM_IN_WIN_NS.load(Ordering::SeqCst) }
+#[no_mangle]
+pub extern "C" fn mmtk_diag_pkt_max_any_ns() -> u64 { mmtk::diag::PKT_MAX_ANY_NS.load(Ordering::SeqCst) }
+
+#[no_mangle]
+pub extern "C" fn mmtk_diag_self_triggered() -> u64 { mmtk::diag::SELF_TRIGGERED.load(Ordering::SeqCst) }
+
+#[no_mangle]
+pub extern "C" fn mmtk_diag_noreq_parks() -> u64 { mmtk::diag::NOREQ_PARKS.load(Ordering::SeqCst) }
+#[no_mangle]
+pub extern "C" fn mmtk_diag_noreq_conc_some() -> u64 { mmtk::diag::NOREQ_CONCURRENT_SOME.load(Ordering::SeqCst) }
+#[no_mangle]
+pub extern "C" fn mmtk_diag_noreq_cm_active() -> u64 { mmtk::diag::NOREQ_CM_ACTIVE.load(Ordering::SeqCst) }
+
+#[no_mangle]
+pub extern "C" fn mmtk_diag_sweep_ns() -> u64 { mmtk::diag::SWEEP_NS.load(Ordering::SeqCst) }
+#[no_mangle]
+pub extern "C" fn mmtk_diag_sweep_pkts() -> u64 { mmtk::diag::SWEEP_PKTS.load(Ordering::SeqCst) }
+
+#[no_mangle]
+pub extern "C" fn mmtk_diag_triage() -> u64 {
+    mmtk::diag::TRIAGE_CHUNKS.load(Ordering::SeqCst) << 48
+        | mmtk::diag::TRIAGE_FREED.load(Ordering::SeqCst) << 32
+        | mmtk::diag::TRIAGE_POOLED.load(Ordering::SeqCst) << 16
+        | mmtk::diag::POOL_POPS.load(Ordering::SeqCst).min(0xffff)
+}
+#[no_mangle]
+pub extern "C" fn mmtk_diag_clean_blocks() -> u64 { mmtk::diag::CLEAN_BLOCKS.load(Ordering::SeqCst) }
+
+#[no_mangle]
+pub extern "C" fn mmtk_stw_kind_ns(k: usize) -> u64 { crate::STW_KIND_NS[k.min(3)].load(Ordering::SeqCst) }
+#[no_mangle]
+pub extern "C" fn mmtk_stw_kind_n(k: usize) -> u64 { crate::STW_KIND_N[k.min(3)].load(Ordering::SeqCst) }
+
+#[no_mangle]
+pub extern "C" fn mmtk_stw_kind_max_ns(k: usize) -> u64 { crate::STW_KIND_MAX[k.min(3)].load(Ordering::SeqCst) }
+#[no_mangle]
+pub extern "C" fn mmtk_stw_kind_max_at(k: usize) -> u64 { crate::STW_KIND_MAX_AT[k.min(3)].load(Ordering::SeqCst) }
+#[no_mangle]
+pub extern "C" fn mmtk_reset_kind_stats() {
+    for i in 0..4 {
+        crate::STW_KIND_NS[i].store(0, Ordering::SeqCst);
+        crate::STW_KIND_N[i].store(0, Ordering::SeqCst);
+        crate::STW_KIND_MAX[i].store(0, Ordering::SeqCst);
+        crate::STW_KIND_MAX_AT[i].store(0, Ordering::SeqCst);
+    }
+    crate::STOP_WAIT_MAX_NS.store(0, Ordering::SeqCst);
+    mmtk::diag::TRIAGE_MAX_NS.store(0, Ordering::SeqCst);
+    mmtk::diag::TRIAGE_NS_TOTAL.store(0, Ordering::SeqCst);
+    mmtk::diag::UNLOG_MAX_NS.store(0, Ordering::SeqCst);
+}
+
+#[no_mangle]
+pub extern "C" fn mmtk_stop_wait_max_ns() -> u64 { crate::STOP_WAIT_MAX_NS.load(Ordering::SeqCst) }
+#[no_mangle]
+pub extern "C" fn mmtk_triage_max_ns() -> u64 { mmtk::diag::TRIAGE_MAX_NS.load(Ordering::SeqCst) }
+#[no_mangle]
+pub extern "C" fn mmtk_triage_ns_total() -> u64 { mmtk::diag::TRIAGE_NS_TOTAL.load(Ordering::SeqCst) }
+#[no_mangle]
+pub extern "C" fn mmtk_unlog_max_ns() -> u64 { mmtk::diag::UNLOG_MAX_NS.load(Ordering::SeqCst) }
+#[no_mangle]
+pub extern "C" fn mmtk_set_pause_pkt_report_ns(ns: u64) {
+    mmtk::diag::PAUSE_PKT_REPORT_NS.store(ns, Ordering::SeqCst);
+}
