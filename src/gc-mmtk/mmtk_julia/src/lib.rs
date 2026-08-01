@@ -110,9 +110,17 @@ pub static STW_KIND_N: [std::sync::atomic::AtomicU64; 4] = [std::sync::atomic::A
 /// per-object unlog bit).  Nonzero exactly while concurrent marking is
 /// active; while zero the barrier slow path is unreachable, so unlog bits
 /// cannot be consumed outside marking and all arming can happen off-pause.
-#[no_mangle]
-pub static MMTK_SATB_MARKING_ACTIVE: std::sync::atomic::AtomicU8 =
-    std::sync::atomic::AtomicU8::new(0);
+extern "C" {
+    static mut MMTK_SATB_MARKING_ACTIVE: u8;
+}
+
+/// Store the marking-active flag (defined in C so AOT images link it).
+pub fn set_satb_marking_active(active: bool) {
+    unsafe {
+        std::sync::atomic::AtomicU8::from_ptr(std::ptr::addr_of_mut!(MMTK_SATB_MARKING_ACTIVE))
+            .store(active as u8, std::sync::atomic::Ordering::SeqCst)
+    }
+}
 
 pub static BLOCK_MAX_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Longest wait inside jl_mmtk_gc_stw_begin (bringing mutators to the safepoint).

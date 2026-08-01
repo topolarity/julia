@@ -288,7 +288,17 @@ impl<VM: VMBinding> VMSpace<VM> {
             .try_map_metadata_space(chunk_start, chunk_size, self.get_name())
             .unwrap();
         #[cfg(feature = "set_unlog_bits_vm_space")]
-        if self.common.needs_log_bit {
+        // MARKING-GATED BARRIER: never arm a freshly-registered image while
+        // marking is active -- its objects are being relocated (half
+        // initialized), and firing the object-snapshot barrier on them
+        // enqueues garbage.  Image objects are new to the heap (nothing in
+        // the snapshot references their pre-restore state), so like
+        // allocate-black objects they need no SATB coverage this cycle; the
+        // per-cycle deferred common-space re-arm covers them before the
+        // next InitialMark.
+        if self.common.needs_log_bit
+            && !crate::diag::SATB_MARKING_ACTIVE.load(std::sync::atomic::Ordering::SeqCst)
+        {
             // Bulk set unlog bits for all addresses in the VM space. This ensures that any
             // modification to the bootimage is logged
             if let MetadataSpec::OnSide(side) = *VM::VMObjectModel::GLOBAL_LOG_BIT_SPEC {

@@ -84,6 +84,12 @@ pub mod diag {
     /// packets executed inside the pause window.
     pub static PAUSE_ACTIVE: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
+    /// Mirror of the binding's SATB marking-active flag, for policy code
+    /// that cannot reach the plan (e.g. VMSpace registration must not arm
+    /// unlog bits mid-marking: half-relocated image objects would fire the
+    /// snapshot barrier).
+    pub static SATB_MARKING_ACTIVE: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
     /// Threshold (ns) above which an in-pause packet is reported to stderr.
     pub static PAUSE_PKT_REPORT_NS: AtomicU64 = AtomicU64::new(u64::MAX);
     /// Per-pause packet accounting (reset by the binding at pause start):

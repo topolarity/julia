@@ -217,6 +217,19 @@ int jl_safepoint_start_gc(jl_task_t *ct)
     return 1;
 }
 
+// FIX D addendum: a mutator that parks for a collector-driven pause (e.g.
+// jl_gc_prepare_to_collect) publishes its gc_state with a plain store.  The
+// GC worker in jl_gc_wait_for_the_world sleeps on safepoint_cond_begin, so
+// the transition must be signalled under the safepoint lock or the worker
+// can sample the old state and miss the wakeup forever (observed as a
+// stop-the-world wedge with the only mutator already parked).
+JL_DLLEXPORT void jl_safepoint_signal_begin(void)
+{
+    uv_mutex_lock(&safepoint_lock);
+    uv_cond_broadcast(&safepoint_cond_begin);
+    uv_mutex_unlock(&safepoint_lock);
+}
+
 // Arm the GC safepoint from a thread that is not a Julia mutator (a GC
 // worker). Pairs with jl_safepoint_end_gc(). Unlike jl_safepoint_start_gc,
 // the caller cannot be suspended, and the GC scheduler admits only one

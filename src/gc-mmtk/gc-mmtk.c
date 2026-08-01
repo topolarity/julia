@@ -60,6 +60,11 @@ extern void mmtk_post_alloc(void* mutator, void* refer, size_t bytes, int alloca
 extern void mmtk_store_obj_size_c(void* obj, size_t size);
 JL_DLLEXPORT void* MMTK_SIDE_LOG_BIT_BASE_ADDRESS;
 JL_DLLEXPORT void* MMTK_SIDE_VO_BIT_BASE_ADDRESS;
+// Marking-gated SATB barrier flag.  DEFINED HERE (libjulia-internal) so that
+// AOT-linked pkgimages/sysimages resolve it at link time; the Rust binding
+// writes it through an extern declaration (same pattern as
+// MMTK_SIDE_LOG_BIT_BASE_ADDRESS).
+JL_DLLEXPORT uint8_t MMTK_SATB_MARKING_ACTIVE = 0;
 
 // ========================================================================= //
 // GC Initialization and Control
@@ -368,6 +373,9 @@ JL_DLLEXPORT void jl_gc_prepare_to_collect(void)
 
     int8_t old_state = jl_atomic_load_relaxed(&ptls->gc_state);
     jl_atomic_store_release(&ptls->gc_state, JL_GC_STATE_WAITING);
+    // FIX D addendum: wake a GC worker that may already be sleeping in
+    // jl_gc_wait_for_the_world having sampled our previous gc_state.
+    jl_safepoint_signal_begin();
 
     JL_TIMING_SUSPEND_TASK(GC, ct);
     JL_TIMING(GC, GC);
@@ -1338,12 +1346,28 @@ _Atomic(int) gc_stack_free_idx = 0;
 
 JL_DLLEXPORT void jl_gc_queue_root(const struct _jl_value_t *ptr) JL_NOTSAFEPOINT
 {
+#ifdef MMTK_PLAN_CONCURRENTIMMIX
+    // MARKING-GATED BARRIER: this is a direct slow entry (called by the
+    // JIT's lowered slow path AND unconditionally by C runtime code under
+    // stock-GC conventions).  Outside marking it must be a no-op: the slow
+    // path consumes the object's unlog bit (log_object), and with arming
+    // now maintained incrementally there is no in-pause re-arm to repair
+    // it -- a consumed bit means the object's next mutation during marking
+    // is never logged (SATB miss; found via the Init-time unlog audit).
+    if (__atomic_load_n(&MMTK_SATB_MARKING_ACTIVE, __ATOMIC_RELAXED) == 0)
+        return;
+#endif
     jl_task_t *ct = jl_current_task;
     jl_ptls_t ptls = ct->ptls;
     mmtk_object_reference_write_slow(&ptls->gc_tls.mmtk_mutator, ptr, (const void*) 0);
 }
 
 JL_DLLEXPORT void jl_gc_wb_cold(const void *parent, const void *ptr) JL_NOTSAFEPOINT {
+#ifdef MMTK_PLAN_CONCURRENTIMMIX
+    // See jl_gc_queue_root.
+    if (__atomic_load_n(&MMTK_SATB_MARKING_ACTIVE, __ATOMIC_RELAXED) == 0)
+        return;
+#endif
     jl_task_t *ct = jl_current_task;
     jl_ptls_t ptls = ct->ptls;
     mmtk_object_reference_write_slow(&ptls->gc_tls.mmtk_mutator, ptr, (const void*) 0);

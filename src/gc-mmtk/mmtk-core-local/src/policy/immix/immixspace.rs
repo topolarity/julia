@@ -649,6 +649,67 @@ impl<VM: VMBinding> ImmixSpace<VM> {
         // chunk-granular arming at first allocation) and are inert while the
         // marking flag is off, so this pause has no per-chunk work at all.
 
+        // AUDIT ORACLE (MMTK_AUDIT_UNLOG): in the marking-gated barrier
+        // scheme, EVERY unlog bit over the immix chunks must be armed at
+        // InitialMark (the reference in-pause BulkSet would make it so).
+        // Any zero bit here is a hole in the incremental arming; report its
+        // data address and region state.
+        if std::env::var_os("MMTK_AUDIT_UNLOG").is_some() {
+            let unlog = VM::VMObjectModel::GLOBAL_LOG_BIT_SPEC.extract_side_spec();
+            let mut bad_chunks = 0usize;
+            let mut bad_bytes = 0usize;
+            let mut reported = 0usize;
+            for chunk in self.chunk_map.all_chunks() {
+                let meta_start = crate::util::metadata::side_metadata::helpers::address_to_meta_address(
+                    unlog,
+                    chunk.start(),
+                );
+                let meta_bytes =
+                    (Chunk::BYTES >> unlog.log_bytes_in_region) >> (3 - unlog.log_num_of_bits);
+                let mut nz = 0usize;
+                for i in 0..meta_bytes {
+                    let b: u8 = unsafe { (meta_start + i).load::<u8>() };
+                    if b != 0xFF {
+                        nz += 1;
+                        if reported < 5 {
+                            reported += 1;
+                            // Reconstruct the data address for this meta byte.
+                            let granules_per_byte = 8usize >> unlog.log_num_of_bits;
+                            let data = chunk.start()
+                                + (i * granules_per_byte) * (1usize << unlog.log_bytes_in_region);
+                            let block = Block::from_unaligned_address(data);
+                            let line = Line::from_unaligned_address(data);
+                            let cur = self.line_mark_state.load(Ordering::Acquire);
+                            let unav = self.line_unavail_state.load(Ordering::Acquire);
+                            eprintln!(
+                                "[unlog-audit] HOLE meta[{}]={:#04x} data={:?} block_state={:?} line_marked(cur={})={} line_marked(unav={})={}",
+                                i,
+                                b,
+                                data,
+                                block.get_state(),
+                                cur,
+                                line.is_marked(cur),
+                                unav,
+                                line.is_marked(unav),
+                            );
+                        }
+                    }
+                }
+                if nz > 0 {
+                    bad_chunks += 1;
+                    bad_bytes += nz;
+                }
+            }
+            if bad_bytes > 0 {
+                eprintln!(
+                    "[unlog-audit] AT INIT: {} chunks with {} non-0xFF unlog bytes",
+                    bad_chunks, bad_bytes
+                );
+            } else {
+                eprintln!("[unlog-audit] AT INIT: fully armed");
+            }
+        }
+
         // DIAG (MMTK_CHECK_STALE_MARKS): at InitialMark, no object mark bit
         // should be set (the deferred post-FinalMark clear must have wiped
         // them all).  Scan and report any that survive.
