@@ -85,6 +85,9 @@ impl Collection<JuliaVM> for VMCollection {
         #[cfg(feature = "concurrentimmix")]
         if let Some(cp) = SINGLETON.get_plan().concurrent() {
             if let Some(p) = cp.current_pause() {
+                if std::env::var_os("MMTK_PAUSE_TRACE").is_some() {
+                    eprintln!("[pause] {:?}", p);
+                }
                 // `Pause` is public API but lives in a private module, so match on Debug
                 match format!("{:?}", p).as_str() {
                     "Full" => { crate::STW_KIND.store(1, Ordering::SeqCst); crate::GC_COUNT_FULL.fetch_add(1, Ordering::SeqCst) },

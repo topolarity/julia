@@ -658,6 +658,102 @@ impl<VM: VMBinding> ImmixSpace<VM> {
             .collect();
         self.scheduler().work_buckets[WorkBucketStage::Prepare].bulk_add(packets);
 
+        // DIAG (MMTK_CHECK_STALE_MARKS): at InitialMark, no object mark bit
+        // should be set (the deferred post-FinalMark clear must have wiped
+        // them all).  Scan and report any that survive.
+        if std::env::var_os("MMTK_CHECK_STALE_MARKS").is_some() {
+            // Layout probe: metadata addresses of the three specs for one chunk.
+            if let Some(chunk) = self.chunk_map.all_chunks().next() {
+                use crate::util::metadata::side_metadata::helpers::address_to_meta_address;
+                if let crate::util::metadata::MetadataSpec::OnSide(mark) =
+                    *VM::VMObjectModel::LOCAL_MARK_BIT_SPEC
+                {
+                    let log = VM::VMObjectModel::GLOBAL_LOG_BIT_SPEC.extract_side_spec();
+                    let line = &Line::MARK_TABLE;
+                    eprintln!(
+                        "[meta-layout] chunk={:?} log_bit={:?}..(+{:#x}) line_mark={:?}..(+{:#x}) obj_mark={:?}..(+{:#x})",
+                        chunk.start(),
+                        address_to_meta_address(log, chunk.start()),
+                        (Chunk::BYTES >> log.log_bytes_in_region) >> (3 - log.log_num_of_bits),
+                        address_to_meta_address(line, chunk.start()),
+                        (Chunk::BYTES >> line.log_bytes_in_region) << line.log_num_of_bits.saturating_sub(3),
+                        address_to_meta_address(&mark, chunk.start()),
+                        (Chunk::BYTES >> mark.log_bytes_in_region) >> (3 - mark.log_num_of_bits),
+                    );
+                }
+            }
+            if let crate::util::metadata::MetadataSpec::OnSide(side) =
+                *VM::VMObjectModel::LOCAL_MARK_BIT_SPEC
+            {
+                let mut stale_chunks = 0usize;
+                let mut stale_bytes = 0usize;
+                let mut first: Option<(Address, usize)> = None;
+                for chunk in self.chunk_map.all_chunks() {
+                    let meta_start = crate::util::metadata::side_metadata::helpers::address_to_meta_address(
+                        &side,
+                        chunk.start(),
+                    );
+                    let meta_bytes =
+                        (Chunk::BYTES >> side.log_bytes_in_region) >> (3 - side.log_num_of_bits);
+                    let mut nz = 0usize;
+                    for i in 0..meta_bytes {
+                        let b: u8 = unsafe { (meta_start + i).load::<u8>() };
+                        if b != 0 {
+                            nz += 1;
+                        }
+                    }
+                    if nz > 0 {
+                        stale_chunks += 1;
+                        stale_bytes += nz;
+                        if first.is_none() {
+                            first = Some((chunk.start(), nz));
+                        }
+                    }
+                }
+                if stale_bytes > 0 {
+                    // Value histogram of the first stale chunk's meta bytes.
+                    if let Some((cstart, _)) = first {
+                        let meta_start = crate::util::metadata::side_metadata::helpers::address_to_meta_address(&side, cstart);
+                        let meta_bytes = (Chunk::BYTES >> side.log_bytes_in_region) >> (3 - side.log_num_of_bits);
+                        let mut h = std::collections::HashMap::new();
+                        for i in 0..meta_bytes {
+                            let b: u8 = unsafe { (meta_start + i).load::<u8>() };
+                            *h.entry(b).or_insert(0usize) += 1;
+                        }
+                        let mut hv: Vec<_> = h.into_iter().collect();
+                        hv.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
+                        eprintln!("[stale-vals] top bytes: {:?}", &hv[..hv.len().min(6)]);
+                    }
+                    eprintln!(
+                        "[stale-marks] AT INIT: {} chunks with {} nonzero meta bytes; first chunk {:?} nz={}",
+                        stale_chunks,
+                        stale_bytes,
+                        first.map(|f| f.0),
+                        first.map(|f| f.1).unwrap_or(0)
+                    );
+                } else {
+                    eprintln!("[stale-marks] AT INIT: clean");
+                }
+            }
+        }
+
+        // DIAG (MMTK_INPAUSE_MARK_CLEAR): re-instate the in-pause object
+        // mark-bit clear to test whether stale mark bits at InitialMark are
+        // the cause of the bootstrap SATB corruption.
+        if std::env::var_os("MMTK_INPAUSE_MARK_CLEAR").is_some() {
+            let clear_packets: Vec<Box<dyn GCWork<VM>>> = self
+                .chunk_map
+                .all_chunks()
+                .map(|chunk| {
+                    Box::new(ClearChunkMarks::<VM> {
+                        chunk,
+                        _p: std::marker::PhantomData,
+                    }) as _
+                })
+                .collect();
+            self.scheduler().work_buckets[WorkBucketStage::Prepare].bulk_add(clear_packets);
+        }
+
         if !super::BLOCK_ONLY {
             self.line_mark_state.fetch_add(1, Ordering::AcqRel);
             if self.line_mark_state.load(Ordering::Acquire) > Line::MAX_MARK_STATE {
@@ -835,6 +931,12 @@ impl<VM: VMBinding> ImmixSpace<VM> {
                 .count();
             if marked == 0 {
                 crate::diag::TRIAGE_FREED.fetch_add(1, Ordering::SeqCst);
+                // DIAG QUARANTINE: leak dead blocks instead of freeing them
+                // (MMTK_TRIAGE_QUARANTINE env) to discriminate "triage freed
+                // a live block" from "someone scribbled on live memory".
+                if std::env::var_os("MMTK_TRIAGE_QUARANTINE").is_some() {
+                    continue;
+                }
                 block.deinit();
                 dead.push(block);
             } else if marked < Block::LINES {

@@ -294,7 +294,18 @@ impl<VM: VMBinding> ImmixAllocator<VM> {
                 // cost of one cycle of float per claimed hole.
                 {
                     let state = self.space.line_mark_state.load(Ordering::Acquire);
-                    Line::eager_mark_lines::<VM>(state, start_line..end_line);
+                    // LAZY-SWEEP: line epochs are ALWAYS written at claim (triage
+                    // liveness).  The object-mark-bit saturation
+                    // (allocate-black) is ONLY valid during marking: the
+                    // per-cycle clear now runs post-FinalMark, so saturating
+                    // outside marking would leave objects "already marked" at
+                    // the next InitialMark, making the tracer skip them (and
+                    // everything reachable only through them) -- the cause of
+                    // the bootstrap typemap corruption.
+                    Line::bulk_set_line_mark_states(state, start_line..end_line);
+                    if self.space.should_allocate_as_live() {
+                        Line::initialize_mark_table_as_marked::<VM>(start_line..end_line);
+                    }
                 }
                 return true;
             } else {
@@ -384,7 +395,14 @@ impl<VM: VMBinding> ImmixAllocator<VM> {
                 // line-marked at acquisition.
                 {
                     let state = self.space.line_mark_state.load(Ordering::Acquire);
-                    Line::eager_mark_lines::<VM>(state, block.start_line()..block.end_line());
+                    // See acquire_recyclable_lines: line epochs always, mark-table
+                    // saturation only while allocate-as-live (marking).
+                    Line::bulk_set_line_mark_states(state, block.start_line()..block.end_line());
+                    if self.space.should_allocate_as_live() {
+                        Line::initialize_mark_table_as_marked::<VM>(
+                            block.start_line()..block.end_line(),
+                        );
+                    }
                 }
                 if self.request_for_large {
                     self.large_bump_pointer.cursor = block.start();

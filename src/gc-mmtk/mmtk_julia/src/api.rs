@@ -115,6 +115,23 @@ pub extern "C" fn mmtk_gc_init(
             mmtk::util::metadata::side_metadata::global_side_metadata_vm_base_address();
     }
 
+    // DIAG (MMTK_WATCH_MARK_EARLY): publish the watch address at the earliest
+    // possible moment (right after metadata layout init) to catch the
+    // boot-time 0xFF writer.
+    if std::env::var_os("MMTK_WATCH_MARK_EARLY").is_some() {
+        use mmtk::vm::ObjectModel;
+        if let mmtk::util::metadata::MetadataSpec::OnSide(side) =
+            *<JuliaVM as mmtk::vm::VMBinding>::VMObjectModel::LOCAL_MARK_BIT_SPEC
+        {
+            let chunk = unsafe { Address::from_usize(0x200bcc00000usize) };
+            let meta =
+                mmtk::util::metadata::side_metadata::helpers::address_to_meta_address(&side, chunk);
+            unsafe { MMTK_DEBUG_WATCH_ADDR = meta.as_usize() };
+            eprintln!("[watch-mark-early] meta addr = {:?}", meta);
+            unsafe { libc::raise(libc::SIGTRAP) };
+        }
+    }
+
     // Hijack the panic hook to make sure that if we crash in the GC threads, the process aborts.
     crate::set_panic_hook();
 
@@ -392,9 +409,29 @@ pub extern "C" fn mmtk_unreachable() {
     unreachable!()
 }
 
+/// DIAG: address for gdb hardware watchpoint (see MMTK_WATCH_MARK).
+#[no_mangle]
+pub static mut MMTK_DEBUG_WATCH_ADDR: usize = 0;
+
 #[no_mangle]
 #[allow(mutable_transmutes)]
 pub extern "C" fn mmtk_set_vm_space(start: Address, size: usize) {
+    // DIAG (MMTK_WATCH_MARK): compute the object-mark metadata address for
+    // the (deterministic) first immix chunk, publish it for gdb, and trap so
+    // a script can arm a hardware watchpoint before the corruption happens.
+    if std::env::var_os("MMTK_WATCH_MARK").is_some() {
+        use mmtk::vm::ObjectModel;
+        if let mmtk::util::metadata::MetadataSpec::OnSide(side) =
+            *<JuliaVM as mmtk::vm::VMBinding>::VMObjectModel::LOCAL_MARK_BIT_SPEC
+        {
+            let chunk = unsafe { Address::from_usize(0x200bcc00000usize) };
+            let meta =
+                mmtk::util::metadata::side_metadata::helpers::address_to_meta_address(&side, chunk);
+            unsafe { MMTK_DEBUG_WATCH_ADDR = meta.as_usize() };
+            eprintln!("[watch-mark] meta addr for chunk 0x200bcc00000 = {:?}", meta);
+            unsafe { libc::raise(libc::SIGTRAP) };
+        }
+    }
     let mmtk: &mmtk::MMTK<JuliaVM> = &SINGLETON;
     let mmtk_mut: &mut mmtk::MMTK<JuliaVM> = unsafe { std::mem::transmute(mmtk) };
     memory_manager::set_vm_space(mmtk_mut, start, size);

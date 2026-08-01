@@ -292,6 +292,15 @@ impl<VM: VMBinding> VMSpace<VM> {
             // Bulk set unlog bits for all addresses in the VM space. This ensures that any
             // modification to the bootimage is logged
             if let MetadataSpec::OnSide(side) = *VM::VMObjectModel::GLOBAL_LOG_BIT_SPEC {
+                eprintln!(
+                    "[vmspace-unlog] data={:?}..{:?} meta={:?}..(+{:#x})",
+                    _raw_start,
+                    _raw_start + _raw_size,
+                    crate::util::metadata::side_metadata::helpers::address_to_meta_address(
+                        &side, _raw_start
+                    ),
+                    (_raw_size >> side.log_bytes_in_region) >> (3 - side.log_num_of_bits)
+                );
                 side.bset_metadata(_raw_start, _raw_size);
             }
         }
