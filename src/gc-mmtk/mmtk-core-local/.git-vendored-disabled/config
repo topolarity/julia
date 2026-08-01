@@ -1,0 +1,12 @@
+[core]
+	bare = false
+	repositoryformatversion = 0
+	filemode = true
+	logallrefupdates = true
+	autocrlf = false
+[remote "origin"]
+	url = file:///home/topolarity/.cargo/git/db/mmtk-core-e070c0ac3da07192
+	fetch = +refs/heads/*:refs/remotes/origin/*
+[branch "master"]
+	remote = origin
+	merge = refs/heads/master
