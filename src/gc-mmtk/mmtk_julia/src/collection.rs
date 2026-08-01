@@ -104,6 +104,7 @@ impl Collection<JuliaVM> for VMCollection {
         // STW -- concurrent marking is not active.
         #[cfg(feature = "concurrentimmix")]
         CONCURRENT_MARKING_ACTIVE.store(false, Ordering::SeqCst);
+        crate::MMTK_SATB_MARKING_ACTIVE.store(0, Ordering::SeqCst);
 
         // Tell MMTk the stacks are ready.
         {
@@ -150,6 +151,8 @@ impl Collection<JuliaVM> for VMCollection {
             }
 
             CONCURRENT_MARKING_ACTIVE.store(concurrent_marking_active, Ordering::SeqCst);
+            crate::MMTK_SATB_MARKING_ACTIVE
+                .store(concurrent_marking_active as u8, Ordering::SeqCst);
             log::info!("Set CONCURRENT_MARKING_ACTIVE to {concurrent_marking_active}");
         }
 

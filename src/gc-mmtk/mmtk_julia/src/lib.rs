@@ -105,6 +105,15 @@ pub static STW_KIND_MAX_AT: [std::sync::atomic::AtomicU64; 4] = [
     std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
 ];
 pub static STW_KIND_N: [std::sync::atomic::AtomicU64; 4] = [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+/// SATB barrier gate, exported for the write-barrier fastpath (both the C
+/// inline fastpath and JIT-emitted code load this before touching the
+/// per-object unlog bit).  Nonzero exactly while concurrent marking is
+/// active; while zero the barrier slow path is unreachable, so unlog bits
+/// cannot be consumed outside marking and all arming can happen off-pause.
+#[no_mangle]
+pub static MMTK_SATB_MARKING_ACTIVE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
 pub static BLOCK_MAX_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Longest wait inside jl_mmtk_gc_stw_begin (bringing mutators to the safepoint).
 pub static STOP_WAIT_MAX_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

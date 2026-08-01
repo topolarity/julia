@@ -319,6 +319,14 @@ JL_DLLEXPORT void jl_gc_collect(jl_gc_collection_t collection) {
 // the GC while mutators keep running.
 JL_DLLEXPORT void jl_mmtk_gc_stw_begin(void)
 {
+    // DIAG: the worker-side world stop must honor `GC.enable(false)` --
+    // collector-initiated pauses (async trigger, self-triggered FinalMark)
+    // would otherwise collect inside windows where the runtime holds
+    // live-but-unrooted pointers (e.g. staticdata image save/load).
+    if (jl_atomic_load_acquire(&jl_gc_disable_counter)) {
+        jl_safe_printf("MMTK-DIAG: worker-side STW while GC is DISABLED (counter=%d)\n",
+                       jl_atomic_load_acquire(&jl_gc_disable_counter));
+    }
     uint64_t t0 = jl_hrtime();
     jl_safepoint_stw_begin();
     jl_fence();

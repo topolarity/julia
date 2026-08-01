@@ -644,19 +644,10 @@ impl<VM: VMBinding> ImmixSpace<VM> {
             unimplemented!("cyclic mark bits is not supported at the moment");
         }
 
-        let space = unsafe { &*(self as *const Self) };
-        let packets: Vec<Box<dyn GCWork<VM>>> = self
-            .chunk_map
-            .all_chunks()
-            .map(|chunk| {
-                Box::new(UnlogBitsChunk {
-                    space,
-                    chunk,
-                    op: UnlogBitsOperation::BulkSet,
-                }) as _
-            })
-            .collect();
-        self.scheduler().work_buckets[WorkBucketStage::Prepare].bulk_add(packets);
+        // MARKING-GATED BARRIER: no unlog-bit arming here.  Bits are kept
+        // armed across the idle window (deferred re-arm after FinalMark,
+        // chunk-granular arming at first allocation) and are inert while the
+        // marking flag is off, so this pause has no per-chunk work at all.
 
         // DIAG (MMTK_CHECK_STALE_MARKS): at InitialMark, no object mark bit
         // should be set (the deferred post-FinalMark clear must have wiped
@@ -835,6 +826,22 @@ impl<VM: VMBinding> ImmixSpace<VM> {
         // acquisition but tracing never visits them.
         if self.should_allocate_as_live() {
             block.set_state(BlockState::Marked);
+        }
+        // MARKING-GATED BARRIER: chunks entering service must come up with
+        // their unlog bits ARMED (fresh side metadata is zeroed).  The bits
+        // are inert while the marking flag is off, so this is safe at any
+        // time, and the per-cycle deferred re-arm keeps them set thereafter.
+        // Racing first-allocators may both set the metadata; bset is
+        // idempotent.
+        if self.common.needs_log_bit
+            && self
+                .chunk_map
+                .get(block.chunk())
+                .map_or(true, |s| !s.is_allocated())
+        {
+            VM::VMObjectModel::GLOBAL_LOG_BIT_SPEC
+                .extract_side_spec()
+                .bset_metadata(block.chunk().start(), Chunk::BYTES);
         }
         self.chunk_map.set_allocated(block.chunk(), true);
         self.lines_consumed

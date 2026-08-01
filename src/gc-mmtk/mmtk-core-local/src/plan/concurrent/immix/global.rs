@@ -242,16 +242,16 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
                 );
             }
             Pause::InitialMark => {
-                // LEG 1: slim prepare -- only the SATB unlog-bit arming stays
-                // in the pause (it IS the snapshot boundary); mark-bit
-                // clearing was deferred to post-FinalMark packets and block
-                // state resets are unnecessary for the lazy-sweep plan.
+                // MARKING-GATED BARRIER: no arming happens in this pause at
+                // all.  The write-barrier fastpath is gated on
+                // MMTK_SATB_MARKING_ACTIVE, so unlog bits are inert outside
+                // marking and stay armed from the previous cycle's deferred
+                // re-arm pass (fresh chunks are armed at first allocation,
+                // common-space objects at allocation).  Enabling the barrier
+                // is the flag store in the binding's resume path.
                 self.immix_space.prepare_concurrent_initial();
 
                 self.common.prepare(tls, true);
-                // Bulk set log bits so SATB barrier will be triggered on the existing objects.
-                self.common
-                    .schedule_unlog_bits_op(UnlogBitsOperation::BulkSet);
             }
             Pause::FinalMark => (),
         }
@@ -264,8 +264,13 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
             Pause::Full | Pause::FinalMark => {
                 self.immix_space.release(
                     true,
-                    // Bulk clear log bits so SATB barrier will not be triggered.
-                    UnlogBitsOperation::BulkClear,
+                    // MARKING-GATED BARRIER: RE-ARM (BulkSet) the unlog bits
+                    // in deferred post-pause packets.  Bits consumed by the
+                    // barrier during this cycle's marking get set again; with
+                    // the fastpath gated on the marking flag, armed bits are
+                    // inert until the next InitialMark, so nothing needs to
+                    // happen in that pause.
+                    UnlogBitsOperation::BulkSet,
                     // ALL collections use the lazy release path: an eager
                     // sweep would walk blocks that are simultaneously members
                     // of the lazy lists/pool, creating duplicate ownership --
@@ -275,22 +280,13 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
 
                 self.common.release(tls, true);
 
-                if pause == Pause::FinalMark {
-                    // LEG 1: the common-space unlog clear is deferred with
-                    // the immix-space packets (stale set bits outside marking
-                    // only cause discarded barrier slow calls).
-                    let common_plan =
-                        unsafe { &*(&self.common as *const crate::plan::global::CommonPlan<VM>) };
-                    self.immix_space.defer_post_pause_packet(Box::new(
-                        crate::plan::gc_work::ClearCommonPlanUnlogBits { common_plan },
-                    ));
-                } else {
-                    // Full pauses didn't set unlog bits in the first place,
-                    // so there is no need to clear them.
-                    // TODO: Currently InitialMark must be followed by a FinalMark.
-                    // If we allow upgrading a concurrent GC to a full STW GC,
-                    // we will need to clear the unlog bits at an appropriate place.
-                }
+                // Re-arm the common spaces (sysimage immortal, LOS) the same
+                // way, after every major collection.
+                let common_plan =
+                    unsafe { &*(&self.common as *const crate::plan::global::CommonPlan<VM>) };
+                self.immix_space.defer_post_pause_packet(Box::new(
+                    crate::plan::gc_work::SetCommonPlanUnlogBits { common_plan },
+                ));
             }
         }
     }
@@ -433,7 +429,20 @@ impl<VM: VMBinding> ConcurrentImmix<VM> {
 
         ConcurrentImmix {
             immix_space: ImmixSpace::new(
-                plan_args.get_normal_space_args("immix", true, false, VMRequest::discontiguous()),
+                // MARKING-GATED BARRIER: unlog_traced_object=true so that
+                // (a) tracing re-arms every traced object's unlog bit each
+                // cycle and (b) defrag `post_copy` arms moved copies.  With
+                // the in-pause bulk arming gone, these are the paths that
+                // keep every live object armed at each InitialMark
+                // (allocation-time chunk arming covers the rest).
+                plan_args._get_space_args(
+                    "immix",
+                    true,
+                    false,
+                    false,
+                    true,
+                    VMRequest::discontiguous(),
+                ),
                 immix_args,
             ),
             common: CommonPlan::new(plan_args),

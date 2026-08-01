@@ -14,6 +14,11 @@ extern "C" {
 extern void mmtk_object_reference_write_pre(void* mutator, const void* parent, const void* ptr);
 extern void mmtk_object_reference_write_slow(void* mutator, const void* parent, const void* ptr);
 extern void* MMTK_SIDE_LOG_BIT_BASE_ADDRESS;
+// Marking-gated SATB barrier: nonzero exactly while concurrent marking is
+// active.  Checked before the per-object unlog bit so that (a) the barrier
+// costs one predictable branch outside marking and (b) unlog bits are never
+// consumed outside marking, which lets all arming happen off-pause.
+extern uint8_t MMTK_SATB_MARKING_ACTIVE;
 
 #define MMTK_OBJECT_BARRIER (1)
 // Stickyimmix needs write barrier. Immix does not need write barrier.
@@ -44,6 +49,12 @@ STATIC_INLINE void mmtk_gc_wb_full(const void *parent, const void *ptr) JL_NOTSA
 STATIC_INLINE void mmtk_gc_wb_fast(const void *parent, const void *ptr) JL_NOTSAFEPOINT
 {
     if (MMTK_NEEDS_WRITE_BARRIER == MMTK_OBJECT_BARRIER) {
+#ifdef MMTK_PLAN_CONCURRENTIMMIX
+        // SATB is only needed while marking; the flag gate also protects the
+        // armed unlog bits from being consumed between cycles.
+        if (__atomic_load_n(&MMTK_SATB_MARKING_ACTIVE, __ATOMIC_RELAXED) == 0)
+            return;
+#endif
         intptr_t addr = (intptr_t) (void*) parent;
         uint8_t* meta_addr = (uint8_t*) (MMTK_SIDE_LOG_BIT_BASE_ADDRESS) + (addr >> 6);
         intptr_t shift = (addr >> 3) & 0b111;

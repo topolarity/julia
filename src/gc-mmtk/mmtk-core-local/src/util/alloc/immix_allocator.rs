@@ -305,6 +305,19 @@ impl<VM: VMBinding> ImmixAllocator<VM> {
                     Line::bulk_set_line_mark_states(state, start_line..end_line);
                     if self.space.should_allocate_as_live() {
                         Line::initialize_mark_table_as_marked::<VM>(start_line..end_line);
+                        // MARKING-GATED BARRIER: objects allocated during
+                        // marking must be UNARMED -- allocate-black covers
+                        // their liveness, and firing the object-snapshot
+                        // barrier on a half-initialized object would enqueue
+                        // garbage fields.  The claimed range may carry armed
+                        // bits from the standing all-armed invariant; disarm
+                        // it for the new objects.
+                        if let crate::util::metadata::MetadataSpec::OnSide(unlog) =
+                            *VM::VMObjectModel::GLOBAL_LOG_BIT_SPEC
+                        {
+                            let start = start_line.start();
+                            unlog.bzero_metadata(start, end_line.start() - start);
+                        }
                     }
                 }
                 return true;
@@ -402,6 +415,16 @@ impl<VM: VMBinding> ImmixAllocator<VM> {
                         Line::initialize_mark_table_as_marked::<VM>(
                             block.start_line()..block.end_line(),
                         );
+                        // See acquire_recyclable_lines: during-marking
+                        // allocations must be unarmed.
+                        if let crate::util::metadata::MetadataSpec::OnSide(unlog) =
+                            *VM::VMObjectModel::GLOBAL_LOG_BIT_SPEC
+                        {
+                            unlog.bzero_metadata(
+                                block.start(),
+                                crate::policy::immix::block::Block::BYTES,
+                            );
+                        }
                     }
                 }
                 if self.request_for_large {

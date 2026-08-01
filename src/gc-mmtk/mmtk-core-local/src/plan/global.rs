@@ -742,11 +742,18 @@ impl<VM: VMBinding> CommonPlan<VM> {
         let needs_log_bit = args.constraints.needs_log_bit;
         let generational = args.constraints.generational;
         CommonPlan {
-            immortal: ImmortalSpace::new(args.get_common_space_args(generational, "immortal")),
+            // Key the unlog-at-allocation/trace behavior on `needs_log_bit`
+            // rather than `generational`: any plan that maintains log bits
+            // (generational plans AND the marking-gated SATB plan) needs
+            // common-space objects to come up armed.  Generational plans are
+            // unaffected (generational implies needs_log_bit).
+            immortal: ImmortalSpace::new(args.get_common_space_args(needs_log_bit, "immortal")),
             los: LargeObjectSpace::new(
                 // LOS is a bit special, as it is a mixed age space. It has a logical nursery.
                 if generational {
                     args.get_mixed_age_space_args("los", true, false, VMRequest::discontiguous())
+                } else if needs_log_bit {
+                    args._get_space_args("los", true, false, true, true, VMRequest::discontiguous())
                 } else {
                     args.get_normal_space_args("los", true, false, VMRequest::discontiguous())
                 },
@@ -828,7 +835,7 @@ impl<VM: VMBinding> CommonPlan<VM> {
     }
 
     fn new_nonmoving_space(args: &mut CreateSpecificPlanArgs<VM>) -> NonMovingSpace<VM> {
-        let space_args = args.get_common_space_args(args.constraints.generational, "nonmoving");
+        let space_args = args.get_common_space_args(args.constraints.needs_log_bit, "nonmoving");
         cfg_if::cfg_if! {
             if #[cfg(any(feature = "immortal_as_nonmoving", feature = "marksweep_as_nonmoving"))] {
                 NonMovingSpace::new(space_args)
