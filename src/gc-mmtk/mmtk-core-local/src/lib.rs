@@ -116,12 +116,37 @@ pub mod diag {
     pub static LAST_FIND_BRANCH: AtomicU64 = AtomicU64::new(0);
     /// Remaining churn-event log lines (global budget).
     pub static CHURN_LOG_BUDGET: AtomicU64 = AtomicU64::new(40);
+    /// Root-scan anatomy (reset by the binding at pause start): splits the
+    /// in-pause root work by class so the Init pause floor can be attributed.
+    pub static ROOTS_MUT_NS: AtomicU64 = AtomicU64::new(0); // sum of ScanMutatorRoots packets
+    pub static ROOTS_MUT_MAX_NS: AtomicU64 = AtomicU64::new(0);
+    pub static ROOTS_MUT_N: AtomicU64 = AtomicU64::new(0);
+    pub static ROOTS_VM_NS: AtomicU64 = AtomicU64::new(0); // ScanVMSpecificRoots
+    pub static PREP_NS: AtomicU64 = AtomicU64::new(0); // global Prepare packet
+    pub static PREP_MUT_NS: AtomicU64 = AtomicU64::new(0); // sum of PrepareMutator packets
+    // CommonPlan::prepare sub-parts (immortal / LOS / nonmoving / base+vmspace)
+    pub static PREP_IMM_NS: AtomicU64 = AtomicU64::new(0);
+    pub static PREP_LOS_NS: AtomicU64 = AtomicU64::new(0);
+    pub static PREP_NM_NS: AtomicU64 = AtomicU64::new(0);
+    pub static PREP_BASE_NS: AtomicU64 = AtomicU64::new(0);
+    /// Written by the binding: time inside `mmtk_scan_gcstack` walks and the
+    /// number of task stacks walked during mutator root scanning.
+    pub static STACKSCAN_NS: AtomicU64 = AtomicU64::new(0);
+    pub static STACKSCAN_TASKS: AtomicU64 = AtomicU64::new(0);
+    pub static STACKSCAN_SLOTS: AtomicU64 = AtomicU64::new(0);
     pub static TRIAGE_FREED: AtomicU64 = AtomicU64::new(0);
     pub static TRIAGE_POOLED: AtomicU64 = AtomicU64::new(0);
     pub static POOL_POPS: AtomicU64 = AtomicU64::new(0);
     pub static CLEAN_BLOCKS: AtomicU64 = AtomicU64::new(0);
     pub static PAUSE_PENDING: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
+    /// Env-gated (MMTK_TRACE_GUARDS) validity checks on traced values:
+    /// report-and-skip refs outside every MMTk space instead of chasing them.
+    /// Diagnostic only -- costs an SFT lookup per traced edge when enabled.
+    pub fn trace_guards_enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("MMTK_TRACE_GUARDS").is_some())
+    }
     pub fn record_max(s: &AtomicU64, v: u64) {
         let mut c = s.load(Ordering::Relaxed);
         while v > c {

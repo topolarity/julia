@@ -680,13 +680,33 @@ JL_DLLEXPORT int jl_gc_enable(int on)
         if (jl_atomic_fetch_add(&jl_gc_disable_counter, -1) == 1) {
             gc_num.allocd += gc_num.deferred_alloc;
             gc_num.deferred_alloc = 0;
+            jl_gc_notify_collections_enabled();
         }
     }
     else if (prev && !on) {
         // enable -> disable
         jl_atomic_fetch_add(&jl_gc_disable_counter, 1);
-        // check if the GC is running and wait for it to finish
-        jl_gc_safepoint_(ptls);
+        // Collectors that cannot no-op an already-scheduled pause must never
+        // observe a mutator inside a disabled window: if a collection is
+        // pending or running, RELEASE the counter and participate in it
+        // before entering the window.  Parking at a safepoint with the
+        // counter held would let the pause run against a disabled mutator
+        // (and, with concurrent tracing suspended while disabled, wedge it).
+        // The stock GC always reports "not pending" (it no-ops a collection
+        // after stopping the world instead), making this the plain
+        // wait-for-running-GC safepoint it has always been.
+        if (!jl_gc_is_collection_pending()) {
+            // check if the GC is running and wait for it to finish
+            jl_gc_safepoint_(ptls);
+        }
+        else {
+            do {
+                jl_atomic_fetch_add(&jl_gc_disable_counter, -1);
+                jl_gc_safepoint_(ptls);
+                jl_cpu_pause();
+                jl_atomic_fetch_add(&jl_gc_disable_counter, 1);
+            } while (jl_gc_is_collection_pending());
+        }
     }
     return prev;
 }

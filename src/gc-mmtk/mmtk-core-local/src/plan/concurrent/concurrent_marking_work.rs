@@ -6,7 +6,7 @@ use crate::policy::gc_work::TraceKind;
 use crate::scheduler::{GCWork, GCWorker, WorkBucketStage};
 use crate::util::{scanning_helper, ObjectReference};
 use crate::vm::slot::Slot;
-use crate::vm::{RootsKind, RootsWorkFactory, VMBinding};
+use crate::vm::{Collection, RootsKind, RootsWorkFactory, VMBinding};
 use crate::MMTK;
 
 use std::collections::VecDeque;
@@ -69,6 +69,14 @@ impl<VM: VMBinding, P: ConcurrentPlan<VM = VM> + PlanTraceObject<VM>, const KIND
         } else {
             // We scan each object and only enqueue newly visited objects.
             for object in initial_objects {
+                // DIAG/GUARD (env MMTK_TRACE_GUARDS): report and skip garbage
+                // entering via roots/modbuf.
+                if crate::diag::trace_guards_enabled()
+                    && !crate::memory_manager::is_in_mmtk_spaces(object)
+                {
+                    eprintln!("[trace-garbage] initial={:?}", object);
+                    continue;
+                }
                 trace.trace_object(worker, object, &mut |enqueued_object| {
                     debug_assert_eq!(enqueued_object, object);
                     queue.push_back(enqueued_object);
@@ -80,6 +88,26 @@ impl<VM: VMBinding, P: ConcurrentPlan<VM = VM> + PlanTraceObject<VM>, const KIND
         // Loop until the queue is drained or the scan budget is exhausted.
         let mut scanned = 0usize;
         while let Some(object) = queue.pop_back() {
+            // CONTRACT (checked at entry and every 64 objects): while the VM
+            // has collections disabled (`jl_gc_disable`), the runtime may
+            // hold GC-unobservable heap states -- e.g. package-image objects
+            // mid-uniquing whose fields transiently hold encoded values.
+            // Scanning must not observe them.  Repackage the remaining
+            // (already marked) objects into the Concurrent bucket, which is
+            // not polled while collections are disabled; tracing resumes
+            // after re-enable.  Marking/enqueuing an object stays safe --
+            // only scanning its fields is deferred.
+            if scanned % 64 == 0
+                && !<VM as VMBinding>::VMCollection::is_collection_enabled()
+                && !crate::diag::PAUSE_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+            {
+                queue.push_back(object);
+                let rest: Vec<_> = queue.drain(..).collect();
+                let w = Self::new(rest, true);
+                mmtk.scheduler.work_buckets[WorkBucketStage::Concurrent]
+                    .add_boxed_no_notify(Box::new(w));
+                break;
+            }
             scanned += 1;
             if scanned > Self::SCAN_BUDGET {
                 queue.push_back(object);
@@ -89,6 +117,21 @@ impl<VM: VMBinding, P: ConcurrentPlan<VM = VM> + PlanTraceObject<VM>, const KIND
                 break;
             }
             scanning_helper::visit_children_non_moving::<VM>(tls, object, &mut |child| {
+                // DIAG/GUARD (env MMTK_TRACE_GUARDS): a child outside every
+                // MMTk space means the scan of `object` read a non-pointer
+                // word as a slot.  Report the parent and its header so the
+                // mis-scanned type is identifiable, then skip.
+                if crate::diag::trace_guards_enabled()
+                    && !crate::memory_manager::is_in_mmtk_spaces(child)
+                {
+                    let parent_header =
+                        unsafe { *((object.to_raw_address().as_usize() - 8) as *const u64) };
+                    eprintln!(
+                        "[trace-garbage] child={:?} parent={:?} parent_header={:#x}",
+                        child, object, parent_header
+                    );
+                    return child;
+                }
                 trace.trace_object(worker, child, &mut |enqueued_child| {
                     debug_assert_eq!(enqueued_child, child);
                     queue.push_back(enqueued_child);

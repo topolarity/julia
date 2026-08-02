@@ -88,13 +88,30 @@ impl<VM: VMBinding> GCTrigger<VM> {
             return;
         }
 
-        if !self.request_flag.swap(true, Ordering::Relaxed) {
+        if !self.request_flag.swap(true, Ordering::SeqCst) {
+            // Close the race with `disable_collection`-style windows: the VM's
+            // disable path increments its counter and THEN checks this flag
+            // (backing off if set); we set the flag and THEN re-check the
+            // counter.  Sequential consistency guarantees one side observes
+            // the other, so no pause is ever initiated against a mutator
+            // that has entered a disabled window.
+            if !VM::VMCollection::is_collection_enabled() {
+                self.request_flag.store(false, Ordering::SeqCst);
+                return;
+            }
             // `GCWorkScheduler::request_schedule_collection` needs to hold a mutex to communicate
             // with GC workers, which is expensive for functions like `poll`.  We use the atomic
             // flag `request_flag` to elide the need to acquire the mutex in subsequent calls.
             probe!(mmtk, gc_requested);
             self.scheduler.request_schedule_collection();
         }
+    }
+
+    /// Whether a GC request is currently pending (raised but the collection
+    /// has not yet started).  Used by the VM's collection-disable path to
+    /// avoid entering a disabled window while a pause is initiating.
+    pub fn is_request_pending(&self) -> bool {
+        self.request_flag.load(Ordering::SeqCst)
     }
 
     /// Clear the "GC requested" flag so that mutators can trigger the next GC.

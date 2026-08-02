@@ -17,6 +17,23 @@ impl<VM: VMBinding> GCWork<VM> for SetCommonPlanUnlogBits<VM> {
     }
 }
 
+/// Deferred counterpart of the mark-bit resets skipped by
+/// `CommonPlan::prepare_deferred_mark_reset`: bulk-zeroes the immortal and
+/// VM-space (boot/package image) side mark bits outside the pause.
+pub(super) struct ResetCommonPlanMarkBits<VM: VMBinding> {
+    pub common_plan: &'static CommonPlan<VM>,
+}
+
+impl<VM: VMBinding> GCWork<VM> for ResetCommonPlanMarkBits<VM> {
+    fn do_work(
+        &mut self,
+        _worker: &mut crate::scheduler::GCWorker<VM>,
+        _mmtk: &'static crate::MMTK<VM>,
+    ) {
+        self.common_plan.reset_deferred_mark_bits();
+    }
+}
+
 pub(super) struct ClearCommonPlanUnlogBits<VM: VMBinding> {
     pub common_plan: &'static CommonPlan<VM>,
 }

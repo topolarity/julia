@@ -40,6 +40,21 @@ pub(crate) fn is_gc_thread() -> bool {
     GC_THREADS.read().unwrap().contains(&id)
 }
 
+/// True while the world is stopped for an InitialMark pause.  Used by the
+/// mutator root scan to decide between eager in-pause stack walking (Full:
+/// STW tracing, may defrag, needs the tpinning walk) and deferred
+/// snapshot-based stack scanning during concurrent marking (InitialMark).
+#[cfg(feature = "concurrentimmix")]
+pub(crate) fn current_pause_is_initial_mark() -> bool {
+    if let Some(cp) = SINGLETON.get_plan().concurrent() {
+        if let Some(p) = cp.current_pause() {
+            // `Pause` is public API but lives in a private module, so match on Debug
+            return format!("{:?}", p) == "InitialMark";
+        }
+    }
+    false
+}
+
 pub struct VMCollection {}
 
 impl Collection<JuliaVM> for VMCollection {
@@ -69,6 +84,23 @@ impl Collection<JuliaVM> for VMCollection {
         mmtk::diag::TRANS_N.store(0, Ordering::SeqCst);
         mmtk::diag::CHURN_N.store(0, Ordering::SeqCst);
         mmtk::diag::LAST_SEEN_PKT_N.store(u64::MAX, Ordering::SeqCst);
+        for s in [
+            &mmtk::diag::ROOTS_MUT_NS,
+            &mmtk::diag::ROOTS_MUT_MAX_NS,
+            &mmtk::diag::ROOTS_MUT_N,
+            &mmtk::diag::ROOTS_VM_NS,
+            &mmtk::diag::PREP_NS,
+            &mmtk::diag::PREP_MUT_NS,
+            &mmtk::diag::PREP_IMM_NS,
+            &mmtk::diag::PREP_LOS_NS,
+            &mmtk::diag::PREP_NM_NS,
+            &mmtk::diag::PREP_BASE_NS,
+            &mmtk::diag::STACKSCAN_NS,
+            &mmtk::diag::STACKSCAN_TASKS,
+            &mmtk::diag::STACKSCAN_SLOTS,
+        ] {
+            s.store(0, Ordering::SeqCst);
+        }
         mmtk::diag::PAUSE_ACTIVE.store(true, Ordering::SeqCst);
         {
             let now = crate::now_ns();
@@ -106,6 +138,49 @@ impl Collection<JuliaVM> for VMCollection {
         CONCURRENT_MARKING_ACTIVE.store(false, Ordering::SeqCst);
         crate::set_satb_marking_active(false);
         mmtk::diag::SATB_MARKING_ACTIVE.store(false, Ordering::SeqCst);
+
+        // FinalMark: trace the stacks of tasks whose concurrent snapshot
+        // capture was deferred (task was running, or GC was disabled).  The
+        // world is now stopped, so their stacks are frozen.  Prefer the
+        // first-resume snapshot when one was captured since (it is the
+        // Init-state, strictly more conservative); the values are traced with
+        // SATB-snapshot semantics in the Closure stage, ahead of the
+        // weak-ref/finalizer stages that read mark bits.
+        #[cfg(feature = "concurrentimmix")]
+        if crate::STW_KIND.load(Ordering::SeqCst) == 3 {
+            let pending = crate::scanning::GC_STACK_SNAPSHOTS.drain_pending();
+            if !pending.is_empty() {
+                let mut values: Vec<mmtk::util::ObjectReference> = vec![];
+                for key in &pending {
+                    let task = *key as *const crate::julia_types::_jl_task_t;
+                    if let Some(snapshot) =
+                        crate::scanning::GC_STACK_SNAPSHOTS.peek_snapshot(task)
+                    {
+                        values.extend(snapshot.iter().copied());
+                    } else {
+                        let mut buf = crate::scanning::StackRootBuffer { buffer: vec![] };
+                        unsafe {
+                            crate::julia_scanning::mmtk_scan_gcstack(task, &mut buf);
+                        }
+                        values.extend(buf.buffer);
+                    }
+                }
+                if mmtk::diag::trace_guards_enabled()
+                    || std::env::var_os("MMTK_ROOT_ANATOMY").is_some()
+                {
+                    eprintln!(
+                        "[pending-rescan] finalmark: {} tasks, {} stack values",
+                        pending.len(),
+                        values.len()
+                    );
+                }
+                SINGLETON
+                    .get_plan()
+                    .concurrent()
+                    .unwrap()
+                    .enqueue_satb_values(values);
+            }
+        }
 
         // Tell MMTk the stacks are ready.
         {
@@ -170,6 +245,37 @@ impl Collection<JuliaVM> for VMCollection {
                     crate::STW_KIND_MAX[k.min(3)].store(d, Ordering::SeqCst);
                     crate::STW_KIND_MAX_AT[k.min(3)]
                         .store(crate::GC_COUNT_TOTAL.load(Ordering::SeqCst) as u64, Ordering::SeqCst);
+                }
+                // Root-scan anatomy: per-pause breakdown of the in-pause root
+                // work by class (env-gated; used to size the Init floor).
+                {
+                    use std::sync::OnceLock;
+                    static ROOT_ANATOMY: OnceLock<bool> = OnceLock::new();
+                    if *ROOT_ANATOMY
+                        .get_or_init(|| std::env::var_os("MMTK_ROOT_ANATOMY").is_some())
+                    {
+                        let us = |v: u64| v as f64 / 1000.0;
+                        eprintln!(
+                            "[roots] kind={} dur={:.1}us mut={:.1}us(max {:.1}us, n={}) stack={:.1}us(tasks={} slots={}) vm={:.1}us prep={:.1}us prepmut={:.1}us prep[imm={:.1} los={:.1} nm={:.1} base={:.1}]us pkt_sum={:.1}us pkt_n={}",
+                            k,
+                            us(d),
+                            us(mmtk::diag::ROOTS_MUT_NS.load(Ordering::SeqCst)),
+                            us(mmtk::diag::ROOTS_MUT_MAX_NS.load(Ordering::SeqCst)),
+                            mmtk::diag::ROOTS_MUT_N.load(Ordering::SeqCst),
+                            us(mmtk::diag::STACKSCAN_NS.load(Ordering::SeqCst)),
+                            mmtk::diag::STACKSCAN_TASKS.load(Ordering::SeqCst),
+                            mmtk::diag::STACKSCAN_SLOTS.load(Ordering::SeqCst),
+                            us(mmtk::diag::ROOTS_VM_NS.load(Ordering::SeqCst)),
+                            us(mmtk::diag::PREP_NS.load(Ordering::SeqCst)),
+                            us(mmtk::diag::PREP_MUT_NS.load(Ordering::SeqCst)),
+                            us(mmtk::diag::PREP_IMM_NS.load(Ordering::SeqCst)),
+                            us(mmtk::diag::PREP_LOS_NS.load(Ordering::SeqCst)),
+                            us(mmtk::diag::PREP_NM_NS.load(Ordering::SeqCst)),
+                            us(mmtk::diag::PREP_BASE_NS.load(Ordering::SeqCst)),
+                            us(mmtk::diag::PAUSE_PKT_SUM_NS.load(Ordering::SeqCst)),
+                            mmtk::diag::PAUSE_PKT_N.load(Ordering::SeqCst),
+                        );
+                    }
                 }
                 // Pause anatomy: for slow pauses, report whether the time is
                 // packet work (sum ~ d x workers) or barrier/idle time.

@@ -400,6 +400,16 @@ pub extern "C" fn mmtk_gc_poll(tls: VMMutatorThread) {
 }
 
 #[no_mangle]
+pub extern "C" fn mmtk_notify_collections_enabled() {
+    memory_manager::notify_collections_enabled(&SINGLETON);
+}
+
+#[no_mangle]
+pub extern "C" fn mmtk_gc_request_pending() -> u8 {
+    memory_manager::is_gc_request_pending(&SINGLETON) as u8
+}
+
+#[no_mangle]
 pub extern "C" fn mmtk_runtime_panic() {
     panic!("Panicking at runtime!")
 }

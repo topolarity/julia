@@ -7,4 +7,11 @@ pub trait ConcurrentPlan: Plan {
     fn concurrent_work_in_progress(&self) -> bool;
     /// Return the current pause kind.  `None` if not in a pause.
     fn current_pause(&self) -> Option<Pause>;
+    /// Enqueue a batch of object values to be traced with SATB-snapshot
+    /// semantics (same treatment as barrier-logged old values).  Used by the
+    /// binding during the FinalMark pause to trace stack values of tasks
+    /// whose concurrent snapshot capture was deferred.
+    fn enqueue_satb_values(&self, _values: Vec<crate::util::ObjectReference>) {
+        unimplemented!()
+    }
 }

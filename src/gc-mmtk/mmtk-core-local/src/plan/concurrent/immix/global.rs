@@ -251,7 +251,18 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
                 // is the flag store in the binding's resume path.
                 self.immix_space.prepare_concurrent_initial();
 
-                self.common.prepare(tls, true);
+                // The immortal/VM-space bulk mark-bit resets were already
+                // performed by the deferred post-pause packet after the last
+                // FinalMark/Full (ResetCommonPlanMarkBits); this pause only
+                // does the O(1) per-space state flips.
+                // A/B kill-switch: MMTK_EAGER_COMMON_RESET restores the
+                // upstream in-pause reset (the deferred packet still runs;
+                // double-zeroing is harmless).
+                if std::env::var_os("MMTK_EAGER_COMMON_RESET").is_some() {
+                    self.common.prepare(tls, true);
+                } else {
+                    self.common.prepare_deferred_mark_reset(tls, true);
+                }
             }
             Pause::FinalMark => (),
         }
@@ -286,6 +297,14 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
                     unsafe { &*(&self.common as *const crate::plan::global::CommonPlan<VM>) };
                 self.immix_space.defer_post_pause_packet(Box::new(
                     crate::plan::gc_work::SetCommonPlanUnlogBits { common_plan },
+                ));
+                // Also reset the immortal/VM-space mark bits off-pause, so
+                // the next InitialMark's prepare has no metadata sweep left
+                // (the bits are unread between cycles; allocations only set
+                // them while allocate-as-live is active, i.e. during the
+                // marking that just ended).
+                self.immix_space.defer_post_pause_packet(Box::new(
+                    crate::plan::gc_work::ResetCommonPlanMarkBits { common_plan },
                 ));
             }
         }
@@ -568,5 +587,16 @@ impl<VM: VMBinding> ConcurrentPlan for ConcurrentImmix<VM> {
 
     fn concurrent_work_in_progress(&self) -> bool {
         self.concurrent_marking_in_progress()
+    }
+
+    fn enqueue_satb_values(&self, values: Vec<crate::util::ObjectReference>) {
+        use crate::plan::concurrent::concurrent_marking_work::ProcessModBufSATB;
+        if values.is_empty() {
+            return;
+        }
+        // Same stage the barrier's own FinalMark flush uses; these values are
+        // traced before the weak-ref/finalizer stages read mark bits.
+        self.base().scheduler.work_buckets[WorkBucketStage::Closure]
+            .add(ProcessModBufSATB::<VM, Self, TRACE_KIND_FAST>::new(values));
     }
 }

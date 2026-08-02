@@ -67,11 +67,53 @@ impl Scanning<JuliaVM> for VMScanning {
         let mut slot_buffer = StackRootBuffer { buffer: vec![] }; // need to be tpinned as they're all from the shadow stack
         let mut node_buffer = vec![];
 
+        // CONCURRENT STACK SCAN (InitialMark): skip the eager in-pause stack
+        // walks.  Every reachable task object is traced during concurrent
+        // marking, and the task branch of `scan_julia_object` scans its stack
+        // from a per-task snapshot: captured at first resume (the
+        // scheduler/safepoint `jl_gc_notify_task_resume` hooks fire before a
+        // task can mutate its stack, including the running task at
+        // safepoint exit) or lazily at trace time for tasks that stay
+        // parked.  InitialMark/FinalMark never move objects, so the
+        // transitive pinning this walk provided is not needed; Full GCs
+        // (STW tracing, may defrag) keep the eager tpinning walk.  This
+        // makes the InitialMark pause O(1) in the number of live tasks
+        // instead of ~0.6us per parked task.
+        // A/B kill-switch: MMTK_EAGER_STACK_SCAN restores the upstream eager
+        // in-pause walk.
+        #[cfg(feature = "concurrentimmix")]
+        let skip_stack_walk = {
+            use std::sync::OnceLock;
+            static EAGER: OnceLock<bool> = OnceLock::new();
+            !*EAGER.get_or_init(|| std::env::var_os("MMTK_EAGER_STACK_SCAN").is_some())
+                && crate::collection::current_pause_is_initial_mark()
+        };
+        #[cfg(not(feature = "concurrentimmix"))]
+        let skip_stack_walk = false;
+
         // Scan thread local from ptls: See gc_queue_thread_local in gc.c
         let mut root_scan_task = |task: *const _jl_task_t, task_is_root: bool| {
             if !task.is_null() {
-                unsafe {
-                    crate::julia_scanning::mmtk_scan_gcstack(task, &mut slot_buffer);
+                let t0 = mmtk::diag::now_ns();
+                if !skip_stack_walk {
+                    unsafe {
+                        crate::julia_scanning::mmtk_scan_gcstack(task, &mut slot_buffer);
+                    }
+                } else {
+                    // Pre-seed the per-task stack snapshot while the world is
+                    // stopped.  This matters for mutators sitting in GC_SAFE
+                    // (foreign code) through the whole pause: they never fire
+                    // the safepoint-exit `jl_gc_notify_task_resume` hook, so
+                    // without a seed the concurrent tracer could capture their
+                    // current task's stack while it is running.
+                    #[cfg(feature = "concurrentimmix")]
+                    crate::scanning::GC_STACK_SNAPSHOTS.resume_barrier_scan_task(task);
+                }
+                {
+                    use std::sync::atomic::Ordering;
+                    mmtk::diag::STACKSCAN_NS
+                        .fetch_add(mmtk::diag::now_ns().saturating_sub(t0), Ordering::Relaxed);
+                    mmtk::diag::STACKSCAN_TASKS.fetch_add(1, Ordering::Relaxed);
                 }
                 if task_is_root {
                     // captures wrong root nodes before creating the work
@@ -94,13 +136,17 @@ impl Scanning<JuliaVM> for VMScanning {
 
         // need to iterate over live tasks as well to process their shadow stacks
         // we should not set the task themselves as roots as we will know which ones are still alive after GC
-        let mut i = 0;
-        while i < ptls.gc_tls_common.heap.live_tasks.len {
-            let mut task_address = Address::from_ptr(ptls.gc_tls_common.heap.live_tasks.items);
-            task_address = task_address.shift::<Address>(i as isize);
-            let task = unsafe { task_address.load::<*const jl_task_t>() };
-            root_scan_task(task, false);
-            i += 1;
+        // (skipped entirely for InitialMark: parked tasks' stacks are scanned
+        // from snapshots when their task object is traced concurrently)
+        if !skip_stack_walk {
+            let mut i = 0;
+            while i < ptls.gc_tls_common.heap.live_tasks.len {
+                let mut task_address = Address::from_ptr(ptls.gc_tls_common.heap.live_tasks.items);
+                task_address = task_address.shift::<Address>(i as isize);
+                let task = unsafe { task_address.load::<*const jl_task_t>() };
+                root_scan_task(task, false);
+                i += 1;
+            }
         }
 
         root_scan_task(ptls.current_task as *mut _jl_task_t, true);
@@ -145,6 +191,11 @@ impl Scanning<JuliaVM> for VMScanning {
         }
 
         // We do not need gc_queue_remset from gc.c (we are not using remset in the thread)
+
+        mmtk::diag::STACKSCAN_SLOTS.fetch_add(
+            slot_buffer.buffer.len() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
 
         // Push work
         const CAPACITY_PER_PACKET: usize = 4096;
@@ -271,6 +322,11 @@ impl<C: ObjectTracerContext<JuliaVM>> GCWork<JuliaVM> for ScanFinalizersSingleTh
 pub struct GCStackSnapshots {
     snapshots: DashMap<usize, Arc<[ObjectReference]>>,
     task_scan_locks: DashMap<usize, Arc<Mutex<()>>>,
+    /// Tasks whose stack scan was deferred to the FinalMark pause because a
+    /// concurrent capture was not safe at trace time (task running, or GC
+    /// disabled so the runtime may hold non-scannable stack states, e.g. a
+    /// loader task parked mid-image-restore with unrelocated pointers).
+    pending_rescan: DashMap<usize, ()>,
 }
 
 #[cfg(feature = "concurrentimmix")]
@@ -279,7 +335,22 @@ impl GCStackSnapshots {
         Self {
             snapshots: DashMap::new(),
             task_scan_locks: DashMap::new(),
+            pending_rescan: DashMap::new(),
         }
+    }
+
+    /// Drain the deferred-rescan set.  Called during the FinalMark pause.
+    pub fn drain_pending(&self) -> Vec<usize> {
+        let keys: Vec<usize> = self.pending_rescan.iter().map(|e| *e.key()).collect();
+        for k in &keys {
+            self.pending_rescan.remove(k);
+        }
+        keys
+    }
+
+    /// Look up an existing snapshot without capturing one.
+    pub fn peek_snapshot(&self, task: *const _jl_task_t) -> Option<Arc<[ObjectReference]>> {
+        self.get_snapshot(task)
     }
 
     fn get_task_scan_lock(&self, task_key: usize) -> Arc<Mutex<()>> {
@@ -311,7 +382,23 @@ impl GCStackSnapshots {
         if let Some(snapshot) = self.snapshots.get(&task_key) {
             Some(snapshot.clone())
         } else {
-            let snapshot = self.capture_snapshot(task);
+            // Capture-at-trace safety, holding the per-task lock (the resume
+            // hook serializes on the same lock, so a parked task cannot start
+            // running during the walk):
+            //  - during a pause the world is stopped: walking is safe (this
+            //    matches the exposure of an eager STW root scan);
+            //  - otherwise, a running task (`ptls` set) must not be walked,
+            //    and while the GC is disabled the runtime may legally hold
+            //    non-scannable parked stacks (mid-image-restore yields), so
+            //    defer those tasks to the FinalMark pause.
+            let in_pause = mmtk::diag::PAUSE_ACTIVE.load(std::sync::atomic::Ordering::Relaxed);
+            let running = unsafe { !(*task).ptls.is_null() };
+            let disabled = unsafe { crate::jl_get_gc_disable_counter() } > 0;
+            if !in_pause && (running || disabled) {
+                self.pending_rescan.insert(task_key, ());
+                return None;
+            }
+            let snapshot = self.capture_snapshot_who(task, "trace");
             self.snapshots.insert(task_key, snapshot.clone());
             Some(snapshot)
         }
@@ -326,13 +413,48 @@ impl GCStackSnapshots {
         if self.snapshots.contains_key(&task_key) {
             return;
         }
-        self.snapshots.insert(task_key, self.capture_snapshot(task));
+        let who = if mmtk::diag::PAUSE_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
+            "preseed"
+        } else {
+            "hook"
+        };
+        self.snapshots
+            .insert(task_key, self.capture_snapshot_who(task, who));
     }
 
     fn capture_snapshot(&self, task: *const _jl_task_t) -> Arc<[ObjectReference]> {
+        self.capture_snapshot_who(task, "trace")
+    }
+
+    fn capture_snapshot_who(&self, task: *const _jl_task_t, who: &str) -> Arc<[ObjectReference]> {
         let mut snapshot_roots = StackRootBuffer { buffer: vec![] };
         unsafe {
             crate::julia_scanning::mmtk_scan_gcstack(task, &mut snapshot_roots);
+        }
+        // DIAG/GUARD (env MMTK_TRACE_GUARDS): a captured "root" outside every
+        // MMTk space is evidence the stack was walked in an unscannable state
+        // (torn capture).  Report the capture context and drop the value so
+        // the tracer does not chase garbage.
+        if mmtk::diag::trace_guards_enabled() {
+            let dc = unsafe { crate::jl_get_gc_disable_counter() };
+            if dc > 0 {
+                eprintln!("[snap-disabled] who={} task={:?} disable={}", who, task, dc);
+            }
+            let n_before = snapshot_roots.buffer.len();
+            snapshot_roots
+                .buffer
+                .retain(|r| mmtk::memory_manager::is_in_mmtk_spaces(*r));
+            let dropped = n_before - snapshot_roots.buffer.len();
+            if dropped > 0 {
+                let (ptls_null, copy, stkbuf) = unsafe {
+                    let ta = &*task;
+                    (ta.ptls.is_null(), ta.ctx.copy_stack_custom(), ta.ctx.stkbuf as usize)
+                };
+                eprintln!(
+                    "[snapcheck] who={} task={:?} DROPPED {} of {} refs (ptls_null={} copy_stack={} stkbuf={:#x})",
+                    who, task, dropped, n_before, ptls_null, copy, stkbuf
+                );
+            }
         }
         log::info!(
             "Took snapshot of stack roots for task {:?}, num roots = {}",
@@ -345,5 +467,6 @@ impl GCStackSnapshots {
     pub fn clear_snapshots(&self) {
         self.snapshots.clear();
         self.task_scan_locks.clear();
+        self.pending_rescan.clear();
     }
 }

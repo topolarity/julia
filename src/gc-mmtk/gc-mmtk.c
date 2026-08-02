@@ -945,6 +945,30 @@ void jl_gc_notify_task_resume(jl_task_t *task) JL_NOTSAFEPOINT
 #endif
 }
 
+extern void mmtk_notify_collections_enabled(void);
+extern uint8_t mmtk_gc_request_pending(void);
+
+void jl_gc_notify_collections_enabled(void) JL_NOTSAFEPOINT
+{
+#ifdef MMTK_PLAN_CONCURRENTIMMIX
+    // Wake parked GC workers: concurrent tracing is suspended while
+    // collections are disabled (the runtime may hold GC-unobservable heap
+    // states inside a `jl_gc_disable` window) and resumes on this signal.
+    mmtk_notify_collections_enabled();
+#endif
+}
+
+int jl_gc_is_collection_pending(void) JL_NOTSAFEPOINT
+{
+#ifdef MMTK_PLAN_CONCURRENTIMMIX
+    // MMTk cannot no-op an already-scheduled pause, so the disable path
+    // must not enter its window while a pause is requested or running.
+    return mmtk_gc_request_pending() || jl_atomic_load_acquire(&jl_gc_running);
+#else
+    return 0;
+#endif
+}
+
 JL_DLLEXPORT void* jl_gc_get_stackbase(int16_t tid) {
     assert(tid >= 0);
     jl_ptls_t ptls2 = jl_all_tls_states[tid];

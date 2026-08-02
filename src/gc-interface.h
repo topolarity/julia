@@ -161,6 +161,16 @@ JL_DLLEXPORT const char* jl_gc_active_impl(void) JL_NOTSAFEPOINT;
 JL_DLLEXPORT void jl_gc_sweep_stack_pools_and_mtarraylist_buffers(jl_ptls_t ptls) JL_NOTSAFEPOINT;
 // Notify the GC that a task is resuming execution on a mutator thread.
 void jl_gc_notify_task_resume(struct _jl_task_t *task) JL_NOTSAFEPOINT;
+// Notify the GC that collections were re-enabled (`jl_gc_disable_counter`
+// dropped to zero).  Concurrent collectors may have suspended background
+// work while collections were disabled and should resume it.
+void jl_gc_notify_collections_enabled(void) JL_NOTSAFEPOINT;
+// Whether a collection has been requested or is running.  Used by the
+// collection-disable path (`jl_gc_enable(0)`) to avoid entering a disabled
+// window while a pause is initiating: collectors that cannot no-op an
+// already-scheduled pause (unlike the stock GC's post-STW disable re-check)
+// rely on this to keep pauses and disabled windows mutually exclusive.
+int jl_gc_is_collection_pending(void) JL_NOTSAFEPOINT;
 
 // ========================================================================= //
 // Metrics

@@ -702,6 +702,20 @@ pub fn is_mmtk_object(addr: Address) -> Option<ObjectReference> {
     crate::util::is_mmtk_object::check_object_reference(addr)
 }
 
+/// Notify MMTk that the VM has re-enabled collections
+/// (`Collection::is_collection_enabled` turned true again).  Wakes parked GC
+/// workers so concurrent tracing that was suspended during the disabled
+/// window resumes promptly.
+pub fn notify_collections_enabled<VM: VMBinding>(mmtk: &'static MMTK<VM>) {
+    mmtk.scheduler.worker_monitor.notify_work_available(true);
+}
+
+/// Whether a GC request is pending (raised but the collection has not yet
+/// started).  See `GCTrigger::is_request_pending`.
+pub fn is_gc_request_pending<VM: VMBinding>(mmtk: &'static MMTK<VM>) -> bool {
+    mmtk.gc_trigger.is_request_pending()
+}
+
 /// Find if there is an object with VO bit set for the given address range.
 /// This should be used instead of [`crate::memory_manager::is_mmtk_object`] for conservative stack scanning if
 /// the binding may have internal pointers on the stack.

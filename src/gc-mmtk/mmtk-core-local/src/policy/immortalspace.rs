@@ -175,7 +175,19 @@ impl<VM: VMBinding> ImmortalSpace<VM> {
 
     pub fn prepare(&mut self) {
         self.mark_state.on_global_prepare::<VM>();
-        // Reset the mark bit for the allocated regions.
+        self.reset_mark_bits();
+    }
+
+    /// Like `prepare`, but without the bulk mark-bit reset.  Used by plans
+    /// that perform the reset in a deferred post-pause packet after the
+    /// marking cycle ends (`MarkState::on_block_reset` supports resetting
+    /// either before or after tracing; nothing reads the bits in between).
+    pub fn prepare_no_mark_reset(&mut self) {
+        self.mark_state.on_global_prepare::<VM>();
+    }
+
+    /// Reset the mark bit for the allocated regions.
+    pub fn reset_mark_bits(&self) {
         for (addr, size) in self.pr.iterate_allocated_regions() {
             debug!(
                 "{:?}: reset mark bit from {} to {}",

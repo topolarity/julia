@@ -1313,6 +1313,19 @@ void jl_gc_notify_task_resume(jl_task_t *task) JL_NOTSAFEPOINT
     // do nothing
 }
 
+void jl_gc_notify_collections_enabled(void) JL_NOTSAFEPOINT
+{
+    // do nothing
+}
+
+int jl_gc_is_collection_pending(void) JL_NOTSAFEPOINT
+{
+    // The stock GC re-checks `jl_gc_disable_counter` after stopping the
+    // world and no-ops the collection, so the disable path never needs to
+    // wait out a pending pause.
+    return 0;
+}
+
 static void gc_pool_sync_nfree(jl_gc_pagemeta_t *pg, jl_taggedvalue_t *last) JL_NOTSAFEPOINT
 {
     assert(pg->fl_begin_offset != UINT16_MAX);

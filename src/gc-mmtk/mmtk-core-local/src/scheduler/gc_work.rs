@@ -50,9 +50,14 @@ impl<C: GCWorkContext> Prepare<C> {
 impl<C: GCWorkContext> GCWork<C::VM> for Prepare<C> {
     fn do_work(&mut self, worker: &mut GCWorker<C::VM>, mmtk: &'static MMTK<C::VM>) {
         trace!("Prepare Global");
+        let t0 = crate::diag::now_ns();
         // We assume this is the only running work packet that accesses plan at the point of execution
         let plan_mut: &mut C::PlanType = unsafe { &mut *(self.plan as *const _ as *mut _) };
         plan_mut.prepare(worker.tls);
+        crate::diag::PREP_NS.fetch_add(
+            crate::diag::now_ns().saturating_sub(t0),
+            std::sync::atomic::Ordering::Relaxed,
+        );
 
         if plan_mut.constraints().needs_prepare_mutator {
             let prepare_mutator_packets = <C::VM as VMBinding>::VMActivePlan::mutators()
@@ -94,7 +99,12 @@ impl<VM: VMBinding> PrepareMutator<VM> {
 impl<VM: VMBinding> GCWork<VM> for PrepareMutator<VM> {
     fn do_work(&mut self, worker: &mut GCWorker<VM>, _mmtk: &'static MMTK<VM>) {
         trace!("Prepare Mutator");
+        let t0 = crate::diag::now_ns();
         self.mutator.prepare(worker.tls);
+        crate::diag::PREP_MUT_NS.fetch_add(
+            crate::diag::now_ns().saturating_sub(t0),
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 }
 
@@ -254,6 +264,7 @@ pub struct ScanMutatorRoots<C: GCWorkContext>(pub &'static mut Mutator<C::VM>);
 impl<C: GCWorkContext> GCWork<C::VM> for ScanMutatorRoots<C> {
     fn do_work(&mut self, worker: &mut GCWorker<C::VM>, mmtk: &'static MMTK<C::VM>) {
         trace!("ScanMutatorRoots for mutator {:?}", self.0.get_tls());
+        let t0 = crate::diag::now_ns();
         let mutators = <C::VM as VMBinding>::VMActivePlan::number_of_mutators();
         let factory = C::make_roots_work_factory(mmtk);
         <C::VM as VMBinding>::VMScanning::scan_roots_in_mutator_thread(
@@ -262,6 +273,13 @@ impl<C: GCWorkContext> GCWork<C::VM> for ScanMutatorRoots<C> {
             factory,
         );
         self.0.flush();
+        {
+            use std::sync::atomic::Ordering;
+            let d = crate::diag::now_ns().saturating_sub(t0);
+            crate::diag::ROOTS_MUT_NS.fetch_add(d, Ordering::Relaxed);
+            crate::diag::record_max(&crate::diag::ROOTS_MUT_MAX_NS, d);
+            crate::diag::ROOTS_MUT_N.fetch_add(1, Ordering::Relaxed);
+        }
 
         if mmtk.state.inform_stack_scanned(mutators) {
             <C::VM as VMBinding>::VMScanning::notify_initial_thread_scan_complete(
@@ -284,7 +302,12 @@ impl<C: GCWorkContext> ScanVMSpecificRoots<C> {
 impl<C: GCWorkContext> GCWork<C::VM> for ScanVMSpecificRoots<C> {
     fn do_work(&mut self, worker: &mut GCWorker<C::VM>, mmtk: &'static MMTK<C::VM>) {
         trace!("ScanStaticRoots");
+        let t0 = crate::diag::now_ns();
         let factory = C::make_roots_work_factory(mmtk);
         <C::VM as VMBinding>::VMScanning::scan_vm_specific_roots(worker.tls, factory);
+        crate::diag::ROOTS_VM_NS.fetch_add(
+            crate::diag::now_ns().saturating_sub(t0),
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 }

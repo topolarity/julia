@@ -318,6 +318,21 @@ impl<VM: VMBinding> VMSpace<VM> {
 
     pub fn prepare(&mut self) {
         self.mark_state.on_global_prepare::<VM>();
+        self.reset_mark_bits();
+    }
+
+    /// Like `prepare`, but without the bulk mark-bit reset.  Used by plans
+    /// that perform the reset in a deferred post-pause packet after the
+    /// marking cycle ends (`MarkState::on_block_reset` supports resetting
+    /// either before or after tracing; nothing reads the bits in between).
+    pub fn prepare_no_mark_reset(&mut self) {
+        self.mark_state.on_global_prepare::<VM>();
+    }
+
+    /// Bulk-zero the side mark bits for every registered external page range
+    /// (boot image and package images).  This walks megabytes of metadata for
+    /// a full sysimage, so latency-sensitive plans run it outside the pause.
+    pub fn reset_mark_bits(&self) {
         for external_pages in self.pr.get_external_pages().iter() {
             self.mark_state.on_block_reset::<VM>(
                 external_pages.start,

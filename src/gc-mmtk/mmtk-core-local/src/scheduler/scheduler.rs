@@ -372,7 +372,20 @@ impl<VM: VMBinding> GCWorkScheduler<VM> {
             return Steal::Success(w);
         }
         // Try get a packet from a work bucket.
-        for work_bucket in self.work_buckets.values() {
+        // The Concurrent bucket is not polled while the VM has collections
+        // disabled: concurrent tracing must not observe heap states inside a
+        // `jl_gc_disable` window (see ConcurrentTraceObjects::do_work), and
+        // packets that bail there re-queue into this bucket.
+        // Never gate during a pause: the disable path guarantees pauses and
+        // disabled windows are mutually exclusive, and if that invariant is
+        // ever violated an in-pause SATB drain must still complete rather
+        // than wedge the stopped world.
+        let concurrent_ok = <VM as VMBinding>::VMCollection::is_collection_enabled()
+            || crate::diag::PAUSE_ACTIVE.load(std::sync::atomic::Ordering::Relaxed);
+        for (id, work_bucket) in self.work_buckets.iter() {
+            if id == WorkBucketStage::Concurrent && !concurrent_ok {
+                continue;
+            }
             match work_bucket.poll(&worker.local_work_buffer) {
                 Steal::Success(w) => return Steal::Success(w),
                 Steal::Retry => should_retry = true,
@@ -586,7 +599,16 @@ impl<VM: VMBinding> GCWorkScheduler<VM> {
             if cp_opt.is_some() {
                 crate::diag::NOREQ_CONCURRENT_SOME.fetch_add(1, DO::SeqCst);
             }
-            let ready_for_final_mark = cp_opt.is_some_and(|cp| cp.concurrent_work_in_progress());
+            // The self-trigger must honor the VM's collection-disabled window
+            // just like mutator-side polls (`GCTrigger::poll`): a pause that
+            // fires while the VM has GC disabled stops mutators in states the
+            // disabled-GC contract declares unobservable (e.g. a loader task
+            // mid-image-restore with unrelocated pointers on its stack), and
+            // the FinalMark stack walks would read them.  When suppressed,
+            // the next mutator poll after re-enable raises the FinalMark
+            // request through the ordinary (gated) trigger path.
+            let ready_for_final_mark = cp_opt.is_some_and(|cp| cp.concurrent_work_in_progress())
+                && <VM as crate::vm::VMBinding>::VMCollection::is_collection_enabled();
             if ready_for_final_mark {
                 crate::diag::NOREQ_CM_ACTIVE.fetch_add(1, DO::SeqCst);
             }

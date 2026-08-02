@@ -639,6 +639,19 @@ impl<VM: VMBinding> BasePlan<VM> {
         self.vm_space.prepare();
     }
 
+    /// Like `prepare`, but the VM space skips its bulk mark-bit reset (the
+    /// plan runs the reset in a deferred post-pause packet instead).
+    pub fn prepare_deferred_mark_reset(&mut self, _tls: VMWorkerThread, _full_heap: bool) {
+        #[cfg(feature = "code_space")]
+        self.code_space.prepare();
+        #[cfg(feature = "code_space")]
+        self.code_lo_space.prepare();
+        #[cfg(feature = "ro_space")]
+        self.ro_space.prepare();
+        #[cfg(feature = "vm_space")]
+        self.vm_space.prepare_no_mark_reset();
+    }
+
     pub fn release(&mut self, _tls: VMWorkerThread, _full_heap: bool) {
         #[cfg(feature = "code_space")]
         self.code_space.release();
@@ -773,10 +786,53 @@ impl<VM: VMBinding> CommonPlan<VM> {
     }
 
     pub fn prepare(&mut self, tls: VMWorkerThread, full_heap: bool) {
+        use std::sync::atomic::Ordering;
+        let mut t = crate::diag::now_ns();
+        let mut lap = |s: &std::sync::atomic::AtomicU64| {
+            let now = crate::diag::now_ns();
+            s.fetch_add(now.saturating_sub(t), Ordering::Relaxed);
+            t = now;
+        };
         self.immortal.prepare();
+        lap(&crate::diag::PREP_IMM_NS);
         self.los.prepare(full_heap);
+        lap(&crate::diag::PREP_LOS_NS);
         self.prepare_nonmoving_space(full_heap);
-        self.base.prepare(tls, full_heap)
+        lap(&crate::diag::PREP_NM_NS);
+        self.base.prepare(tls, full_heap);
+        lap(&crate::diag::PREP_BASE_NS);
+    }
+
+    /// Like `prepare`, but the immortal and VM spaces skip their bulk
+    /// mark-bit resets: the plan defers those (see
+    /// [`CommonPlan::reset_deferred_mark_bits`]) to a post-pause packet after
+    /// FinalMark/Full, so the InitialMark pause carries no metadata sweep.
+    pub fn prepare_deferred_mark_reset(&mut self, tls: VMWorkerThread, full_heap: bool) {
+        use std::sync::atomic::Ordering;
+        let mut t = crate::diag::now_ns();
+        let mut lap = |s: &std::sync::atomic::AtomicU64| {
+            let now = crate::diag::now_ns();
+            s.fetch_add(now.saturating_sub(t), Ordering::Relaxed);
+            t = now;
+        };
+        self.immortal.prepare_no_mark_reset();
+        lap(&crate::diag::PREP_IMM_NS);
+        self.los.prepare(full_heap);
+        lap(&crate::diag::PREP_LOS_NS);
+        self.prepare_nonmoving_space(full_heap);
+        lap(&crate::diag::PREP_NM_NS);
+        self.base.prepare_deferred_mark_reset(tls, full_heap);
+        lap(&crate::diag::PREP_BASE_NS);
+    }
+
+    /// The deferred counterpart of the resets skipped by
+    /// [`CommonPlan::prepare_deferred_mark_reset`].  Must run after the
+    /// marking cycle ends and before the next InitialMark; nothing reads
+    /// these mark bits in between.
+    pub fn reset_deferred_mark_bits(&self) {
+        self.immortal.reset_mark_bits();
+        #[cfg(feature = "vm_space")]
+        self.base.vm_space.reset_mark_bits();
     }
 
     pub fn release(&mut self, tls: VMWorkerThread, full_heap: bool) {
