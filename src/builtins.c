@@ -1711,6 +1711,19 @@ JL_CALLABLE(jl_f_define_method)
 
 // import, using --------------------------------------------------------------
 
+static void call_package_require_hook(const char *name, jl_module_t *to, jl_module_t *from) JL_CANSAFEPOINT
+{
+    if (jl_base_module == NULL)
+        return;
+    jl_value_t *hook = jl_get_global(jl_base_module, jl_symbol(name));
+    if (hook == NULL)
+        return;
+    JL_GC_PUSH1(&hook);
+    jl_value_t *hook_args[3] = {hook, (jl_value_t*)to, (jl_value_t*)from};
+    jl_apply(hook_args, 3);
+    JL_GC_POP();
+}
+
 // Import binding `from.sym` as `asname` into `to`:
 //     _import(to::Module, from::Module, asname::Symbol, sym::Symbol, imported::Bool)
 //
@@ -1722,19 +1735,23 @@ JL_CALLABLE(jl_f__import)
     JL_TYPECHK(_import, module, args[0]);
     JL_TYPECHK(_import, module, args[1]);
     JL_TYPECHK(_import, symbol, args[2]);
+    if (nargs == 4) {
+        jl_too_few_args("_import", 5);
+    }
+    if (nargs == 5) {
+        JL_TYPECHK(_import, symbol, args[3]);
+        JL_TYPECHK(_import, bool, args[4]);
+    }
+    call_package_require_hook("_check_package_require", (jl_module_t*)args[0], (jl_module_t*)args[1]);
     if (nargs == 3) {
         jl_import_module(jl_current_task, (jl_module_t *)args[0], (jl_module_t *)args[1],
                          (jl_sym_t *)args[2]);
     }
-    else if (nargs == 4) {
-        jl_too_few_args("_import", 5);
-    }
-    else if (nargs == 5) {
-        JL_TYPECHK(_import, symbol, args[3]);
-        JL_TYPECHK(_import, bool, args[4]);
+    else {
         jl_module_import(jl_current_task, (jl_module_t *)args[0], (jl_module_t *)args[1],
                          (jl_sym_t *)args[2], (jl_sym_t *)args[3], args[4] == jl_true);
     }
+    call_package_require_hook("_record_package_require!", (jl_module_t*)args[0], (jl_module_t*)args[1]);
     return jl_nothing;
 }
 
@@ -1749,7 +1766,9 @@ JL_CALLABLE(jl_f__using)
         JL_TYPECHK(_using, uint8, args[2]);
         flags = jl_unbox_uint8(args[2]);
     }
+    call_package_require_hook("_check_package_require", (jl_module_t*)args[0], (jl_module_t*)args[1]);
     jl_module_using((jl_module_t *)args[0], (jl_module_t *)args[1], flags);
+    call_package_require_hook("_record_package_require!", (jl_module_t*)args[0], (jl_module_t*)args[1]);
     return jl_nothing;
 }
 

@@ -786,28 +786,13 @@ JL_DLLEXPORT void jl_check_top_level_effect(jl_module_t *m, const char *fname) J
 {
     if (jl_current_task->ptls->in_pure_callback)
         jl_errorf("%s cannot be used in a generated function", fname);
-    if (jl_options.incremental && jl_generating_output()) {
-        if (m != jl_main_module) { // TODO: this was grand-fathered in
-            JL_LOCK(&jl_modules_mutex);
-            int open = ptrhash_has(&jl_current_modules, (void*)m);
-            if (!open && jl_module_init_order != NULL) {
-                size_t i, l = jl_array_nrows(jl_module_init_order);
-                for (i = 0; i < l; i++) {
-                    if (m == (jl_module_t*)jl_array_ptr_ref(jl_module_init_order, i)) {
-                        open = 1;
-                        break;
-                    }
-                }
-            }
-            JL_UNLOCK(&jl_modules_mutex);
-            if (!open && !jl_is__toplevel__mod(m, jl_current_task)) {
-                const char* name = jl_symbol_name(m->name);
-                jl_errorf("Evaluation into the closed module `%s` breaks incremental compilation "
-                          "because the side effects will not be permanent. "
-                          "This is likely due to some other module mutating `%s` with `%s` during "
-                          "precompilation - don't do this.", name, name, fname);
-            }
-        }
+    if (m != jl_main_module && // TODO: this was grand-fathered in
+            !jl_module_is_open(m) && !jl_is__toplevel__mod(m, jl_current_task)) {
+        const char* name = jl_symbol_name(m->name);
+        jl_errorf("Evaluation into the closed module `%s` breaks incremental compilation "
+                  "because the side effects will not be permanent. "
+                  "This is likely due to some other module mutating `%s` with `%s` during "
+                  "precompilation - don't do this.", name, name, fname);
     }
 }
 

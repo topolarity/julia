@@ -309,13 +309,16 @@
     XX(jl_method_table_insert) \
     XX(jl_methtable_lookup) \
     XX(jl_mi_cache_insert) \
+    XX(jl_module_add_package_require) \
     XX(jl_module_build_id) \
     XX(jl_module_exports_p) \
     XX(jl_module_globalref) \
     XX(jl_module_import) \
+    XX(jl_module_is_open) \
     XX(jl_module_name) \
     XX(jl_module_names) \
     XX(jl_module_parent) \
+    XX(jl_module_package_requires) \
     XX(jl_module_getloc) \
     XX(jl_module_public) \
     XX(jl_module_public_p) \
