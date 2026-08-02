@@ -938,7 +938,7 @@ typedef struct {
 } jl_uuid_t;
 
 // Reading or writing requires `lock`:
-//   scanned_methods, usings
+//   scanned_methods, package_requires, usings
 // Reading or writing requires `Base.require_lock`:
 //   uuid
 // Reading or writing requires `world_counter_lock`:
@@ -956,6 +956,7 @@ typedef struct _jl_module_t {
     int32_t line;
     jl_value_t *usings_backedges;
     jl_value_t *scanned_methods;
+    jl_value_t *package_requires; // direct requirements of the package containing this module
     // hidden fields:
     arraylist_t usings; /* arraylist of struct jl_module_using */  // modules with all bindings potentially imported
     jl_uuid_t build_id;
@@ -2231,6 +2232,9 @@ JL_DLLEXPORT void jl_set_module_max_methods(jl_module_t *self, int value);
 JL_DLLEXPORT int jl_get_module_max_methods(jl_module_t *m);
 JL_DLLEXPORT jl_value_t *jl_get_module_usings_backedges(jl_module_t *m);
 JL_DLLEXPORT jl_value_t *jl_get_module_scanned_methods(jl_module_t *m);
+JL_DLLEXPORT int jl_module_is_open(jl_module_t *m) JL_CANSAFEPOINT;
+JL_DLLEXPORT jl_value_t *jl_module_package_requires(jl_module_t *m);
+JL_DLLEXPORT void jl_module_add_package_require(jl_module_t *m, jl_module_t *target) JL_CANSAFEPOINT;
 JL_DLLEXPORT jl_value_t *jl_get_module_binding_or_nothing(jl_module_t *m, jl_sym_t *s) JL_CANSAFEPOINT;
 
 // get binding for reading

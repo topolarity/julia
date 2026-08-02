@@ -615,6 +615,7 @@ static jl_module_t *jl_new_module__(jl_sym_t *name, jl_module_t *parent) JL_CANS
     jl_atomic_store_relaxed(&m->counter, 1);
     m->usings_backedges = jl_nothing;
     m->scanned_methods = jl_nothing;
+    m->package_requires = jl_nothing;
     m->nospecialize = 0;
     m->optlevel = -1;
     m->compile = -1;
@@ -883,8 +884,15 @@ static jl_binding_t *new_binding(jl_module_t *mod, jl_sym_t *name) JL_CANSAFEPOI
 
 extern jl_mutex_t jl_modules_mutex;
 
-static int is_module_open(jl_module_t *m) JL_CANSAFEPOINT
+// Module effects are permanent at ordinary runtime. While generating an
+// incremental image, only modules owned by the current output transaction are
+// open to additional permanent effects.
+JL_DLLEXPORT int jl_module_is_open(jl_module_t *m)
 {
+    if (!jl_options.incremental || !jl_generating_output())
+        return 1;
+    m = jl_module_root(m);
+    JL_GC_PUSH1(&m);
     JL_LOCK(&jl_modules_mutex);
     int open = ptrhash_has(&jl_current_modules, (void*)m);
     if (!open && jl_module_init_order != NULL) {
@@ -897,6 +905,7 @@ static int is_module_open(jl_module_t *m) JL_CANSAFEPOINT
         }
     }
     JL_UNLOCK(&jl_modules_mutex);
+    JL_GC_POP();
     return open;
 }
 
@@ -904,11 +913,34 @@ void check_safe_newbinding(jl_module_t *m, jl_sym_t *var)
 {
     if (jl_current_task->ptls->in_pure_callback)
         jl_errorf("new strong globals cannot be created in a generated function. Declare them outside using `global x::Any`.");
-    if (jl_options.incremental && jl_generating_output() && !is_module_open(m)) {
+    if (!jl_module_is_open(m)) {
         jl_errorf("Creating a new global in closed module `%s` (`%s`) breaks incremental compilation "
                     "because the side effects will not be permanent.",
                     jl_symbol_name(m->name), jl_symbol_name(var));
     }
+}
+
+JL_DLLEXPORT jl_value_t *jl_module_package_requires(jl_module_t *m)
+{
+    return m->package_requires;
+}
+
+JL_DLLEXPORT void jl_module_add_package_require(jl_module_t *m, jl_module_t *target)
+{
+    JL_LOCK(&m->lock);
+    if (m->package_requires == jl_nothing) {
+        jl_gc_write(m, m->package_requires, jl_value_t, (jl_value_t*)jl_alloc_vec_any(0));
+    }
+    jl_array_t *requires = (jl_array_t*)m->package_requires;
+    size_t i, n = jl_array_len(requires);
+    for (i = 0; i < n; i++) {
+        if (jl_array_ptr_ref(requires, i) == (jl_value_t*)target) {
+            JL_UNLOCK(&m->lock);
+            return;
+        }
+    }
+    jl_array_ptr_1d_push(requires, (jl_value_t*)target);
+    JL_UNLOCK(&m->lock);
 }
 
 static jl_module_t *jl_binding_dbgmodule(jl_binding_t *b) JL_CANSAFEPOINT JL_GLOBALLY_ROOTED;
@@ -2290,7 +2322,7 @@ JL_DLLEXPORT jl_module_t *jl_module_parent(jl_module_t *m) { return m->parent; }
 jl_module_t *jl_module_root(jl_module_t *m)
 {
     while (1) {
-        if (m->parent == NULL || m->parent == m)
+        if (m->istopmod || m->parent == NULL || m->parent == m)
             return m;
         m = m->parent;
     }

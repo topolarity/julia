@@ -2663,11 +2663,14 @@ function __require(into::Module, mod::Symbol)
             end
         end
         uuidkey, env = uuidkey_env
+        _check_package_require(into, uuidkey)
         if _track_dependencies[]
             path = binpack(uuidkey)
             push!(_require_dependencies, (into, path, UInt64(0), UInt32(0), 0.0))
         end
-        return _require_prelocked(uuidkey, env)
+        loaded = _require_prelocked(uuidkey, env)
+        loaded isa Module && _record_package_require!(into, loaded)
+        return loaded
     finally
         LOADING_CACHE[] = nothing
     end
