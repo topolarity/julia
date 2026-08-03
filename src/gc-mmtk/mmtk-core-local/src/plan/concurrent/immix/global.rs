@@ -370,6 +370,27 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
         if pause == Pause::InitialMark {
             self.set_concurrent_marking_state(true);
         }
+        // Background sweep: parallel self-requeuing BackgroundTriage chains
+        // (one is far outpaced by the churn), so recycled blocks come back
+        // warm and promptly; the allocator's triage remains as fallback.
+        const BG_TRIAGE_CHAINS: usize = 8;
+        if matches!(pause, Pause::FinalMark | Pause::Full)
+            && self.immix_space.has_unswept()
+            && self
+                .immix_space
+                .bg_triage_active
+                .compare_exchange(0, BG_TRIAGE_CHAINS, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        {
+            let space =
+                unsafe { &*(&self.immix_space as *const crate::policy::immix::ImmixSpace<VM>) };
+            for _ in 0..BG_TRIAGE_CHAINS {
+                self.immix_space.defer_post_pause_packet(Box::new(
+                    crate::policy::immix::immixspace::BackgroundTriage { space },
+                ));
+            }
+        }
+
         // LEG 1: schedule the deferred metadata packets (unlog/mark-bit
         // clears from FinalMark) into the always-open bucket.  Workers pick
         // them up as they wake after the pause; the all-parked rendezvous

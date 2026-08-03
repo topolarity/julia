@@ -152,6 +152,13 @@ pub mod diag {
         static ON: OnceLock<bool> = OnceLock::new();
         *ON.get_or_init(|| std::env::var_os("MMTK_PACER_TRACE").is_some())
     }
+    /// Env-gated (MMTK_GC_STATS) fine-grained timing counters on hot paths
+    /// (e.g. per-triage clock reads in the allocation slowpath).  The
+    /// latency harnesses set this; production runs skip the clock reads.
+    pub fn stats_enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("MMTK_GC_STATS").is_some())
+    }
     pub fn record_max(s: &AtomicU64, v: u64) {
         let mut c = s.load(Ordering::Relaxed);
         while v > c {
