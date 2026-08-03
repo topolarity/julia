@@ -14,4 +14,11 @@ pub trait ConcurrentPlan: Plan {
     fn enqueue_satb_values(&self, _values: Vec<crate::util::ObjectReference>) {
         unimplemented!()
     }
+    /// A live-set estimate in pages for heap-target sizing.  Under lazy
+    /// sweeping, `get_reserved_pages` includes dead-but-untriaged backlog,
+    /// so a trigger policy that bases its target on reserved pages inflates
+    /// it unboundedly; this estimate excludes the backlog.
+    fn live_pages_estimate(&self) -> Option<usize> {
+        None
+    }
 }

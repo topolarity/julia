@@ -97,7 +97,9 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
             if marking {
                 if space_full {
                     // The allocation actually failed: real wall, block.
-                    info!("Allocation failure during concurrent marking: hastening FinalMark (blocking)");
+                    if crate::diag::pacer_trace_enabled() {
+                        eprintln!("[pacer-block] space_full during marking: hasten FinalMark (blocking)");
+                    }
                     return true;
                 }
                 info!("Heap trigger during concurrent marking: hastening FinalMark (async)");
@@ -112,14 +114,29 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
             // the mutator with no collection in flight (deadlock).
             if self.immix_space.has_unswept() {
                 if space_full {
-                    info!("Allocation failure with unswept backlog: starting a cycle (blocking)");
+                    if crate::diag::pacer_trace_enabled() {
+                        eprintln!("[pacer-block] space_full with unswept backlog: start cycle (blocking)");
+                    }
                     return true;
                 }
                 return false;
             }
+            // Over the goal with the aged generation empty.  The goal is a
+            // heuristic threshold, not a limit (Go-goal semantics): unless
+            // an allocation actually FAILED, blocking a mutator or forcing
+            // a synchronous Full is never the right trade against floating
+            // garbage -- request a concurrent cycle and let allocation
+            // proceed as float.  True walls (hard limit / memory ceiling /
+            // page-resource failure) arrive here with `space_full == true`.
+            if !space_full {
+                self.base().gc_trigger.request();
+                return false;
+            }
             // Genuine exhaustion: old generation empty, heap full.
             self.should_do_full_gc.store(true, Ordering::Release);
-            info!("Triggering full GC");
+            if crate::diag::pacer_trace_enabled() {
+                eprintln!("[pacer-block] genuine exhaustion (space_full={space_full}): full GC (blocking)");
+            }
             return true;
         }
 
@@ -128,6 +145,24 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
         }
 
         let total = self.get_total_pages();
+
+        // PACING TRIGGER (Go-pacer style): the trigger policy publishes how
+        // many pages of allocation a full concurrent cycle must ride out
+        // (`alloc_rate x cycle_duration x margin`, measured in-system).
+        // Request the next cycle while at least that much headroom remains
+        // below the target, so the cycle finishes before allocation reaches
+        // the blocking wall (`is_heap_full`).  Advisory: never blocks.
+        if let Some(headroom) = self.base().gc_trigger.policy.concurrent_headroom_pages() {
+            let reserved = self.get_reserved_pages();
+            if reserved + headroom >= total {
+                info!(
+                    "Pacing trigger: reserved {reserved} + cycle headroom {headroom} >= target {total} pages: request concurrent marking (async)"
+                );
+                self.base().gc_trigger.request();
+                return false;
+            }
+        }
+
         let live = self
             .immix_space
             .live_prev_pages();
@@ -587,6 +622,12 @@ impl<VM: VMBinding> ConcurrentPlan for ConcurrentImmix<VM> {
 
     fn concurrent_work_in_progress(&self) -> bool {
         self.concurrent_marking_in_progress()
+    }
+
+    fn live_pages_estimate(&self) -> Option<usize> {
+        // Immix live lines from the previous cycle plus the (stably
+        // accounted) common spaces: immortal, LOS, nonmoving, VM/image.
+        Some(self.immix_space.live_prev_pages() + self.common.get_used_pages())
     }
 
     fn enqueue_satb_values(&self, values: Vec<crate::util::ObjectReference>) {

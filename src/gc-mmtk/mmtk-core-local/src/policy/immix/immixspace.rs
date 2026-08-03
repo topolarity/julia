@@ -470,6 +470,11 @@ impl<VM: VMBinding> ImmixSpace<VM> {
                 unimplemented!("cyclic mark bits is not supported at the moment");
             }
 
+            // Fresh live accounting for a full trace (see
+            // `prepare_concurrent_initial`; nursery collections keep
+            // accumulating since their trace only covers new objects).
+            self.live_bytes.store(0, std::sync::atomic::Ordering::SeqCst);
+
             // Prepare defrag info
             if self.is_defrag_enabled() {
                 self.defrag.prepare(self, plan_stats.unwrap());
@@ -643,6 +648,12 @@ impl<VM: VMBinding> ImmixSpace<VM> {
         } else {
             unimplemented!("cyclic mark bits is not supported at the moment");
         }
+
+        // `live_bytes` accumulates at every marked object and is snapshotted
+        // into `live_bytes_prev` at release; without a per-cycle reset it
+        // grows monotonically and poisons every consumer (float budget,
+        // pacing live estimate).
+        self.live_bytes.store(0, std::sync::atomic::Ordering::SeqCst);
 
         // MARKING-GATED BARRIER: no unlog-bit arming here.  Bits are kept
         // armed across the idle window (deferred re-arm after FinalMark,

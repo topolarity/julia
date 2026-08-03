@@ -147,6 +147,11 @@ pub mod diag {
         static ON: OnceLock<bool> = OnceLock::new();
         *ON.get_or_init(|| std::env::var_os("MMTK_TRACE_GUARDS").is_some())
     }
+    /// Env-gated (MMTK_PACER_TRACE) tracing of GC-trigger/pacing decisions.
+    pub fn pacer_trace_enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("MMTK_PACER_TRACE").is_some())
+    }
     pub fn record_max(s: &AtomicU64, v: u64) {
         let mut c = s.load(Ordering::Relaxed);
         while v > c {

@@ -326,6 +326,16 @@ pub trait GCTriggerPolicy<VM: VMBinding>: Sync + Send {
     /// Failing to do so may result in unnecessay GCs, or result in an infinite loop if the new heap size
     /// can never accomodate the pending allocation.
     fn on_pending_allocation(&self, _pages: usize) {}
+    /// For concurrent plans: the number of pages of allocation a full
+    /// concurrent cycle must be able to ride out (pacing headroom, e.g.
+    /// `alloc_rate x cycle_duration x margin` as measured by the policy).
+    /// The plan's advisory trigger uses this to REQUEST the next cycle
+    /// while at least this much headroom remains below the heap target, so
+    /// the cycle completes before allocation hits the blocking wall.
+    /// `None` disables pacing-based triggering.
+    fn concurrent_headroom_pages(&self) -> Option<usize> {
+        None
+    }
     /// Inform the triggering policy that a GC starts.
     fn on_gc_start(&self, _mmtk: &'static MMTK<VM>) {}
     /// Inform the triggering policy that a GC is about to start the release work. This is called
