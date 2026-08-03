@@ -58,8 +58,6 @@ pub struct ImmixSpace<VM: VMBinding> {
     /// spliced into `unswept` only at FinalMark, so everything in `unswept`
     /// has survived a full marking and is safe to triage at any time.
     unswept_blocks: std::sync::Mutex<Vec<Block>>,
-    /// Number of `BackgroundTriage` chains currently queued/running.
-    pub(crate) bg_triage_active: std::sync::atomic::AtomicUsize,
     /// PATH 2: blocks listed at the LAST FinalMark.  Their garbage is still
     /// epoch-marked (SATB float): neither reclaimable nor worth triaging until
     /// the next FinalMark ages them into `unswept_blocks`.
@@ -398,7 +396,6 @@ impl<VM: VMBinding> ImmixSpace<VM> {
             line_unavail_state: AtomicU8::new(Line::RESET_MARK_STATE),
             lines_consumed: AtomicUsize::new(0),
             unswept_blocks: std::sync::Mutex::new(Vec::new()),
-            bg_triage_active: std::sync::atomic::AtomicUsize::new(0),
             unswept_young: std::sync::Mutex::new(Vec::new()),
             deferred_post_pause_packets: std::sync::Mutex::new(Vec::new()),
             live_bytes: std::sync::atomic::AtomicUsize::new(0),
@@ -975,11 +972,6 @@ impl<VM: VMBinding> ImmixSpace<VM> {
     }
 
     pub fn lazy_triage_some(&self, budget: usize) -> bool {
-        // Runs in the allocation slowpath (per block acquisition): skip the
-        // clock reads unless timing stats were requested.
-        if !crate::diag::stats_enabled() {
-            return self.lazy_triage_some_inner(budget);
-        }
         let t0 = crate::diag::now_ns();
         let r = self.lazy_triage_some_inner(budget);
         let d = crate::diag::now_ns().saturating_sub(t0);
@@ -1001,21 +993,10 @@ impl<VM: VMBinding> ImmixSpace<VM> {
         crate::diag::TRIAGE_CHUNKS.fetch_add(1, Ordering::SeqCst);
         let cur = self.line_mark_state.load(Ordering::Acquire);
         let unavail = self.line_unavail_state.load(Ordering::Acquire);
+        // BISECT: idle-window only (during marking cur != unavail)
         if cur != unavail {
-            // Marking is in flight.  Triage remains sound: a block with no
-            // previous-epoch line marks was unreachable at the last
-            // FinalMark and stays so (SATB), and current-epoch marks only
-            // land on previously-live lines, so holes cannot gain marks
-            // mid-cycle.  MMTK_TRIAGE_IDLE_ONLY defers triage to the idle
-            // window instead (for A/B).
-            use std::sync::OnceLock;
-            static IDLE_ONLY: OnceLock<bool> = OnceLock::new();
-            if *IDLE_ONLY
-                .get_or_init(|| std::env::var_os("MMTK_TRIAGE_IDLE_ONLY").is_some())
-            {
-                self.unswept_blocks.lock().unwrap().append(&mut { blocks });
-                return false;
-            }
+            self.unswept_blocks.lock().unwrap().append(&mut { blocks });
+            return false;
         }
         // Batch dead-block releases: one accounting update and one global
         // queue-lock acquisition for the whole quantum, instead of a
@@ -1506,34 +1487,6 @@ impl<VM: VMBinding> GCWork<VM> for UnlogBitsChunk<VM> {
             UnlogBitsOperation::BulkClear => log_bit.bzero_metadata(self.chunk.start(), Chunk::BYTES),
             UnlogBitsOperation::BulkSet => log_bit.bset_metadata(self.chunk.start(), Chunk::BYTES),
             UnlogBitsOperation::NoOp => {}
-        }
-    }
-}
-
-/// Background lazy-sweep: drains the aged unswept backlog on GC workers
-/// (idle between cycles, and safely concurrent with marking) so the
-/// allocator finds recycled -- warm -- blocks instead of falling through
-/// to fresh cold ones.  Re-queues itself in bounded quanta while backlog
-/// remains; allocation-paid triage stays as the assist/fallback path.
-pub(crate) struct BackgroundTriage<VM: VMBinding> {
-    pub space: &'static ImmixSpace<VM>,
-}
-
-impl<VM: VMBinding> GCWork<VM> for BackgroundTriage<VM> {
-    fn do_work(&mut self, worker: &mut GCWorker<VM>, _mmtk: &'static MMTK<VM>) {
-        // ~8MB of blocks per run: long enough to amortize the locking,
-        // short enough not to delay pause work.
-        const QUANTUM: usize = 256;
-        self.space.lazy_triage_some(QUANTUM);
-        if self.space.has_unswept() {
-            worker.add_work(
-                crate::scheduler::WorkBucketStage::Unconstrained,
-                BackgroundTriage { space: self.space },
-            );
-        } else {
-            self.space
-                .bg_triage_active
-                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         }
     }
 }
