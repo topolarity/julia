@@ -257,6 +257,7 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
             }
             Pause::InitialMark => self.schedule_concurrent_marking_initial_pause(scheduler),
             Pause::FinalMark => self.schedule_concurrent_marking_final_pause(scheduler),
+            Pause::Nursery => unreachable!("Nursery pauses are not scheduled yet"),
         }
     }
 
@@ -300,6 +301,7 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
                 }
             }
             Pause::FinalMark => (),
+            Pause::Nursery => unreachable!("Nursery pauses are not scheduled yet"),
         }
     }
 
@@ -307,6 +309,7 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
         let pause = self.current_pause().unwrap();
         match pause {
             Pause::InitialMark => (),
+            Pause::Nursery => unreachable!("Nursery pauses are not scheduled yet"),
             Pause::Full | Pause::FinalMark => {
                 self.immix_space.release(
                     true,
@@ -363,7 +366,7 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
                         self.mark_dur_ns.store(ewma, Ordering::Relaxed);
                     }
                 }
-                Pause::Full => {}
+                Pause::Full | Pause::Nursery => {}
             }
             self.gc_end_ns.store(now, Ordering::Relaxed);
         }
@@ -441,6 +444,7 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
                 }
                 self.set_concurrent_marking_state(false);
             }
+            Pause::Nursery => unreachable!("Nursery pauses are not scheduled yet"),
         }
         info!("{:?} start", pause);
     }

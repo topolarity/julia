@@ -125,6 +125,7 @@ impl Collection<JuliaVM> for VMCollection {
                     "Full" => { crate::STW_KIND.store(1, Ordering::SeqCst); crate::GC_COUNT_FULL.fetch_add(1, Ordering::SeqCst) },
                     "InitialMark" => { crate::STW_KIND.store(2, Ordering::SeqCst); crate::GC_COUNT_INITIAL.fetch_add(1, Ordering::SeqCst) },
                     "FinalMark" => { crate::STW_KIND.store(3, Ordering::SeqCst); crate::GC_COUNT_FINAL.fetch_add(1, Ordering::SeqCst) },
+                    "Nursery" => { crate::STW_KIND.store(4, Ordering::SeqCst); crate::GC_COUNT_NURSERY.fetch_add(1, Ordering::SeqCst) },
                     _ => 0,
                 };
             }
@@ -239,11 +240,11 @@ impl Collection<JuliaVM> for VMCollection {
                 crate::record_max(&crate::STW_MAX_NS, d);
                 crate::STW_TOTAL_NS.fetch_add(d, Ordering::SeqCst);
                 let k = crate::STW_KIND.swap(0, Ordering::SeqCst) as usize;
-                crate::STW_KIND_NS[k.min(3)].fetch_add(d, Ordering::SeqCst);
-                crate::STW_KIND_N[k.min(3)].fetch_add(1, Ordering::SeqCst);
-                if d > crate::STW_KIND_MAX[k.min(3)].load(Ordering::SeqCst) {
-                    crate::STW_KIND_MAX[k.min(3)].store(d, Ordering::SeqCst);
-                    crate::STW_KIND_MAX_AT[k.min(3)]
+                crate::STW_KIND_NS[k.min(4)].fetch_add(d, Ordering::SeqCst);
+                crate::STW_KIND_N[k.min(4)].fetch_add(1, Ordering::SeqCst);
+                if d > crate::STW_KIND_MAX[k.min(4)].load(Ordering::SeqCst) {
+                    crate::STW_KIND_MAX[k.min(4)].store(d, Ordering::SeqCst);
+                    crate::STW_KIND_MAX_AT[k.min(4)]
                         .store(crate::GC_COUNT_TOTAL.load(Ordering::SeqCst) as u64, Ordering::SeqCst);
                 }
                 // Root-scan anatomy: per-pause breakdown of the in-pause root

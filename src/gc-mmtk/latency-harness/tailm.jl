@@ -14,8 +14,8 @@ kt(q) = Int(ccall(:mmtk_stw_kind_ns, UInt64, (Csize_t,), q))
 km(q) = Int(ccall(:mmtk_stw_kind_max_ns, UInt64, (Csize_t,), q))
 ka(q) = Int(ccall(:mmtk_stw_kind_max_at, UInt64, (Csize_t,), q))
 pk(q) = kn(q)==0 ? "-" : string(ms(kt(q)/kn(q)), "/", ms(km(q)), "@", ka(q))
-mn = Int(ccall(:jl_gc_mutator_stall_count, UInt64, ())); mm = Int(ccall(:jl_gc_mutator_stall_max_ns, UInt64, ())); mt = Int(ccall(:jl_gc_mutator_stall_total_ns, UInt64, ())); println("mstall mean=", mn==0 ? 0.0 : ms(mt/mn), " max=", ms(mm), " n=", mn); println("tmax=", round(tmax*1000,digits=1), "ms n=", kn(1)+kn(2)+kn(3),
-        " Init(mean/max@ord)=", pk(2), " Final=", pk(3), " Full=", pk(1),
+mn = Int(ccall(:jl_gc_mutator_stall_count, UInt64, ())); mm = Int(ccall(:jl_gc_mutator_stall_max_ns, UInt64, ())); mt = Int(ccall(:jl_gc_mutator_stall_total_ns, UInt64, ())); println("mstall mean=", mn==0 ? 0.0 : ms(mt/mn), " max=", ms(mm), " n=", mn); println("tmax=", round(tmax*1000,digits=1), "ms n=", kn(1)+kn(2)+kn(3)+kn(4),
+        " Init(mean/max@ord)=", pk(2), " Final=", pk(3), " Full=", pk(1), " Nursery=", pk(4),
         " block_max=", ms(Int(ccall(:mmtk_block_max_ns, UInt64, ()))),
         " stopw_max=", ms(Int(ccall(:mmtk_stop_wait_max_ns, UInt64, ()))),
         " triage_max=", ms(Int(ccall(:mmtk_triage_max_ns, UInt64, ()))),

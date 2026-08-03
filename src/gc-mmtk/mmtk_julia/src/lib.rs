@@ -87,24 +87,27 @@ pub static GC_COUNT_EMERGENCY: std::sync::atomic::AtomicUsize = std::sync::atomi
 pub static GC_COUNT_FULL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 pub static GC_COUNT_INITIAL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 pub static GC_COUNT_FINAL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub static GC_COUNT_NURSERY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 // Timing: STW pause (world stopped -> resumed) vs mutator blocked time in block_for_gc.
 pub static STW_START_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static STW_MAX_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static STW_TOTAL_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub static STW_KIND: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0); // 1=Full 2=Initial 3=Final
-pub static STW_KIND_NS: [std::sync::atomic::AtomicU64; 4] = [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
-pub static STW_KIND_MAX: [std::sync::atomic::AtomicU64; 4] = [
+pub static STW_KIND: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0); // 1=Full 2=Initial 3=Final 4=Nursery
+pub static STW_KIND_NS: [std::sync::atomic::AtomicU64; 5] = [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+pub static STW_KIND_MAX: [std::sync::atomic::AtomicU64; 5] = [
     std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
 ];
 /// GC ordinal (per kind) at which the max was set -- discriminates
 /// first-cycle cold effects from recurring tails.
-pub static STW_KIND_MAX_AT: [std::sync::atomic::AtomicU64; 4] = [
+pub static STW_KIND_MAX_AT: [std::sync::atomic::AtomicU64; 5] = [
     std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
 ];
-pub static STW_KIND_N: [std::sync::atomic::AtomicU64; 4] = [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+pub static STW_KIND_N: [std::sync::atomic::AtomicU64; 5] = [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
 /// SATB barrier gate, exported for the write-barrier fastpath (both the C
 /// inline fastpath and JIT-emitted code load this before touching the
 /// per-object unlog bit).  Nonzero exactly while concurrent marking is

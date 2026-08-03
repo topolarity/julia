@@ -669,6 +669,8 @@ pub extern "C" fn mmtk_gc_count_full() -> usize { crate::GC_COUNT_FULL.load(Orde
 pub extern "C" fn mmtk_gc_count_initial() -> usize { crate::GC_COUNT_INITIAL.load(Ordering::SeqCst) }
 #[no_mangle]
 pub extern "C" fn mmtk_gc_count_final() -> usize { crate::GC_COUNT_FINAL.load(Ordering::SeqCst) }
+#[no_mangle]
+pub extern "C" fn mmtk_gc_count_nursery() -> usize { crate::GC_COUNT_NURSERY.load(Ordering::SeqCst) }
 
 #[no_mangle]
 pub extern "C" fn mmtk_stw_max_ns() -> u64 { crate::STW_MAX_NS.load(Ordering::SeqCst) }
@@ -754,17 +756,17 @@ pub extern "C" fn mmtk_diag_triage() -> u64 {
 pub extern "C" fn mmtk_diag_clean_blocks() -> u64 { mmtk::diag::CLEAN_BLOCKS.load(Ordering::SeqCst) }
 
 #[no_mangle]
-pub extern "C" fn mmtk_stw_kind_ns(k: usize) -> u64 { crate::STW_KIND_NS[k.min(3)].load(Ordering::SeqCst) }
+pub extern "C" fn mmtk_stw_kind_ns(k: usize) -> u64 { crate::STW_KIND_NS[k.min(4)].load(Ordering::SeqCst) }
 #[no_mangle]
-pub extern "C" fn mmtk_stw_kind_n(k: usize) -> u64 { crate::STW_KIND_N[k.min(3)].load(Ordering::SeqCst) }
+pub extern "C" fn mmtk_stw_kind_n(k: usize) -> u64 { crate::STW_KIND_N[k.min(4)].load(Ordering::SeqCst) }
 
 #[no_mangle]
-pub extern "C" fn mmtk_stw_kind_max_ns(k: usize) -> u64 { crate::STW_KIND_MAX[k.min(3)].load(Ordering::SeqCst) }
+pub extern "C" fn mmtk_stw_kind_max_ns(k: usize) -> u64 { crate::STW_KIND_MAX[k.min(4)].load(Ordering::SeqCst) }
 #[no_mangle]
-pub extern "C" fn mmtk_stw_kind_max_at(k: usize) -> u64 { crate::STW_KIND_MAX_AT[k.min(3)].load(Ordering::SeqCst) }
+pub extern "C" fn mmtk_stw_kind_max_at(k: usize) -> u64 { crate::STW_KIND_MAX_AT[k.min(4)].load(Ordering::SeqCst) }
 #[no_mangle]
 pub extern "C" fn mmtk_reset_kind_stats() {
-    for i in 0..4 {
+    for i in 0..5 {
         crate::STW_KIND_NS[i].store(0, Ordering::SeqCst);
         crate::STW_KIND_N[i].store(0, Ordering::SeqCst);
         crate::STW_KIND_MAX[i].store(0, Ordering::SeqCst);

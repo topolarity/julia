@@ -22,6 +22,9 @@ pub enum Pause {
     InitialMark,
     /// The pause after concurrent marking.
     FinalMark,
+    /// A generational minor collection in a single pause: traces roots and the
+    /// remembered set, terminating at marked (old) objects.
+    Nursery,
 }
 
 unsafe impl bytemuck::ZeroableInOption for Pause {}

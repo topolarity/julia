@@ -30,7 +30,8 @@ kindn(q) = Int(ccall(:mmtk_stw_kind_n, UInt64, (Csize_t,), q))
 # binding) or are never set (non-concurrent plans).
 cycles0() = IS_MMTK ? (try kindn(1) + kindn(2) catch; 0 end) : 0
 full0() = IS_MMTK ? (try kindn(1) catch; 0 end) : 0
-c0 = cycles0(); f0 = full0()
+minor0() = IS_MMTK ? (try kindn(4) catch; 0 end) : 0
+c0 = cycles0(); f0 = full0(); m0 = minor0()
 n0 = Base.gc_num().pause
 t = @elapsed for i = 1:10_000_000
     [1 i; i 1]
@@ -38,7 +39,8 @@ end
 pauses = Base.gc_num().pause - n0
 c = cycles0() - c0
 fulls = full0() - f0
+minors = minor0() - m0
 cycles = c > 0 ? c : pauses
 println("wall = ", round(t, digits=2), "s   cycles = ", cycles,
         "   full = ", fulls, "   concurrent = ", cycles - fulls,
-        "   (pauses = ", pauses, ")")
+        "   minor = ", minors, "   (pauses = ", pauses, ")")
