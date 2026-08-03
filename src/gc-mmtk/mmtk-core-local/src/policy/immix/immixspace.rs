@@ -1002,7 +1002,12 @@ impl<VM: VMBinding> ImmixSpace<VM> {
                 // DIAG QUARANTINE: leak dead blocks instead of freeing them
                 // (MMTK_TRIAGE_QUARANTINE env) to discriminate "triage freed
                 // a live block" from "someone scribbled on live memory".
-                if std::env::var_os("MMTK_TRIAGE_QUARANTINE").is_some() {
+                // Cached: getenv takes a process-wide libc lock and this runs
+                // per dead block in the allocation slowpath.
+                static QUARANTINE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                if *QUARANTINE
+                    .get_or_init(|| std::env::var_os("MMTK_TRIAGE_QUARANTINE").is_some())
+                {
                     continue;
                 }
                 block.deinit();
