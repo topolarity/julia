@@ -263,6 +263,9 @@ impl<VM: VMBinding> GCWorker<VM> {
             probe!(mmtk, work, typename.as_ptr(), typename.len());
             let __t0 = crate::diag::now_ns();
             work.do_work_with_stat(&mut self, mmtk);
+            // Drain this worker's batched live-bytes cell (pacer input);
+            // see LIVE_BYTES_TLS in immixspace.
+            crate::policy::immix::immixspace::flush_live_bytes_tls();
             {
                 use std::sync::atomic::Ordering as O;
                 let __d = crate::diag::now_ns().saturating_sub(__t0);

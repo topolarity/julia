@@ -36,6 +36,24 @@ use std::sync::{atomic::AtomicU8, atomic::AtomicUsize, Arc};
 pub(crate) const TRACE_KIND_FAST: TraceKind = 0;
 pub(crate) const TRACE_KIND_DEFRAG: TraceKind = 1;
 
+/// Shared live-bytes total for the (single) immix space, fed by per-worker
+/// thread-local cells flushed at packet boundaries.
+pub static LIVE_BYTES_TOTAL: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    static LIVE_BYTES_TLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+/// Flush the executing thread's live-bytes cell into the shared total.
+/// Called from the worker loop after each work packet.
+pub fn flush_live_bytes_tls() {
+    LIVE_BYTES_TLS.with(|c| {
+        let v = c.take();
+        if v != 0 {
+            LIVE_BYTES_TOTAL.fetch_add(v, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+}
+
 pub struct ImmixSpace<VM: VMBinding> {
     common: CommonSpace<VM>,
     pr: BlockPageResource<VM, Block>,
@@ -70,7 +88,7 @@ pub struct ImmixSpace<VM: VMBinding> {
     /// scheduled.
     deferred_post_pause_packets: std::sync::Mutex<Vec<Box<dyn GCWork<VM>>>>,
     /// PATH 2: bytes of objects marked this cycle (Go's `heapMarked`).
-    live_bytes: std::sync::atomic::AtomicUsize,
+    live_bytes: &'static std::sync::atomic::AtomicUsize,
     /// CONCURRENT FINALIZER SWEEP: while set, lazy triage must not hand out
     /// lines freed by the pause that set it -- the deferred finalizer sweep
     /// still reads (and may resurrect) dead objects in them.
@@ -421,7 +439,7 @@ impl<VM: VMBinding> ImmixSpace<VM> {
             unswept_blocks: std::sync::Mutex::new(Vec::new()),
             unswept_young: std::sync::Mutex::new(Vec::new()),
             deferred_post_pause_packets: std::sync::Mutex::new(Vec::new()),
-            live_bytes: std::sync::atomic::AtomicUsize::new(0),
+            live_bytes: &LIVE_BYTES_TOTAL,
             finalizer_reclaim_gate: std::sync::atomic::AtomicBool::new(false),
             live_bytes_prev: std::sync::atomic::AtomicUsize::new(0),
             pending_blocks: std::sync::Mutex::new(Vec::new()),
@@ -1379,10 +1397,20 @@ impl<VM: VMBinding> ImmixSpace<VM> {
         vo_bit::helper::on_trace_object::<VM>(object);
 
         if self.attempt_mark(object, self.mark_state) {
-            self.live_bytes.fetch_add(
-                <VM::VMObjectModel as crate::vm::ObjectModel<VM>>::get_current_size(object),
-                std::sync::atomic::Ordering::Relaxed,
-            );
+            // Per-worker batched live-bytes accounting (pacer input): a
+            // per-object fetch_add on the shared counter was a locked RMW
+            // per marked object; the thread-local cell is flushed once per
+            // work packet (see the worker loop), so the shared line sees
+            // one RMW per ~thousands of objects and end_of_gc still reads
+            // a complete total (workers only park between packets).
+            LIVE_BYTES_TLS.with(|c| {
+                c.set(
+                    c.get()
+                        + <VM::VMObjectModel as crate::vm::ObjectModel<VM>>::get_current_size(
+                            object,
+                        ),
+                )
+            });
             // Mark block and lines
             if !super::BLOCK_ONLY {
                 if !super::MARK_LINE_AT_SCAN_TIME {
