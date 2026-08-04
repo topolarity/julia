@@ -283,6 +283,33 @@ pub unsafe fn scan_julia_object<SV: SlotVisitor<JuliaVMSlot>>(obj: Address, clos
             let length = (*m).length;
             let mut objary_begin = Address::from_ptr((*m).ptr);
             let objary_end = objary_begin.shift::<Address>(length as isize);
+            // Value-prefilter (sound only because this build is non-moving:
+            // slots are never needed for forwarding, so a slot may be dropped
+            // whenever tracing its current target is already guaranteed).
+            // Null slots need no trace at all.  A slot equal to the previous
+            // non-null value needs none either: its target is traced via the
+            // slot we did push, and if a mutator overwrites either slot while
+            // marking is concurrent, the SATB barrier logs the old value --
+            // the same snapshot argument the slot-buffer design itself relies
+            // on.  Each buffered slot costs a 24-byte queue element (two
+            // stores) plus a later re-read on another worker; a giant
+            // fill!-ed array (GCBenchmarks single_ref: 107M slots, one
+            // target) put 2.6GB of buffer stores on the serial scan packet,
+            // 16x the cost of just reading the elements.
+            #[cfg(feature = "non_moving")]
+            {
+                let mut last_val = Address::ZERO;
+                while objary_begin < objary_end {
+                    let val = objary_begin.load::<Address>();
+                    if !val.is_zero() && val != last_val {
+                        last_val = val;
+                        process_slot(closure, objary_begin);
+                    }
+                    objary_begin = objary_begin.shift::<Address>(1);
+                }
+            }
+            // A moving plan must visit every slot for forwarding.
+            #[cfg(not(feature = "non_moving"))]
             while objary_begin < objary_end {
                 process_slot(closure, objary_begin);
                 objary_begin = objary_begin.shift::<Address>(1);
