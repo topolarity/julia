@@ -781,20 +781,21 @@ impl<VM: VMBinding> ConcurrentImmix<VM> {
     }
 
     /// GENERATIONAL: nursery threshold that triggers a minor collection, in
-    /// pages.  Default 32 MB with dirty handover -- the measured optimum of
-    /// the (nursery size x zero mode) surface: wall 1.06s at ~75ms/pass
-    /// stall on the allocation benchmark, vs 1.08s at 172ms for the old
-    /// 8 MB+memset point.  Small heaps bind on the total/6 cap and land at
-    /// cache-scale nurseries with warm-up zeroing instead (see the zeroed
-    /// selection in the constructor).  Overridable via MMTK_NURSERY_MB;
-    /// MMTK_NURSERY_MB=0 disables minors entirely (majors-only, for A/B).
+    /// pages.  Default 64 MB with dirty handover: once the line-state
+    /// census made pause cost independent of nursery size, the size sweep
+    /// optimum moved from 32 MB up to 64 MB (~65 minors/pass at ~0.3ms,
+    /// stall 22-28ms/pass ~ stock's inline young-GC budget; paired reps
+    /// beat stock's wall by ~3.4% mean).  Small heaps bind on the total/6
+    /// cap and land at cache-scale nurseries with warm-up zeroing instead
+    /// (see the zeroed selection in the constructor).  Overridable via
+    /// MMTK_NURSERY_MB; MMTK_NURSERY_MB=0 disables minors (majors-only).
     fn nursery_threshold_pages() -> usize {
         static PAGES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
         *PAGES.get_or_init(|| {
             let mb = std::env::var("MMTK_NURSERY_MB")
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(32);
+                .unwrap_or(64);
             mb << (20 - 12)
         })
     }

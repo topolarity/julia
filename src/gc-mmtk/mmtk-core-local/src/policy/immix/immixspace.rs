@@ -1061,7 +1061,11 @@ impl<VM: VMBinding> ImmixSpace<VM> {
             }
         }
         let space = unsafe { &*(self as *const Self) };
-        let chunk = (blocks.len() / 16).max(32);
+        // The line-state census costs ~100ns/block; one packet per ~1000
+        // blocks costs less in wake edges than 16 packets of trivial work.
+        let chunk = blocks.len().max(1);
+        let _ = chunk;
+        let chunk = (blocks.len() / 2).max(1024);
         let packets: Vec<Box<dyn GCWork<VM>>> = blocks
             .chunks(chunk)
             .map(|c| {
