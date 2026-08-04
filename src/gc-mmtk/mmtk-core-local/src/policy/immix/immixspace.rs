@@ -1119,75 +1119,46 @@ impl<VM: VMBinding> ImmixSpace<VM> {
 
     fn census_nursery_blocks(&self, blocks: Vec<Block>) {
         let state = self.line_mark_state.load(Ordering::Acquire);
-        let mark = VM::VMObjectModel::LOCAL_MARK_BIT_SPEC.extract_side_spec();
         let mut dead: Vec<Block> = Vec::new();
         let mut freed_lines = 0usize;
         let mut live_blocks = 0usize;
         for block in blocks {
             debug_assert_ne!(block.get_state(), BlockState::Unallocated);
-            // SPAN-AWARE line liveness: mark bits sit at object START
-            // addresses only, so a per-line bit test would classify the tail
-            // lines of a straddling object as dead (measured: freed live
-            // compiler objects under MT).  Walk the marked object starts and
-            // paint each object's full extent instead.  Every set bit here
-            // is a real object header: nursery blocks are claimed outside
-            // marking (no allocate-black saturation -- pending drains at
-            // FinalMark and minors are forbidden while marking), so bits
-            // come only from tracing or old-mark persistence.
-            let mut any_live = false;
-            let mut live = [false; Block::LINES];
-            mark.scan_non_zero_values::<u8>(block.start(), block.end(), &mut |addr| {
-                any_live = true;
-                let Some(obj) = ObjectReference::from_raw_address(addr) else {
-                    return;
-                };
-                // AUDIT ORACLE (MMTK_AUDIT_NURSERY): every marked object at
-                // sweep time is old (survivor just traced, prior promotion,
-                // or persisted major mark) and MUST be armed -- a disarmed
-                // old object's future mutations would skip the barrier and
-                // its young children would be lost to the next minor.
-                {
-                    static AUDIT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-                    if *AUDIT.get_or_init(|| std::env::var_os("MMTK_AUDIT_NURSERY").is_some())
-                        && !VM::VMObjectModel::GLOBAL_LOG_BIT_SPEC
-                            .is_unlogged::<VM>(obj, Ordering::Relaxed)
-                    {
-                        eprintln!("[nursery-audit] marked-but-DISARMED {:?}", obj);
-                    }
+            // LINE-STATE CENSUS: liveness is read directly from the line
+            // marks.  Scan-time line marking painted every survivor's full
+            // extent with the current epoch (so straddle tails are covered),
+            // recycled blocks' old-live lines carry the last major's epoch
+            // (same value between majors), and idle-window claim protection
+            // uses the distinct CLAIMED sentinel -- so a line is live iff it
+            // is epoch-marked, with no object-mark scan and no header reads
+            // (the survivor-heavy census previously cost 5-29ms per startup
+            // minor in cold `get_current_size` reads).
+            let mark_data = block.line_mark_table();
+            let mut live_lines: usize = 0;
+            for i in 0..mark_data.len() {
+                if mark_data.get(i) == state {
+                    live_lines += 1;
                 }
-                let start = obj.to_object_start::<VM>();
-                let end = start + VM::VMObjectModel::get_current_size(obj);
-                let first = (start.max(block.start()) - block.start()) >> Line::LOG_BYTES;
-                let last = ((end - 1usize).min(block.end() - 1usize) - block.start())
-                    >> Line::LOG_BYTES;
-                for slot in live.iter_mut().take(last + 1).skip(first) {
-                    *slot = true;
-                }
-            });
+            }
             // Fast path for the dominant case: a fully dead block needs no
-            // per-line bookkeeping -- clear its line marks in one metadata
+            // per-line rewriting -- clear its line marks in one metadata
             // bzero and release it.
-            if !any_live {
+            if live_lines == 0 {
                 Line::MARK_TABLE.bzero_metadata(block.start(), Block::BYTES);
                 freed_lines += Block::LINES;
                 block.deinit();
                 dead.push(block);
                 continue;
             }
-            let mut live_lines: usize = 0;
+            // Mixed block: clear non-epoch lines (CLAIMED noise and stale
+            // states) so hole search sees the reclaimed lines as free.
             for (i, line) in block.lines().enumerate() {
-                if live[i] {
-                    line.mark(state);
-                    live_lines += 1;
-                } else {
+                if mark_data.get(i) != state {
                     line.mark(0);
                     freed_lines += 1;
                 }
             }
-            if live_lines == 0 {
-                block.deinit();
-                dead.push(block);
-            } else if live_lines < Block::LINES {
+            if live_lines < Block::LINES {
                 block.set_state(BlockState::Reusable {
                     unavailable_lines: live_lines as _,
                 });
@@ -1596,7 +1567,7 @@ impl<VM: VMBinding> ImmixSpace<VM> {
         // Find start
         while cursor < mark_data.len() {
             let mark = mark_data.get(cursor);
-            if mark != unavail_state && mark != current_state {
+            if mark != unavail_state && mark != current_state && mark != Line::CLAIMED_MARK_STATE {
                 break;
             }
             cursor += 1;
@@ -1608,14 +1579,16 @@ impl<VM: VMBinding> ImmixSpace<VM> {
         // Find limit
         while cursor < mark_data.len() {
             let mark = mark_data.get(cursor);
-            if mark == unavail_state || mark == current_state {
+            if mark == unavail_state || mark == current_state || mark == Line::CLAIMED_MARK_STATE {
                 break;
             }
             cursor += 1;
         }
         let end = search_start.next_nth(cursor - start_cursor);
-        debug_assert!(RegionIterator::<Line>::new(start, end)
-            .all(|line| !line.is_marked(unavail_state) && !line.is_marked(current_state)));
+        debug_assert!(RegionIterator::<Line>::new(start, end).all(|line| !line
+            .is_marked(unavail_state)
+            && !line.is_marked(current_state)
+            && !line.is_marked(Line::CLAIMED_MARK_STATE)));
         Some((start, end))
     }
 

@@ -324,9 +324,17 @@ impl<VM: VMBinding> ImmixAllocator<VM> {
                     // hole is only offered when its lines went unmarked
                     // through that trace -- no live or stale-marked object
                     // can be inside it.
-                    Line::bulk_set_line_mark_states(state, start_line..end_line);
                     if self.space.should_allocate_as_live() {
+                        Line::bulk_set_line_mark_states(state, start_line..end_line);
                         Line::initialize_mark_table_as_marked::<VM>(start_line..end_line);
+                    } else {
+                        // Idle-window claims use the CLAIMED sentinel so the
+                        // nursery census can tell claim noise from survivor
+                        // spans (see Line::CLAIMED_MARK_STATE).
+                        Line::bulk_set_line_mark_states(
+                            Line::CLAIMED_MARK_STATE,
+                            start_line..end_line,
+                        );
                     }
                     // ALWAYS-ON BARRIER: objects must be born UNARMED.  During
                     // marking, allocate-black covers their liveness and firing
@@ -446,9 +454,18 @@ impl<VM: VMBinding> ImmixAllocator<VM> {
                     // See acquire_recyclable_lines: line epochs always;
                     // mark-table saturation while allocate-as-live (marking);
                     // unlog bits always cleared (objects born unarmed).
-                    Line::bulk_set_line_mark_states(state, block.start_line()..block.end_line());
                     if self.space.should_allocate_as_live() {
+                        Line::bulk_set_line_mark_states(
+                            state,
+                            block.start_line()..block.end_line(),
+                        );
                         Line::initialize_mark_table_as_marked::<VM>(
+                            block.start_line()..block.end_line(),
+                        );
+                    } else {
+                        // See acquire_recyclable_lines: CLAIMED sentinel.
+                        Line::bulk_set_line_mark_states(
+                            Line::CLAIMED_MARK_STATE,
                             block.start_line()..block.end_line(),
                         );
                     }

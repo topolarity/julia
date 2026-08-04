@@ -32,6 +32,14 @@ impl Region for Line {
 impl Line {
     pub const RESET_MARK_STATE: u8 = 1;
     pub const MAX_MARK_STATE: u8 = 127;
+    /// Sentinel line state for idle-window claims (outside the epoch range):
+    /// protects claimed holes from re-offer like an epoch mark, but stays
+    /// distinguishable from scan-time survivor marks -- the nursery census
+    /// reads liveness directly from line states (cur = survivor/old span,
+    /// CLAIMED = unre-marked claim noise, i.e., dead young).  During-marking
+    /// claims keep writing the current epoch (allocate-black floats need the
+    /// two-epoch hold through the cycle).
+    pub const CLAIMED_MARK_STATE: u8 = 255;
 
     /// Line mark table (side)
     pub const MARK_TABLE: SideMetadataSpec =

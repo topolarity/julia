@@ -296,6 +296,12 @@ pub extern "C" fn mmtk_start_worker(tls: VMWorkerThread, worker: *mut GCWorker<J
 
 #[no_mangle]
 pub extern "C" fn mmtk_initialize_collection(tls: VMThread) {
+    // Diagnostics: report in-pause packets slower than this (ns) to stderr.
+    if let Ok(v) = std::env::var("MMTK_PAUSE_PKT_REPORT_NS") {
+        if let Ok(ns) = v.parse::<u64>() {
+            mmtk::diag::PAUSE_PKT_REPORT_NS.store(ns, Ordering::SeqCst);
+        }
+    }
     memory_manager::initialize_collection(&SINGLETON, tls);
 }
 
