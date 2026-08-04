@@ -1013,6 +1013,12 @@ impl<VM: VMBinding> ConcurrentPlan for ConcurrentImmix<VM> {
         self.base().global_state.is_user_triggered_collection()
     }
 
+    fn finalizer_sweep_pending(&self) -> bool {
+        self.immix_space
+            .finalizer_reclaim_gate
+            .load(Ordering::SeqCst)
+    }
+
     fn concurrent_work_in_progress(&self) -> bool {
         self.concurrent_marking_in_progress()
     }

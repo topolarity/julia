@@ -796,3 +796,16 @@ pub extern "C" fn mmtk_unlog_max_ns() -> u64 { mmtk::diag::UNLOG_MAX_NS.load(Ord
 pub extern "C" fn mmtk_set_pause_pkt_report_ns(ns: u64) {
     mmtk::diag::PAUSE_PKT_REPORT_NS.store(ns, Ordering::SeqCst);
 }
+
+/// EXIT-PATH SUPPORT: whether a deferred concurrent finalizer sweep still
+/// holds detached entries.  `jl_gc_run_all_finalizers` harvests the lists
+/// wholesale at exit; it must wait until pending sweeps have published
+/// their entries back, or finalizers (including the stream flushers) are
+/// silently skipped.
+#[no_mangle]
+pub extern "C" fn mmtk_concurrent_finalizer_sweep_pending() -> i32 {
+    match crate::SINGLETON.get_plan().concurrent() {
+        Some(plan) if plan.finalizer_sweep_pending() => 1,
+        _ => 0,
+    }
+}

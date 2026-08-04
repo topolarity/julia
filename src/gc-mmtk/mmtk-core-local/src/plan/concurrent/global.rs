@@ -47,6 +47,11 @@ pub trait ConcurrentPlan: Plan {
     fn finalizer_sweep_done(&self) {
         unimplemented!()
     }
+    /// Whether a deferred finalizer sweep is still pending (detached
+    /// entries not yet published back to the lists).
+    fn finalizer_sweep_pending(&self) -> bool {
+        false
+    }
     /// Whether the current collection was requested explicitly (GC.gc(),
     /// including the exit-path full collections).  Those keep the
     /// synchronous in-pause finalizer sweep: the exit path's

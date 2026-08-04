@@ -407,7 +407,25 @@ void jl_gc_run_all_finalizers(jl_task_t *ct)
     gc_all_tls_states = jl_atomic_load_relaxed(&jl_all_tls_states);
     // this is called from `jl_atexit_hook`; threads could still be running
     // so we have to guard the finalizers' lists
+#ifdef WITH_THIRD_PARTY_HEAP
+    // A deferred concurrent finalizer sweep holds entries detached from the
+    // lists; harvesting before it publishes them back would silently skip
+    // those finalizers (observed: the stdout IOStream flusher, losing the
+    // final output buffer at exit).  Holding finalizers_lock afterwards
+    // prevents a new pause (whose stw_begin takes this lock) from detaching
+    // again underneath us.
+    extern int mmtk_concurrent_finalizer_sweep_pending(void);
+    while (1) {
+        while (mmtk_concurrent_finalizer_sweep_pending())
+            uv_sleep(1);
+        JL_LOCK_NOGC(&finalizers_lock);
+        if (!mmtk_concurrent_finalizer_sweep_pending())
+            break;
+        JL_UNLOCK_NOGC(&finalizers_lock);
+    }
+#else
     JL_LOCK_NOGC(&finalizers_lock);
+#endif
     schedule_all_finalizers(&finalizer_list_marked);
     for (int i = 0; i < gc_n_threads; i++) {
         jl_ptls_t ptls2 = gc_all_tls_states[i];
