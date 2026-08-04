@@ -19,6 +19,7 @@ extern void* MMTK_SIDE_LOG_BIT_BASE_ADDRESS;
 // costs one predictable branch outside marking and (b) unlog bits are never
 // consumed outside marking, which lets all arming happen off-pause.
 extern uint8_t MMTK_SATB_MARKING_ACTIVE;
+extern void mmtk_gc_wb_slots_pre(void** slots, size_t n);
 
 #define MMTK_OBJECT_BARRIER (1)
 // Stickyimmix needs write barrier. Immix does not need write barrier.
@@ -85,7 +86,28 @@ STATIC_INLINE void jl_gc_wb_genericmemory_copy_boxed(const jl_value_t *dest_owne
                                           jl_genericmemory_t *src, _Atomic(void*) ** src_pp,
                                           size_t* n) JL_NOTSAFEPOINT
 {
-    mmtk_gc_wb_fast(dest_owner, (void*)0);
+    if (MMTK_NEEDS_WRITE_BARRIER == MMTK_OBJECT_BARRIER) {
+        // Same armed check as mmtk_gc_wb_fast, but during marking the SATB
+        // capture is sized to the mutation: only the overwritten range's
+        // old values are recorded (handed to concurrent workers), instead
+        // of the whole-object field iteration that stalled the mutator for
+        // O(object) on large arrays.  The object is deliberately NOT
+        // logged on this path, so later writes keep capturing their own
+        // ranges.  Outside marking the object-granularity remset entry is
+        // unchanged.
+        intptr_t addr = (intptr_t) (void*) dest_owner;
+        uint8_t* meta_addr = (uint8_t*) (MMTK_SIDE_LOG_BIT_BASE_ADDRESS) + (addr >> 6);
+        intptr_t shift = (addr >> 3) & 0b111;
+        uint8_t byte_val = *meta_addr;
+        if (((byte_val >> shift) & 1) == 1) {
+            if (MMTK_SATB_MARKING_ACTIVE) {
+                mmtk_gc_wb_slots_pre((void**)*dest_pp, *n);
+            }
+            else {
+                mmtk_gc_wb_fast(dest_owner, (void*)0);
+            }
+        }
+    }
 }
 
 STATIC_INLINE void jl_gc_wb_genericmemory_copy_ptr(const jl_value_t *owner, jl_genericmemory_t *src, char* src_p,

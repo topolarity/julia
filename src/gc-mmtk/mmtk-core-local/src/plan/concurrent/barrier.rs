@@ -77,6 +77,14 @@ impl<VM: VMBinding, P: ConcurrentPlan<VM = VM> + PlanTraceObject<VM>, const KIND
         if !self.satb.is_empty() {
             if self.should_create_satb_packets() {
                 let satb = self.satb.take();
+                let bytes: usize = {
+                    use crate::vm::ObjectModel;
+                    satb.iter()
+                        .map(|o| <VM as VMBinding>::VMObjectModel::get_current_size(*o))
+                        .sum()
+                };
+                crate::plan::concurrent::PENDING_SATB_BYTES
+                    .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
                 let bucket = if self.plan.concurrent_work_in_progress() {
                     WorkBucketStage::Concurrent
                 } else {

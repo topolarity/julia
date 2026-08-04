@@ -62,6 +62,15 @@ pub fn scan_finalizers_in_rust<T: ObjectTracer>(tracer: &mut T) {
     #[cfg(feature = "concurrentimmix")]
     {
         use crate::mmtk::vm::ActivePlan;
+        // Aborted FinalMark: marking incomplete, liveness unknown -- no
+        // finalizer processing this pause (retried with the FinalMark).
+        if crate::SINGLETON
+            .get_plan()
+            .concurrent()
+            .is_some_and(|p| p.final_mark_aborted())
+        {
+            return;
+        }
         if let Some(plan) = crate::SINGLETON
             .get_plan()
             .concurrent()

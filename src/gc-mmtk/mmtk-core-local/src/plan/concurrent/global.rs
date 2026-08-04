@@ -52,6 +52,21 @@ pub trait ConcurrentPlan: Plan {
     fn finalizer_sweep_pending(&self) -> bool {
         false
     }
+    /// RANGE-PRECISE SATB: accept old values captured by a mutator from
+    /// exactly the slot range a bulk write is about to overwrite, during
+    /// concurrent marking.  Scheduled into the Concurrent bucket (the
+    /// mutator keeps running; workers trace them).  This replaces the
+    /// whole-object snapshot for large objects, whose inline field
+    /// iteration stalled the mutator O(object size) in the barrier.
+    fn satb_capture_values(&self, _values: Vec<crate::util::ObjectReference>) {
+        unimplemented!()
+    }
+    /// GO-STYLE TERMINATION: whether the current FinalMark pause was
+    /// aborted (over-budget SATB work found at the flush; marking
+    /// continues).  Release/finalizer/weak-ref processing must all no-op.
+    fn final_mark_aborted(&self) -> bool {
+        false
+    }
     /// Whether the current collection was requested explicitly (GC.gc(),
     /// including the exit-path full collections).  Those keep the
     /// synchronous in-pause finalizer sweep: the exit path's

@@ -809,3 +809,33 @@ pub extern "C" fn mmtk_concurrent_finalizer_sweep_pending() -> i32 {
         _ => 0,
     }
 }
+
+/// RANGE-PRECISE SATB PRE-WRITE BARRIER: capture the old values of exactly
+/// the `n` slots about to be overwritten by a bulk write (memmove_refs /
+/// copyto! into an old object).  Only meaningful during concurrent marking;
+/// the C fast path gates on MMTK_SATB_MARKING_ACTIVE and the owner's unlog
+/// bit before calling.  Packets are capped so no single work unit scales
+/// beyond the mutation.
+#[no_mangle]
+pub extern "C" fn mmtk_gc_wb_slots_pre(slots: *const Address, n: usize) {
+    use mmtk::util::ObjectReference;
+    if n == 0 || !crate::collection::CONCURRENT_MARKING_ACTIVE.load(atomic::Ordering::SeqCst) {
+        return;
+    }
+    let Some(plan) = crate::SINGLETON.get_plan().concurrent() else {
+        return;
+    };
+    const CAP: usize = 4096;
+    let mut buf: Vec<ObjectReference> = Vec::with_capacity(n.min(CAP));
+    for i in 0..n {
+        let v = unsafe { *slots.add(i) };
+        if let Some(obj) = ObjectReference::from_raw_address(v) {
+            buf.push(obj);
+            if buf.len() == CAP {
+                plan.satb_capture_values(std::mem::take(&mut buf));
+                buf.reserve(CAP.min(n - i));
+            }
+        }
+    }
+    plan.satb_capture_values(buf);
+}

@@ -30,3 +30,11 @@ pub enum Pause {
 unsafe impl bytemuck::ZeroableInOption for Pause {}
 
 unsafe impl bytemuck::PodInOption for Pause {}
+
+/// GO-STYLE TERMINATION: bytes of SATB-logged objects flushed to the
+/// Concurrent bucket and not yet scanned.  FinalMark reads this after the
+/// in-pause barrier flush to decide detect-and-abort: over-budget work is
+/// left in the (closed-for-this-pause) Concurrent bucket and marking
+/// continues instead of the pause absorbing a giant scan.
+pub static PENDING_SATB_BYTES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);

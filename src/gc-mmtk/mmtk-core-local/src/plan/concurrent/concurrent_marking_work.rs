@@ -185,6 +185,18 @@ impl<VM: VMBinding, P: ConcurrentPlan<VM = VM> + PlanTraceObject<VM>, const KIND
     GCWork<VM> for ProcessModBufSATB<VM, P, KIND>
 {
     fn do_work(&mut self, worker: &mut GCWorker<VM>, mmtk: &'static MMTK<VM>) {
+        if let Some(nodes) = &self.nodes {
+            use crate::vm::ObjectModel;
+            let bytes: usize = nodes
+                .iter()
+                .map(|o| <VM as VMBinding>::VMObjectModel::get_current_size(*o))
+                .sum();
+            crate::plan::concurrent::PENDING_SATB_BYTES
+                .fetch_sub(bytes.min(
+                    crate::plan::concurrent::PENDING_SATB_BYTES
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                ), std::sync::atomic::Ordering::Relaxed);
+        }
         let mut w = if let Some(nodes) = self.nodes.take() {
             if nodes.is_empty() {
                 return;

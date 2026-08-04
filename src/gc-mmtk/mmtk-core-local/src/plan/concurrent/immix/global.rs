@@ -72,6 +72,10 @@ pub struct ConcurrentImmix<VM: VMBinding> {
     /// `schedule_collection`; a major request wins over a minor one.
     minor_due: AtomicBool,
     major_due: AtomicBool,
+    /// GO-STYLE TERMINATION: set when a FinalMark pause found over-budget
+    /// SATB work at the flush and aborted (marking continues; the pause's
+    /// release/ref stages no-op; the next pause retries FinalMark).
+    final_mark_aborted: AtomicBool,
     /// EXTERNAL-QUANTA PRESSURE: snapshots of counted-malloc (vm_live_bytes)
     /// and LOS reserved pages at the last collection.  The nursery trigger
     /// only counted immix claimed lines, so workloads whose allocation is
@@ -317,6 +321,7 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
             self.should_do_full_gc.store(true, Ordering::SeqCst);
         }
 
+        self.final_mark_aborted.store(false, Ordering::SeqCst);
         let minor_due = self.minor_due.swap(false, Ordering::SeqCst);
         let major_due = self.major_due.swap(false, Ordering::SeqCst);
         let pause = if self.concurrent_marking_in_progress() {
@@ -444,6 +449,11 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
                 }
             }
             Pause::Full | Pause::FinalMark => {
+                // Aborted FinalMark: marking is still in progress, so no
+                // release/sweep decisions are valid yet.
+                if pause == Pause::FinalMark && self.final_mark_aborted.load(Ordering::SeqCst) {
+                    return;
+                }
                 self.immix_space.release(
                     true,
                     // ALWAYS-ON BARRIER: no bulk re-arm.  A deferred
@@ -502,6 +512,7 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
             let now = crate::diag::now_ns();
             match pause {
                 Pause::InitialMark => { self.mark_start_ns.store(now, Ordering::Relaxed); }
+                Pause::FinalMark if self.final_mark_aborted.load(Ordering::SeqCst) => {}
                 Pause::FinalMark => {
                     let s = self.mark_start_ns.load(Ordering::Relaxed);
                     if s != 0 && now > s {
@@ -617,7 +628,33 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
                 // normally empty; drain defensively (SATB treatment is
                 // conservative for any straggler).
                 self.drain_remset_rearm();
-                self.set_concurrent_marking_state(false);
+                // GO-STYLE TERMINATION (detect-and-abort): the flush above
+                // routed logged objects to the Concurrent bucket, which is
+                // worker-pollable during the pause -- the rendezvous would
+                // stretch the pause by the full scan (measured: one growing
+                // array = 33-107ms FinalMark pauses).  If the pending SATB
+                // work exceeds the budget, abort the termination instead:
+                // leave the work in the (closed) Concurrent bucket, keep
+                // marking active, and let the ordinary self-trigger retry
+                // FinalMark after the concurrent drain.  Convergence: the
+                // barrier logs each object at most once per cycle.
+                let pending =
+                    crate::plan::concurrent::PENDING_SATB_BYTES.load(Ordering::Relaxed);
+                let budget = Self::term_budget_bytes();
+                if std::env::var_os("MMTK_TERM_TRACE").is_some() {
+                    eprintln!(
+                        "[term] FinalMark: pending_satb={}B budget={}B",
+                        pending, budget
+                    );
+                }
+                if pending > budget {
+                    self.final_mark_aborted.store(true, Ordering::SeqCst);
+                    let scheduler = &self.base().scheduler;
+                    scheduler.work_buckets[WorkBucketStage::Concurrent].close();
+                    self.set_ref_closure_buckets_enabled(false);
+                } else {
+                    self.set_concurrent_marking_state(false);
+                }
             }
             Pause::Nursery => {
                 debug_assert!(!self.concurrent_marking_in_progress());
@@ -824,6 +861,7 @@ impl<VM: VMBinding> ConcurrentImmix<VM> {
             gc_end_ns: AtomicU64::new(0),
             remset: std::sync::Mutex::new(Vec::new()),
             minor_due: AtomicBool::new(false),
+            final_mark_aborted: AtomicBool::new(false),
             major_due: AtomicBool::new(false),
             malloc_pages_at_last_gc: std::sync::atomic::AtomicUsize::new(0),
             los_pages_at_last_gc: std::sync::atomic::AtomicUsize::new(0),
@@ -868,6 +906,18 @@ impl<VM: VMBinding> ConcurrentImmix<VM> {
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(64);
             mb << (20 - 12)
+        })
+    }
+
+    /// GO-STYLE TERMINATION: FinalMark in-pause SATB budget (bytes).
+    fn term_budget_bytes() -> usize {
+        static B: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *B.get_or_init(|| {
+            std::env::var("MMTK_TERM_BUDGET_KB")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(1024)
+                << 10
         })
     }
 
@@ -1022,6 +1072,20 @@ impl<VM: VMBinding> ConcurrentPlan for ConcurrentImmix<VM> {
         self.immix_space
             .finalizer_reclaim_gate
             .load(Ordering::SeqCst)
+    }
+
+    fn final_mark_aborted(&self) -> bool {
+        self.final_mark_aborted.load(Ordering::SeqCst)
+    }
+
+    fn satb_capture_values(&self, values: Vec<crate::util::ObjectReference>) {
+        use crate::plan::concurrent::concurrent_marking_work::ProcessModBufSATB;
+        if values.is_empty() {
+            return;
+        }
+        debug_assert!(self.concurrent_marking_in_progress());
+        self.base().scheduler.work_buckets[WorkBucketStage::Concurrent]
+            .add(ProcessModBufSATB::<VM, Self, TRACE_KIND_FAST>::new(values));
     }
 
     fn concurrent_work_in_progress(&self) -> bool {
