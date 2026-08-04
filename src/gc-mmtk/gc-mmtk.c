@@ -1107,7 +1107,12 @@ STATIC_INLINE void mmtk_immortal_post_alloc_fast(MMTkMutatorContext* mutator, vo
     }
 }
 
-JL_DLLEXPORT jl_value_t *jl_mmtk_gc_alloc_default(jl_ptls_t ptls, int osize, size_t align, void *ty)
+// The body lives in a STATIC_INLINE impl so that in-DSO callers
+// (jl_gc_alloc_ below, and through it the boxing/genericmemory paths) can
+// flatten the fastpath: calling the JL_DLLEXPORT symbol directly defeats
+// inlining under -fPIC semantic interposition, which showed up as ~25% of
+// the wrapper's IBS samples being pure frame/call machinery.
+STATIC_INLINE jl_value_t *jl_mmtk_gc_alloc_default_impl(jl_ptls_t ptls, int osize, size_t align, void *ty)
 {
     // safepoint
     jl_gc_safepoint_(ptls);
@@ -1138,6 +1143,11 @@ JL_DLLEXPORT jl_value_t *jl_mmtk_gc_alloc_default(jl_ptls_t ptls, int osize, siz
         jl_atomic_load_relaxed(&ptls->gc_tls_common.gc_num.poolalloc) + 1);
 
     return v;
+}
+
+JL_DLLEXPORT jl_value_t *jl_mmtk_gc_alloc_default(jl_ptls_t ptls, int osize, size_t align, void *ty)
+{
+    return jl_mmtk_gc_alloc_default_impl(ptls, osize, align, ty);
 }
 
 JL_DLLEXPORT jl_value_t *jl_mmtk_gc_alloc_big(jl_ptls_t ptls, size_t sz)
@@ -1180,7 +1190,7 @@ JL_DLLEXPORT jl_value_t *jl_gc_small_alloc(jl_ptls_t ptls, int offset, int osize
 {
     assert(jl_atomic_load_relaxed(&ptls->gc_state) == 0);
 
-    jl_value_t *val = jl_mmtk_gc_alloc_default(ptls, osize, 16, NULL);
+    jl_value_t *val = jl_mmtk_gc_alloc_default_impl(ptls, osize, 16, NULL);
     maybe_record_alloc_to_profile(val, osize, (jl_datatype_t*)type);
     return val;
 }
@@ -1201,7 +1211,7 @@ inline jl_value_t *jl_gc_alloc_(jl_ptls_t ptls, size_t sz, void *ty)
     jl_value_t *v;
     const size_t allocsz = sz + sizeof(jl_taggedvalue_t);
     if (sz <= GC_MAX_SZCLASS) {
-        v = jl_mmtk_gc_alloc_default(ptls, allocsz, 16, ty);
+        v = jl_mmtk_gc_alloc_default_impl(ptls, allocsz, 16, ty);
     }
     else {
         if (allocsz < sz) // overflow in adding offs, size was "negative"
