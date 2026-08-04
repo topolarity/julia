@@ -169,6 +169,29 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
         // cache scale.  Minors are forbidden while marking (`!marking`
         // guards this branch); during a major cycle the nursery just grows
         // and the FinalMark-hastening path bounds the wait.
+        // OLD-GROWTH TRIGGER: with minors absorbing the allocation float,
+        // only a major reclaims promoted garbage.  Reserved pages are no
+        // signal under lazy sweep (backlog-inflated right after a major),
+        // so use the promotion volume the nursery sweeps measure directly:
+        // request a major once promotion since the last major exceeds
+        // max(live estimate, 64 MB capped at a quarter of the heap) --
+        // GOGC-style 100% growth with a floor.  Checked before the minor
+        // branch: a major subsumes the pending minor.
+        {
+            let promoted_pages = self
+                .immix_space
+                .promoted_lines_since_major
+                .load(Ordering::Relaxed)
+                / 16; // 256 B lines, 4 KB pages
+            let live = self.immix_space.live_prev_pages();
+            let threshold = live.max(16384usize.min(total / 4).max(1024));
+            if promoted_pages >= threshold {
+                self.major_due.store(true, Ordering::Release);
+                self.base().gc_trigger.request();
+                return false;
+            }
+        }
+
         if Self::nursery_threshold_pages() != 0 {
             let live = self.immix_space.live_prev_pages();
             let scaled = total.saturating_sub(live) / 6;
@@ -454,6 +477,13 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
             for p in deferred {
                 bucket.add_boxed_no_notify(p);
             }
+        }
+        if matches!(pause, Pause::FinalMark | Pause::Full) {
+            // The major just re-proved the old set; promotion accounting
+            // restarts.
+            self.immix_space
+                .promoted_lines_since_major
+                .store(0, Ordering::Relaxed);
         }
         self.previous_pause.store(Some(pause), Ordering::SeqCst);
         self.current_pause.store(None, Ordering::SeqCst);

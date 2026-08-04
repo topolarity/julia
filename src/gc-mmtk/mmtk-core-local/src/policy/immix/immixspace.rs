@@ -74,6 +74,9 @@ pub struct ImmixSpace<VM: VMBinding> {
     /// Snapshot of `live_bytes` at the last FinalMark.
     live_bytes_prev: std::sync::atomic::AtomicUsize,
     pending_blocks: std::sync::Mutex<Vec<Block>>,
+    /// Lines kept by nursery sweeps since the last major: the promotion
+    /// volume driving the old-growth major trigger.  Reset at major end.
+    pub promoted_lines_since_major: std::sync::atomic::AtomicUsize,
     full_blocks: std::sync::Mutex<Vec<Block>>,
     /// Object mark state
     mark_state: u8,
@@ -401,6 +404,7 @@ impl<VM: VMBinding> ImmixSpace<VM> {
             live_bytes: std::sync::atomic::AtomicUsize::new(0),
             live_bytes_prev: std::sync::atomic::AtomicUsize::new(0),
             pending_blocks: std::sync::Mutex::new(Vec::new()),
+            promoted_lines_since_major: std::sync::atomic::AtomicUsize::new(0),
             full_blocks: std::sync::Mutex::new(Vec::new()),
             reusable_blocks: ReusableBlockPool::new(scheduler.num_workers()),
             defrag: Defrag::default(),
@@ -673,21 +677,6 @@ impl<VM: VMBinding> ImmixSpace<VM> {
         // pacing live estimate).
         self.live_bytes.store(0, std::sync::atomic::Ordering::SeqCst);
 
-        // GENERATIONAL: clear the object mark bits IN-PAUSE, right before
-        // this cycle's trace.  Marks persist between collections as the
-        // old-set indicator for minors, so the clear cannot be deferred
-        // post-pause as before; parallel per-chunk packets in the (open)
-        // Prepare bucket keep the cost off the critical path.
-        {
-            let packets = self.chunk_map.generate_tasks(|chunk| {
-                Box::new(ClearChunkMarks::<VM> {
-                    chunk,
-                    _p: std::marker::PhantomData,
-                })
-            });
-            self.scheduler().work_buckets[WorkBucketStage::Prepare].bulk_add(packets);
-        }
-
         // ALWAYS-ON BARRIER: arm the blocks claimed since the last collection
         // (they hold the young objects, born unarmed).  The pause IS the SATB
         // snapshot boundary: every live object must be armed when marking
@@ -703,65 +692,50 @@ impl<VM: VMBinding> ImmixSpace<VM> {
             }
         }
 
-        // AUDIT ORACLE (MMTK_AUDIT_UNLOG): after the young-block arming
-        // above, EVERY unlog bit over the immix chunks must be armed at
-        // InitialMark (the reference in-pause BulkSet would make it so).
-        // Any zero bit here is a hole in the incremental arming; report its
-        // data address and region state.
+        // AUDIT ORACLE (MMTK_AUDIT_UNLOG): the live=>armed snapshot
+        // invariant, checked against the persisted old set BEFORE the mark
+        // bits are cleared below (and before the clear packets can run):
+        // every MARKED object must be armed at InitialMark.  (The historic
+        // every-bit-armed form is obsolete: arming is per-object now, so
+        // non-object granules and dead ranges are legitimately zero.  Young
+        // objects are covered by the whole-range pending arm above.)
         if std::env::var_os("MMTK_AUDIT_UNLOG").is_some() {
-            let unlog = VM::VMObjectModel::GLOBAL_LOG_BIT_SPEC.extract_side_spec();
-            let mut bad_chunks = 0usize;
-            let mut bad_bytes = 0usize;
-            let mut reported = 0usize;
+            let mark = VM::VMObjectModel::LOCAL_MARK_BIT_SPEC.extract_side_spec();
+            let mut bad = 0usize;
             for chunk in self.chunk_map.all_chunks() {
-                let meta_start = crate::util::metadata::side_metadata::helpers::address_to_meta_address(
-                    unlog,
-                    chunk.start(),
-                );
-                let meta_bytes =
-                    (Chunk::BYTES >> unlog.log_bytes_in_region) >> (3 - unlog.log_num_of_bits);
-                let mut nz = 0usize;
-                for i in 0..meta_bytes {
-                    let b: u8 = unsafe { (meta_start + i).load::<u8>() };
-                    if b != 0xFF {
-                        nz += 1;
-                        if reported < 5 {
-                            reported += 1;
-                            // Reconstruct the data address for this meta byte.
-                            let granules_per_byte = 8usize >> unlog.log_num_of_bits;
-                            let data = chunk.start()
-                                + (i * granules_per_byte) * (1usize << unlog.log_bytes_in_region);
-                            let block = Block::from_unaligned_address(data);
-                            let line = Line::from_unaligned_address(data);
-                            let cur = self.line_mark_state.load(Ordering::Acquire);
-                            let unav = self.line_unavail_state.load(Ordering::Acquire);
-                            eprintln!(
-                                "[unlog-audit] HOLE meta[{}]={:#04x} data={:?} block_state={:?} line_marked(cur={})={} line_marked(unav={})={}",
-                                i,
-                                b,
-                                data,
-                                block.get_state(),
-                                cur,
-                                line.is_marked(cur),
-                                unav,
-                                line.is_marked(unav),
-                            );
+                mark.scan_non_zero_values::<u8>(chunk.start(), chunk.end(), &mut |addr| {
+                    if let Some(obj) = ObjectReference::from_raw_address(addr) {
+                        if !VM::VMObjectModel::GLOBAL_LOG_BIT_SPEC
+                            .is_unlogged::<VM>(obj, Ordering::Relaxed)
+                        {
+                            if bad < 5 {
+                                eprintln!("[unlog-audit] marked-but-DISARMED {:?}", obj);
+                            }
+                            bad += 1;
                         }
                     }
-                }
-                if nz > 0 {
-                    bad_chunks += 1;
-                    bad_bytes += nz;
-                }
+                });
             }
-            if bad_bytes > 0 {
-                eprintln!(
-                    "[unlog-audit] AT INIT: {} chunks with {} non-0xFF unlog bytes",
-                    bad_chunks, bad_bytes
-                );
+            if bad > 0 {
+                eprintln!("[unlog-audit] AT INIT: {bad} marked-but-disarmed objects");
             } else {
-                eprintln!("[unlog-audit] AT INIT: fully armed");
+                eprintln!("[unlog-audit] AT INIT: live=>armed holds");
             }
+        }
+
+        // GENERATIONAL: clear the object mark bits IN-PAUSE, right before
+        // this cycle's trace.  Marks persist between collections as the
+        // old-set indicator for minors, so the clear cannot be deferred
+        // post-pause as before; parallel per-chunk packets in the (open)
+        // Prepare bucket keep the cost off the critical path.
+        {
+            let packets = self.chunk_map.generate_tasks(|chunk| {
+                Box::new(ClearChunkMarks::<VM> {
+                    chunk,
+                    _p: std::marker::PhantomData,
+                })
+            });
+            self.scheduler().work_buckets[WorkBucketStage::Prepare].bulk_add(packets);
         }
 
         // DIAG (MMTK_CHECK_STALE_MARKS): OBSOLETE under mark persistence --
@@ -1037,6 +1011,7 @@ impl<VM: VMBinding> ImmixSpace<VM> {
         let mut dead: Vec<Block> = Vec::new();
         let mut freed_lines = 0usize;
         let mut live_blocks = 0usize;
+        let mut total_live_lines = 0usize;
         for block in blocks {
             debug_assert_ne!(block.get_state(), BlockState::Unallocated);
             // SPAN-AWARE line liveness: mark bits sit at object START
@@ -1053,6 +1028,20 @@ impl<VM: VMBinding> ImmixSpace<VM> {
                 let Some(obj) = ObjectReference::from_raw_address(addr) else {
                     return;
                 };
+                // AUDIT ORACLE (MMTK_AUDIT_NURSERY): every marked object at
+                // sweep time is old (survivor just traced, prior promotion,
+                // or persisted major mark) and MUST be armed -- a disarmed
+                // old object's future mutations would skip the barrier and
+                // its young children would be lost to the next minor.
+                {
+                    static AUDIT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                    if *AUDIT.get_or_init(|| std::env::var_os("MMTK_AUDIT_NURSERY").is_some())
+                        && !VM::VMObjectModel::GLOBAL_LOG_BIT_SPEC
+                            .is_unlogged::<VM>(obj, Ordering::Relaxed)
+                    {
+                        eprintln!("[nursery-audit] marked-but-DISARMED {:?}", obj);
+                    }
+                }
                 let start = obj.to_object_start::<VM>();
                 let end = start + VM::VMObjectModel::get_current_size(obj);
                 let first = (start.max(block.start()) - block.start()) >> Line::LOG_BYTES;
@@ -1072,6 +1061,7 @@ impl<VM: VMBinding> ImmixSpace<VM> {
                     freed_lines += 1;
                 }
             }
+            total_live_lines += live_lines;
             if live_lines == 0 {
                 block.deinit();
                 dead.push(block);
@@ -1090,6 +1080,12 @@ impl<VM: VMBinding> ImmixSpace<VM> {
         crate::diag::NURSERY_SWEPT_BLOCKS.fetch_add(dead.len(), Ordering::Relaxed);
         crate::diag::NURSERY_KEPT_BLOCKS.fetch_add(live_blocks, Ordering::Relaxed);
         crate::diag::NURSERY_FREED_LINES.fetch_add(freed_lines, Ordering::Relaxed);
+        // Promotion volume for the old-growth major trigger.  Kept lines in
+        // recycled blocks re-count their old objects' lines each time the
+        // block is touched, so this over-estimates -- conservative in the
+        // right direction (earlier majors).
+        self.promoted_lines_since_major
+            .fetch_add(total_live_lines, Ordering::Relaxed);
         if !dead.is_empty() {
             self.pr.release_blocks_batch(&dead);
         }
