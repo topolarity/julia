@@ -74,6 +74,13 @@ pub struct ImmixSpace<VM: VMBinding> {
     /// Snapshot of `live_bytes` at the last FinalMark.
     live_bytes_prev: std::sync::atomic::AtomicUsize,
     pending_blocks: std::sync::Mutex<Vec<Block>>,
+    /// Lock-free mirror of `unswept_blocks.is_empty()`.  The triage entry
+    /// runs on every allocator refill; between majors the backlog is empty
+    /// and the wrapper's diag clocks alone cost ~36ms/pass (measured) --
+    /// exit before touching clocks or locks.  Written only inside pauses
+    /// (aging) and by the triage that empties the list, so a stale value
+    /// can only cause one extra timed call, never skipped work.
+    unswept_nonempty: std::sync::atomic::AtomicBool,
     /// NURSERY ACCOUNTING: free lines handed to allocators since the last
     /// collection.  This is the real nursery size for the minor trigger:
     /// counting whole pending blocks over-fires ~3x, because a pool re-pop
@@ -406,6 +413,7 @@ impl<VM: VMBinding> ImmixSpace<VM> {
             live_bytes: std::sync::atomic::AtomicUsize::new(0),
             live_bytes_prev: std::sync::atomic::AtomicUsize::new(0),
             pending_blocks: std::sync::Mutex::new(Vec::new()),
+            unswept_nonempty: std::sync::atomic::AtomicBool::new(false),
             nursery_lines_claimed: std::sync::atomic::AtomicUsize::new(0),
             full_blocks: std::sync::Mutex::new(Vec::new()),
             reusable_blocks: ReusableBlockPool::new(scheduler.num_workers()),
@@ -616,7 +624,13 @@ impl<VM: VMBinding> ImmixSpace<VM> {
             // Age the generations: last cycle's float becomes triageable,
             // this cycle's float becomes the new young generation.
             let mut young = self.unswept_young.lock().unwrap();
-            self.unswept_blocks.lock().unwrap().append(&mut young);
+            {
+                let mut unswept = self.unswept_blocks.lock().unwrap();
+                unswept.append(&mut young);
+                if !unswept.is_empty() {
+                    self.unswept_nonempty.store(true, Ordering::Relaxed);
+                }
+            }
             // Drain the reusable pool: pool entries must not outlive the
             // window -- tracing and PrepareBlockState mutate the states of
             // pool-resident blocks (eager sweep enforced this via reset()).
@@ -1140,6 +1154,9 @@ impl<VM: VMBinding> ImmixSpace<VM> {
     }
 
     pub fn lazy_triage_some(&self, budget: usize) -> bool {
+        if !self.unswept_nonempty.load(Ordering::Relaxed) {
+            return false;
+        }
         let t0 = crate::diag::now_ns();
         let r = self.lazy_triage_some_inner(budget);
         let d = crate::diag::now_ns().saturating_sub(t0);
@@ -1153,10 +1170,15 @@ impl<VM: VMBinding> ImmixSpace<VM> {
             let mut q = self.unswept_blocks.lock().unwrap();
             let n = q.len().min(budget);
             if n == 0 {
+                self.unswept_nonempty.store(false, Ordering::Relaxed);
                 return false;
             }
             let at = q.len() - n;
-            q.split_off(at)
+            let taken = q.split_off(at);
+            if q.is_empty() {
+                self.unswept_nonempty.store(false, Ordering::Relaxed);
+            }
+            taken
         };
         crate::diag::TRIAGE_CHUNKS.fetch_add(1, Ordering::SeqCst);
         let cur = self.line_mark_state.load(Ordering::Acquire);
@@ -1164,6 +1186,7 @@ impl<VM: VMBinding> ImmixSpace<VM> {
         // BISECT: idle-window only (during marking cur != unavail)
         if cur != unavail {
             self.unswept_blocks.lock().unwrap().append(&mut { blocks });
+            self.unswept_nonempty.store(true, Ordering::Relaxed);
             return false;
         }
         // Batch dead-block releases: one accounting update and one global
