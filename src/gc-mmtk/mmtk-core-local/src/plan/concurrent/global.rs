@@ -21,4 +21,9 @@ pub trait ConcurrentPlan: Plan {
     fn live_pages_estimate(&self) -> Option<usize> {
         None
     }
+    /// ALWAYS-ON BARRIER: accept a flushed batch of remembered-set entries
+    /// (old objects mutated outside marking) from a mutator's barrier.
+    fn append_remset(&self, _buf: Vec<crate::util::ObjectReference>) {
+        unimplemented!()
+    }
 }

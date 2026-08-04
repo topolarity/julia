@@ -498,6 +498,17 @@ impl<VM: VMBinding> ImmixSpace<VM> {
             });
             self.scheduler().work_buckets[WorkBucketStage::Prepare].bulk_add(work_packets);
 
+            // GENERATIONAL: marks persist between collections (see
+            // `prepare_concurrent_initial`); a full-heap trace must start
+            // from clean mark bits, cleared in-pause.
+            let clear_packets = self.chunk_map.generate_tasks(|chunk| {
+                Box::new(ClearChunkMarks::<VM> {
+                    chunk,
+                    _p: std::marker::PhantomData,
+                })
+            });
+            self.scheduler().work_buckets[WorkBucketStage::Prepare].bulk_add(clear_packets);
+
             if !super::BLOCK_ONLY {
                 self.line_mark_state.fetch_add(1, Ordering::AcqRel);
                 if self.line_mark_state.load(Ordering::Acquire) > Line::MAX_MARK_STATE {
@@ -568,31 +579,21 @@ impl<VM: VMBinding> ImmixSpace<VM> {
         // full blocks into the unswept list.  Triage happens on the allocator
         // slow path (`lazy_triage_some`).
         if concurrent_sweep {
-            // LEG 1: neither the unlog-bit clear nor the mark-bit clear needs
-            // the world stopped -- they only need to complete before the NEXT
-            // pause.  Defer both as per-chunk packets that the plan schedules
-            // after this pause (stale set unlog bits between cycles only
-            // cause discarded barrier slow calls; mark bits are unread
-            // between cycles).
+            // GENERATIONAL: mark bits are NOT cleared after this pause.  They
+            // persist between collections as the old-set indicator (minors
+            // terminate on them); the next InitialMark/Full clears them
+            // in-pause before its own trace.  Unlog-bit maintenance is
+            // precise (trace-time, float promotion below, remset re-arm), so
+            // no deferred chunk packets remain here.
             let t0 = crate::diag::now_ns();
-            {
+            if !matches!(unlog_bits_op, UnlogBitsOperation::NoOp) {
                 let space = unsafe { &*(self as *const Self) };
                 let mut deferred = self.deferred_post_pause_packets.lock().unwrap();
-                if !matches!(unlog_bits_op, UnlogBitsOperation::NoOp) {
-                    for chunk in self.chunk_map.all_chunks() {
-                        deferred.push(Box::new(UnlogBitsChunk {
-                            space,
-                            chunk,
-                            op: unlog_bits_op,
-                        }) as _);
-                    }
-                }
-                // Mark bits must be clear before the next cycle's marking;
-                // between cycles nothing reads them.
                 for chunk in self.chunk_map.all_chunks() {
-                    deferred.push(Box::new(ClearChunkMarks::<VM> {
+                    deferred.push(Box::new(UnlogBitsChunk {
+                        space,
                         chunk,
-                        _p: std::marker::PhantomData,
+                        op: unlog_bits_op,
                     }) as _);
                 }
             }
@@ -617,7 +618,24 @@ impl<VM: VMBinding> ImmixSpace<VM> {
             while let Some(b) = self.reusable_blocks.pop() {
                 young.push(b);
             }
-            young.append(&mut self.pending_blocks.lock().unwrap());
+            {
+                let mut pending = self.pending_blocks.lock().unwrap();
+                // ALWAYS-ON BARRIER: promote the cycle's float.  Blocks
+                // claimed since InitialMark hold allocate-black objects
+                // (marked-live, never traced, so never trace-armed); after
+                // this pause they are old and their mutations must be logged.
+                // Arm them IN-PAUSE: once mutators resume, a disarmed old
+                // object's write would skip the barrier.  (Blocks claimed
+                // before InitialMark were armed in that pause; re-arming is
+                // idempotent.)
+                if self.common.needs_log_bit {
+                    let unlog = VM::VMObjectModel::GLOBAL_LOG_BIT_SPEC.extract_side_spec();
+                    for block in pending.iter() {
+                        unlog.bset_metadata(block.start(), Block::BYTES);
+                    }
+                }
+                young.append(&mut pending);
+            }
             young.append(&mut self.full_blocks.lock().unwrap());
             drop(young);
             // Release is fully deferred (float-budget trigger keeps the
@@ -655,13 +673,38 @@ impl<VM: VMBinding> ImmixSpace<VM> {
         // pacing live estimate).
         self.live_bytes.store(0, std::sync::atomic::Ordering::SeqCst);
 
-        // MARKING-GATED BARRIER: no unlog-bit arming here.  Bits are kept
-        // armed across the idle window (deferred re-arm after FinalMark,
-        // chunk-granular arming at first allocation) and are inert while the
-        // marking flag is off, so this pause has no per-chunk work at all.
+        // GENERATIONAL: clear the object mark bits IN-PAUSE, right before
+        // this cycle's trace.  Marks persist between collections as the
+        // old-set indicator for minors, so the clear cannot be deferred
+        // post-pause as before; parallel per-chunk packets in the (open)
+        // Prepare bucket keep the cost off the critical path.
+        {
+            let packets = self.chunk_map.generate_tasks(|chunk| {
+                Box::new(ClearChunkMarks::<VM> {
+                    chunk,
+                    _p: std::marker::PhantomData,
+                })
+            });
+            self.scheduler().work_buckets[WorkBucketStage::Prepare].bulk_add(packets);
+        }
 
-        // AUDIT ORACLE (MMTK_AUDIT_UNLOG): in the marking-gated barrier
-        // scheme, EVERY unlog bit over the immix chunks must be armed at
+        // ALWAYS-ON BARRIER: arm the blocks claimed since the last collection
+        // (they hold the young objects, born unarmed).  The pause IS the SATB
+        // snapshot boundary: every live object must be armed when marking
+        // starts, or its overwritten fields escape the snapshot.  Block
+        // ranges are armed whole; unallocated tails are unreachable for
+        // allocation until they cycle through FinalMark aging and are
+        // disarmed at re-claim.  Old blocks stay armed from trace-time
+        // arming, the FinalMark float promotion, and the remset drain re-arm.
+        if self.common.needs_log_bit {
+            let unlog = VM::VMObjectModel::GLOBAL_LOG_BIT_SPEC.extract_side_spec();
+            for block in self.pending_blocks.lock().unwrap().iter() {
+                unlog.bset_metadata(block.start(), Block::BYTES);
+            }
+        }
+
+        // AUDIT ORACLE (MMTK_AUDIT_UNLOG): after the young-block arming
+        // above, EVERY unlog bit over the immix chunks must be armed at
         // InitialMark (the reference in-pause BulkSet would make it so).
         // Any zero bit here is a hole in the incremental arming; report its
         // data address and region state.
@@ -721,9 +764,11 @@ impl<VM: VMBinding> ImmixSpace<VM> {
             }
         }
 
-        // DIAG (MMTK_CHECK_STALE_MARKS): at InitialMark, no object mark bit
-        // should be set (the deferred post-FinalMark clear must have wiped
-        // them all).  Scan and report any that survive.
+        // DIAG (MMTK_CHECK_STALE_MARKS): OBSOLETE under mark persistence --
+        // marks now survive between collections by design (the old set), and
+        // the in-pause ClearChunkMarks packets scheduled above run after this
+        // function returns.  Kept for layout probing only; expect nonzero
+        // counts.
         if std::env::var_os("MMTK_CHECK_STALE_MARKS").is_some() {
             // Layout probe: metadata addresses of the three specs for one chunk.
             if let Some(chunk) = self.chunk_map.all_chunks().next() {
@@ -899,22 +944,12 @@ impl<VM: VMBinding> ImmixSpace<VM> {
         if self.should_allocate_as_live() {
             block.set_state(BlockState::Marked);
         }
-        // MARKING-GATED BARRIER: chunks entering service must come up with
-        // their unlog bits ARMED (fresh side metadata is zeroed).  The bits
-        // are inert while the marking flag is off, so this is safe at any
-        // time, and the per-cycle deferred re-arm keeps them set thereafter.
-        // Racing first-allocators may both set the metadata; bset is
-        // idempotent.
-        if self.common.needs_log_bit
-            && self
-                .chunk_map
-                .get(block.chunk())
-                .map_or(true, |s| !s.is_allocated())
-        {
-            VM::VMObjectModel::GLOBAL_LOG_BIT_SPEC
-                .extract_side_spec()
-                .bset_metadata(block.chunk().start(), Chunk::BYTES);
-        }
+        // ALWAYS-ON BARRIER: no chunk-level arming.  Objects are born unarmed
+        // (the allocator disarms every claimed range); arming is precise:
+        // trace-time (`unlog_traced_object`), the in-pause arming of blocks
+        // claimed since the last collection (InitialMark makes the young part
+        // of the snapshot; FinalMark promotes the cycle's float), and the
+        // remset drain re-arm.
         self.chunk_map.set_allocated(block.chunk(), true);
         self.lines_consumed
             .fetch_add(Block::LINES, Ordering::SeqCst);
@@ -969,6 +1004,95 @@ impl<VM: VMBinding> ImmixSpace<VM> {
 
     pub fn has_unswept(&self) -> bool {
         !self.unswept_blocks.lock().unwrap().is_empty()
+    }
+
+    /// NURSERY SWEEP (in-pause, minor collections): drain `pending_blocks`
+    /// (= every block touched by allocation since the last collection) and
+    /// reclaim its dead lines, using OBJECT mark bits as the liveness
+    /// source.  Line marks cannot serve here: claims line-mark their ranges
+    /// as double-claim protection for the lazy major pipeline, so a
+    /// claim-marked dead line is indistinguishable from a live one.  Object
+    /// marks are exact at this point in the pause: the nursery trace just
+    /// marked survivors, old objects' marks persist from the last major, and
+    /// claim noise never touches them.  Line marks are then REWRITTEN to
+    /// match (live -> current epoch, dead -> cleared) so the hole-search and
+    /// triage predicates continue to see the truth.
+    pub(crate) fn sweep_nursery_blocks(&self) {
+        // DIAG (MMTK_NURSERY_NOSWEEP): trace-only minors -- promotion and
+        // remset behavior run, but nothing is reclaimed (blocks stay
+        // pending).  Discriminates "sweep freed live memory" from
+        // trace/metadata corruption.
+        {
+            static NOSWEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *NOSWEEP.get_or_init(|| std::env::var_os("MMTK_NURSERY_NOSWEEP").is_some()) {
+                return;
+            }
+        }
+        let blocks: Vec<Block> = std::mem::take(&mut *self.pending_blocks.lock().unwrap());
+        if blocks.is_empty() {
+            return;
+        }
+        let state = self.line_mark_state.load(Ordering::Acquire);
+        let mark = VM::VMObjectModel::LOCAL_MARK_BIT_SPEC.extract_side_spec();
+        let mut dead: Vec<Block> = Vec::new();
+        let mut freed_lines = 0usize;
+        let mut live_blocks = 0usize;
+        for block in blocks {
+            debug_assert_ne!(block.get_state(), BlockState::Unallocated);
+            // SPAN-AWARE line liveness: mark bits sit at object START
+            // addresses only, so a per-line bit test would classify the tail
+            // lines of a straddling object as dead (measured: freed live
+            // compiler objects under MT).  Walk the marked object starts and
+            // paint each object's full extent instead.  Every set bit here
+            // is a real object header: nursery blocks are claimed outside
+            // marking (no allocate-black saturation -- pending drains at
+            // FinalMark and minors are forbidden while marking), so bits
+            // come only from tracing or old-mark persistence.
+            let mut live = [false; Block::LINES];
+            mark.scan_non_zero_values::<u8>(block.start(), block.end(), &mut |addr| {
+                let Some(obj) = ObjectReference::from_raw_address(addr) else {
+                    return;
+                };
+                let start = obj.to_object_start::<VM>();
+                let end = start + VM::VMObjectModel::get_current_size(obj);
+                let first = (start.max(block.start()) - block.start()) >> Line::LOG_BYTES;
+                let last = ((end - 1usize).min(block.end() - 1usize) - block.start())
+                    >> Line::LOG_BYTES;
+                for slot in live.iter_mut().take(last + 1).skip(first) {
+                    *slot = true;
+                }
+            });
+            let mut live_lines: usize = 0;
+            for (i, line) in block.lines().enumerate() {
+                if live[i] {
+                    line.mark(state);
+                    live_lines += 1;
+                } else {
+                    line.mark(0);
+                    freed_lines += 1;
+                }
+            }
+            if live_lines == 0 {
+                block.deinit();
+                dead.push(block);
+            } else if live_lines < Block::LINES {
+                block.set_state(BlockState::Reusable {
+                    unavailable_lines: live_lines as _,
+                });
+                self.reusable_blocks.push(block);
+                live_blocks += 1;
+            } else {
+                block.set_state(BlockState::Marked);
+                self.full_blocks.lock().unwrap().push(block);
+                live_blocks += 1;
+            }
+        }
+        crate::diag::NURSERY_SWEPT_BLOCKS.fetch_add(dead.len(), Ordering::Relaxed);
+        crate::diag::NURSERY_KEPT_BLOCKS.fetch_add(live_blocks, Ordering::Relaxed);
+        crate::diag::NURSERY_FREED_LINES.fetch_add(freed_lines, Ordering::Relaxed);
+        if !dead.is_empty() {
+            self.pr.release_blocks_batch(&dead);
+        }
     }
 
     pub fn lazy_triage_some(&self, budget: usize) -> bool {

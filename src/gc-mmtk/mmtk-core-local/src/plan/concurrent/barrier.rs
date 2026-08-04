@@ -23,6 +23,12 @@ pub struct SATBBarrierSemantics<
     mmtk: &'static MMTK<VM>,
     tls: VMMutatorThread,
     satb: VectorQueue<ObjectReference>,
+    /// ALWAYS-ON BARRIER: mutated old objects logged outside marking.  These
+    /// are remembered-set entries: minors scan them for old->young edges, and
+    /// an InitialMark/Full pause drains them as additional (conservative)
+    /// roots.  Entries are re-armed at the drain, so each old object enters
+    /// at most once per window.
+    remset: VectorQueue<ObjectReference>,
     refs: VectorQueue<ObjectReference>,
     plan: &'static P,
 }
@@ -35,6 +41,7 @@ impl<VM: VMBinding, P: ConcurrentPlan<VM = VM> + PlanTraceObject<VM>, const KIND
             mmtk,
             tls,
             satb: VectorQueue::default(),
+            remset: VectorQueue::default(),
             refs: VectorQueue::default(),
             plan: mmtk.get_plan().downcast_ref::<P>().unwrap(),
         }
@@ -84,6 +91,13 @@ impl<VM: VMBinding, P: ConcurrentPlan<VM = VM> + PlanTraceObject<VM>, const KIND
         }
     }
 
+    fn flush_remset(&mut self) {
+        if !self.remset.is_empty() {
+            let buf = self.remset.take();
+            self.plan.append_remset(buf);
+        }
+    }
+
     #[cold]
     fn flush_weak_refs(&mut self) {
         if !self.refs.is_empty() {
@@ -113,6 +127,7 @@ impl<VM: VMBinding, P: ConcurrentPlan<VM = VM> + PlanTraceObject<VM>, const KIND
     #[cold]
     fn flush(&mut self) {
         self.flush_satb();
+        self.flush_remset();
         self.flush_weak_refs();
     }
 
@@ -122,7 +137,29 @@ impl<VM: VMBinding, P: ConcurrentPlan<VM = VM> + PlanTraceObject<VM>, const KIND
         _slot: <Self::VM as VMBinding>::VMSlot,
         _target: Option<ObjectReference>,
     ) {
-        self.object_probable_write_slow(src);
+        if self.should_create_satb_packets() {
+            // Marking: snapshot the object's still-current fields (SATB).
+            self.object_probable_write_slow(src);
+            // The consumed unlog bit must be set again before the next window
+            // opens, and tracing cannot do it: if the object was traced
+            // before it was logged, `trace_object` short-circuits on the mark
+            // bit without re-arming.  Route the object through the remset,
+            // whose FinalMark drain re-arms every entry inside the pause.
+            self.remset.push(src);
+            if self.remset.is_full() {
+                self.flush_remset();
+            }
+        } else {
+            // Between collections: remember the mutated old object.  Its
+            // fields are scanned at the next collection (minor remset scan,
+            // or conservative extra root at InitialMark/Full); no snapshot is
+            // needed because the world is stopped when the entry is drained
+            // and re-armed.
+            self.remset.push(src);
+            if self.remset.is_full() {
+                self.flush_remset();
+            }
+        }
         self.log_object(src);
     }
 
@@ -131,6 +168,9 @@ impl<VM: VMBinding, P: ConcurrentPlan<VM = VM> + PlanTraceObject<VM>, const KIND
         _src: <Self::VM as VMBinding>::VMMemorySlice,
         dst: <Self::VM as VMBinding>::VMMemorySlice,
     ) {
+        // The Julia binding routes bulk copies through the object-level
+        // barrier (jl_gc_wb_genericmemory_copy_*), so this slice path only
+        // serves the SATB (marking) case where value snapshots are correct.
         for s in dst.iter_slots() {
             self.enqueue_node(None, s, None);
         }

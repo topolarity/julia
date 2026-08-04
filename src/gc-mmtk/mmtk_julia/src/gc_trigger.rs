@@ -89,6 +89,7 @@ fn current_pause_kind(mmtk: &'static MMTK<JuliaVM>) -> Option<&'static str> {
         "InitialMark" => Some("initial"),
         "FinalMark" => Some("final"),
         "Full" => Some("full"),
+        "Nursery" => Some("nursery"),
         _ => None,
     }
 }
@@ -197,6 +198,13 @@ impl GCTriggerPolicy<JuliaVM> for JuliaGCTrigger {
             // the matching FinalMark end with the full span.
             self.cycle_start_time
                 .store(self.gc_start_time.load(Ordering::Relaxed), Ordering::Relaxed);
+            return;
+        }
+        if kind == Some("nursery") {
+            // A minor pause is not a major-cycle boundary: it must not feed
+            // the balancer or shift the cycle accounting (rate/target
+            // updates run on InitialMark..FinalMark spans).  Post-minor live
+            // feeding is Phase 2 work.
             return;
         }
 

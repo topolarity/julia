@@ -11,6 +11,7 @@ use crate::plan::tracing::gc_work::weakref::VMProcessWeakRefs;
 use crate::plan::AllocationSemantics;
 use crate::plan::Plan;
 use crate::plan::PlanConstraints;
+use crate::policy::gc_work::TraceKind;
 use crate::policy::immix::defrag::StatsForDefrag;
 use crate::policy::immix::ImmixSpaceArgs;
 use crate::policy::immix::TRACE_KIND_DEFRAG;
@@ -27,6 +28,7 @@ use crate::util::metadata::log_bit::UnlogBitsOperation;
 use crate::util::metadata::side_metadata::SideMetadataContext;
 use crate::vm::ObjectModel;
 use crate::vm::VMBinding;
+use crate::util::ObjectReference;
 use crate::{policy::immix::ImmixSpace, util::opaque_pointer::VMWorkerThread};
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
@@ -58,6 +60,17 @@ pub struct ConcurrentImmix<VM: VMBinding> {
     mark_start_ns: AtomicU64,
     mark_dur_ns: AtomicU64,
     gc_end_ns: AtomicU64,
+    /// ALWAYS-ON BARRIER: remembered set accumulated between collections (old
+    /// objects mutated while no marking is active; flushed here from the
+    /// per-mutator barrier buffers).  Drained inside every pause: minors scan
+    /// the entries for old->young edges; InitialMark/Full re-arm them (a
+    /// major traces everything reachable anyway).
+    remset: std::sync::Mutex<Vec<ObjectReference>>,
+    /// GENERATIONAL TRIGGER: which collection kind the last trigger request
+    /// asked for.  Set by `collection_required`, consumed by
+    /// `schedule_collection`; a major request wins over a minor one.
+    minor_due: AtomicBool,
+    major_due: AtomicBool,
 }
 
 /// The plan constraints for the concurrent immix plan.
@@ -129,6 +142,7 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
             // proceed as float.  True walls (hard limit / memory ceiling /
             // page-resource failure) arrive here with `space_full == true`.
             if !space_full {
+                self.major_due.store(true, Ordering::Release);
                 self.base().gc_trigger.request();
                 return false;
             }
@@ -146,6 +160,28 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
 
         let total = self.get_total_pages();
 
+        // MINOR TRIGGER: checked before the major advisories -- minors have
+        // first claim on the allocation float (it IS the nursery), and each
+        // minor resets it, so the float-budget major below stops firing once
+        // minors run.  Majors then come from the pacing/goal path, driven by
+        // genuine old-generation growth.  The threshold stays under the
+        // major float budget (else majors always preempt) and is capped at
+        // cache scale.  Minors are forbidden while marking (`!marking`
+        // guards this branch); during a major cycle the nursery just grows
+        // and the FinalMark-hastening path bounds the wait.
+        if Self::nursery_threshold_pages() != 0 {
+            let live = self.immix_space.live_prev_pages();
+            let scaled = total.saturating_sub(live) / 6;
+            let threshold = Self::nursery_threshold_pages()
+                .min(scaled)
+                .max(1024 /* 4 MB floor */);
+            if self.immix_space.float_pages() >= threshold {
+                self.minor_due.store(true, Ordering::Release);
+                self.base().gc_trigger.request();
+                return false;
+            }
+        }
+
         // PACING TRIGGER (Go-pacer style): the trigger policy publishes how
         // many pages of allocation a full concurrent cycle must ride out
         // (`alloc_rate x cycle_duration x margin`, measured in-system).
@@ -158,6 +194,7 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
                 info!(
                     "Pacing trigger: reserved {reserved} + cycle headroom {headroom} >= target {total} pages: request concurrent marking (async)"
                 );
+                self.major_due.store(true, Ordering::Release);
                 self.base().gc_trigger.request();
                 return false;
             }
@@ -177,6 +214,7 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
             // Advisory by construction: budget <= (total - live)/3, so there
             // is always headroom to satisfy this allocation.  Never block.
             info!("Float exceeds budget ({budget} pages): request concurrent marking (async)");
+            self.major_due.store(true, Ordering::Release);
             self.base().gc_trigger.request();
             return false;
         }
@@ -194,7 +232,7 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
     /// Keep them for Full, which may defrag.
     fn needs_collector_context_packets(&self) -> bool {
         match self.current_pause() {
-            Some(Pause::InitialMark) | Some(Pause::FinalMark) => false,
+            Some(Pause::InitialMark) | Some(Pause::FinalMark) | Some(Pause::Nursery) => false,
             _ => true,
         }
     }
@@ -225,6 +263,8 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
             self.should_do_full_gc.store(true, Ordering::SeqCst);
         }
 
+        let minor_due = self.minor_due.swap(false, Ordering::SeqCst);
+        let major_due = self.major_due.swap(false, Ordering::SeqCst);
         let pause = if self.concurrent_marking_in_progress() {
             // FIXME: Currently it is unsafe to bypass `FinalMark` and go directly from `InitialMark` to `Full`.
             // It is related to defragmentation.  See https://github.com/mmtk/mmtk-core/issues/1357 for more details.
@@ -236,6 +276,11 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
             || self.base().global_state.is_user_triggered_collection()
         {
             Pause::Full
+        } else if minor_due && !major_due {
+            // GENERATIONAL: nursery-threshold request, with no major
+            // condition outstanding.  A major request wins when both fired
+            // in the same window (it subsumes the minor).
+            Pause::Nursery
         } else {
             Pause::InitialMark
         };
@@ -257,7 +302,15 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
             }
             Pause::InitialMark => self.schedule_concurrent_marking_initial_pause(scheduler),
             Pause::FinalMark => self.schedule_concurrent_marking_final_pause(scheduler),
-            Pause::Nursery => unreachable!("Nursery pauses are not scheduled yet"),
+            Pause::Nursery => {
+                // Minors process weak refs/finalizers (dead nursery weakrefs
+                // must clear); InitialMark disables these buckets for the
+                // concurrent cycle, so re-enable like Full does.
+                self.set_ref_closure_buckets_enabled(true);
+                scheduler.schedule_common_work::<
+                    crate::plan::concurrent::immix::gc_work::ConcurrentImmixNurseryGCWorkContext<VM>,
+                >(self);
+            }
         }
     }
 
@@ -301,7 +354,14 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
                 }
             }
             Pause::FinalMark => (),
-            Pause::Nursery => unreachable!("Nursery pauses are not scheduled yet"),
+            Pause::Nursery => {
+                // Minor prepare: no mark-state or line-epoch changes (marks
+                // persist as the old set; survivor lines are marked with the
+                // current epoch at scan time).  Only the LOS needs its
+                // logical-nursery flip.
+                self.immix_space.prepare(false, None, UnlogBitsOperation::NoOp);
+                self.common.los.prepare(false);
+            }
         }
     }
 
@@ -309,17 +369,24 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
         let pause = self.current_pause().unwrap();
         match pause {
             Pause::InitialMark => (),
-            Pause::Nursery => unreachable!("Nursery pauses are not scheduled yet"),
+            Pause::Nursery => {
+                // In-pause nursery sweep: reclaims dead nursery lines and
+                // feeds them straight back to the allocator (the warm-reuse
+                // locality mechanism).  LOS sweeps its logical nursery.
+                self.immix_space.sweep_nursery_blocks();
+                self.common.los.release(false);
+            }
             Pause::Full | Pause::FinalMark => {
                 self.immix_space.release(
                     true,
-                    // MARKING-GATED BARRIER: RE-ARM (BulkSet) the unlog bits
-                    // in deferred post-pause packets.  Bits consumed by the
-                    // barrier during this cycle's marking get set again; with
-                    // the fastpath gated on the marking flag, armed bits are
-                    // inert until the next InitialMark, so nothing needs to
-                    // happen in that pause.
-                    UnlogBitsOperation::BulkSet,
+                    // ALWAYS-ON BARRIER: no bulk re-arm.  A deferred
+                    // chunk-wide BulkSet would race the allocator's claim-time
+                    // disarm (a range claimed and disarmed after the pause
+                    // could be re-armed by the packet, making young objects
+                    // look old).  Arming is precise instead: trace-time
+                    // arming, the in-pause float promotion in
+                    // `ImmixSpace::release`, and the remset drain re-arm.
+                    UnlogBitsOperation::NoOp,
                     // ALL collections use the lazy release path: an eager
                     // sweep would walk blocks that are simultaneously members
                     // of the lazy lists/pool, creating duplicate ownership --
@@ -428,6 +495,13 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
         match pause {
             Pause::Full => {
                 self.set_concurrent_marking_state(false);
+                // ALWAYS-ON BARRIER: collect the mutators' remset buffers and
+                // trace the entries as conservative extra roots of this STW
+                // collection.
+                for mutator in <VM as VMBinding>::VMActivePlan::mutators() {
+                    mutator.barrier.flush();
+                }
+                self.drain_remset_rearm();
             }
             Pause::InitialMark => {
                 debug_assert!(
@@ -435,6 +509,14 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
                     "prev pause: {:?}",
                     self.previous_pause().unwrap()
                 );
+                // ALWAYS-ON BARRIER: remset entries pending at the snapshot
+                // boundary are old objects mutated since the last collection;
+                // scanning them (and retaining their current referents) makes
+                // them valid SATB work.
+                for mutator in <VM as VMBinding>::VMActivePlan::mutators() {
+                    mutator.barrier.flush();
+                }
+                self.drain_remset_rearm();
             }
             Pause::FinalMark => {
                 debug_assert!(self.concurrent_marking_in_progress());
@@ -442,15 +524,122 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
                 for mutator in <VM as VMBinding>::VMActivePlan::mutators() {
                     mutator.barrier.flush();
                 }
+                // The remset is drained at every InitialMark/Full and no
+                // entries accumulate while marking is active, so this is
+                // normally empty; drain defensively (SATB treatment is
+                // conservative for any straggler).
+                self.drain_remset_rearm();
                 self.set_concurrent_marking_state(false);
             }
-            Pause::Nursery => unreachable!("Nursery pauses are not scheduled yet"),
+            Pause::Nursery => {
+                debug_assert!(!self.concurrent_marking_in_progress());
+                // Collect the mutators' remset buffers and schedule the
+                // entries as the minor's extra roots.  ProcessModBuf re-arms
+                // each entry and scans it for old->young edges; both happen
+                // inside this (fully STW) pause.
+                for mutator in <VM as VMBinding>::VMActivePlan::mutators() {
+                    mutator.barrier.flush();
+                }
+                let entries = std::mem::take(&mut *self.remset.lock().unwrap());
+                if !entries.is_empty() {
+                    use crate::plan::generational::gc_work::{GenNurseryTrace, ProcessModBuf};
+                    use crate::policy::gc_work::DEFAULT_TRACE;
+                    for chunk in entries.chunks(4096) {
+                        self.base().scheduler.work_buckets[WorkBucketStage::Closure].add(
+                            ProcessModBuf::<GenNurseryTrace<VM, Self, DEFAULT_TRACE>>::new(
+                                chunk.to_vec(),
+                            ),
+                        );
+                    }
+                }
+            }
         }
         info!("{:?} start", pause);
     }
 
     fn concurrent(&self) -> Option<&dyn ConcurrentPlan<VM = VM>> {
         Some(self)
+    }
+
+    fn generational(
+        &self,
+    ) -> Option<&dyn crate::plan::generational::global::GenerationalPlan<VM = Self::VM>> {
+        Some(self)
+    }
+}
+
+impl<VM: VMBinding> crate::plan::generational::global::GenerationalPlan for ConcurrentImmix<VM> {
+    fn is_current_gc_nursery(&self) -> bool {
+        self.current_pause() == Some(Pause::Nursery)
+    }
+
+    /// Young = unmarked immix object.  Mark bits persist between collections
+    /// as the old-set indicator: survivors of the last trace (or minors'
+    /// promotions, or allocate-black floats) are marked; objects allocated
+    /// since are born unmarked (claims clear stale marks outside marking).
+    fn is_object_in_nursery(&self, object: ObjectReference) -> bool {
+        self.immix_space.in_space(object) && !self.immix_space.is_marked(object)
+    }
+
+    // Same conservative stance as StickyImmix: for address-only queries
+    // (memory-slice barriers) claim "mature", which at worst remembers too
+    // much.
+    fn is_address_in_nursery(&self, _addr: crate::util::Address) -> bool {
+        false
+    }
+
+    fn get_mature_physical_pages_available(&self) -> usize {
+        self.immix_space.available_physical_pages()
+    }
+
+    fn get_mature_reserved_pages(&self) -> usize {
+        self.immix_space.reserved_pages()
+    }
+
+    fn force_full_heap_collection(&self) {
+        self.should_do_full_gc.store(true, Ordering::SeqCst);
+    }
+
+    fn last_collection_full_heap(&self) -> bool {
+        matches!(
+            self.previous_pause(),
+            Some(Pause::Full) | Some(Pause::FinalMark)
+        )
+    }
+}
+
+impl<VM: VMBinding> crate::plan::generational::global::GenerationalPlanExt<VM>
+    for ConcurrentImmix<VM>
+{
+    /// The nursery trace: terminates at marked (old) objects.  Strictly
+    /// non-moving (the Julia binding pins everything; `TRACE_KIND_FAST`).
+    fn trace_object_nursery<Q: crate::ObjectQueue, const KIND: TraceKind>(
+        &self,
+        queue: &mut Q,
+        object: ObjectReference,
+        _worker: &mut crate::scheduler::GCWorker<VM>,
+    ) -> ObjectReference {
+        use crate::plan::generational::global::GenerationalPlan;
+        if self.immix_space.in_space(object) {
+            if !self.is_object_in_nursery(object) {
+                // Mature object: stop here.  Old->young edges are covered by
+                // the remembered set.
+                return object;
+            }
+            // Marks the object (promotion: it is now part of the old set),
+            // marks its lines, and re-arms its unlog bit
+            // (`unlog_traced_object`) so its future mutations are logged.
+            return self.immix_space.trace_object_without_moving(queue, object);
+        }
+
+        if self.common.get_los().in_space(object) {
+            return self.common.get_los().trace_object::<Q>(queue, object);
+        }
+
+        // Immortal/nonmoving/VM-space objects are never nursery members and
+        // are not scanned by minors; their outgoing edges are covered by the
+        // remembered set (they are armed at allocation).
+        object
     }
 }
 
@@ -512,7 +701,46 @@ impl<VM: VMBinding> ConcurrentImmix<VM> {
             mark_start_ns: AtomicU64::new(0),
             mark_dur_ns: AtomicU64::new(0),
             gc_end_ns: AtomicU64::new(0),
+            remset: std::sync::Mutex::new(Vec::new()),
+            minor_due: AtomicBool::new(false),
+            major_due: AtomicBool::new(false),
         }
+    }
+
+    /// ALWAYS-ON BARRIER: drain the remembered set at a major pause by
+    /// re-arming every entry, inside the pause.  No scanning is needed: a
+    /// major collection traces the current heap from roots, so any live
+    /// entry is reached (and trace-armed) anyway.  The re-arm cannot be
+    /// deferred or skipped: a live old object whose bit stayed consumed
+    /// could be mutated during the upcoming marking and the overwritten
+    /// value would escape the SATB snapshot.  (Minor pauses instead drain
+    /// entries through `ProcessModBuf`, which scans them for old->young
+    /// edges.)
+    fn drain_remset_rearm(&self) {
+        let entries = std::mem::take(&mut *self.remset.lock().unwrap());
+        for obj in entries {
+            VM::VMObjectModel::GLOBAL_LOG_BIT_SPEC.store_atomic::<VM, u8>(
+                obj,
+                1,
+                None,
+                Ordering::SeqCst,
+            );
+        }
+    }
+
+    /// GENERATIONAL: nursery threshold that triggers a minor collection, in
+    /// pages.  Default 32 MB (cache-scale: the warm-reuse loop should fit
+    /// the L3 tier); overridable via MMTK_NURSERY_MB for the size sweep.
+    /// MMTK_NURSERY_MB=0 disables minors entirely (majors-only, for A/B).
+    fn nursery_threshold_pages() -> usize {
+        static PAGES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *PAGES.get_or_init(|| {
+            let mb = std::env::var("MMTK_NURSERY_MB")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(32);
+            mb << (20 - 12)
+        })
     }
 
     fn set_ref_closure_buckets_enabled(&self, do_closure: bool) {
@@ -632,6 +860,10 @@ impl<VM: VMBinding> ConcurrentPlan for ConcurrentImmix<VM> {
         // Immix live lines from the previous cycle plus the (stably
         // accounted) common spaces: immortal, LOS, nonmoving, VM/image.
         Some(self.immix_space.live_prev_pages() + self.common.get_used_pages())
+    }
+
+    fn append_remset(&self, buf: Vec<ObjectReference>) {
+        self.remset.lock().unwrap().extend(buf);
     }
 
     fn enqueue_satb_values(&self, values: Vec<crate::util::ObjectReference>) {

@@ -138,6 +138,13 @@ pub mod diag {
     pub static TRIAGE_POOLED: AtomicU64 = AtomicU64::new(0);
     pub static POOL_POPS: AtomicU64 = AtomicU64::new(0);
     pub static CLEAN_BLOCKS: AtomicU64 = AtomicU64::new(0);
+    /// Nursery (minor) sweep results: blocks released / kept, lines freed.
+    pub static NURSERY_SWEPT_BLOCKS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+    pub static NURSERY_KEPT_BLOCKS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+    pub static NURSERY_FREED_LINES: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
     pub static PAUSE_PENDING: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
     /// Env-gated (MMTK_TRACE_GUARDS) validity checks on traced values:

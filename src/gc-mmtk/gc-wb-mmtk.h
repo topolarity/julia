@@ -49,12 +49,11 @@ STATIC_INLINE void mmtk_gc_wb_full(const void *parent, const void *ptr) JL_NOTSA
 STATIC_INLINE void mmtk_gc_wb_fast(const void *parent, const void *ptr) JL_NOTSAFEPOINT
 {
     if (MMTK_NEEDS_WRITE_BARRIER == MMTK_OBJECT_BARRIER) {
-#ifdef MMTK_PLAN_CONCURRENTIMMIX
-        // SATB is only needed while marking; the flag gate also protects the
-        // armed unlog bits from being consumed between cycles.
-        if (__atomic_load_n(&MMTK_SATB_MARKING_ACTIVE, __ATOMIC_RELAXED) == 0)
-            return;
-#endif
+        // ALWAYS-ON BARRIER (ConcurrentImmix): the unlog bit alone gates the
+        // slow path.  Armed = old object not yet logged this window; the slow
+        // path snapshots fields during marking (SATB) and records the object
+        // in the remembered set otherwise.  Young objects are born unarmed,
+        // so the common case is one predictable branch.
         intptr_t addr = (intptr_t) (void*) parent;
         uint8_t* meta_addr = (uint8_t*) (MMTK_SIDE_LOG_BIT_BASE_ADDRESS) + (addr >> 6);
         intptr_t shift = (addr >> 3) & 0b111;

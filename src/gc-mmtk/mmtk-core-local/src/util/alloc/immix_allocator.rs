@@ -301,23 +301,28 @@ impl<VM: VMBinding> ImmixAllocator<VM> {
                     // outside marking would leave objects "already marked" at
                     // the next InitialMark, making the tracer skip them (and
                     // everything reachable only through them) -- the cause of
-                    // the bootstrap typemap corruption.
+                    // the bootstrap typemap corruption.  Outside marking no
+                    // mark maintenance is needed: marks always reflect the
+                    // last trace (in-pause clear at InitialMark/Full), and a
+                    // hole is only offered when its lines went unmarked
+                    // through that trace -- no live or stale-marked object
+                    // can be inside it.
                     Line::bulk_set_line_mark_states(state, start_line..end_line);
                     if self.space.should_allocate_as_live() {
                         Line::initialize_mark_table_as_marked::<VM>(start_line..end_line);
-                        // MARKING-GATED BARRIER: objects allocated during
-                        // marking must be UNARMED -- allocate-black covers
-                        // their liveness, and firing the object-snapshot
-                        // barrier on a half-initialized object would enqueue
-                        // garbage fields.  The claimed range may carry armed
-                        // bits from the standing all-armed invariant; disarm
-                        // it for the new objects.
-                        if let crate::util::metadata::MetadataSpec::OnSide(unlog) =
-                            *VM::VMObjectModel::GLOBAL_LOG_BIT_SPEC
-                        {
-                            let start = start_line.start();
-                            unlog.bzero_metadata(start, end_line.start() - start);
-                        }
+                    }
+                    // ALWAYS-ON BARRIER: objects must be born UNARMED.  During
+                    // marking, allocate-black covers their liveness and firing
+                    // the object-snapshot barrier on a half-initialized object
+                    // would enqueue garbage fields; outside marking, an armed
+                    // fresh object would look old and flood the remset.  The
+                    // claimed range may carry armed bits from dead old
+                    // objects; disarm it.
+                    if let crate::util::metadata::MetadataSpec::OnSide(unlog) =
+                        *VM::VMObjectModel::GLOBAL_LOG_BIT_SPEC
+                    {
+                        let start = start_line.start();
+                        unlog.bzero_metadata(start, end_line.start() - start);
                     }
                 }
                 return true;
@@ -408,23 +413,22 @@ impl<VM: VMBinding> ImmixAllocator<VM> {
                 // line-marked at acquisition.
                 {
                     let state = self.space.line_mark_state.load(Ordering::Acquire);
-                    // See acquire_recyclable_lines: line epochs always, mark-table
-                    // saturation only while allocate-as-live (marking).
+                    // See acquire_recyclable_lines: line epochs always;
+                    // mark-table saturation while allocate-as-live (marking);
+                    // unlog bits always cleared (objects born unarmed).
                     Line::bulk_set_line_mark_states(state, block.start_line()..block.end_line());
                     if self.space.should_allocate_as_live() {
                         Line::initialize_mark_table_as_marked::<VM>(
                             block.start_line()..block.end_line(),
                         );
-                        // See acquire_recyclable_lines: during-marking
-                        // allocations must be unarmed.
-                        if let crate::util::metadata::MetadataSpec::OnSide(unlog) =
-                            *VM::VMObjectModel::GLOBAL_LOG_BIT_SPEC
-                        {
-                            unlog.bzero_metadata(
-                                block.start(),
-                                crate::policy::immix::block::Block::BYTES,
-                            );
-                        }
+                    }
+                    if let crate::util::metadata::MetadataSpec::OnSide(unlog) =
+                        *VM::VMObjectModel::GLOBAL_LOG_BIT_SPEC
+                    {
+                        unlog.bzero_metadata(
+                            block.start(),
+                            crate::policy::immix::block::Block::BYTES,
+                        );
                     }
                 }
                 if self.request_for_large {

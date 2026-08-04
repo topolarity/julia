@@ -1368,17 +1368,26 @@ _Atomic(int) gc_ptls_sweep_idx;
 // counter for round robin of giving back stack pages to the OS
 _Atomic(int) gc_stack_free_idx = 0;
 
+#ifdef MMTK_PLAN_CONCURRENTIMMIX
+// ALWAYS-ON BARRIER: direct slow entries (called by the JIT's lowered slow
+// path AND unconditionally by C runtime code under stock-GC conventions)
+// must check the object's unlog bit themselves.  The slow path consumes the
+// bit and records the object (SATB snapshot while marking, remembered set
+// otherwise); entering it for an unarmed (young) object would flood the
+// remembered set with nursery objects on every mutation.
+STATIC_INLINE int mmtk_object_is_armed(const void *parent) JL_NOTSAFEPOINT
+{
+    intptr_t addr = (intptr_t) parent;
+    uint8_t *meta_addr = (uint8_t*) (MMTK_SIDE_LOG_BIT_BASE_ADDRESS) + (addr >> 6);
+    intptr_t shift = (addr >> 3) & 0b111;
+    return (*meta_addr >> shift) & 1;
+}
+#endif
+
 JL_DLLEXPORT void jl_gc_queue_root(const struct _jl_value_t *ptr) JL_NOTSAFEPOINT
 {
 #ifdef MMTK_PLAN_CONCURRENTIMMIX
-    // MARKING-GATED BARRIER: this is a direct slow entry (called by the
-    // JIT's lowered slow path AND unconditionally by C runtime code under
-    // stock-GC conventions).  Outside marking it must be a no-op: the slow
-    // path consumes the object's unlog bit (log_object), and with arming
-    // now maintained incrementally there is no in-pause re-arm to repair
-    // it -- a consumed bit means the object's next mutation during marking
-    // is never logged (SATB miss; found via the Init-time unlog audit).
-    if (__atomic_load_n(&MMTK_SATB_MARKING_ACTIVE, __ATOMIC_RELAXED) == 0)
+    if (!mmtk_object_is_armed(ptr))
         return;
 #endif
     jl_task_t *ct = jl_current_task;
@@ -1388,13 +1397,12 @@ JL_DLLEXPORT void jl_gc_queue_root(const struct _jl_value_t *ptr) JL_NOTSAFEPOIN
 
 JL_DLLEXPORT void jl_gc_wb_cold(const void *parent, const void *ptr) JL_NOTSAFEPOINT {
 #ifdef MMTK_PLAN_CONCURRENTIMMIX
-    // See jl_gc_queue_root.
-    if (__atomic_load_n(&MMTK_SATB_MARKING_ACTIVE, __ATOMIC_RELAXED) == 0)
+    if (!mmtk_object_is_armed(parent))
         return;
 #endif
     jl_task_t *ct = jl_current_task;
     jl_ptls_t ptls = ct->ptls;
-    mmtk_object_reference_write_slow(&ptls->gc_tls.mmtk_mutator, ptr, (const void*) 0);
+    mmtk_object_reference_write_slow(&ptls->gc_tls.mmtk_mutator, parent, (const void*) 0);
 }
 
 JL_DLLEXPORT void jl_gc_queue_multiroot(const struct _jl_value_t *root, const void *stored,

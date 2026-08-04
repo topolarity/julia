@@ -134,34 +134,12 @@ void FinalLowerGC::lowerWriteBarrier(CallInst *target, Function &F) {
             auto intptr_ty = T_size;
             auto i8_ptr_ty = PointerType::getUnqual(F.getContext());
 
-#ifdef MMTK_PLAN_CONCURRENTIMMIX
-            // MARKING-GATED SATB: check the global marking flag before the
-            // per-object unlog bit.  Outside marking the barrier is one load
-            // and a perfectly-predicted branch, and unlog bits are never
-            // consumed, which lets all arming happen outside pauses.
-            //
-            // The load MUST NOT be invariant/const-TBAA (unlike the metadata
-            // base below): the flag changes at pauses, and letting LLVM hoist
-            // or CSE it across safepoints would cache a stale "off" and miss
-            // barriers.  Emit it as an atomic monotonic load, which will not
-            // be speculated or hoisted.
-            F.getParent()->getOrInsertGlobal("MMTK_SATB_MARKING_ACTIVE", i8_ty);
-            auto marking_flag_global = F.getParent()->getNamedGlobal("MMTK_SATB_MARKING_ACTIVE");
-            assert(marking_flag_global != nullptr);
-            auto marking_flag_load = builder.CreateAlignedLoad(
-                i8_ty, marking_flag_global, Align(1), "mmtk_satb_marking_active");
-            marking_flag_load->setAtomic(AtomicOrdering::Monotonic);
-            auto marking_on = builder.CreateICmpNE(
-                marking_flag_load, ConstantInt::get(i8_ty, 0));
-
-            MDBuilder FlagMDB(F.getContext());
-            SmallVector<uint32_t, 2> FlagWeights{1, 99};
-            Instruction *splitAnchor = SplitBlockAndInsertIfThen(
-                marking_on, target, false, FlagMDB.createBranchWeights(FlagWeights));
-            builder.SetInsertPoint(splitAnchor);
-#else
+            // ALWAYS-ON BARRIER (ConcurrentImmix): the per-object unlog bit
+            // alone gates the slow path -- old objects are armed, young
+            // objects are born unarmed, so the common case is one metadata
+            // load and a well-predicted branch (same cost profile as the
+            // StickyImmix object barrier).
             Instruction *splitAnchor = target;
-#endif
 
             // intptr_t addr = (intptr_t) (void*) src;
             // uint8_t* meta_addr = (uint8_t*) (SIDE_METADATA_BASE_ADDRESS + (addr >> 6));
