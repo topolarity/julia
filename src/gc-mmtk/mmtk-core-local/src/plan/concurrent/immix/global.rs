@@ -698,6 +698,16 @@ impl<VM: VMBinding> ConcurrentImmix<VM> {
         scheduler.work_buckets[WorkBucketStage::FinalizableForwarding].set_enabled(false);
         scheduler.work_buckets[WorkBucketStage::Compact].set_enabled(false);
 
+        // CLAIM-TIME ZEROING IS LOAD-BEARING (measured both ways): it is the
+        // mutator-side warm-up pass -- the dense zero stream takes the
+        // reuse-distance misses with deep MLP, so the subsequent scattered
+        // object writes hit L1/L2 (the analog of stock's sweep writing
+        // freelist links through dead objects, at the same bandwidth).
+        // Removing it (zeroed=false) regressed wall 1.09-1.15s -> 1.51-1.58s
+        // even though the memset was the top demand-L3-fill site.
+        // MMTK_ZERO_MODE=off selects the dirty-handover variant for A/B.
+        let zeroed = std::env::var("MMTK_ZERO_MODE").map_or(true, |v| v != "off" && v != "0");
+
         ConcurrentImmix {
             immix_space: ImmixSpace::new(
                 // MARKING-GATED BARRIER: unlog_traced_object=true so that
@@ -708,7 +718,7 @@ impl<VM: VMBinding> ConcurrentImmix<VM> {
                 // (allocation-time chunk arming covers the rest).
                 plan_args._get_space_args(
                     "immix",
-                    true,
+                    zeroed,
                     false,
                     false,
                     true,
