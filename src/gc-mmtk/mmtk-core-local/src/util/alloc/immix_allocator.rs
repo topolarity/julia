@@ -36,6 +36,13 @@ pub struct ImmixAllocator<VM: VMBinding> {
     line: Option<Line>,
 }
 
+/// MMTK_ZERO_MODE=pw: write-intent prefetch of claimed ranges under dirty
+/// handover (see `memory::prefetchw_claim`).
+fn claim_prefetchw() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("MMTK_ZERO_MODE").map_or(false, |v| v == "pw"))
+}
+
 impl<VM: VMBinding> ImmixAllocator<VM> {
     /// FIX E: every acquired block is recorded with the space.  Allocators
     /// reset at every pause, so by the FinalMark that splices these into the
@@ -279,6 +286,11 @@ impl<VM: VMBinding> ImmixAllocator<VM> {
                         self.bump_pointer.cursor,
                         self.bump_pointer.limit - self.bump_pointer.cursor,
                     );
+                } else if claim_prefetchw() {
+                    crate::util::memory::prefetchw_claim(
+                        self.bump_pointer.cursor,
+                        self.bump_pointer.limit - self.bump_pointer.cursor,
+                    );
                 }
                 debug_assert!(
                     align_allocation_no_fill::<VM>(self.bump_pointer.cursor, align, offset) + size
@@ -455,6 +467,12 @@ impl<VM: VMBinding> ImmixAllocator<VM> {
                 } else {
                     self.bump_pointer.cursor = block.start();
                     self.bump_pointer.limit = block.end();
+                }
+                if !self.space.common().zeroed && claim_prefetchw() {
+                    crate::util::memory::prefetchw_claim(
+                        block.start(),
+                        crate::policy::immix::block::Block::BYTES,
+                    );
                 }
                 return self.alloc(size, align, offset);
             }

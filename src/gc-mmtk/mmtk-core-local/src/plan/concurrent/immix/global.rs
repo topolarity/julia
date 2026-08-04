@@ -711,7 +711,7 @@ impl<VM: VMBinding> ConcurrentImmix<VM> {
         // stock's: demand-DRAM/L3 parity, L2-fill streaming signature).
         // MMTK_ZERO_MODE={on,off,warm} overrides the automatic choice.
         let zeroed = match std::env::var("MMTK_ZERO_MODE") {
-            Ok(v) if v == "off" || v == "0" => false,
+            Ok(v) if v == "off" || v == "0" || v == "pw" => false,
             Ok(_) => true,
             Err(_) => {
                 // Boot-time nursery estimate: the trigger's threshold with

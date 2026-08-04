@@ -11,6 +11,30 @@ pub fn zero(start: Address, len: usize) {
 /// software-prefetches one chunk ahead of the store loop -- the same lines
 /// the stores would RFO anyway, requested earlier so the fills overlap
 /// (no added bandwidth, higher MLP than a plain memset).
+/// Write-intent prefetch over a claimed range (MMTK_ZERO_MODE=pw): pulls
+/// each line into the local cache in writable state ahead of the
+/// allocation stream's stores -- the same RFOs those stores would incur,
+/// issued early and overlappable, with no duplicate write stream (unlike
+/// zeroing, which writes every line twice).
+pub fn prefetchw_claim(start: Address, len: usize) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let mut p = 0usize;
+        while p < len {
+            unsafe {
+                std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_ET0 }>(
+                    (start + p).to_ptr(),
+                );
+            }
+            p += 64;
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (start, len);
+    }
+}
+
 pub fn zero_claim(start: Address, len: usize) {
     #[cfg(target_arch = "x86_64")]
     {
