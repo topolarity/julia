@@ -74,9 +74,6 @@ pub struct ImmixSpace<VM: VMBinding> {
     /// Snapshot of `live_bytes` at the last FinalMark.
     live_bytes_prev: std::sync::atomic::AtomicUsize,
     pending_blocks: std::sync::Mutex<Vec<Block>>,
-    /// Lines kept by nursery sweeps since the last major: the promotion
-    /// volume driving the old-growth major trigger.  Reset at major end.
-    pub promoted_lines_since_major: std::sync::atomic::AtomicUsize,
     full_blocks: std::sync::Mutex<Vec<Block>>,
     /// Object mark state
     mark_state: u8,
@@ -404,7 +401,6 @@ impl<VM: VMBinding> ImmixSpace<VM> {
             live_bytes: std::sync::atomic::AtomicUsize::new(0),
             live_bytes_prev: std::sync::atomic::AtomicUsize::new(0),
             pending_blocks: std::sync::Mutex::new(Vec::new()),
-            promoted_lines_since_major: std::sync::atomic::AtomicUsize::new(0),
             full_blocks: std::sync::Mutex::new(Vec::new()),
             reusable_blocks: ReusableBlockPool::new(scheduler.num_workers()),
             defrag: Defrag::default(),
@@ -1011,7 +1007,6 @@ impl<VM: VMBinding> ImmixSpace<VM> {
         let mut dead: Vec<Block> = Vec::new();
         let mut freed_lines = 0usize;
         let mut live_blocks = 0usize;
-        let mut total_live_lines = 0usize;
         for block in blocks {
             debug_assert_ne!(block.get_state(), BlockState::Unallocated);
             // SPAN-AWARE line liveness: mark bits sit at object START
@@ -1061,7 +1056,6 @@ impl<VM: VMBinding> ImmixSpace<VM> {
                     freed_lines += 1;
                 }
             }
-            total_live_lines += live_lines;
             if live_lines == 0 {
                 block.deinit();
                 dead.push(block);
@@ -1080,15 +1074,23 @@ impl<VM: VMBinding> ImmixSpace<VM> {
         crate::diag::NURSERY_SWEPT_BLOCKS.fetch_add(dead.len(), Ordering::Relaxed);
         crate::diag::NURSERY_KEPT_BLOCKS.fetch_add(live_blocks, Ordering::Relaxed);
         crate::diag::NURSERY_FREED_LINES.fetch_add(freed_lines, Ordering::Relaxed);
-        // Promotion volume for the old-growth major trigger.  Kept lines in
-        // recycled blocks re-count their old objects' lines each time the
-        // block is touched, so this over-estimates -- conservative in the
-        // right direction (earlier majors).
-        self.promoted_lines_since_major
-            .fetch_add(total_live_lines, Ordering::Relaxed);
         if !dead.is_empty() {
             self.pr.release_blocks_batch(&dead);
         }
+    }
+
+    /// Bytes promoted by minors since the last major: `live_bytes` counts
+    /// every first-time `attempt_mark` (a minor's successful marks are
+    /// exactly its promotions; old objects short-circuit), is reset at
+    /// InitialMark/Full prepare, and `live_bytes_prev` snapshots the major's
+    /// own total at its release -- so the delta is pure minor promotion.
+    pub fn promoted_bytes_since_major(&self) -> usize {
+        self.live_bytes
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .saturating_sub(
+                self.live_bytes_prev
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )
     }
 
     pub fn lazy_triage_some(&self, budget: usize) -> bool {
