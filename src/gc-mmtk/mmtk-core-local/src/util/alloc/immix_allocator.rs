@@ -347,6 +347,7 @@ impl<VM: VMBinding> ImmixAllocator<VM> {
         // the debt amortized, and all-dead chunks still make progress because
         // their blocks go to the page resource, satisfying the caller's
         // clean-block fallback.
+        let mut censused = false;
         let mut triaged = false;
         loop {
             match self.immix_space().get_reusable_block(self.copy) {
@@ -356,6 +357,14 @@ impl<VM: VMBinding> ImmixAllocator<VM> {
                     // Set the hole-searching cursor to the start of this block.
                     self.line = Some(block.start_line());
                     return true;
+                }
+                // Freshest reclaimable memory first: the last minor's blocks
+                // (shortest reuse distance), then the aged major backlog.
+                _ if !censused => {
+                    censused = true;
+                    if !self.immix_space().nursery_census_some(32) {
+                        continue;
+                    }
                 }
                 _ if !triaged => {
                     triaged = true;
@@ -383,7 +392,11 @@ impl<VM: VMBinding> ImmixAllocator<VM> {
             // reclaimable memory may still be sitting in the unswept list.
             // Small quantum: the loop retries allocation after every ~4 MB of
             // triage, so the worst single stall stays bounded even here.
-            None if self.immix_space().lazy_triage_some(128) => continue,
+            None if self.immix_space().nursery_census_some(128)
+                || self.immix_space().lazy_triage_some(128) =>
+            {
+                continue
+            }
             None => return Address::ZERO,
             Some(block) => {
                 trace!(

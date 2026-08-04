@@ -81,6 +81,13 @@ pub struct ImmixSpace<VM: VMBinding> {
     /// (aging) and by the triage that empties the list, so a stale value
     /// can only cause one extra timed call, never skipped work.
     unswept_nonempty: std::sync::atomic::AtomicBool,
+    /// LAZY NURSERY CENSUS: blocks drained from `pending_blocks` at a minor
+    /// pause, awaiting claim-time classification.  The census does not need
+    /// the world stopped (object marks are stable between collections), so
+    /// the pause pays only an O(1) splice; classification runs on the
+    /// allocator slow path like the majors' lazy triage.
+    unswept_nursery: std::sync::Mutex<Vec<Block>>,
+    nursery_unswept_nonempty: std::sync::atomic::AtomicBool,
     /// NURSERY ACCOUNTING: free lines handed to allocators since the last
     /// collection.  This is the real nursery size for the minor trigger:
     /// counting whole pending blocks over-fires ~3x, because a pool re-pop
@@ -414,6 +421,8 @@ impl<VM: VMBinding> ImmixSpace<VM> {
             live_bytes_prev: std::sync::atomic::AtomicUsize::new(0),
             pending_blocks: std::sync::Mutex::new(Vec::new()),
             unswept_nonempty: std::sync::atomic::AtomicBool::new(false),
+            unswept_nursery: std::sync::Mutex::new(Vec::new()),
+            nursery_unswept_nonempty: std::sync::atomic::AtomicBool::new(false),
             nursery_lines_claimed: std::sync::atomic::AtomicUsize::new(0),
             full_blocks: std::sync::Mutex::new(Vec::new()),
             reusable_blocks: ReusableBlockPool::new(scheduler.num_workers()),
@@ -657,6 +666,13 @@ impl<VM: VMBinding> ImmixSpace<VM> {
                 young.append(&mut pending);
             }
             young.append(&mut self.full_blocks.lock().unwrap());
+            // Uncensused nursery-list blocks were re-proven by this major
+            // (traced + line-marked); their object-mark census is invalid
+            // after the InitialMark clear, so route them through the regular
+            // line-census aging pipeline instead.
+            young.append(&mut self.unswept_nursery.lock().unwrap());
+            self.nursery_unswept_nonempty
+                .store(false, std::sync::atomic::Ordering::Relaxed);
             drop(young);
             self.nursery_lines_claimed
                 .store(0, Ordering::Relaxed);
@@ -1017,21 +1033,78 @@ impl<VM: VMBinding> ImmixSpace<VM> {
     /// claim noise never touches them.  Line marks are then REWRITTEN to
     /// match (live -> current epoch, dead -> cleared) so the hole-search and
     /// triage predicates continue to see the truth.
+    /// Minor-pause release work: drain the nursery (pending blocks) and
+    /// schedule the census as PARALLEL packets in the open Release bucket.
+    /// The census is the only minor-pause work that scales with nursery
+    /// size, it parallelizes perfectly (independent blocks), and it has
+    /// worker-side cache affinity (the trace workers wrote the marks it
+    /// reads) -- measured: serial-in-pause cost ~0.35ms/pause and
+    /// claim-time (mutator) cost ~2x that in cross-CCX metadata fills.
     pub(crate) fn sweep_nursery_blocks(&self) {
-        // DIAG (MMTK_NURSERY_NOSWEEP): trace-only minors -- promotion and
-        // remset behavior run, but nothing is reclaimed (blocks stay
-        // pending).  Discriminates "sweep freed live memory" from
-        // trace/metadata corruption.
-        {
-            static NOSWEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            if *NOSWEEP.get_or_init(|| std::env::var_os("MMTK_NURSERY_NOSWEEP").is_some()) {
-                return;
-            }
-        }
         let blocks: Vec<Block> = std::mem::take(&mut *self.pending_blocks.lock().unwrap());
+        self.nursery_lines_claimed
+            .store(0, std::sync::atomic::Ordering::Relaxed);
         if blocks.is_empty() {
             return;
         }
+        let space = unsafe { &*(self as *const Self) };
+        let chunk = (blocks.len() / 16).max(32);
+        let packets: Vec<Box<dyn GCWork<VM>>> = blocks
+            .chunks(chunk)
+            .map(|c| {
+                Box::new(CensusNurseryBlocks {
+                    space,
+                    blocks: c.to_vec(),
+                }) as _
+            })
+            .collect();
+        self.scheduler().work_buckets[WorkBucketStage::Release].bulk_add(packets);
+    }
+
+    /// LAZY NURSERY CENSUS (allocation-paid): classify up to `budget` blocks
+    /// from the last minor(s) by walking marked object starts and painting
+    /// their extents (see the span-aware liveness rationale below), rewrite
+    /// line marks to match, then release dead blocks and pool holed ones.
+    /// Sound whenever no marking is in flight: object marks are stable
+    /// between collections (minors only add marks; the census list is never
+    /// allocated into).  During a major's marking the InitialMark clear has
+    /// invalidated the old set, so defer (same idle-only guard as the major
+    /// triage); FinalMark re-proves these blocks and ages them into the
+    /// regular unswept pipeline instead.
+    pub fn nursery_census_some(&self, budget: usize) -> bool {
+        if !self
+            .nursery_unswept_nonempty
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return false;
+        }
+        // Idle-only: cur != unavail exactly while a major cycle is open.
+        let cur = self.line_mark_state.load(Ordering::Acquire);
+        let unavail = self.line_unavail_state.load(Ordering::Acquire);
+        if cur != unavail {
+            return false;
+        }
+        let blocks: Vec<Block> = {
+            let mut q = self.unswept_nursery.lock().unwrap();
+            let n = q.len().min(budget);
+            if n == 0 {
+                self.nursery_unswept_nonempty
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                return false;
+            }
+            let at = q.len() - n;
+            let taken = q.split_off(at);
+            if q.is_empty() {
+                self.nursery_unswept_nonempty
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+            taken
+        };
+        self.census_nursery_blocks(blocks);
+        true
+    }
+
+    fn census_nursery_blocks(&self, blocks: Vec<Block>) {
         let state = self.line_mark_state.load(Ordering::Acquire);
         let mark = VM::VMObjectModel::LOCAL_MARK_BIT_SPEC.extract_side_spec();
         let mut dead: Vec<Block> = Vec::new();
@@ -1048,8 +1121,10 @@ impl<VM: VMBinding> ImmixSpace<VM> {
             // marking (no allocate-black saturation -- pending drains at
             // FinalMark and minors are forbidden while marking), so bits
             // come only from tracing or old-mark persistence.
+            let mut any_live = false;
             let mut live = [false; Block::LINES];
             mark.scan_non_zero_values::<u8>(block.start(), block.end(), &mut |addr| {
+                any_live = true;
                 let Some(obj) = ObjectReference::from_raw_address(addr) else {
                     return;
                 };
@@ -1076,6 +1151,16 @@ impl<VM: VMBinding> ImmixSpace<VM> {
                     *slot = true;
                 }
             });
+            // Fast path for the dominant case: a fully dead block needs no
+            // per-line bookkeeping -- clear its line marks in one metadata
+            // bzero and release it.
+            if !any_live {
+                Line::MARK_TABLE.bzero_metadata(block.start(), Block::BYTES);
+                freed_lines += Block::LINES;
+                block.deinit();
+                dead.push(block);
+                continue;
+            }
             let mut live_lines: usize = 0;
             for (i, line) in block.lines().enumerate() {
                 if live[i] {
@@ -1101,28 +1186,19 @@ impl<VM: VMBinding> ImmixSpace<VM> {
                 live_blocks += 1;
             }
         }
-        // DIAG (MMTK_NURSERY_TRACE): per-minor ledger -- where did the
-        // claimed capacity go?
+        // DIAG (MMTK_NURSERY_TRACE): per-census ledger.
         {
             static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
             if *TRACE.get_or_init(|| std::env::var_os("MMTK_NURSERY_TRACE").is_some()) {
-                let claimed = self
-                    .nursery_lines_claimed
-                    .load(std::sync::atomic::Ordering::Relaxed);
                 eprintln!(
-                    "[nursery] claimed_lines={} ({:.1}MB) blocks={} dead={} kept={} freed_lines={} live_lines={}",
-                    claimed,
-                    claimed as f64 * 256.0 / 1048576.0,
+                    "[nursery-census] blocks={} dead={} kept={} freed_lines={}",
                     dead.len() + live_blocks,
                     dead.len(),
                     live_blocks,
                     freed_lines,
-                    (dead.len() + live_blocks) * Block::LINES - freed_lines,
                 );
             }
         }
-        self.nursery_lines_claimed
-            .store(0, Ordering::Relaxed);
         crate::diag::NURSERY_SWEPT_BLOCKS.fetch_add(dead.len(), Ordering::Relaxed);
         crate::diag::NURSERY_KEPT_BLOCKS.fetch_add(live_blocks, Ordering::Relaxed);
         crate::diag::NURSERY_FREED_LINES.fetch_add(freed_lines, Ordering::Relaxed);
@@ -1652,6 +1728,19 @@ impl Drop for SweepTimer {
 /// `PrepareBlockState::reset_object_mark` used to do inside the InitialMark
 /// pause).  Runs concurrently after FinalMark; mark bits are unread between
 /// cycles and mutators never write them.
+/// In-pause parallel nursery census (see `sweep_nursery_blocks`).
+struct CensusNurseryBlocks<VM: VMBinding> {
+    space: &'static ImmixSpace<VM>,
+    blocks: Vec<Block>,
+}
+
+impl<VM: VMBinding> GCWork<VM> for CensusNurseryBlocks<VM> {
+    fn do_work(&mut self, _worker: &mut GCWorker<VM>, _mmtk: &'static MMTK<VM>) {
+        self.space
+            .census_nursery_blocks(std::mem::take(&mut self.blocks));
+    }
+}
+
 struct ClearChunkMarks<VM: VMBinding> {
     chunk: Chunk,
     _p: std::marker::PhantomData<VM>,
