@@ -698,15 +698,33 @@ impl<VM: VMBinding> ConcurrentImmix<VM> {
         scheduler.work_buckets[WorkBucketStage::FinalizableForwarding].set_enabled(false);
         scheduler.work_buckets[WorkBucketStage::Compact].set_enabled(false);
 
-        // CLAIM-TIME ZEROING IS LOAD-BEARING (measured both ways): it is the
-        // mutator-side warm-up pass -- the dense zero stream takes the
-        // reuse-distance misses with deep MLP, so the subsequent scattered
-        // object writes hit L1/L2 (the analog of stock's sweep writing
-        // freelist links through dead objects, at the same bandwidth).
-        // Removing it (zeroed=false) regressed wall 1.09-1.15s -> 1.51-1.58s
-        // even though the memset was the top demand-L3-fill site.
-        // MMTK_ZERO_MODE=off selects the dirty-handover variant for A/B.
-        let zeroed = std::env::var("MMTK_ZERO_MODE").map_or(true, |v| v != "off" && v != "0");
+        // CLAIM-TIME ZEROING FOLLOWS THE NURSERY SCALE (measured at both
+        // operating points).  At cache-scale rotations (<= ~16 MB) the zero
+        // is the load-bearing warm-up: its dense stream takes the L3-tier
+        // reuse misses with deep MLP and the scattered object writes then
+        // hit L1/L2; removing it there costs 10-35% wall.  At DRAM-scale
+        // rotations the same burst outruns the L2 stream prefetcher and eats
+        // unhidden DRAM latency; DIRTY handover wins there (1.25 -> 1.13s at
+        // 48 MB), because Julia's own paced allocation writes become the
+        // first touch and the prefetcher stays ahead of them -- stock's
+        // sweep-at-adoption mechanism, reproduced (fill profiles match
+        // stock's: demand-DRAM/L3 parity, L2-fill streaming signature).
+        // MMTK_ZERO_MODE={on,off,warm} overrides the automatic choice.
+        let zeroed = match std::env::var("MMTK_ZERO_MODE") {
+            Ok(v) if v == "off" || v == "0" => false,
+            Ok(_) => true,
+            Err(_) => {
+                // Boot-time nursery estimate: the trigger's threshold with
+                // live=0 (min of the configured nursery and total/6).
+                let total_pages = plan_args
+                    .global_args
+                    .gc_trigger
+                    .policy
+                    .get_current_heap_size_in_pages();
+                let boot_nursery = Self::nursery_threshold_pages().min(total_pages / 6);
+                boot_nursery <= 4096 // 16 MB
+            }
+        };
 
         ConcurrentImmix {
             immix_space: ImmixSpace::new(
@@ -763,10 +781,12 @@ impl<VM: VMBinding> ConcurrentImmix<VM> {
     }
 
     /// GENERATIONAL: nursery threshold that triggers a minor collection, in
-    /// pages.  Default 8 MB, from the size sweep on the allocation
-    /// benchmark (8G heap): 8 MB gave both the best wall (1.08s vs 1.20s
-    /// at 32 MB, 1.25s at 4 MB) and the best pauses (mean 0.21 ms) -- the
-    /// warm-reuse loop stays cache-tier.  Overridable via MMTK_NURSERY_MB;
+    /// pages.  Default 32 MB with dirty handover -- the measured optimum of
+    /// the (nursery size x zero mode) surface: wall 1.06s at ~75ms/pass
+    /// stall on the allocation benchmark, vs 1.08s at 172ms for the old
+    /// 8 MB+memset point.  Small heaps bind on the total/6 cap and land at
+    /// cache-scale nurseries with warm-up zeroing instead (see the zeroed
+    /// selection in the constructor).  Overridable via MMTK_NURSERY_MB;
     /// MMTK_NURSERY_MB=0 disables minors entirely (majors-only, for A/B).
     fn nursery_threshold_pages() -> usize {
         static PAGES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -774,7 +794,7 @@ impl<VM: VMBinding> ConcurrentImmix<VM> {
             let mb = std::env::var("MMTK_NURSERY_MB")
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(8);
+                .unwrap_or(32);
             mb << (20 - 12)
         })
     }
