@@ -297,6 +297,12 @@ static inline void malloc_maybe_collect(jl_ptls_t ptls, size_t sz)
     if (ptls->gc_tls.malloc_sz_since_last_poll > (1 << 20)) {
         jl_atomic_store_relaxed(&ptls->gc_tls.malloc_sz_since_last_poll, 0);
         mmtk_gc_poll(ptls);
+        // See bump_alloc_fast: the poll sites stand in for stock's
+        // maybe_collect as the finalizer-running points; malloc-only
+        // phases may not touch the pool refill path for a long time.
+        if (__unlikely(jl_atomic_load_relaxed(&jl_gc_have_pending_finalizers))) {
+            jl_gc_run_pending_finalizers(NULL);
+        }
     } else {
         size_t curr = jl_atomic_load_relaxed(&ptls->gc_tls.malloc_sz_since_last_poll);
         jl_atomic_store_relaxed(&ptls->gc_tls.malloc_sz_since_last_poll, curr + sz);
@@ -1067,6 +1073,18 @@ STATIC_INLINE void* bump_alloc_fast(MMTkMutatorContext* mutator, uintptr_t* curs
     uintptr_t result = *cursor + (uintptr_t)delta;
 
     if (__unlikely(result + size > limit)) {
+        // Drain pending finalizers before refilling.  With the concurrent
+        // request-and-continue trigger no mutator blocks in
+        // jl_gc_prepare_to_collect for automatic collections, so this and
+        // the malloc poll are the only points that run what the pauses
+        // queue (stock runs finalizers at these same alloc sites, via
+        // maybe_collect's inline collection).  Must precede mmtk_alloc:
+        // afterwards we would hold a type-tag-less object across arbitrary
+        // finalizer code.  jl_gc_run_pending_finalizers guards against
+        // reentrancy, held locks, and inhibited states itself.
+        if (__unlikely(jl_atomic_load_relaxed(&jl_gc_have_pending_finalizers))) {
+            jl_gc_run_pending_finalizers(NULL);
+        }
         return (void*) mmtk_alloc(mutator, size, align, offset, allocator);
     } else{
         *cursor = result + size;

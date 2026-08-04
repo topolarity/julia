@@ -23,6 +23,12 @@ pub const GC_FIN_COBJ_TAG: usize = 0x2;
 /// All bits used to tag finalizer list entries.
 pub const GC_FIN_TAG_MASK: usize = GC_FIN_CFUNC_TAG | GC_FIN_COBJ_TAG;
 
+/// Diagnostic (MMTK_FIN_STATS=1): per-pause finalizer-sweep accounting.
+fn fin_stats_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("MMTK_FIN_STATS").is_some())
+}
+
 /// This is a Rust implementation of finalizer scanning in _jl_gc_collect() in gc.c
 pub fn scan_finalizers_in_rust<T: ObjectTracer>(tracer: &mut T) {
     use crate::mmtk::vm::ActivePlan;
@@ -32,6 +38,17 @@ pub fn scan_finalizers_in_rust<T: ObjectTracer>(tracer: &mut T) {
 
     // Current length of marked list: we only need to trace objects after this length if this is a nursery GC.
     let mut orig_marked_len = marked_finalizers_list.len;
+
+    let stats = fin_stats_enabled();
+    let (tl_before, tf_before, marked_before) = if stats {
+        let mut tl = 0;
+        for mutator in <JuliaVM as VMBinding>::VMActivePlan::mutators() {
+            tl += ArrayListT::thread_local_finalizer_list(mutator).len;
+        }
+        (tl, to_finalize.len, marked_finalizers_list.len)
+    } else {
+        (0, 0, 0)
+    };
 
     // Sweep thread local list: if they are not alive, move to to_finalize.
     for mutator in <JuliaVM as VMBinding>::VMActivePlan::mutators() {
@@ -44,8 +61,19 @@ pub fn scan_finalizers_in_rust<T: ObjectTracer>(tracer: &mut T) {
         );
     }
 
+    let (tl_after_sweep, marked_after_tl) = if stats {
+        let mut tl = 0;
+        for mutator in <JuliaVM as VMBinding>::VMActivePlan::mutators() {
+            tl += ArrayListT::thread_local_finalizer_list(mutator).len;
+        }
+        (tl, marked_finalizers_list.len)
+    } else {
+        (0, 0)
+    };
+
     // If this is a full heap GC, we also sweep marked list.
-    if !crate::collection::is_current_gc_nursery() {
+    let nursery = crate::collection::is_current_gc_nursery();
+    if !nursery {
         sweep_finalizer_list(
             marked_finalizers_list,
             to_finalize,
@@ -53,6 +81,21 @@ pub fn scan_finalizers_in_rust<T: ObjectTracer>(tracer: &mut T) {
             jl_gc_have_pending_finalizers,
         );
         orig_marked_len = 0;
+    }
+
+    if stats {
+        eprintln!(
+            "FINSTAT kind={} tl={}->{} migrated={} marked={}->{} freed={} tf={}->{}",
+            if nursery { "minor" } else { "major" },
+            tl_before / 2,
+            tl_after_sweep / 2,
+            (marked_after_tl - marked_before) / 2,
+            marked_after_tl / 2,
+            marked_finalizers_list.len / 2,
+            (to_finalize.len - tf_before) / 2,
+            tf_before / 2,
+            to_finalize.len / 2,
+        );
     }
 
     // Go through thread local list again and trace objects
