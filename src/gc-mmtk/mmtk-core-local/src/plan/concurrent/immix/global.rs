@@ -27,6 +27,7 @@ use crate::util::heap::VMRequest;
 use crate::util::metadata::log_bit::UnlogBitsOperation;
 use crate::util::metadata::side_metadata::SideMetadataContext;
 use crate::vm::ObjectModel;
+use crate::vm::Collection;
 use crate::vm::VMBinding;
 use crate::util::ObjectReference;
 use crate::{policy::immix::ImmixSpace, util::opaque_pointer::VMWorkerThread};
@@ -71,6 +72,19 @@ pub struct ConcurrentImmix<VM: VMBinding> {
     /// `schedule_collection`; a major request wins over a minor one.
     minor_due: AtomicBool,
     major_due: AtomicBool,
+    /// EXTERNAL-QUANTA PRESSURE: snapshots of counted-malloc (vm_live_bytes)
+    /// and LOS reserved pages at the last collection.  The nursery trigger
+    /// only counted immix claimed lines, so workloads whose allocation is
+    /// dominated by malloc'd memory (BigInt limbs via counted_malloc) or
+    /// large objects never fired minors: reclamation became major-only,
+    /// majors are paced by heap size, heap size includes the unreclaimed
+    /// float -- a feedback loop that grew the heap without bound
+    /// (pidigits: RSS past 80 GB).  Growth since these snapshots now counts
+    /// toward the nursery threshold, so external pressure drives frequent
+    /// cheap minors (whose finalizer sweep is what frees malloc'd memory),
+    /// matching the stock GC's malloc-driven young-collection cadence.
+    malloc_pages_at_last_gc: std::sync::atomic::AtomicUsize,
+    los_pages_at_last_gc: std::sync::atomic::AtomicUsize,
 }
 
 /// The plan constraints for the concurrent immix plan.
@@ -105,6 +119,39 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
         // satisfied from the guaranteed headroom and the mutator is stopped
         // later by the pause safepoint, paying only the true pause.
         let marking = self.concurrent_marking_in_progress();
+        // MINOR TRIGGER -- checked FIRST on advisory polls.  It must not sit
+        // behind the base heap-full branch: a heap running over its goal
+        // (large malloc/LOS float) takes that branch on every poll and its
+        // backlog-suppress path returns early, which starved minors exactly
+        // when external pressure made them most necessary (pidigits: one
+        // minor in 45s, reclamation went major-only, the float fed back
+        // into the goal).  Real walls (space_full) still take the blocking
+        // paths below.
+        if !space_full && !marking && Self::nursery_threshold_pages() != 0 {
+            let total = self.get_total_pages();
+            let live = self.immix_space.live_prev_pages();
+            let scaled = total.saturating_sub(live) / 6;
+            let threshold = Self::nursery_threshold_pages()
+                .min(scaled)
+                .max(1024 /* 4 MB floor */);
+            // External quanta count toward the nursery: counted-malloc
+            // growth (net vm_live_bytes since the last collection) and LOS
+            // growth.  See the snapshot fields for the rationale.
+            let malloc_pages = crate::util::conversions::bytes_to_pages_up(
+                <VM as VMBinding>::VMCollection::vm_live_bytes(),
+            )
+            .saturating_sub(self.malloc_pages_at_last_gc.load(Ordering::Relaxed));
+            let los_pages = self
+                .common
+                .get_los()
+                .reserved_pages()
+                .saturating_sub(self.los_pages_at_last_gc.load(Ordering::Relaxed));
+            if self.immix_space.nursery_claimed_pages() + malloc_pages + los_pages >= threshold {
+                self.minor_due.store(true, Ordering::Release);
+                self.base().gc_trigger.request();
+                return false;
+            }
+        }
         if self.base().collection_required(self, space_full) {
             // FIX C: a running cycle is never abandoned -- hasten FinalMark.
             if marking {
@@ -188,18 +235,6 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
             }
         }
 
-        if Self::nursery_threshold_pages() != 0 {
-            let live = self.immix_space.live_prev_pages();
-            let scaled = total.saturating_sub(live) / 6;
-            let threshold = Self::nursery_threshold_pages()
-                .min(scaled)
-                .max(1024 /* 4 MB floor */);
-            if self.immix_space.nursery_claimed_pages() >= threshold {
-                self.minor_due.store(true, Ordering::Release);
-                self.base().gc_trigger.request();
-                return false;
-            }
-        }
 
         // PACING TRIGGER (Go-pacer style): the trigger policy publishes how
         // many pages of allocation a full concurrent cycle must ride out
@@ -474,6 +509,16 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
                 bucket.add_boxed_no_notify(p);
             }
         }
+        self.malloc_pages_at_last_gc.store(
+            crate::util::conversions::bytes_to_pages_up(
+                <VM as VMBinding>::VMCollection::vm_live_bytes(),
+            ),
+            Ordering::Relaxed,
+        );
+        self.los_pages_at_last_gc.store(
+            self.common.get_los().reserved_pages(),
+            Ordering::Relaxed,
+        );
         self.previous_pause.store(Some(pause), Ordering::SeqCst);
         self.current_pause.store(None, Ordering::SeqCst);
         // FIX C: clear unconditionally.  The flag used to be kept across a `FinalMark` so that a
@@ -756,6 +801,8 @@ impl<VM: VMBinding> ConcurrentImmix<VM> {
             remset: std::sync::Mutex::new(Vec::new()),
             minor_due: AtomicBool::new(false),
             major_due: AtomicBool::new(false),
+            malloc_pages_at_last_gc: std::sync::atomic::AtomicUsize::new(0),
+            los_pages_at_last_gc: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 

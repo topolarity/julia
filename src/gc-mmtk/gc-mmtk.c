@@ -289,7 +289,12 @@ static inline void malloc_maybe_collect(jl_ptls_t ptls, size_t sz)
     // We do not need to carefully maintain malloc_sz_since_last_poll. We just need to
     // avoid using mmtk_gc_poll too frequently, and try to be precise on our heap usage
     // as much as we can.
-    if (ptls->gc_tls.malloc_sz_since_last_poll > 4096) {
+    // Poll once per MB of malloc'd bytes, not per 4 KB: the poll runs the
+    // full trigger chain (space walks, list mutexes), and malloc-heavy
+    // workloads (BigInt limbs) were paying ~375k polls/s -- a 10x mutator
+    // slowdown on pidigits.  1 MB granularity still polls ~64x per default
+    // nursery threshold.
+    if (ptls->gc_tls.malloc_sz_since_last_poll > (1 << 20)) {
         jl_atomic_store_relaxed(&ptls->gc_tls.malloc_sz_since_last_poll, 0);
         mmtk_gc_poll(ptls);
     } else {
@@ -1267,8 +1272,14 @@ JL_DLLEXPORT void *jl_gc_counted_realloc_with_old_size(void *p, size_t old, size
     if (pgcstack && ct->world_age) {
         jl_ptls_t ptls = ct->ptls;
         malloc_maybe_collect(ptls, sz);
+        // Shrinking reallocs must SUBTRACT: both branches previously added
+        // |sz-old|, so realloc-churn workloads (in-place BigInt arithmetic)
+        // inflated the counter monotonically -- and this counter is the
+        // pacer's vm_live_bytes, so reserved pages and the heap target
+        // ratcheted upward without bound (pidigits: heap_size grew past
+        // 80 GB, collection intervals stretched, never terminated).
         if (sz < old)
-            jl_atomic_fetch_add_relaxed(&JULIA_MALLOC_BYTES, old - sz);
+            jl_atomic_fetch_add_relaxed(&JULIA_MALLOC_BYTES, -(old - sz));
         else
             jl_atomic_fetch_add_relaxed(&JULIA_MALLOC_BYTES, sz - old);
     }
