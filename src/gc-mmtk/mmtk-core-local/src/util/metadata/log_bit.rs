@@ -30,7 +30,17 @@ impl VMGlobalLogBitSpec {
             // know we are setting log bit for mature space, and every object in the space should have log
             // bit as 1.
             MetadataSpec::OnSide(spec) => unsafe {
-                spec.set_raw_byte_atomic(object.to_raw_address(), order)
+                // Test before storing: the byte covers 8 objects, so
+                // consecutive small objects redundantly re-arm the same
+                // byte, and re-traced mature objects are already 0xff.  The
+                // unconditional cold store was the dominant full-trace cost:
+                // the next object's mark CAS (a locked op) drains the store
+                // buffer and absorbs this store's RFO miss latency
+                // (~42 cycles/object on many_refs; profile-invisible
+                // because the stall lands on the CAS).
+                if spec.load_raw_byte(object.to_raw_address()) != 0xff {
+                    spec.set_raw_byte_atomic(object.to_raw_address(), order)
+                }
             },
         }
     }
