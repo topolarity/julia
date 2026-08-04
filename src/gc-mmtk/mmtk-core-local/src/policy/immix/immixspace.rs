@@ -1047,6 +1047,19 @@ impl<VM: VMBinding> ImmixSpace<VM> {
         if blocks.is_empty() {
             return;
         }
+        // MMTK_LAZY_NURSERY=1: skip the in-pause census entirely; blocks are
+        // classified at claim time (`nursery_census_some`, with the all-dead
+        // fast path).  A/B knob for the pause-floor experiment.
+        {
+            static LAZY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *LAZY.get_or_init(|| std::env::var_os("MMTK_LAZY_NURSERY").is_some()) {
+                let mut q = self.unswept_nursery.lock().unwrap();
+                q.extend(blocks);
+                self.nursery_unswept_nonempty
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                return;
+            }
+        }
         let space = unsafe { &*(self as *const Self) };
         let chunk = (blocks.len() / 16).max(32);
         let packets: Vec<Box<dyn GCWork<VM>>> = blocks
