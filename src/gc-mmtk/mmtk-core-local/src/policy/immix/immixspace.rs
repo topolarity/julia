@@ -74,6 +74,11 @@ pub struct ImmixSpace<VM: VMBinding> {
     /// Snapshot of `live_bytes` at the last FinalMark.
     live_bytes_prev: std::sync::atomic::AtomicUsize,
     pending_blocks: std::sync::Mutex<Vec<Block>>,
+    /// NURSERY ACCOUNTING: free lines handed to allocators since the last
+    /// collection.  This is the real nursery size for the minor trigger:
+    /// counting whole pending blocks over-fires ~3x, because a pool re-pop
+    /// of a holed block counts 32KB while offering only its free lines.
+    nursery_lines_claimed: std::sync::atomic::AtomicUsize,
     full_blocks: std::sync::Mutex<Vec<Block>>,
     /// Object mark state
     mark_state: u8,
@@ -401,6 +406,7 @@ impl<VM: VMBinding> ImmixSpace<VM> {
             live_bytes: std::sync::atomic::AtomicUsize::new(0),
             live_bytes_prev: std::sync::atomic::AtomicUsize::new(0),
             pending_blocks: std::sync::Mutex::new(Vec::new()),
+            nursery_lines_claimed: std::sync::atomic::AtomicUsize::new(0),
             full_blocks: std::sync::Mutex::new(Vec::new()),
             reusable_blocks: ReusableBlockPool::new(scheduler.num_workers()),
             defrag: Defrag::default(),
@@ -638,6 +644,8 @@ impl<VM: VMBinding> ImmixSpace<VM> {
             }
             young.append(&mut self.full_blocks.lock().unwrap());
             drop(young);
+            self.nursery_lines_claimed
+                .store(0, Ordering::Relaxed);
             // Release is fully deferred (float-budget trigger keeps the
             // reserved-pages signal irrelevant); the aged generation is
             // drained by allocation-time triage and the drain-before-OOM loop.
@@ -923,6 +931,8 @@ impl<VM: VMBinding> ImmixSpace<VM> {
         self.chunk_map.set_allocated(block.chunk(), true);
         self.lines_consumed
             .fetch_add(Block::LINES, Ordering::SeqCst);
+        self.nursery_lines_claimed
+            .fetch_add(Block::LINES, Ordering::Relaxed);
         Some(block)
     }
 
@@ -1077,12 +1087,42 @@ impl<VM: VMBinding> ImmixSpace<VM> {
                 live_blocks += 1;
             }
         }
+        // DIAG (MMTK_NURSERY_TRACE): per-minor ledger -- where did the
+        // claimed capacity go?
+        {
+            static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *TRACE.get_or_init(|| std::env::var_os("MMTK_NURSERY_TRACE").is_some()) {
+                let claimed = self
+                    .nursery_lines_claimed
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                eprintln!(
+                    "[nursery] claimed_lines={} ({:.1}MB) blocks={} dead={} kept={} freed_lines={} live_lines={}",
+                    claimed,
+                    claimed as f64 * 256.0 / 1048576.0,
+                    dead.len() + live_blocks,
+                    dead.len(),
+                    live_blocks,
+                    freed_lines,
+                    (dead.len() + live_blocks) * Block::LINES - freed_lines,
+                );
+            }
+        }
+        self.nursery_lines_claimed
+            .store(0, Ordering::Relaxed);
         crate::diag::NURSERY_SWEPT_BLOCKS.fetch_add(dead.len(), Ordering::Relaxed);
         crate::diag::NURSERY_KEPT_BLOCKS.fetch_add(live_blocks, Ordering::Relaxed);
         crate::diag::NURSERY_FREED_LINES.fetch_add(freed_lines, Ordering::Relaxed);
         if !dead.is_empty() {
             self.pr.release_blocks_batch(&dead);
         }
+    }
+
+    /// Real nursery size in pages: free lines handed to allocators since
+    /// the last collection (see `nursery_lines_claimed`).
+    pub fn nursery_claimed_pages(&self) -> usize {
+        self.nursery_lines_claimed
+            .load(std::sync::atomic::Ordering::Relaxed)
+            / (4096 / Line::BYTES)
     }
 
     /// Bytes promoted by minors since the last major: `live_bytes` counts
@@ -1195,6 +1235,8 @@ impl<VM: VMBinding> ImmixSpace<VM> {
                 _ => unreachable!("{:?} {:?}", block, block.get_state()),
             };
             self.lines_consumed.fetch_add(lines_delta, Ordering::SeqCst);
+            self.nursery_lines_claimed
+                .fetch_add(lines_delta, Ordering::Relaxed);
 
             block.init(copy);
             crate::diag::POOL_POPS.fetch_add(1, Ordering::SeqCst);

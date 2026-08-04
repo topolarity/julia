@@ -194,7 +194,7 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
             let threshold = Self::nursery_threshold_pages()
                 .min(scaled)
                 .max(1024 /* 4 MB floor */);
-            if self.immix_space.float_pages() >= threshold {
+            if self.immix_space.nursery_claimed_pages() >= threshold {
                 self.minor_due.store(true, Ordering::Release);
                 self.base().gc_trigger.request();
                 return false;
