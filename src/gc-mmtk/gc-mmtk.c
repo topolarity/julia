@@ -1127,8 +1127,15 @@ JL_DLLEXPORT jl_value_t *jl_mmtk_gc_alloc_default(jl_ptls_t ptls, int osize, siz
         mmtk_immix_post_alloc_fast(&ptls->gc_tls.mmtk_mutator, v, LLT_ALIGN(osize+sizeof(jl_taggedvalue_t), align));
     }
 
-    ptls->gc_tls_common.gc_num.allocd += osize;
-    ptls->gc_tls_common.gc_num.poolalloc++;
+    // Relaxed accounting (stock parity): these are single-writer per-thread
+    // counters, but the fields are _Atomic, so a bare += compiles to a
+    // seq-cst LOCK RMW -- two of them on every pool allocation were ~15 of
+    // the mutator's extra uops/alloc and a large share of its backend
+    // stalls (found by IBS annotate: `lock add`/`lock incq` hotspots).
+    jl_atomic_store_relaxed(&ptls->gc_tls_common.gc_num.allocd,
+        jl_atomic_load_relaxed(&ptls->gc_tls_common.gc_num.allocd) + osize);
+    jl_atomic_store_relaxed(&ptls->gc_tls_common.gc_num.poolalloc,
+        jl_atomic_load_relaxed(&ptls->gc_tls_common.gc_num.poolalloc) + 1);
 
     return v;
 }
@@ -1156,8 +1163,11 @@ JL_DLLEXPORT jl_value_t *jl_mmtk_gc_alloc_big(jl_ptls_t ptls, size_t sz)
     }
     v->sz = allocsz;
 
-    ptls->gc_tls_common.gc_num.allocd += allocsz;
-    ptls->gc_tls_common.gc_num.bigalloc++;
+    // Relaxed accounting; see jl_mmtk_gc_alloc_default.
+    jl_atomic_store_relaxed(&ptls->gc_tls_common.gc_num.allocd,
+        jl_atomic_load_relaxed(&ptls->gc_tls_common.gc_num.allocd) + allocsz);
+    jl_atomic_store_relaxed(&ptls->gc_tls_common.gc_num.bigalloc,
+        jl_atomic_load_relaxed(&ptls->gc_tls_common.gc_num.bigalloc) + 1);
 
     jl_value_t *result = jl_valueof(&v->header);
     mmtk_post_alloc(&ptls->gc_tls.mmtk_mutator, result, allocsz, 2);
