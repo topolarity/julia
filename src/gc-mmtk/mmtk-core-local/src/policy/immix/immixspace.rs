@@ -71,6 +71,10 @@ pub struct ImmixSpace<VM: VMBinding> {
     deferred_post_pause_packets: std::sync::Mutex<Vec<Box<dyn GCWork<VM>>>>,
     /// PATH 2: bytes of objects marked this cycle (Go's `heapMarked`).
     live_bytes: std::sync::atomic::AtomicUsize,
+    /// CONCURRENT FINALIZER SWEEP: while set, lazy triage must not hand out
+    /// lines freed by the pause that set it -- the deferred finalizer sweep
+    /// still reads (and may resurrect) dead objects in them.
+    pub(crate) finalizer_reclaim_gate: std::sync::atomic::AtomicBool,
     /// Snapshot of `live_bytes` at the last FinalMark.
     live_bytes_prev: std::sync::atomic::AtomicUsize,
     pending_blocks: std::sync::Mutex<Vec<Block>>,
@@ -418,6 +422,7 @@ impl<VM: VMBinding> ImmixSpace<VM> {
             unswept_young: std::sync::Mutex::new(Vec::new()),
             deferred_post_pause_packets: std::sync::Mutex::new(Vec::new()),
             live_bytes: std::sync::atomic::AtomicUsize::new(0),
+            finalizer_reclaim_gate: std::sync::atomic::AtomicBool::new(false),
             live_bytes_prev: std::sync::atomic::AtomicUsize::new(0),
             pending_blocks: std::sync::Mutex::new(Vec::new()),
             unswept_nonempty: std::sync::atomic::AtomicBool::new(false),
@@ -1051,8 +1056,18 @@ impl<VM: VMBinding> ImmixSpace<VM> {
         // classified at claim time (`nursery_census_some`, with the all-dead
         // fast path).  A/B knob for the pause-floor experiment.
         {
+            // CONCURRENT FINALIZER SWEEP: the in-pause census bzeroes and
+            // releases all-dead blocks, but the deferred sweep may still
+            // read (and resurrect) dead objects in them.  While the gate is
+            // up, divert everything to the lazy path, whose entry points
+            // honor the gate.
+            let finalizer_gated = self
+                .finalizer_reclaim_gate
+                .load(std::sync::atomic::Ordering::SeqCst);
             static LAZY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            if *LAZY.get_or_init(|| std::env::var_os("MMTK_LAZY_NURSERY").is_some()) {
+            if finalizer_gated
+                || *LAZY.get_or_init(|| std::env::var_os("MMTK_LAZY_NURSERY").is_some())
+            {
                 let mut q = self.unswept_nursery.lock().unwrap();
                 q.extend(blocks);
                 self.nursery_unswept_nonempty
@@ -1088,7 +1103,24 @@ impl<VM: VMBinding> ImmixSpace<VM> {
     /// invalidated the old set, so defer (same idle-only guard as the major
     /// triage); FinalMark re-proves these blocks and ages them into the
     /// regular unswept pipeline instead.
+    /// Mark an object reached by the deferred finalizer sweep so lazy reuse
+    /// keeps it (see `ConcurrentPlan::finalizer_resurrect_object`).  Returns
+    /// whether the object was newly marked.
+    pub(crate) fn resurrect_object(&self, object: ObjectReference) -> bool {
+        if self.attempt_mark(object, self.mark_state) {
+            self.mark_lines(object);
+            return true;
+        }
+        false
+    }
+
     pub fn nursery_census_some(&self, budget: usize) -> bool {
+        if self
+            .finalizer_reclaim_gate
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return false;
+        }
         if !self
             .nursery_unswept_nonempty
             .load(std::sync::atomic::Ordering::Relaxed)
@@ -1218,6 +1250,12 @@ impl<VM: VMBinding> ImmixSpace<VM> {
     }
 
     pub fn lazy_triage_some(&self, budget: usize) -> bool {
+        if self
+            .finalizer_reclaim_gate
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return false;
+        }
         if !self.unswept_nonempty.load(Ordering::Relaxed) {
             return false;
         }

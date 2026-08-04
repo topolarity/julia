@@ -428,7 +428,15 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
                 // feeds them straight back to the allocator (the warm-reuse
                 // locality mechanism).  LOS sweeps its logical nursery.
                 self.immix_space.sweep_nursery_blocks();
-                self.common.los.release(false);
+                // If the finalizer sweep was deferred (gate up), the packet
+                // performs the LOS release; otherwise do it here as before.
+                if !self
+                    .immix_space
+                    .finalizer_reclaim_gate
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    self.common.los.release(false);
+                }
             }
             Pause::Full | Pause::FinalMark => {
                 self.immix_space.release(
@@ -448,7 +456,18 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
                     pause == Pause::FinalMark || pause == Pause::Full,
                 );
 
-                self.common.release(tls, true);
+                // If the finalizer sweep was deferred (gate up), dead LOS
+                // objects must stay intact until classified/resurrected --
+                // the packet performs the LOS release.
+                if self
+                    .immix_space
+                    .finalizer_reclaim_gate
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    self.common.release_defer_los(tls, true);
+                } else {
+                    self.common.release(tls, true);
+                }
 
                 // Re-arm the common spaces (sysimage immortal, LOS) the same
                 // way, after every major collection.
@@ -701,7 +720,7 @@ impl<VM: VMBinding> crate::plan::generational::global::GenerationalPlanExt<VM>
             return self.immix_space.trace_object_without_moving(queue, object);
         }
 
-        if self.common.get_los().in_space(object) {
+        if self.common.los.in_space(object) {
             return self.common.get_los().trace_object::<Q>(queue, object);
         }
 
@@ -954,6 +973,44 @@ impl<VM: VMBinding> ConcurrentImmix<VM> {
 impl<VM: VMBinding> ConcurrentPlan for ConcurrentImmix<VM> {
     fn current_pause(&self) -> Option<Pause> {
         self.current_pause.load(Ordering::SeqCst)
+    }
+
+    fn finalizer_defer_packet(&self, w: Box<dyn crate::scheduler::GCWork<VM>>) {
+        self.immix_space
+            .finalizer_reclaim_gate
+            .store(true, Ordering::SeqCst);
+        self.immix_space.defer_post_pause_packet(w);
+    }
+
+    fn finalizer_resurrect_object(&self, object: crate::util::ObjectReference) -> bool {
+        if self.immix_space.in_space(object) {
+            return self.immix_space.resurrect_object(object);
+        }
+        if self.common.los.in_space(object) {
+            if crate::memory_manager::is_live_object(object) {
+                return false;
+            }
+            // Marks the object and moves it out of the treadmill set the
+            // deferred LOS release will sweep.
+            struct DiscardQueue;
+            impl crate::ObjectQueue for DiscardQueue {
+                fn enqueue(&mut self, _object: crate::util::ObjectReference) {}
+            }
+            self.common.los.trace_object(&mut DiscardQueue, object);
+            return true;
+        }
+        // Immortal/VM spaces are never reclaimed; stop the walk here.
+        false
+    }
+
+    fn finalizer_sweep_done(&self) {
+        self.immix_space
+            .finalizer_reclaim_gate
+            .store(false, Ordering::SeqCst);
+    }
+
+    fn current_collection_is_user_triggered(&self) -> bool {
+        self.base().global_state.is_user_triggered_collection()
     }
 
     fn concurrent_work_in_progress(&self) -> bool {

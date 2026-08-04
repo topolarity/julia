@@ -842,6 +842,16 @@ impl<VM: VMBinding> CommonPlan<VM> {
         self.base.release(tls, full_heap)
     }
 
+    /// CONCURRENT FINALIZER SWEEP: release with the LOS sweep left out.
+    /// Dead LOS objects must stay intact until the deferred finalizer sweep
+    /// has classified (and possibly resurrected) them; the sweep packet
+    /// performs the LOS release when it finishes.
+    pub fn release_defer_los(&mut self, tls: VMWorkerThread, full_heap: bool) {
+        self.immortal.release();
+        self.release_nonmoving_space(full_heap);
+        self.base.release(tls, full_heap)
+    }
+
     pub(crate) fn schedule_unlog_bits_op(&mut self, unlog_bits_op: UnlogBitsOperation) {
         if VM::VMObjectModel::GLOBAL_LOG_BIT_SPEC.is_on_side() {
             // # Safety: CommonPlan reference is always valid within this collection cycle.

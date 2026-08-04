@@ -367,6 +367,16 @@ impl<VM: VMBinding> ImmixAllocator<VM> {
         // the debt amortized, and all-dead chunks still make progress because
         // their blocks go to the page resource, satisfying the caller's
         // clean-block fallback.
+        // CONCURRENT FINALIZER SWEEP: while the gate is up, the reusable
+        // pool may contain lines freed by the pause that set it, which the
+        // deferred sweep may still resurrect.  Fall through to clean blocks.
+        if self
+            .immix_space()
+            .finalizer_reclaim_gate
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return false;
+        }
         let mut censused = false;
         let mut triaged = false;
         loop {

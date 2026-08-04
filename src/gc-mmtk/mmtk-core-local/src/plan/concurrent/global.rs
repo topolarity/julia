@@ -26,4 +26,34 @@ pub trait ConcurrentPlan: Plan {
     fn append_remset(&self, _buf: Vec<crate::util::ObjectReference>) {
         unimplemented!()
     }
+    /// CONCURRENT FINALIZER SWEEP: queue the deferred sweep packet for the
+    /// finalizer entries detached during this (major) pause, and gate lazy
+    /// line/block reuse until it completes.  The packet runs post-pause and
+    /// the scheduler's all-parked rendezvous guarantees completion before
+    /// the next pause, so the mark bits it classifies against stay stable.
+    fn finalizer_defer_packet(&self, _w: Box<dyn crate::scheduler::GCWork<Self::VM>>) {
+        unimplemented!()
+    }
+    /// Mark an object reached by the deferred finalizer sweep so reclamation
+    /// keeps it (immix: mark bit + line marks; LOS: mark + treadmill move).
+    /// Returns `true` if the object was newly marked (its children still
+    /// need the same treatment), `false` if it was already live or lives in
+    /// a space that is never reclaimed.
+    fn finalizer_resurrect_object(&self, _object: crate::util::ObjectReference) -> bool {
+        unimplemented!()
+    }
+    /// Deferred finalizer sweep finished: perform the deferred LOS release
+    /// and lift the lazy-reuse gate.
+    fn finalizer_sweep_done(&self) {
+        unimplemented!()
+    }
+    /// Whether the current collection was requested explicitly (GC.gc(),
+    /// including the exit-path full collections).  Those keep the
+    /// synchronous in-pause finalizer sweep: the exit path's
+    /// collect-sweep-run loop and prompt-finalization expectations after an
+    /// explicit collection both assume to_finalize is populated when the
+    /// pause returns.
+    fn current_collection_is_user_triggered(&self) -> bool {
+        unimplemented!()
+    }
 }

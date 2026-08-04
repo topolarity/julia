@@ -45,7 +45,8 @@ mod generational;
 mod sticky;
 
 mod compressor;
-mod concurrent;
+pub(crate) mod concurrent;
+pub use concurrent::global::ConcurrentPlan;
 mod immix;
 mod markcompact;
 mod marksweep;

@@ -1007,3 +1007,18 @@ pub fn add_work_packets<VM: VMBinding>(
 ) {
     mmtk.scheduler.work_buckets[bucket].bulk_add(packets)
 }
+
+/// CONCURRENT FINALIZER SWEEP: perform the major-collection LOS release
+/// that the pause deferred (see `CommonPlan::release_defer_los`).  Must be
+/// called exactly once by the deferred finalizer sweep packet, before it
+/// lifts the reclaim gate; the all-parked rendezvous guarantees no pause
+/// overlaps.  Safe off-pause: prepare already flipped the LOS mark state,
+/// so objects allocated during this window carry the new state and the
+/// sweep only frees old-state unmarked objects.
+pub fn concurrent_finalizer_los_release<VM: VMBinding>(mmtk: &'static MMTK<VM>, full: bool) {
+    use crate::plan::concurrent::immix::ConcurrentImmix;
+    let plan_mut = unsafe { mmtk.get_plan_mut() };
+    if let Some(concurrent_immix) = plan_mut.downcast_mut::<ConcurrentImmix<VM>>() {
+        concurrent_immix.common.los.release(full);
+    }
+}

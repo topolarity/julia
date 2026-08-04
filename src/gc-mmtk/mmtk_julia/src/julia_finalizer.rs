@@ -50,6 +50,65 @@ pub fn scan_finalizers_in_rust<T: ObjectTracer>(tracer: &mut T) {
         (0, 0, 0)
     };
 
+    // CONCURRENT FINALIZER SWEEP (majors): the classification of every
+    // registered entry scales with the number of live finalizers (BigInt
+    // workloads: millions), so like the memory sweep it runs off-pause.
+    // The pause does O(threads) work: steal the thread-local lists and the
+    // marked list wholesale and defer a sweep packet.  Nothing is traced
+    // in-pause; the packet marks everything it keeps (fins, resurrected
+    // dead objects, surviving to_finalize entries) against the stable
+    // post-trace mark bits, and reclamation of anything this cycle freed
+    // is gated (lazy immix reuse, deferred LOS release) until it is done.
+    #[cfg(feature = "concurrentimmix")]
+    {
+        use crate::mmtk::vm::ActivePlan;
+        if let Some(plan) = crate::SINGLETON
+            .get_plan()
+            .concurrent()
+            .filter(|p| !p.current_collection_is_user_triggered())
+        {
+            let nursery = crate::collection::is_current_gc_nursery();
+            // Nothing registered: take the in-pause path (it is O(0) then,
+            // and skipping the gate keeps warm line reuse unthrottled).
+            let mut stealable = if nursery { 0 } else { marked_finalizers_list.len };
+            for mutator in <JuliaVM as VMBinding>::VMActivePlan::mutators() {
+                stealable += ArrayListT::thread_local_finalizer_list(mutator).len;
+            }
+            if stealable == 0 {
+                // Fall through to the in-pause path below.
+            } else {
+            let mut lists = Vec::new();
+            for mutator in <JuliaVM as VMBinding>::VMActivePlan::mutators() {
+                lists.push(StolenList::steal(ArrayListT::thread_local_finalizer_list(
+                    mutator,
+                )));
+            }
+            // Minors never sweep the marked list, and their to_finalize
+            // survivors keep their marks (no chunk-mark clear at minors).
+            let marked = if nursery {
+                StolenList::Copied(Vec::new())
+            } else {
+                StolenList::steal(marked_finalizers_list)
+            };
+            if stats {
+                let n: usize = lists.iter().map(|l| l.len()).sum();
+                eprintln!(
+                    "FINSTAT kind={}-detach tl={} marked={} (deferred)",
+                    if nursery { "minor" } else { "major" },
+                    n / 2,
+                    marked.len() / 2
+                );
+            }
+            plan.finalizer_defer_packet(Box::new(ConcurrentFinalizerSweep {
+                lists,
+                marked,
+                full: !nursery,
+            }));
+            return;
+            }
+        }
+    }
+
     // Sweep thread local list: if they are not alive, move to to_finalize.
     for mutator in <JuliaVM as VMBinding>::VMActivePlan::mutators() {
         let list = ArrayListT::thread_local_finalizer_list(mutator);
@@ -279,5 +338,251 @@ fn mark_finlist<T: ObjectTracer>(list: &mut ArrayListT, start: usize, tracer: &m
         });
 
         i += 1;
+    }
+}
+
+
+/// A thread-local finalizer list (or the marked list) detached from its
+/// C `arraylist_t` during a major pause.  Large lists steal the malloc'd
+/// buffer (freed after the sweep); short inline-storage lists are copied.
+enum StolenList {
+    Owned { items: *mut Address, len: usize },
+    Copied(Vec<Address>),
+}
+
+// The buffers are only touched by the single deferred sweep packet.
+unsafe impl Send for StolenList {}
+
+impl StolenList {
+    /// `arraylist_t` layout: len, max, items, then `_space[AL_N_INLINE]`
+    /// inline storage.  `items` points at `_space` while the list is small.
+    const SPACE_OFFSET: usize = 24;
+    const AL_N_INLINE: usize = 29;
+
+    fn steal(list: &mut ArrayListT) -> StolenList {
+        let inline_space =
+            unsafe { (list as *mut ArrayListT as *mut u8).add(Self::SPACE_OFFSET) }
+                as *mut Address;
+        let len = list.len;
+        let stolen = if std::ptr::eq(list.items, inline_space) {
+            let mut v = Vec::with_capacity(len);
+            for i in 0..len {
+                v.push(unsafe { *list.items.add(i) });
+            }
+            StolenList::Copied(v)
+        } else {
+            let items = list.items;
+            list.items = inline_space;
+            list.max = Self::AL_N_INLINE;
+            StolenList::Owned { items, len }
+        };
+        list.len = 0;
+        stolen
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            StolenList::Owned { len, .. } => *len,
+            StolenList::Copied(v) => v.len(),
+        }
+    }
+
+    fn entries(&self) -> &[Address] {
+        match self {
+            StolenList::Owned { items, len } => unsafe {
+                std::slice::from_raw_parts(*items, *len)
+            },
+            StolenList::Copied(v) => v.as_slice(),
+        }
+    }
+
+    fn free(self) {
+        if let StolenList::Owned { items, .. } = self {
+            unsafe { libc::free(items as *mut libc::c_void) };
+        }
+    }
+}
+
+/// Deferred sweep of the detached finalizer lists.  Runs post-pause; the
+/// all-parked rendezvous guarantees completion before the next pause, so
+/// the mark bits are stable and no ClearChunkMarks can intervene.
+pub struct ConcurrentFinalizerSweep {
+    lists: Vec<StolenList>,
+    marked: StolenList,
+    /// Major collection: sweep the marked list and re-mark to_finalize
+    /// survivors (their marks were erased by this cycle's chunk clear).
+    full: bool,
+}
+
+impl ConcurrentFinalizerSweep {
+    /// Mark `object` and everything reachable from it that reclamation
+    /// could otherwise free.  The subgraph is intact: the mutator cannot
+    /// reach dead objects, immix reuse is gated, and the LOS release is
+    /// deferred behind this packet.  Dead tasks are marked but not
+    /// descended: their stacks were already swept in-pause.
+    fn resurrect(plan: &dyn mmtk::plan::ConcurrentPlan<VM = JuliaVM>, root: ObjectReference) {
+        struct Visitor<'a> {
+            plan: &'a dyn mmtk::plan::ConcurrentPlan<VM = JuliaVM>,
+            stack: &'a mut Vec<ObjectReference>,
+        }
+        impl mmtk::vm::SlotVisitor<crate::slots::JuliaVMSlot> for Visitor<'_> {
+            fn visit_slot(&mut self, slot: crate::slots::JuliaVMSlot) {
+                use crate::mmtk::vm::slot::Slot;
+                let obj = match slot {
+                    crate::slots::JuliaVMSlot::Simple(se) => se.load(),
+                    crate::slots::JuliaVMSlot::Offset(oe) => oe.load(),
+                };
+                if let Some(obj) = obj {
+                    if self.plan.finalizer_resurrect_object(obj) {
+                        self.stack.push(obj);
+                    }
+                }
+            }
+        }
+        let mut stack = Vec::new();
+        if plan.finalizer_resurrect_object(root) {
+            stack.push(root);
+        }
+        while let Some(obj) = stack.pop() {
+            let addr = obj.to_raw_address();
+            if unsafe { crate::julia_scanning::mmtk_jl_typeof(addr) }
+                == unsafe { crate::julia_scanning::jl_task_type }
+            {
+                continue;
+            }
+            let mut visitor = Visitor {
+                plan,
+                stack: &mut stack,
+            };
+            unsafe { crate::julia_scanning::scan_julia_object(addr, &mut visitor) };
+        }
+    }
+
+    fn sweep_entries(
+        plan: &dyn mmtk::plan::ConcurrentPlan<VM = JuliaVM>,
+        entries: &[Address],
+        out_finalize: &mut Vec<(Address, Address)>,
+        out_marked: &mut Vec<(Address, Address)>,
+    ) {
+        let mut i = 0;
+        while i + 1 < entries.len() {
+            let v0 = entries[i];
+            if v0.is_zero() {
+                i += 2;
+                continue;
+            }
+            let fin = entries[i + 1];
+            i += 2;
+            // The fin slot is an object (a Julia function) unless the entry
+            // is tagged; it is reachable only through this list, so keep it.
+            if !gc_ptr_tag(v0, GC_FIN_TAG_MASK) && !fin.is_zero() {
+                Self::resurrect(plan, unsafe {
+                    ObjectReference::from_raw_address_unchecked(fin)
+                });
+            }
+            if gc_ptr_tag(v0, GC_FIN_COBJ_TAG) {
+                out_finalize.push((v0, fin));
+                continue;
+            }
+            let v = unsafe {
+                ObjectReference::from_raw_address_unchecked(gc_ptr_clear_tag(v0, GC_FIN_TAG_MASK))
+            };
+            if memory_manager::is_live_object(v) {
+                out_marked.push((v0, fin));
+            } else {
+                Self::resurrect(plan, v);
+                out_finalize.push((v0, fin));
+            }
+        }
+    }
+}
+
+impl mmtk::scheduler::GCWork<JuliaVM> for ConcurrentFinalizerSweep {
+    fn do_work(
+        &mut self,
+        _worker: &mut mmtk::scheduler::GCWorker<JuliaVM>,
+        mmtk: &'static mmtk::MMTK<JuliaVM>,
+    ) {
+        let plan = mmtk.get_plan().concurrent().unwrap();
+
+        // Surviving to_finalize entries were resurrected when queued, but
+        // this cycle's chunk-mark clear erased that: re-mark them.  Snapshot
+        // under the finalizers lock (the mutator drains this list).
+        let snapshot: Vec<(Address, Address)> = if self.full {
+            unsafe { crate::jl_gc_mmtk_finalizers_lock() };
+            let to_finalize = ArrayListT::to_finalize_list();
+            let mut v = Vec::with_capacity(to_finalize.len);
+            let mut i = 0;
+            while i + 1 < to_finalize.len {
+                v.push((to_finalize.get(i), to_finalize.get(i + 1)));
+                i += 2;
+            }
+            unsafe { crate::jl_gc_mmtk_finalizers_unlock() };
+            v
+        } else {
+            Vec::new()
+        };
+        for (v0, fin) in snapshot {
+            if v0.is_zero() {
+                continue;
+            }
+            if !gc_ptr_tag(v0, GC_FIN_TAG_MASK) && !fin.is_zero() {
+                Self::resurrect(plan, unsafe {
+                    ObjectReference::from_raw_address_unchecked(fin)
+                });
+            }
+            if !gc_ptr_tag(v0, GC_FIN_COBJ_TAG) {
+                let v = unsafe {
+                    ObjectReference::from_raw_address_unchecked(gc_ptr_clear_tag(
+                        v0,
+                        GC_FIN_TAG_MASK,
+                    ))
+                };
+                Self::resurrect(plan, v);
+            }
+        }
+
+        // Classify the detached entries (no lock needed: the lists are ours
+        // and marking is idempotent).
+        let mut out_finalize: Vec<(Address, Address)> = Vec::new();
+        let mut out_marked: Vec<(Address, Address)> = Vec::new();
+        for list in &self.lists {
+            Self::sweep_entries(plan, list.entries(), &mut out_finalize, &mut out_marked);
+        }
+        Self::sweep_entries(plan, self.marked.entries(), &mut out_finalize, &mut out_marked);
+
+        // Publish results.  NOTE: an explicit `finalize(x)` racing this
+        // window cannot see detached entries and returns without running
+        // them; they run via to_finalize shortly after instead.
+        {
+            unsafe { crate::jl_gc_mmtk_finalizers_lock() };
+            let to_finalize = ArrayListT::to_finalize_list();
+            let marked = ArrayListT::marked_finalizers_list();
+            for (v0, fin) in &out_marked {
+                marked.push(*v0);
+                marked.push(*fin);
+            }
+            let have_pending: *mut i32 = unsafe { jl_gc_get_have_pending_finalizers() };
+            if !out_finalize.is_empty() {
+                for (v0, fin) in &out_finalize {
+                    to_finalize.push(*v0);
+                    to_finalize.push(*fin);
+                }
+                unsafe { *have_pending = 1 };
+            }
+            unsafe { crate::jl_gc_mmtk_finalizers_unlock() };
+        }
+
+        for list in std::mem::take(&mut self.lists) {
+            list.free();
+        }
+        StolenList::free(std::mem::replace(
+            &mut self.marked,
+            StolenList::Copied(Vec::new()),
+        ));
+
+        // Deferred LOS release, then lift the reuse gate.
+        memory_manager::concurrent_finalizer_los_release(mmtk, self.full);
+        plan.finalizer_sweep_done();
     }
 }

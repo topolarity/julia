@@ -184,6 +184,8 @@ extern "C" {
     pub fn jl_gc_get_abi_structs_checksum_c() -> usize;
     pub fn jl_gc_get_thread_finalizer_list(tls: OpaquePointer) -> Address;
     pub fn jl_gc_get_to_finalize_list() -> Address;
+    pub fn jl_gc_mmtk_finalizers_lock();
+    pub fn jl_gc_mmtk_finalizers_unlock();
     pub fn jl_gc_get_marked_finalizers_list() -> Address;
     pub fn arraylist_grow(a: Address, n: usize);
     pub fn jl_gc_get_have_pending_finalizers() -> *mut i32;

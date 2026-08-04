@@ -1041,6 +1041,16 @@ JL_DLLEXPORT void* jl_gc_get_marked_finalizers_list(void) {
     return (void*)&finalizer_list_marked;
 }
 
+// CONCURRENT FINALIZER SWEEP: the deferred sweep packet appends to
+// to_finalize / finalizer_list_marked while the mutator may run
+// finalizers (which mutate to_finalize under this same lock).
+JL_DLLEXPORT void jl_gc_mmtk_finalizers_lock(void) {
+    JL_LOCK_NOGC(&finalizers_lock);
+}
+JL_DLLEXPORT void jl_gc_mmtk_finalizers_unlock(void) {
+    JL_UNLOCK_NOGC(&finalizers_lock);
+}
+
 JL_DLLEXPORT int* jl_gc_get_have_pending_finalizers(void) {
     return (int*)&jl_gc_have_pending_finalizers;
 }
