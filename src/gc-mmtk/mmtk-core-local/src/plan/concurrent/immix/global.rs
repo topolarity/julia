@@ -563,7 +563,12 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
                 if !entries.is_empty() {
                     use crate::plan::generational::gc_work::{GenNurseryTrace, ProcessModBuf};
                     use crate::policy::gc_work::DEFAULT_TRACE;
-                    for chunk in entries.chunks(4096) {
+                    // Small chunks: remset entries can have large scan
+                    // fan-out (module binding tables), and one oversized
+                    // packet serializes the pause (measured: a 9.5 ms
+                    // ProcessModBuf at teardown).  512 entries per packet
+                    // spreads the drain across the workers.
+                    for chunk in entries.chunks(512) {
                         self.base().scheduler.work_buckets[WorkBucketStage::Closure].add(
                             ProcessModBuf::<GenNurseryTrace<VM, Self, DEFAULT_TRACE>>::new(
                                 chunk.to_vec(),
@@ -748,8 +753,10 @@ impl<VM: VMBinding> ConcurrentImmix<VM> {
     }
 
     /// GENERATIONAL: nursery threshold that triggers a minor collection, in
-    /// pages.  Default 32 MB (cache-scale: the warm-reuse loop should fit
-    /// the L3 tier); overridable via MMTK_NURSERY_MB for the size sweep.
+    /// pages.  Default 8 MB, from the size sweep on the allocation
+    /// benchmark (8G heap): 8 MB gave both the best wall (1.08s vs 1.20s
+    /// at 32 MB, 1.25s at 4 MB) and the best pauses (mean 0.21 ms) -- the
+    /// warm-reuse loop stays cache-tier.  Overridable via MMTK_NURSERY_MB;
     /// MMTK_NURSERY_MB=0 disables minors entirely (majors-only, for A/B).
     fn nursery_threshold_pages() -> usize {
         static PAGES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -757,7 +764,7 @@ impl<VM: VMBinding> ConcurrentImmix<VM> {
             let mb = std::env::var("MMTK_NURSERY_MB")
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(32);
+                .unwrap_or(8);
             mb << (20 - 12)
         })
     }
@@ -876,9 +883,16 @@ impl<VM: VMBinding> ConcurrentPlan for ConcurrentImmix<VM> {
     }
 
     fn live_pages_estimate(&self) -> Option<usize> {
-        // Immix live lines from the previous cycle plus the (stably
-        // accounted) common spaces: immortal, LOS, nonmoving, VM/image.
-        Some(self.immix_space.live_prev_pages() + self.common.get_used_pages())
+        // Immix live from the previous major PLUS minor promotion since
+        // (live_bytes accumulates each first-time mark and minors' marks are
+        // promotions), plus the (stably accounted) common spaces.  The max
+        // covers the mid-marking window where live_bytes is still being
+        // rebuilt.
+        let immix = self
+            .immix_space
+            .live_prev_pages()
+            .max(self.immix_space.live_now_pages());
+        Some(immix + self.common.get_used_pages())
     }
 
     fn append_remset(&self, buf: Vec<ObjectReference>) {

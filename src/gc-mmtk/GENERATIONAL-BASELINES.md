@@ -43,3 +43,45 @@ tmax 17ms (thread max; MT pause tail is a known pre-existing gap).
 Acceptance targets for the generational work are in GENERATIONAL-PLAN.md
 section 1 (wall <= 1.35s, IPC >= 3.3, minor p99 <= 0.5ms, majors unchanged,
 zero blocking, gates green).
+
+## Phase 2 results (2026-08-04, generational tip; box under load 15-25, numbers stable across reps)
+
+passes.jl 30M steady (passes 2-4), 8 MB nursery default:
+
+| Config | wall (s) | minors/pass | stw/pass | block |
+|---|---|---|---|---|
+| default | 1.09-1.15 | 420-580 | 180ms | 0 |
+| 8G | 1.08-1.12 | 400-520 | 150-177ms | 0 |
+
+tailm 10M: loop tmax 0.4ms; Nursery mean 0.23ms (both default and 320MB cap);
+block_max=0.  Known tail: the process-teardown minor carries a multi-ms
+ProcessModBuf drain (4.8-6.9ms at the final ordinal; steady state unaffected).
+
+trigger-churn: 0.38s (pre-generational 0.96; stock ~0.25), 188 minors, 0 majors.
+surv.jl 10M/200k: correct; heap 141MB (default) / 309MB (8G); majors+minors
+interleave; pacer goal stable (heap 180-195MB envelope, zero blocking).
+
+## Mutator locality (per-thread, identical-work window, passes 2-4)
+
+| Collector | IPC | DRAM fills/G | L3 fills/G | L2 fills/G |
+|---|---|---|---|---|
+| stock | 4.58 | ~0.1 (12M total) | - | L2-resident |
+| StickyImmix | 3.67 | 1.71M | 1.65M | - |
+| ConcImmix pre-gen | 2.51 | 2.67M | 0.16M | - |
+| ConcImmix generational | 3.61 | 0.19M | 3.53M | 1.71M |
+
+The 8 MB warm-reuse loop moved the mutator from DRAM-tier to L3-tier:
+DRAM fills down 14x vs pre-generational (and 9x below Sticky); IPC at
+Sticky parity (3.61 vs 3.67); wall BELOW Sticky (1.08-1.15 vs 1.19-1.30).
+
+## Acceptance criteria (plan section 1)
+
+| Criterion | Target | Result |
+|---|---|---|
+| Steady wall | <= 1.35s | 1.08-1.15s (beats Sticky) |
+| Mutator IPC | >= 3.3 | 3.61 |
+| Minor pause (steady) | p99 <= 0.5ms | mean 0.23ms, loop tmax 0.4ms |
+| Major Init/Final | <= 0.2ms | unchanged machinery; surv cycles 110-138ms concurrent, no blocking |
+| Trigger blocking | 0 | 0 everywhere |
+| Footprint | <= 3x live + nursery | NOT MET on surv-8G (309MB vs ~40MB bound): old-growth 64MB floor + lazy backlog; tightenable via threshold vs major-frequency trade |
+| Gates | green | full make; 30x+10x REPLExt (0 fail 0 wedge); guards+audits clean ST/MT |

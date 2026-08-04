@@ -972,6 +972,12 @@ impl<VM: VMBinding> ImmixSpace<VM> {
             >> 12
     }
 
+    /// Current-cycle live accumulation in pages (complete after a major's
+    /// trace; between majors it also carries minor promotion).
+    pub fn live_now_pages(&self) -> usize {
+        self.live_bytes.load(std::sync::atomic::Ordering::Relaxed) >> 12
+    }
+
     pub fn has_unswept(&self) -> bool {
         !self.unswept_blocks.lock().unwrap().is_empty()
     }
