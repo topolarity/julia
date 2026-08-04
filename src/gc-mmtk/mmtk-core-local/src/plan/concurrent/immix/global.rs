@@ -380,8 +380,17 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
                 self.immix_space.prepare(
                     true,
                     Some(StatsForDefrag::new(self)),
-                    // Ignore unlog bits in full GCs because unlog bits should be all 0.
-                    UnlogBitsOperation::NoOp,
+                    // Clear-then-reconstruct, as StickyImmix does for full
+                    // collections: the in-pause bulk bzero leaves the unlog
+                    // metadata cache-warm, so the trace's per-object arming
+                    // stores stop paying cold-RFO misses that the following
+                    // mark CAS (a locked op draining the store buffer) would
+                    // absorb.  Safe only in this fully-STW pause: mutators
+                    // cannot observe the cleared window, and the trace
+                    // re-arms every live object (dead ones correctly end
+                    // disarmed).  The concurrent cycle's pauses must keep
+                    // the persistent bits (the barrier reads them live).
+                    UnlogBitsOperation::BulkClear,
                 );
             }
             Pause::InitialMark => {
