@@ -115,6 +115,7 @@ pub struct ImmixSpace<VM: VMBinding> {
     /// counting whole pending blocks over-fires ~3x, because a pool re-pop
     /// of a holed block counts 32KB while offering only its free lines.
     nursery_lines_claimed: std::sync::atomic::AtomicUsize,
+    reuse_pressure: std::sync::atomic::AtomicBool,
     /// FLOAT-IN-BYTES (pacer input): free lines actually handed to
     /// allocators since the last FinalMark/minor drain.  Replaces the
     /// blocks-touched float measure (`pending_blocks.len()`), which under
@@ -453,6 +454,7 @@ impl<VM: VMBinding> ImmixSpace<VM> {
             unswept_nursery: std::sync::Mutex::new(Vec::new()),
             nursery_unswept_nonempty: std::sync::atomic::AtomicBool::new(false),
             nursery_lines_claimed: std::sync::atomic::AtomicUsize::new(0),
+            reuse_pressure: std::sync::atomic::AtomicBool::new(false),
             float_lines_claimed: std::sync::atomic::AtomicUsize::new(0),
             full_blocks: std::sync::Mutex::new(Vec::new()),
             reusable_blocks: ReusableBlockPool::new(scheduler.num_workers()),
@@ -928,6 +930,8 @@ impl<VM: VMBinding> ImmixSpace<VM> {
     /// This is called when a GC finished.
     /// Return whether this GC was a defrag GC, as a plan may want to know this.
     pub fn end_of_gc(&mut self) -> bool {
+        self.reuse_pressure
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         let did_defrag = self.defrag.in_defrag();
         if self.is_defrag_enabled() {
             self.defrag.reset_in_defrag();
@@ -972,6 +976,9 @@ impl<VM: VMBinding> ImmixSpace<VM> {
     ) -> Option<Block> {
         let block_address = self.acquire(tls, Block::PAGES, alloc_options);
         if block_address.is_zero() {
+            // PRESSURE VALVE (see `effective_min_hole`).
+            self.reuse_pressure
+                .store(true, std::sync::atomic::Ordering::Relaxed);
             return None;
         }
         self.defrag.notify_new_clean_block(copy);
@@ -1054,6 +1061,45 @@ impl<VM: VMBinding> ImmixSpace<VM> {
     /// trace; between majors it also carries minor promotion).
     pub fn live_now_pages(&self) -> usize {
         self.live_bytes.load(std::sync::atomic::Ordering::Relaxed) >> 12
+    }
+
+    /// SIZE-SELECTIVE REUSE (MMTK_MIN_HOLE_LINES, default 1 = reuse all):
+    /// only pool a block whose largest free run is at least this many lines.
+    /// Measured on strings: 86% of true free runs are a single 256B line;
+    /// claiming them costs full per-hole machinery (1.9M claims/run) while
+    /// buying no footprint (RSS equals StickyImmix's, which reclaims rarely
+    /// and routes allocation through clean blocks instead).  Crumb-only
+    /// blocks keep state Marked and simply age until enough neighbors die.
+    /// PRESSURE VALVE: when a clean-block acquisition actually fails, the
+    /// size-selective threshold collapses to 1 (crumb reuse resumes) until
+    /// the next collection completes -- refusing single-line holes must
+    /// never turn comfortable headroom into an OOM wall.  Crumb-only blocks
+    /// re-enter the pool via the normal aging pipeline once triage runs
+    /// with the relaxed threshold.
+    pub(crate) fn reuse_pressure(&self) -> &std::sync::atomic::AtomicBool {
+        &self.reuse_pressure
+    }
+
+    pub(crate) fn effective_min_hole(&self) -> usize {
+        if self
+            .reuse_pressure
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            1
+        } else {
+            Self::min_hole_lines()
+        }
+    }
+
+    pub(crate) fn min_hole_lines() -> usize {
+        static K: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *K.get_or_init(|| {
+            std::env::var("MMTK_MIN_HOLE_LINES")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(1)
+                .max(1)
+        })
     }
 
     pub fn has_unswept(&self) -> bool {
@@ -1241,19 +1287,29 @@ impl<VM: VMBinding> ImmixSpace<VM> {
             }
             // Mixed block: clear non-epoch lines (CLAIMED noise and stale
             // states) so hole search sees the reclaimed lines as free.
+            let mut run = 0usize;
+            let mut max_run = 0usize;
             for (i, line) in block.lines().enumerate() {
                 if mark_data.get(i) != state {
                     line.mark(0);
                     freed_lines += 1;
+                    run += 1;
+                    max_run = max_run.max(run);
+                } else {
+                    crate::diag::record_free_run(run);
+                    run = 0;
                 }
             }
-            if live_lines < Block::LINES {
+            crate::diag::record_free_run(run);
+            if live_lines < Block::LINES && max_run >= self.effective_min_hole() {
                 block.set_state(BlockState::Reusable {
                     unavailable_lines: live_lines as _,
                 });
                 self.reusable_blocks.push(block);
                 live_blocks += 1;
             } else {
+                // Full, or free space is only sub-threshold crumbs
+                // (size-selective reuse): treat as full and let it age.
                 block.set_state(BlockState::Marked);
                 self.full_blocks.lock().unwrap().push(block);
                 live_blocks += 1;
@@ -1350,10 +1406,18 @@ impl<VM: VMBinding> ImmixSpace<VM> {
         let mut dead: Vec<Block> = Vec::new();
         for block in blocks {
             debug_assert_ne!(block.get_state(), BlockState::Unallocated);
-            let marked = block
-                .lines()
-                .filter(|l| l.is_marked(cur) || l.is_marked(unavail))
-                .count();
+            let mut marked = 0usize;
+            let mut run = 0usize;
+            let mut max_run = 0usize;
+            for l in block.lines() {
+                if l.is_marked(cur) || l.is_marked(unavail) {
+                    marked += 1;
+                    run = 0;
+                } else {
+                    run += 1;
+                    max_run = max_run.max(run);
+                }
+            }
             if marked == 0 {
                 crate::diag::TRIAGE_FREED.fetch_add(1, Ordering::SeqCst);
                 // DIAG QUARANTINE: leak dead blocks instead of freeing them
@@ -1369,7 +1433,7 @@ impl<VM: VMBinding> ImmixSpace<VM> {
                 }
                 block.deinit();
                 dead.push(block);
-            } else if marked < Block::LINES {
+            } else if marked < Block::LINES && max_run >= self.effective_min_hole() {
                 crate::diag::TRIAGE_POOLED.fetch_add(1, Ordering::SeqCst);
                 block.set_state(BlockState::Reusable {
                     unavailable_lines: marked as _,

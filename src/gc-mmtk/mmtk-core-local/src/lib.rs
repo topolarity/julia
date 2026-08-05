@@ -139,6 +139,30 @@ pub mod diag {
     pub static POOL_POPS: AtomicU64 = AtomicU64::new(0);
     pub static CLEAN_BLOCKS: AtomicU64 = AtomicU64::new(0);
     pub static REUSED_BLOCKS: AtomicU64 = AtomicU64::new(0);
+    /// Census free-RUN length histogram (mixed blocks): buckets of
+    /// contiguous non-epoch line runs, i.e. the holes future claims will
+    /// see.  Buckets: 1, 2, 3-4, 5-8, 9-16, 17-32, 33+ lines.
+    pub static FREE_RUN_HIST: [AtomicU64; 7] = [
+        AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+        AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+    ];
+    pub fn record_free_run(len: usize) {
+        let b = match len {
+            0 => return,
+            1 => 0, 2 => 1, 3..=4 => 2, 5..=8 => 3, 9..=16 => 4, 17..=32 => 5, _ => 6,
+        };
+        FREE_RUN_HIST[b].fetch_add(1, Ordering::Relaxed);
+    }
+    pub static HOLE_CLAIMS: AtomicU64 = AtomicU64::new(0);
+    pub static HOLE_LINES: AtomicU64 = AtomicU64::new(0);
+    /// Monotone pause counter: bumped by the scheduler just before mutators
+    /// resume from ANY pause.  Used by the allocator's thread-local claimed-
+    /// hole cache to detect that a pause (and thus a possible remote
+    /// allocator reset) happened since the holes were scanned.
+    pub static PAUSE_EPOCH: AtomicU64 = AtomicU64::new(0);
+    pub static CLAIM_NS: AtomicU64 = AtomicU64::new(0);
+    pub static CLAIM_N: AtomicU64 = AtomicU64::new(0);
+    pub static CLAIM_MAX_NS: AtomicU64 = AtomicU64::new(0);
     /// Nursery (minor) sweep results: blocks released / kept, lines freed.
     pub static NURSERY_SWEPT_BLOCKS: std::sync::atomic::AtomicUsize =
         std::sync::atomic::AtomicUsize::new(0);
@@ -244,6 +268,23 @@ pub mod diag {
             ms(TRIAGE_MAX_NS.load(Ordering::Relaxed)),
             TRIAGE_FREED.load(Ordering::Relaxed),
             TRIAGE_POOLED.load(Ordering::Relaxed),
+        );
+        eprintln!(
+            "[mutgc] claim_path: n={} total={:.1}ms max={:.3}ms",
+            CLAIM_N.load(Ordering::Relaxed),
+            ms(CLAIM_NS.load(Ordering::Relaxed)),
+            ms(CLAIM_MAX_NS.load(Ordering::Relaxed)),
+        );
+        let h: Vec<u64> = FREE_RUN_HIST.iter().map(|x| x.load(Ordering::Relaxed)).collect();
+        eprintln!("[mutgc] census_free_runs(1,2,3-4,5-8,9-16,17-32,33+)={:?}", h);
+        let hc = HOLE_CLAIMS.load(Ordering::Relaxed);
+        let hl = HOLE_LINES.load(Ordering::Relaxed);
+        eprintln!(
+            "[mutgc] holes: claims={} lines={} avg_run_bytes={} clean_blk={} reused_blk={}",
+            hc, hl,
+            if hc > 0 { hl * 256 / hc } else { 0 },
+            CLEAN_BLOCKS.load(Ordering::Relaxed),
+            REUSED_BLOCKS.load(Ordering::Relaxed),
         );
     }
     pub fn record_max(s: &AtomicU64, v: u64) {

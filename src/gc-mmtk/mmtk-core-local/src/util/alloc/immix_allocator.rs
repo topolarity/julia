@@ -249,6 +249,19 @@ impl<VM: VMBinding> ImmixAllocator<VM> {
 
     /// Search for recyclable lines.
     fn acquire_recyclable_lines(&mut self, size: usize, align: usize, offset: usize) -> bool {
+        if crate::diag::mutgc_enabled() {
+            let t0 = crate::diag::now_ns();
+            let r = self.acquire_recyclable_lines_inner(size, align, offset);
+            let d = crate::diag::now_ns().saturating_sub(t0);
+            crate::diag::CLAIM_NS.fetch_add(d, atomic::Ordering::Relaxed);
+            crate::diag::CLAIM_N.fetch_add(1, atomic::Ordering::Relaxed);
+            crate::diag::record_max(&crate::diag::CLAIM_MAX_NS, d);
+            return r;
+        }
+        self.acquire_recyclable_lines_inner(size, align, offset)
+    }
+
+    fn acquire_recyclable_lines_inner(&mut self, size: usize, align: usize, offset: usize) -> bool {
         while self.line.is_some() || self.acquire_recyclable_block() {
             let line = self.line.unwrap();
             if let Some((start_line, end_line)) = self.immix_space().get_next_available_lines(line)
@@ -268,6 +281,12 @@ impl<VM: VMBinding> ImmixAllocator<VM> {
                     side.bzero_metadata(start_line.start(), end_line.start() - start_line.start());
                 }
                 // Find recyclable lines. Update the bump allocation cursor and limit.
+                crate::diag::HOLE_CLAIMS.fetch_add(1, atomic::Ordering::Relaxed);
+                crate::diag::HOLE_LINES.fetch_add(
+                    ((end_line.start() - start_line.start())
+                        / crate::policy::immix::line::Line::BYTES) as u64,
+                    atomic::Ordering::Relaxed,
+                );
                 self.bump_pointer.cursor = start_line.start();
                 self.bump_pointer.limit = end_line.start();
                 trace!(
@@ -361,6 +380,15 @@ impl<VM: VMBinding> ImmixAllocator<VM> {
 
     /// Get a recyclable block from ImmixSpace.
     fn acquire_recyclable_block(&mut self) -> bool {
+        // ATTRIBUTION KNOB (MMTK_NO_RECYCLE): clean blocks only.
+        {
+            static NO_RECYCLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *NO_RECYCLE
+                .get_or_init(|| std::env::var_os("MMTK_NO_RECYCLE").is_some())
+            {
+                return false;
+            }
+        }
         // FIX E: at most ONE chunk of lazy-sweep debt per allocation slow path.
         // An unbounded retry loop would make the first post-GC allocation
         // triage the entire heap (O(heap) mutator stall); bounding it keeps
