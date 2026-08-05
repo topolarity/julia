@@ -159,6 +159,7 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
                 .saturating_sub(self.los_pages_at_last_gc.load(Ordering::Relaxed));
             if self.immix_space.nursery_claimed_pages() + malloc_pages + los_pages >= threshold {
                 self.minor_due.store(true, Ordering::Release);
+                crate::diag::PACER_REQ_MINOR.fetch_add(1, Ordering::Relaxed);
                 self.base().gc_trigger.request();
                 return false;
             }
@@ -192,33 +193,29 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
             // On a real allocation failure (`space_full`) the caller parks in
             // `block_for_gc` unconditionally, so suppressing here would park
             // the mutator with no collection in flight (deadlock).
-            if self.immix_space.has_unswept() {
-                if space_full {
+            if space_full {
+                // Real wall.  With reclaimable supply left, a (blocking)
+                // concurrent cycle plus the allocator drain loop recovers;
+                // with the aged generation empty this is genuine exhaustion.
+                if self.immix_space.has_unswept() || self.immix_space.has_reusable() {
                     if crate::diag::pacer_trace_enabled() {
-                        eprintln!("[pacer-block] space_full with unswept backlog: start cycle (blocking)");
+                        eprintln!("[pacer-block] space_full with reclaimable supply: start cycle (blocking)");
                     }
                     return true;
                 }
-                return false;
+                self.should_do_full_gc.store(true, Ordering::Release);
+                if crate::diag::pacer_trace_enabled() {
+                    eprintln!("[pacer-block] genuine exhaustion: full GC (blocking)");
+                }
+                return true;
             }
-            // Over the goal with the aged generation empty.  The goal is a
-            // heuristic threshold, not a limit (Go-goal semantics): unless
-            // an allocation actually FAILED, blocking a mutator or forcing
-            // a synchronous Full is never the right trade against floating
-            // garbage -- request a concurrent cycle and let allocation
-            // proceed as float.  True walls (hard limit / memory ceiling /
-            // page-resource failure) arrive here with `space_full == true`.
-            if !space_full {
-                self.major_due.store(true, Ordering::Release);
-                self.base().gc_trigger.request();
-                return false;
-            }
-            // Genuine exhaustion: old generation empty, heap full.
-            self.should_do_full_gc.store(true, Ordering::Release);
-            if crate::diag::pacer_trace_enabled() {
-                eprintln!("[pacer-block] genuine exhaustion (space_full={space_full}): full GC (blocking)");
-            }
-            return true;
+            // Advisory poll while over the reserve goal: reserved pages
+            // carry no information under deferred release (the goal never
+            // accounts for the fragmentation floor, so resv > goal is the
+            // steady state -- measured: this branch alone requested every
+            // cycle, 26 back-to-back on strings, before the promotion and
+            // float budgets below ever fired).  Fall through and let those
+            // byte-accurate budgets decide.
         }
 
         if self.concurrent_marking_is_disabled() || marking {
@@ -250,6 +247,7 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
             let threshold = live.max(16384usize.min(total / 4).max(1024));
             if promoted_pages >= threshold {
                 self.major_due.store(true, Ordering::Release);
+                crate::diag::PACER_REQ_PROMO.fetch_add(1, Ordering::Relaxed);
                 self.base().gc_trigger.request();
                 return false;
             }
@@ -262,13 +260,22 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
         // Request the next cycle while at least that much headroom remains
         // below the target, so the cycle finishes before allocation reaches
         // the blocking wall (`is_heap_full`).  Advisory: never blocks.
+        // START-EARLY pacing on unpolluted inputs: committed = live estimate
+        // (incl. minor promotion) + current byte-accurate float.  `reserved`
+        // is NOT usable here -- the fragmentation floor inflates it (strings:
+        // resv 2.5GB vs live 480MB), and the resv-based check cycled
+        // back-to-back for zero reclaim.  But a workload whose LIVE genuinely
+        // grows toward the goal (list) must start cycles ahead of the
+        // `is_heap_full` wall or every wall blocks for a full cycle
+        // (measured: 30 x ~300ms = 9.2s of blocking on list without this).
         if let Some(headroom) = self.base().gc_trigger.policy.concurrent_headroom_pages() {
-            let reserved = self.get_reserved_pages();
-            if reserved + headroom >= total {
+            let committed = self.immix_space.live_now_pages() + self.immix_space.float_pages();
+            if committed + headroom >= total {
                 info!(
-                    "Pacing trigger: reserved {reserved} + cycle headroom {headroom} >= target {total} pages: request concurrent marking (async)"
+                    "Pacing trigger: committed {committed} + cycle headroom {headroom} >= target {total} pages: request concurrent marking (async)"
                 );
                 self.major_due.store(true, Ordering::Release);
+                crate::diag::PACER_REQ_HEADROOM.fetch_add(1, Ordering::Relaxed);
                 self.base().gc_trigger.request();
                 return false;
             }
@@ -289,6 +296,7 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
             // is always headroom to satisfy this allocation.  Never block.
             info!("Float exceeds budget ({budget} pages): request concurrent marking (async)");
             self.major_due.store(true, Ordering::Release);
+            crate::diag::PACER_REQ_FLOAT.fetch_add(1, Ordering::Relaxed);
             self.base().gc_trigger.request();
             return false;
         }
@@ -541,6 +549,33 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
                 Pause::Full | Pause::Nursery => {}
             }
             self.gc_end_ns.store(now, Ordering::Relaxed);
+        }
+        // DIAG (MMTK_HEAP_TRACE): per-cycle reclaim accounting.
+        {
+            use std::sync::OnceLock;
+            static ON: OnceLock<bool> = OnceLock::new();
+            if *ON.get_or_init(|| std::env::var_os("MMTK_HEAP_TRACE").is_some()) {
+                eprintln!(
+                    "[heap] pause={:?} total_pg={} resv_pg={} live_prev_pg={} clean_blk={} reused_blk={} reusable_pool={} unswept={} pending={}",
+                    pause,
+                    self.get_total_pages(),
+                    self.get_reserved_pages(),
+                    self.immix_space.live_prev_pages(),
+                    crate::diag::CLEAN_BLOCKS.load(Ordering::SeqCst),
+                    crate::diag::REUSED_BLOCKS.load(Ordering::SeqCst),
+                    self.immix_space.reusable_blocks.len(),
+                    self.immix_space.unswept_len(),
+                    self.immix_space.pending_len(),
+                );
+                eprintln!(
+                    "[pacer-req] minor={} overgoal={} promo={} headroom={} float={}",
+                    crate::diag::PACER_REQ_MINOR.load(Ordering::Relaxed),
+                    crate::diag::PACER_REQ_OVERGOAL.load(Ordering::Relaxed),
+                    crate::diag::PACER_REQ_PROMO.load(Ordering::Relaxed),
+                    crate::diag::PACER_REQ_HEADROOM.load(Ordering::Relaxed),
+                    crate::diag::PACER_REQ_FLOAT.load(Ordering::Relaxed),
+                );
+            }
         }
         if pause == Pause::InitialMark {
             self.set_concurrent_marking_state(true);

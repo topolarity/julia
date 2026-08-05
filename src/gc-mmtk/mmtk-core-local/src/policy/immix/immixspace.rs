@@ -115,6 +115,12 @@ pub struct ImmixSpace<VM: VMBinding> {
     /// counting whole pending blocks over-fires ~3x, because a pool re-pop
     /// of a holed block counts 32KB while offering only its free lines.
     nursery_lines_claimed: std::sync::atomic::AtomicUsize,
+    /// FLOAT-IN-BYTES (pacer input): free lines actually handed to
+    /// allocators since the last FinalMark/minor drain.  Replaces the
+    /// blocks-touched float measure (`pending_blocks.len()`), which under
+    /// line-crumb reuse over-counts float by the block/hole ratio (measured
+    /// ~5x on fragmented heaps) and over-triggers concurrent cycles.
+    float_lines_claimed: std::sync::atomic::AtomicUsize,
     full_blocks: std::sync::Mutex<Vec<Block>>,
     /// Object mark state
     mark_state: u8,
@@ -447,6 +453,7 @@ impl<VM: VMBinding> ImmixSpace<VM> {
             unswept_nursery: std::sync::Mutex::new(Vec::new()),
             nursery_unswept_nonempty: std::sync::atomic::AtomicBool::new(false),
             nursery_lines_claimed: std::sync::atomic::AtomicUsize::new(0),
+            float_lines_claimed: std::sync::atomic::AtomicUsize::new(0),
             full_blocks: std::sync::Mutex::new(Vec::new()),
             reusable_blocks: ReusableBlockPool::new(scheduler.num_workers()),
             defrag: Defrag::default(),
@@ -698,6 +705,8 @@ impl<VM: VMBinding> ImmixSpace<VM> {
                 .store(false, std::sync::atomic::Ordering::Relaxed);
             drop(young);
             self.nursery_lines_claimed
+                .store(0, Ordering::Relaxed);
+            self.float_lines_claimed
                 .store(0, Ordering::Relaxed);
             // Release is fully deferred (float-budget trigger keeps the
             // reserved-pages signal irrelevant); the aged generation is
@@ -986,6 +995,8 @@ impl<VM: VMBinding> ImmixSpace<VM> {
             .fetch_add(Block::LINES, Ordering::SeqCst);
         self.nursery_lines_claimed
             .fetch_add(Block::LINES, Ordering::Relaxed);
+        self.float_lines_claimed
+            .fetch_add(Block::LINES, Ordering::Relaxed);
         Some(block)
     }
 
@@ -1024,9 +1035,13 @@ impl<VM: VMBinding> ImmixSpace<VM> {
         old_pages.saturating_sub(live)
     }
 
-    /// Pages of the current cycle's float: blocks acquired since FinalMark.
+    /// Pages of the current cycle's float: free lines claimed by allocators
+    /// since the last FinalMark or minor drain (byte-accurate; see
+    /// `float_lines_claimed`).
     pub fn float_pages(&self) -> usize {
-        self.pending_blocks.lock().unwrap().len() * (Block::BYTES >> 12)
+        self.float_lines_claimed
+            .load(std::sync::atomic::Ordering::Relaxed)
+            / (4096 / Line::BYTES)
     }
 
     pub fn live_prev_pages(&self) -> usize {
@@ -1043,6 +1058,24 @@ impl<VM: VMBinding> ImmixSpace<VM> {
 
     pub fn has_unswept(&self) -> bool {
         !self.unswept_blocks.lock().unwrap().is_empty()
+    }
+
+    /// Reclaimable-supply predicate for the pacer: line-recycled blocks in
+    /// the reusable pool are allocation supply just like the unswept
+    /// backlog.  Without this, a fragmented heap (everything pooled, nothing
+    /// block-free) reads as "aged generation empty" the moment triage
+    /// classifies the backlog, and the over-goal branch re-triggers a cycle
+    /// back-to-back even though allocation is nowhere near starved.
+    pub fn has_reusable(&self) -> bool {
+        self.reusable_blocks.len() > 0
+    }
+
+    pub fn unswept_len(&self) -> usize {
+        self.unswept_blocks.lock().unwrap().len()
+    }
+
+    pub fn pending_len(&self) -> usize {
+        self.pending_blocks.lock().unwrap().len()
     }
 
     /// NURSERY SWEEP (in-pause, minor collections): drain `pending_blocks`
@@ -1066,6 +1099,8 @@ impl<VM: VMBinding> ImmixSpace<VM> {
     pub(crate) fn sweep_nursery_blocks(&self) {
         let blocks: Vec<Block> = std::mem::take(&mut *self.pending_blocks.lock().unwrap());
         self.nursery_lines_claimed
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.float_lines_claimed
             .store(0, std::sync::atomic::Ordering::Relaxed);
         if blocks.is_empty() {
             return;
@@ -1380,7 +1415,10 @@ impl<VM: VMBinding> ImmixSpace<VM> {
             self.lines_consumed.fetch_add(lines_delta, Ordering::SeqCst);
             self.nursery_lines_claimed
                 .fetch_add(lines_delta, Ordering::Relaxed);
+            self.float_lines_claimed
+                .fetch_add(lines_delta, Ordering::Relaxed);
 
+            crate::diag::REUSED_BLOCKS.fetch_add(1, Ordering::SeqCst);
             block.init(copy);
             crate::diag::POOL_POPS.fetch_add(1, Ordering::SeqCst);
             return Some(block);
