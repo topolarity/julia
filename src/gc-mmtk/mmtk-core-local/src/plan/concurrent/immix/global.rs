@@ -59,6 +59,21 @@ pub struct ConcurrentImmix<VM: VMBinding> {
     // heap.  Interacts with FIX C: the head start is what makes the hastened FinalMark cheap,
     // because marking is nearly done by the time the heap trigger fires.
     mark_start_ns: AtomicU64,
+    /// MINOR-FUTILITY BACKOFF: multiplier on the minor trigger's nursery
+    /// threshold.  A minor whose OBJECT survival is near-total (a growing
+    /// permanent structure passing through the nursery, e.g. list) reclaims
+    /// nothing and costs an in-pause census of the whole nursery -- measured
+    /// 20 x ~380ms whenever concurrent marking wasn't masking the minor
+    /// branch.  Futile minors double the backoff (capped); a productive one
+    /// halves it.  Object survival = promoted pages (live_now delta across
+    /// the pause) / nursery pages -- NOT line survival, which over-estimates
+    /// ~4x on small-object heaps (a 256B line is "live" if one object in it
+    /// survives) and misclassifies productive minors as futile.
+    /// With futile minors backed off, the byte-accurate float budget takes
+    /// over (float stops being reset by minors), giving high-survival
+    /// workloads the continuous concurrent cycles that actually serve them.
+    minor_backoff: std::sync::atomic::AtomicUsize,
+    live_at_last_pause: std::sync::atomic::AtomicUsize,
     mark_dur_ns: AtomicU64,
     gc_end_ns: AtomicU64,
     /// ALWAYS-ON BARRIER: remembered set accumulated between collections (old
@@ -157,7 +172,24 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
                 .get_los()
                 .reserved_pages()
                 .saturating_sub(self.los_pages_at_last_gc.load(Ordering::Relaxed));
-            if self.immix_space.nursery_claimed_pages() + malloc_pages + los_pages >= threshold {
+            let backoff = self.minor_backoff.load(Ordering::Relaxed);
+            let claimed = self.immix_space.nursery_claimed_pages();
+            // PAUSE-BOUND GUARD: an STW minor must trace the live young set
+            // in-pause, so its worst case scales with nursery size -- a
+            // nursery past this bound may only be processed by a concurrent
+            // major (measured: 1.9-3.8s minor pauses on a ~100%-survival
+            // multi-hundred-MB nursery; the census cap alone could not help
+            // because the TRACE is the scaling term).  Suppressed minors
+            // leave the float to accumulate, which drives the float-budget
+            // major below -- the collection whose trace is concurrent and
+            // whose pauses stay O(threads).  The malloc/LOS pressure terms
+            // are unaffected: they trigger on external memory, not the
+            // heap nursery, and their minors' trace cost does not scale
+            // with counted-malloc volume.
+            const MAX_MINOR_NURSERY_PAGES: usize = 32768; // 128 MB
+            if claimed <= MAX_MINOR_NURSERY_PAGES
+                && claimed / backoff + malloc_pages + los_pages >= threshold
+            {
                 self.minor_due.store(true, Ordering::Release);
                 crate::diag::PACER_REQ_MINOR.fetch_add(1, Ordering::Relaxed);
                 self.base().gc_trigger.request();
@@ -260,27 +292,17 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
         // Request the next cycle while at least that much headroom remains
         // below the target, so the cycle finishes before allocation reaches
         // the blocking wall (`is_heap_full`).  Advisory: never blocks.
-        // START-EARLY pacing on unpolluted inputs: committed = live estimate
-        // (incl. minor promotion) + current byte-accurate float.  `reserved`
-        // is NOT usable here -- the fragmentation floor inflates it (strings:
-        // resv 2.5GB vs live 480MB), and the resv-based check cycled
-        // back-to-back for zero reclaim.  But a workload whose LIVE genuinely
-        // grows toward the goal (list) must start cycles ahead of the
-        // `is_heap_full` wall or every wall blocks for a full cycle
-        // (measured: 30 x ~300ms = 9.2s of blocking on list without this).
-        if let Some(headroom) = self.base().gc_trigger.policy.concurrent_headroom_pages() {
-            let committed = self.immix_space.live_now_pages() + self.immix_space.float_pages();
-            if committed + headroom >= total {
-                info!(
-                    "Pacing trigger: committed {committed} + cycle headroom {headroom} >= target {total} pages: request concurrent marking (async)"
-                );
-                self.major_due.store(true, Ordering::Release);
-                crate::diag::PACER_REQ_HEADROOM.fetch_add(1, Ordering::Relaxed);
-                self.base().gc_trigger.request();
-                return false;
-            }
-        }
-
+        // START-EARLY (headroom) pacing REMOVED: with goal-not-limit
+        // semantics there is no real wall for it to avoid, and every input
+        // available to it double-counts with live (measured: the policy
+        // headroom is alloc_rate x cycle_duration, and cycle duration grows
+        // with live, so headroom tracked 1.8-2.3x live and the branch fired
+        // the warmup escalator forever -- 24 back-to-back cycles on strings
+        // for zero reclaim).  The remaining triggers cover its two real
+        // jobs: the byte-accurate float budget below bounds floating
+        // garbage (and fires continuously on fast-growing heaps once
+        // futile minors back off), and the promotion trigger above paces
+        // majors GOGC-style.
         let live = self
             .immix_space
             .live_prev_pages();
@@ -549,6 +571,27 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
                 Pause::Full | Pause::Nursery => {}
             }
             self.gc_end_ns.store(now, Ordering::Relaxed);
+            // MINOR-FUTILITY signal update (see `minor_backoff`).  live_now
+            // accumulates promotions monotonically between majors and is
+            // reset at InitialMark/Full prepare, so sample it at every pause
+            // end and use the across-a-minor delta as that minor's promoted
+            // mass.
+            {
+                use std::sync::atomic::Ordering::Relaxed;
+                let live_now = self.immix_space.live_now_pages();
+                let prev = self.live_at_last_pause.swap(live_now, Relaxed);
+                if pause == Pause::Nursery {
+                    let promoted = live_now.saturating_sub(prev);
+                    let nursery = self.immix_space.last_minor_claimed_pages();
+                    let b = self.minor_backoff.load(Relaxed);
+                    let new_b = if nursery > 0 && promoted >= nursery - nursery / 8 {
+                        (b * 2).min(64)
+                    } else {
+                        (b / 2).max(1)
+                    };
+                    self.minor_backoff.store(new_b, Relaxed);
+                }
+            }
         }
         // DIAG (MMTK_HEAP_TRACE): per-cycle reclaim accounting.
         {
@@ -913,6 +956,8 @@ impl<VM: VMBinding> ConcurrentImmix<VM> {
             should_do_full_gc: AtomicBool::new(false),
             concurrent_marking_active: AtomicBool::new(false),
             mark_start_ns: AtomicU64::new(0),
+            minor_backoff: std::sync::atomic::AtomicUsize::new(1),
+            live_at_last_pause: std::sync::atomic::AtomicUsize::new(0),
             mark_dur_ns: AtomicU64::new(0),
             gc_end_ns: AtomicU64::new(0),
             remset: std::sync::Mutex::new(Vec::new()),

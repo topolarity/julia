@@ -116,6 +116,10 @@ pub struct ImmixSpace<VM: VMBinding> {
     /// of a holed block counts 32KB while offering only its free lines.
     nursery_lines_claimed: std::sync::atomic::AtomicUsize,
     reuse_pressure: std::sync::atomic::AtomicBool,
+    /// Nursery size (lines) of the most recent minor, captured before the
+    /// sweep resets the claim counter -- one input of the object-survival
+    /// minor-futility signal (see the minor trigger).
+    last_minor_claimed: std::sync::atomic::AtomicUsize,
     /// FLOAT-IN-BYTES (pacer input): free lines actually handed to
     /// allocators since the last FinalMark/minor drain.  Replaces the
     /// blocks-touched float measure (`pending_blocks.len()`), which under
@@ -455,6 +459,7 @@ impl<VM: VMBinding> ImmixSpace<VM> {
             nursery_unswept_nonempty: std::sync::atomic::AtomicBool::new(false),
             nursery_lines_claimed: std::sync::atomic::AtomicUsize::new(0),
             reuse_pressure: std::sync::atomic::AtomicBool::new(false),
+            last_minor_claimed: std::sync::atomic::AtomicUsize::new(0),
             float_lines_claimed: std::sync::atomic::AtomicUsize::new(0),
             full_blocks: std::sync::Mutex::new(Vec::new()),
             reusable_blocks: ReusableBlockPool::new(scheduler.num_workers()),
@@ -1144,8 +1149,11 @@ impl<VM: VMBinding> ImmixSpace<VM> {
     /// claim-time (mutator) cost ~2x that in cross-CCX metadata fills.
     pub(crate) fn sweep_nursery_blocks(&self) {
         let blocks: Vec<Block> = std::mem::take(&mut *self.pending_blocks.lock().unwrap());
-        self.nursery_lines_claimed
-            .store(0, std::sync::atomic::Ordering::Relaxed);
+        let claimed = self
+            .nursery_lines_claimed
+            .swap(0, std::sync::atomic::Ordering::Relaxed);
+        self.last_minor_claimed
+            .store(claimed, std::sync::atomic::Ordering::Relaxed);
         self.float_lines_claimed
             .store(0, std::sync::atomic::Ordering::Relaxed);
         if blocks.is_empty() {
@@ -1174,6 +1182,27 @@ impl<VM: VMBinding> ImmixSpace<VM> {
                 return;
             }
         }
+        // PAUSE-BOUNDED MINOR CENSUS: the in-pause census must not scale
+        // with nursery size (measured: a backed-off minor accumulated a
+        // multi-hundred-MB nursery and its census ran 1.8-3.8s in-pause).
+        // Census a bounded prefix; the remainder takes the lazy-nursery
+        // route (unswept_nursery: allocation-paced object-mark census, the
+        // same pipeline as MMTK_LAZY_NURSERY and the finalizer gate, whose
+        // soundness is already established) and is re-proven by the next
+        // major if never censused.  Survival accounting is unaffected:
+        // promoted mass is measured globally by the trace, not the census.
+        const MINOR_CENSUS_CAP_BLOCKS: usize = 2048; // 64 MB
+        let blocks = {
+            let mut blocks = blocks;
+            if blocks.len() > MINOR_CENSUS_CAP_BLOCKS {
+                let rest = blocks.split_off(MINOR_CENSUS_CAP_BLOCKS);
+                let mut q = self.unswept_nursery.lock().unwrap();
+                q.extend(rest);
+                self.nursery_unswept_nonempty
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            blocks
+        };
         let space = unsafe { &*(self as *const Self) };
         // The line-state census costs ~100ns/block; one packet per ~1000
         // blocks costs less in wake edges than 16 packets of trivial work.
@@ -1338,6 +1367,12 @@ impl<VM: VMBinding> ImmixSpace<VM> {
 
     /// Real nursery size in pages: free lines handed to allocators since
     /// the last collection (see `nursery_lines_claimed`).
+    pub fn last_minor_claimed_pages(&self) -> usize {
+        self.last_minor_claimed
+            .load(std::sync::atomic::Ordering::Relaxed)
+            / (4096 / Line::BYTES)
+    }
+
     pub fn nursery_claimed_pages(&self) -> usize {
         self.nursery_lines_claimed
             .load(std::sync::atomic::Ordering::Relaxed)
