@@ -216,7 +216,10 @@ impl RawMemoryFreeList {
             "Attempt to grow FreeList beyond limit"
         );
         if self.high_water + grow_extent > self.limit {
-            grow_extent = self.high_water - self.limit;
+            // Clamp growth to the remaining room (operands were swapped:
+            // `high_water - limit` underflows usize and the mmap of the
+            // wrapped size panics -- hit with small fixed heaps).
+            grow_extent = self.limit - self.high_water;
         }
         self.mmap(self.high_water, grow_extent);
         self.high_water += grow_extent;
