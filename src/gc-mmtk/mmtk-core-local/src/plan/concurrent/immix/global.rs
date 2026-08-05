@@ -59,20 +59,6 @@ pub struct ConcurrentImmix<VM: VMBinding> {
     // heap.  Interacts with FIX C: the head start is what makes the hastened FinalMark cheap,
     // because marking is nearly done by the time the heap trigger fires.
     mark_start_ns: AtomicU64,
-    /// MINOR-FUTILITY BACKOFF: multiplier on the minor trigger's nursery
-    /// threshold.  A minor whose OBJECT survival is near-total (a growing
-    /// permanent structure passing through the nursery, e.g. list) reclaims
-    /// nothing and costs an in-pause census of the whole nursery -- measured
-    /// 20 x ~380ms whenever concurrent marking wasn't masking the minor
-    /// branch.  Futile minors double the backoff (capped); a productive one
-    /// halves it.  Object survival = promoted pages (live_now delta across
-    /// the pause) / nursery pages -- NOT line survival, which over-estimates
-    /// ~4x on small-object heaps (a 256B line is "live" if one object in it
-    /// survives) and misclassifies productive minors as futile.
-    /// With futile minors backed off, the byte-accurate float budget takes
-    /// over (float stops being reset by minors), giving high-survival
-    /// workloads the continuous concurrent cycles that actually serve them.
-    minor_backoff: std::sync::atomic::AtomicUsize,
     live_at_last_pause: std::sync::atomic::AtomicUsize,
     /// WHOLESALE-MINOR decision inputs: census minors record their object
     /// survival here (percent); wholesale minors keep the last value.  A
@@ -159,20 +145,7 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
         // into the goal).  Real walls (space_full) still take the blocking
         // paths below.
         if !space_full && !marking && Self::nursery_threshold_pages() != 0 {
-            let total = self.get_total_pages();
-            let live = self.immix_space.live_prev_pages();
-            let scaled = total.saturating_sub(live) / 6;
-            // The 4MB floor applies to the HEURISTIC path only; an explicit
-            // MMTK_NURSERY_MB is respected verbatim (it silently clamped
-            // sub-4MB settings, which invalidated small-nursery pause
-            // experiments).
-            let threshold = if std::env::var_os("MMTK_NURSERY_MB").is_some() {
-                Self::nursery_threshold_pages()
-            } else {
-                Self::nursery_threshold_pages()
-                    .min(scaled)
-                    .max(1024 /* 4 MB floor */)
-            };
+            let threshold = Self::nursery_threshold_pages();
             // External quanta count toward the nursery: counted-malloc
             // growth (net vm_live_bytes since the last collection) and LOS
             // growth.  See the snapshot fields for the rationale.
@@ -185,36 +158,15 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
                 .get_los()
                 .reserved_pages()
                 .saturating_sub(self.los_pages_at_last_gc.load(Ordering::Relaxed));
-            // EXPERIMENT KNOB (MMTK_BOUNDED_MINORS): always-on minors at the
-            // configured nursery size -- no futility backoff, no size-guard
-            // suppression.  Bounds the traced young set by construction
-            // (every minor promotes what it traces, so young-since-last-
-            // minor <= nursery + epsilon); the cost is futile minors on
-            // ~100%-survival workloads, to be absorbed by a concurrent
-            // second generation later.
-            let bounded = {
-                static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-                *ON.get_or_init(|| std::env::var_os("MMTK_BOUNDED_MINORS").is_some())
-            };
-            let backoff = if bounded {
-                1
-            } else {
-                self.minor_backoff.load(Ordering::Relaxed)
-            };
+            // BOUNDED MINORS: minors fire at the configured nursery size
+            // unconditionally -- no futility suppression, no size guard.
+            // Every minor promotes what it traces, so the young set any
+            // pause can see is <= nursery + epsilon: the pause bound holds
+            // by construction, independent of workload survival.  The cost
+            // is minors that reclaim nothing on ~100%-survival workloads;
+            // the wholesale path makes those promote-by-splice (no trace),
+            // and a concurrent second generation later absorbs them fully.
             let claimed = self.immix_space.nursery_claimed_pages();
-            // PAUSE-BOUND GUARD: an STW minor must trace the live young set
-            // in-pause, so its worst case scales with nursery size -- a
-            // nursery past this bound may only be processed by a concurrent
-            // major (measured: 1.9-3.8s minor pauses on a ~100%-survival
-            // multi-hundred-MB nursery; the census cap alone could not help
-            // because the TRACE is the scaling term).  Suppressed minors
-            // leave the float to accumulate, which drives the float-budget
-            // major below -- the collection whose trace is concurrent and
-            // whose pauses stay O(threads).  The malloc/LOS pressure terms
-            // are unaffected: they trigger on external memory, not the
-            // heap nursery, and their minors' trace cost does not scale
-            // with counted-malloc volume.
-            const MAX_MINOR_NURSERY_PAGES: usize = 32768; // 128 MB
             // SPLIT THRESHOLDS: the heap nursery and external (counted-
             // malloc/LOS) pressure have different scales -- a small heap
             // nursery bounds census-minor trace time, while external
@@ -223,13 +175,30 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
             // them made a 1MB nursery fire a minor per MB of malloc
             // (pidigits: 101k pauses).
             let t_ext = threshold.max(1024 /* 4 MB */);
-            // CENSUS SAMPLING: the every-16th census probe re-traces the
-            // live young set, serially where it is chain-shaped (measured:
-            // list's 1MB census probe = 10.9-14.2ms while the wholesale
-            // minors around it stay sub-ms).  The probe is a survival
-            // SAMPLE: a quarter-size nursery measures the same ratio at a
-            // quarter of the serial trace cost, so shrink the trigger for
-            // the minor that will run the probe.
+            // CENSUS TRACE CAP: a minor that will TRACE (a census) has
+            // in-pause cost that scales with the traced live set --
+            // serially where the data is chain-shaped (measured: a 1MB
+            // census on list = 10.9-14.2ms, 8MB = 62ms).  A minor that
+            // promotes by splice (wholesale) costs O(blocks) regardless of
+            // size.  So the pause bound comes from capping the CENSUS
+            // trigger size, not the nursery: predict the schedule-time
+            // census/wholesale decision (the every-16th probe, or a
+            // sub-88% survival estimate -- both inputs only change at
+            // census ends, so the prediction is exact) and fire those
+            // minors at <=0.5MB.  The nursery size proper only paces the
+            // splice-promoted (wholesale) minors and is a pure throughput
+            // knob.  The census stays a valid survival sample at this
+            // size, so no separate probe shrinking is needed.
+            // NOTE (deferred): capping the nursery SIZE here is
+            // conservative for low-survival data, whose census cost is
+            // O(traced live), not O(nursery) -- those workloads bind at
+            // this cadence and forfeit pause-count amortization.  The
+            // trace-volume form (threshold ~ min(N, budget/survival)) is
+            // the natural pacer extension, but the survival input is a
+            // sampled estimate that lags phase changes, so the a-priori
+            // prediction can admit an oversized census; revisit when the
+            // cost is properly motivated.
+            const CENSUS_TRACE_PAGES: usize = 128; // 0.5 MB
             let next_census = self
                 .minor_seq
                 .load(std::sync::atomic::Ordering::Relaxed)
@@ -238,14 +207,12 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
             let surv = self
                 .last_minor_survival_pct
                 .load(std::sync::atomic::Ordering::Relaxed);
-            let threshold = if next_census && surv >= 88 {
-                (threshold / 4).max(64)
+            let threshold = if next_census || surv < 88 {
+                threshold.min(CENSUS_TRACE_PAGES)
             } else {
                 threshold
             };
-            if (bounded || claimed <= MAX_MINOR_NURSERY_PAGES)
-                && (claimed / backoff >= threshold || malloc_pages + los_pages >= t_ext)
-            {
+            if claimed >= threshold || malloc_pages + los_pages >= t_ext {
                 self.minor_due.store(true, Ordering::Release);
                 crate::diag::PACER_REQ_MINOR.fetch_add(1, Ordering::Relaxed);
                 self.base().gc_trigger.request();
@@ -679,11 +646,13 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
                 Pause::Full | Pause::Nursery => {}
             }
             self.gc_end_ns.store(now, Ordering::Relaxed);
-            // MINOR-FUTILITY signal update (see `minor_backoff`).  live_now
+            // SURVIVAL sample (wholesale decision input).  live_now
             // accumulates promotions monotonically between majors and is
             // reset at InitialMark/Full prepare, so sample it at every pause
             // end and use the across-a-minor delta as that minor's promoted
-            // mass.
+            // mass.  Object survival = promoted pages / nursery pages -- NOT
+            // line survival, which over-estimates ~4x on small-object heaps
+            // (a 256B line is "live" if one object in it survives).
             {
                 use std::sync::atomic::Ordering::Relaxed;
                 let live_now = self.immix_space.live_now_pages();
@@ -699,13 +668,6 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
                         self.last_minor_survival_pct
                             .store((promoted * 100 / nursery).min(100), Relaxed);
                     }
-                    let b = self.minor_backoff.load(Relaxed);
-                    let new_b = if nursery > 0 && promoted >= nursery - nursery / 8 {
-                        (b * 2).min(64)
-                    } else {
-                        (b / 2).max(1)
-                    };
-                    self.minor_backoff.store(new_b, Relaxed);
                 }
             }
         }
@@ -1079,7 +1041,6 @@ impl<VM: VMBinding> ConcurrentImmix<VM> {
             should_do_full_gc: AtomicBool::new(false),
             concurrent_marking_active: AtomicBool::new(false),
             mark_start_ns: AtomicU64::new(0),
-            minor_backoff: std::sync::atomic::AtomicUsize::new(1),
             live_at_last_pause: std::sync::atomic::AtomicUsize::new(0),
             last_minor_survival_pct: std::sync::atomic::AtomicUsize::new(0),
             minor_seq: std::sync::atomic::AtomicUsize::new(0),
@@ -1133,21 +1094,18 @@ impl<VM: VMBinding> ConcurrentImmix<VM> {
     }
 
     /// GENERATIONAL: nursery threshold that triggers a minor collection, in
-    /// pages.  Default 64 MB with dirty handover: once the line-state
-    /// census made pause cost independent of nursery size, the size sweep
-    /// optimum moved from 32 MB up to 64 MB (~65 minors/pass at ~0.3ms,
-    /// stall 22-28ms/pass ~ stock's inline young-GC budget; paired reps
-    /// beat stock's wall by ~3.4% mean).  Small heaps bind on the total/6
-    /// cap and land at cache-scale nurseries with warm-up zeroing instead
-    /// (see the zeroed selection in the constructor).  Overridable via
-    /// MMTK_NURSERY_MB; MMTK_NURSERY_MB=0 disables minors (majors-only).
+    /// pages.  Census (tracing) minors are size-capped separately (see the
+    /// census trace cap in `collection_required`), so this paces only the
+    /// splice-promoted wholesale minors and trades pause COUNT against
+    /// float, not pause LENGTH.  Overridable via MMTK_NURSERY_MB (respected
+    /// verbatim; 0 disables minors entirely, majors-only).
     fn nursery_threshold_pages() -> usize {
         static PAGES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
         *PAGES.get_or_init(|| {
             let mb = std::env::var("MMTK_NURSERY_MB")
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(64);
+                .unwrap_or(8);
             mb << (20 - 12)
         })
     }
