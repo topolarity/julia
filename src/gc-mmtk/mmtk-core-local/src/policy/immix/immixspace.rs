@@ -1102,7 +1102,7 @@ impl<VM: VMBinding> ImmixSpace<VM> {
             std::env::var("MMTK_MIN_HOLE_LINES")
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(1)
+                .unwrap_or(4)
                 .max(1)
         })
     }
