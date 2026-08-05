@@ -548,9 +548,6 @@ static void jl_delete_thread(void *value)
     ptls->previous_exception = NULL;
     // allow the page root_task is on to be freed
     ptls->root_task = NULL;
-    jl_free_thread_gc_state(ptls);
-    // park in safe-region from here on (this may run GC again)
-    jl_gc_safe_enter_from_nonmutator(ptls);
     // try to free some state we do not need anymore
 #ifndef _OS_WINDOWS_
     void *signal_stack = ptls->signal_stack;
@@ -604,6 +601,13 @@ static void jl_delete_thread(void *value)
 #endif
     free(ptls->bt_data);
     small_arraylist_free(&ptls->locks);
+    // `current_task` is cleared and this thread has been GC-unsafe throughout,
+    // so its task could not be collected while the profiler could still reach
+    // it; only now may the GC drop this thread's roots.
+    jl_free_thread_gc_state(ptls);
+    // park in safe-region; our roots are no longer scanned, so we must not
+    // poll a safepoint
+    jl_gc_safe_enter_from_nonmutator(ptls);
 }
 
 //// debugging hack: if we are exiting too fast for error message printing on threads,
