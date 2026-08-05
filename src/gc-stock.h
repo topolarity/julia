@@ -530,7 +530,7 @@ STATIC_INLINE void gc_check_ptls_of_parallel_collector_thread(jl_ptls_t ptls) JL
     (void)ptls;
     assert(gc_parallel_collector_threads_enabled());
     assert(ptls != NULL);
-    assert(jl_atomic_load_relaxed(&ptls->gc_state) == JL_GC_PARALLEL_COLLECTOR_THREAD);
+    assert((jl_atomic_load_relaxed(&ptls->gc_state) & JL_GC_STATE_MASK) == JL_GC_PARALLEL_COLLECTOR_THREAD);
 }
 
 extern uintptr_t gc_bigval_sentinel_tag;

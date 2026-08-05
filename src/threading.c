@@ -378,6 +378,8 @@ jl_ptls_t jl_init_threadtls(int16_t tid)
 #ifdef __clang_safetyanalysis__
     jl_gc_unsafe_enter(ptls);
 #else
+    // plain store: this thread is not yet visible to any stopper, so no
+    // claim can exist on it
     jl_atomic_store_relaxed(&ptls->gc_state, JL_GC_STATE_UNSAFE); // GC unsafe
 #endif
     // Conditionally initialize the safepoint address. See comment in
@@ -1010,7 +1012,7 @@ void _jl_mutex_wait(jl_task_t *self, jl_mutex_t *lock, int safepoint) JL_NO_SAFE
         if (!jl_mutex_parked(owner) &&
             !jl_atomic_cmpswap(&lock->owner, &owner, jl_mutex_with_park(owner)))
             continue; // raced; retry
-        int8_t gc_state = 0;
+        uint8_t gc_state = 0;
         if (safepoint)
             gc_state = jl_gc_safe_enter(self->ptls);
         uv_mutex_lock(&jl_mutex_park[idx].mtx);

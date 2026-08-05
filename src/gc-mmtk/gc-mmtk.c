@@ -340,7 +340,7 @@ JL_DLLEXPORT int jl_gc_enable(int on)
                 // be woken by a future stop-the-world pause completing (see resume_mutators() in
                 // the mmtk_julia binding). This mirrors the same jl_gc_safe_enter/leave pattern used around other
                 // blocking waits elsewhere in the runtime (e.g. _jl_mutex_wait in threading.c).
-                int8_t gc_state = jl_gc_safe_enter(ptls);
+                uint8_t gc_state = jl_gc_safe_enter(ptls);
                 mmtk_wait_for_new_gc_epoch(gc_epoch);
                 jl_gc_safe_leave(ptls, gc_state);
             }
@@ -406,8 +406,7 @@ JL_DLLEXPORT void jl_gc_prepare_to_collect(void)
         return;
     }
 
-    int8_t old_state = jl_atomic_load_relaxed(&ptls->gc_state);
-    jl_atomic_store_release(&ptls->gc_state, JL_GC_STATE_WAITING);
+    uint8_t old_state = jl_gc_state_swap_unchecked(ptls, JL_GC_STATE_WAITING) & JL_GC_STATE_MASK;
     // `jl_safepoint_start_gc()` makes sure only one thread can run the GC.
     uint64_t t0 = jl_hrtime();
     if (!jl_safepoint_start_gc(ct)) {

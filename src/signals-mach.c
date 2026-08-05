@@ -409,7 +409,7 @@ static void segv_handler(int sig, siginfo_t *info, void *context)
     }
     jl_task_t *ct = jl_get_current_task();
     if ((sig != SIGBUS || info->si_code == BUS_ADRERR) &&
-    !(ct == NULL || ct->ptls == NULL || jl_atomic_load_relaxed(&ct->ptls->gc_state) == JL_GC_STATE_WAITING || ct->eh == NULL)
+    !(ct == NULL || ct->ptls == NULL || (jl_atomic_load_relaxed(&ct->ptls->gc_state) & JL_GC_STATE_MASK) == JL_GC_STATE_WAITING || ct->eh == NULL)
     && is_addr_on_stack(ct, info->si_addr)) { // stack overflow and not a BUS_ADRALN (alignment error)
         stack_overflow_warning();
     }
@@ -475,7 +475,7 @@ kern_return_t catch_mach_exception_raise_state_identity(
         jl_throw_in_state(ptls2, state, NULL);
         return KERN_SUCCESS;
     }
-    if (jl_atomic_load_acquire(&ptls2->gc_state) == JL_GC_STATE_WAITING)
+    if ((jl_atomic_load_acquire(&ptls2->gc_state) & JL_GC_STATE_MASK) == JL_GC_STATE_WAITING)
         return KERN_FAILURE;
     if (exception == EXC_ARITHMETIC) {
         jl_throw_in_state(ptls2, state, jl_diverror_exception);
@@ -683,6 +683,10 @@ static void jl_send_reset_signal(int16_t tid, int reset_code) JL_NOTSAFEPOINT
     // protocol.
     ct2 = jl_atomic_load_relaxed(&ptls2->current_task);
     if (ct2 != NULL &&
+        // Deliberately NOT masked with JL_GC_STATE_MASK: a claimed thread is
+        // counted as stopped by a collection in progress and must not be
+        // redirected back into Julia code, so only an exactly-UNSAFE (and
+        // therefore unclaimed) thread is eligible.
         jl_atomic_load_relaxed(&ptls2->gc_state) == JL_GC_STATE_UNSAFE) {
         jl_reset_ctx_t *reset_ctx = jl_atomic_load_acquire(&ct2->reset_ctx);
         jl_value_t *bound = jl_atomic_load_relaxed(&ct2->bound_cancel_token);

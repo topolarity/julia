@@ -430,7 +430,7 @@ void jl_register_jit_object(const object::ObjectFile &Object,
             jl_code_instance_t *ci_root = ci;
             // jl_gc_unsafe_enter may safepoint, so root before the transition.
             JL_GC_PUSH1(&ci_root);
-            int8_t gc_state = jl_gc_unsafe_enter(ct->ptls);
+            uint8_t gc_state = jl_gc_unsafe_enter(ct->ptls);
             jl_as_global_root((jl_value_t*)ci_root, 1);
             JL_GC_POP();
             jl_gc_unsafe_leave(ct->ptls, gc_state);

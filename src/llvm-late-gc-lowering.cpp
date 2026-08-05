@@ -1889,6 +1889,9 @@ bool LateLowerGCFrame::CleanupIR(Function &F, State *S, bool *CFGModified) {
         );
     }
     SmallVector<CallInst*, 0> write_barriers;
+    // gc-transition calls whose return-to-UNSAFE is emitted after the loop,
+    // where splitting basic blocks is safe: (call, ptls)
+    SmallVector<std::pair<Instruction*, Value*>, 0> gc_transition_exits;
     for (BasicBlock &BB : F) {
         for (auto it = BB.begin(); it != BB.end();) {
             Instruction *I = &*it;
@@ -2240,22 +2243,20 @@ bool LateLowerGCFrame::CleanupIR(Function &F, State *S, bool *CFGModified) {
 
                 // In theory LLVM wants us to lower this using RewriteStatepointsForGC
                 if (gc_transition) {
-                    // Insert the operations to switch to gc_safe if necessary.
+                    // Insert the operations to switch to gc_safe.
                     IRBuilder<> builder(CI);
                     assert(ptls);
-                    // We dont use emit_state_set here because safepoints are unconditional for any code that reaches this
-                    // We are basically guaranteed to go from gc_unsafe to gc_safe and back, and both transitions need a safepoint
-                    // We also can't add any BBs here, so just avoiding the branches is good
-                    unsigned offset = offsetof(jl_tls_states_t, gc_state);
-                    Value *gc_state = builder.CreateConstInBoundsGEP1_32(Type::getInt8Ty(builder.getContext()), ptls, offset, "gc_state");
-                    LoadInst *last_gc_state = builder.CreateAlignedLoad(Type::getInt8Ty(builder.getContext()), gc_state, Align(sizeof(void*)));
-                    last_gc_state->setOrdering(AtomicOrdering::Monotonic);
+                    // Plain store: we are leaving UNSAFE, and a running thread
+                    // is never claimed (becoming runnable is a checked
+                    // transition), so its word is exactly JL_GC_STATE_UNSAFE.
+                    // The safepoint here is unconditional for any code that
+                    // reaches this.
+                    Value *gc_state = emit_gc_state_ptr(builder, ptls);
                     builder.CreateAlignedStore(builder.getInt8(JL_GC_STATE_SAFE), gc_state, Align(sizeof(void*)))->setOrdering(AtomicOrdering::Release);
                     MDNode *tbaa = get_tbaa_const(builder.getContext());
                     emit_gc_safepoint(builder, T_size, ptls, tbaa, false);
-                    builder.SetInsertPoint(CI->getNextNode());
-                    builder.CreateAlignedStore(last_gc_state, gc_state, Align(sizeof(void*)))->setOrdering(AtomicOrdering::Release);
-                    emit_gc_safepoint(builder, T_size, ptls, tbaa, false);
+                    // The return to UNSAFE is a checked transition needing new
+                    // BBs; emitted after this iteration completes.
                 }
                 if (CI->arg_size() == CI->getNumOperands()) {
                     /* No operand bundle to lower */
@@ -2272,6 +2273,8 @@ bool LateLowerGCFrame::CleanupIR(Function &F, State *S, bool *CFGModified) {
                     NewCall->copyMetadata(*CI);
                     CI->replaceAllUsesWith(NewCall);
                     UpdatePtrNumbering(CI, NewCall, S);
+                    if (gc_transition)
+                        gc_transition_exits.push_back(std::make_pair((Instruction*)NewCall, ptls));
                 }
             }
             if (!CI->use_empty()) {
@@ -2281,6 +2284,18 @@ bool LateLowerGCFrame::CleanupIR(Function &F, State *S, bool *CFGModified) {
             it = CI->eraseFromParent();
             ChangesMade = true;
         }
+    }
+    for (auto &transition : gc_transition_exits) {
+        Instruction *anchor = transition.first;
+        Value *ptls = transition.second;
+        // Checked return to UNSAFE (see emit_gc_state_set_unsafe), then the
+        // safepoint poll for a stop that has not claimed us yet.
+        IRBuilder<> builder(anchor->getNextNode());
+        builder.SetCurrentDebugLocation(anchor->getDebugLoc());
+        emit_gc_state_set_unsafe(builder, ptls, builder.getInt8(JL_GC_STATE_SAFE), CFGModified);
+        MDNode *tbaa = get_tbaa_const(builder.getContext());
+        emit_gc_safepoint(builder, T_size, ptls, tbaa, false);
+        ChangesMade = true;
     }
     CleanupWriteBarriers(F, S, write_barriers, CFGModified);
     if (maxframeargs == 0 && Frame) {

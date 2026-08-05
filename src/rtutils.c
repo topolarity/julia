@@ -269,7 +269,7 @@ JL_DLLEXPORT void jl_enter_handler(jl_task_t *ct, jl_handler_t *eh)
     eh->scope = ct->scope;
     eh->reset_ctx = jl_atomic_load_relaxed(&ct->reset_ctx);
     eh->bound_cancel_token = jl_atomic_load_relaxed(&ct->bound_cancel_token);
-    eh->gc_state = jl_atomic_load_relaxed(&ct->ptls->gc_state);
+    eh->gc_state = jl_atomic_load_relaxed(&ct->ptls->gc_state) & JL_GC_STATE_MASK;
     eh->locks_len = ct->ptls->locks.len;
     eh->defer_signal = ct->ptls->defer_signal;
     eh->world_age = ct->world_age;
@@ -313,15 +313,23 @@ JL_DLLEXPORT void jl_eh_restore_state(jl_task_t *ct, jl_handler_t *eh) JL_NO_SAF
     }
     ct->world_age = eh->world_age;
     ptls->defer_signal = eh->defer_signal;
-    int8_t old_gc_state = jl_atomic_load_relaxed(&ptls->gc_state);
-    if (old_gc_state != eh->gc_state)
-        jl_atomic_store_release(&ptls->gc_state, eh->gc_state);
+    uint8_t old_gc_state = jl_atomic_load_relaxed(&ptls->gc_state) & JL_GC_STATE_MASK;
+    if (old_gc_state != eh->gc_state) {
+        if (eh->gc_state == JL_GC_STATE_UNSAFE) {
+            // checked: park instead of publishing a runnable state while claimed
+            if (!jl_gc_state_try_swap(ptls, JL_GC_STATE_UNSAFE))
+                jl_gc_state_set_unsafe_slow(ptls);
+        }
+        else {
+            jl_gc_state_swap_unchecked(ptls, eh->gc_state);
+        }
+    }
     if (!old_gc_state || !eh->gc_state) // it was or is unsafe now
         jl_gc_safepoint_(ptls);
     jl_value_t *exception = ptls->sig_exception;
     JL_GC_PROMISE_ROOTED(exception);
     if (exception) {
-        int8_t oldstate = jl_gc_unsafe_enter(ptls);
+        uint8_t oldstate = jl_gc_unsafe_enter(ptls);
         /* The temporary ptls->bt_data is rooted by special purpose code in the
         GC. This exists only for the purpose of preserving bt_data until we
         set ptls->bt_size=0 below. */

@@ -191,6 +191,11 @@ void LowerPTLS::fix_pgcstack_use(CallInst *pgcstack, Function *pgcstack_getter, 
         fastTerm->removeFromParent();
         MDNode *tbaa = tbaa_gcframe;
         Value *prior = emit_gc_unsafe_enter(builder, T_size, get_current_ptls_from_task(builder, get_current_task_from_pgcstack(builder, pgcstack), tbaa), true);
+        // Snapshots taken for later restore must not capture claim bits: the
+        // claim belongs to the collection that placed it, and restoring it
+        // later would fabricate a stale claim (emit_gc_state_set already
+        // returns only the state field, but keep this explicit and cheap).
+        prior = builder.CreateAnd(prior, ConstantInt::get(Type::getInt8Ty(M->getContext()), JL_GC_STATE_MASK));
         builder.Insert(fastTerm);
         phi->addIncoming(pgcstack, fastTerm->getParent());
         // emit pre-return cleanup
@@ -205,13 +210,15 @@ void LowerPTLS::fix_pgcstack_use(CallInst *pgcstack, Function *pgcstack_getter, 
             last_gc_state->addIncoming(prior, fastTerm->getParent());
             for (auto &BB : *pgcstack->getParent()->getParent()) {
                 if (isa<ReturnInst>(BB.getTerminator())) {
-                    // Don't use emit_gc_safe_leave here, as that introduces a new BB while iterating BBs
+                    // Out-of-line restore (checked for UNSAFE, claim-preserving
+                    // otherwise, polls): the restore target is dynamic here and
+                    // this iteration cannot add BBs, so call the runtime.
                     builder.SetInsertPoint(BB.getTerminator());
                     Value *ptls = get_current_ptls_from_task(builder, get_current_task_from_pgcstack(builder, phi), tbaa_gcframe);
-                    unsigned offset = offsetof(jl_tls_states_t, gc_state);
-                    Value *gc_state = builder.CreateConstInBoundsGEP1_32(Type::getInt8Ty(builder.getContext()), ptls, offset, "gc_state");
-                    builder.CreateAlignedStore(last_gc_state, gc_state, Align(sizeof(void*)))->setOrdering(AtomicOrdering::Release);
-                    emit_gc_safepoint(builder, T_size, ptls, tbaa, true);
+                    FunctionCallee restoref = M->getOrInsertFunction("jl_gc_state_restore",
+                            FunctionType::get(Type::getVoidTy(M->getContext()),
+                                              {ptls->getType(), Type::getInt8Ty(M->getContext())}, false));
+                    builder.CreateCall(restoref, {ptls, last_gc_state});
                 }
             }
         }

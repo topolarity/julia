@@ -3780,8 +3780,7 @@ JL_DLLEXPORT void jl_gc_collect(jl_gc_collection_t collection)
     }
     jl_gc_debug_print();
 
-    int8_t old_state = jl_atomic_load_relaxed(&ptls->gc_state);
-    jl_atomic_store_release(&ptls->gc_state, JL_GC_STATE_WAITING);
+    uint8_t old_state = jl_gc_state_swap_unchecked(ptls, JL_GC_STATE_WAITING) & JL_GC_STATE_MASK;
     // `jl_safepoint_start_gc()` makes sure only one thread can run the GC.
     uint64_t t0 = jl_hrtime();
     if (!jl_safepoint_start_gc(ct)) {

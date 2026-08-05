@@ -672,7 +672,7 @@ JL_DLLEXPORT void jl_switch(void) JL_CANSAFEPOINT_ENTER_LEAVE
         // current task itself)
         return;
     }
-    int8_t gc_state = jl_gc_unsafe_enter(ptls);
+    uint8_t gc_state = jl_gc_unsafe_enter(ptls);
     if (ptls->in_finalizer)
         jl_error("task switch not allowed from inside gc finalizer");
     if (ptls->in_pure_callback)

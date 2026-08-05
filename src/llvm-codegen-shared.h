@@ -232,24 +232,138 @@ static inline void emit_gc_safepoint(llvm::IRBuilder<> &builder, llvm::Type *T_s
     emit_signal_fence(builder);
 }
 
-static inline llvm::Value *emit_gc_state_set(llvm::IRBuilder<> &builder, llvm::Type *T_size, llvm::Value *ptls, llvm::Value *state, llvm::Value *old_state, bool final)
+// Pointer to this thread's gc_state field.
+static inline llvm::Value *emit_gc_state_ptr(llvm::IRBuilder<> &builder, llvm::Value *ptls)
 {
     using namespace llvm;
-    Type *T_int8 = state->getType();
     unsigned offset = offsetof(jl_tls_states_t, gc_state);
-    Value *gc_state = builder.CreateConstInBoundsGEP1_32(T_int8, ptls, offset, "gc_state");
+    return builder.CreateConstInBoundsGEP1_32(Type::getInt8Ty(builder.getContext()), ptls, offset, "gc_state");
+}
+
+// Call the runtime slow path of a checked transition to UNSAFE: parks until no
+// claim is outstanding and UNSAFE has been published.
+static inline void emit_gc_unsafe_slow_call(llvm::IRBuilder<> &builder, llvm::Value *ptls)
+{
+    using namespace llvm;
+    Module *M = builder.GetInsertBlock()->getModule();
+    FunctionCallee slowf = M->getOrInsertFunction("jl_gc_state_set_unsafe_slow",
+            FunctionType::get(Type::getVoidTy(builder.getContext()), {ptls->getType()}, false));
+    builder.CreateCall(slowf, {ptls});
+}
+
+// Emit the checked transition to JL_GC_STATE_UNSAFE: a compare-exchange that
+// succeeds only while this thread is unclaimed, with a runtime slow path that
+// parks until the collection releases the claim. A claimed word therefore
+// never carries a runnable state. `old_state` is the expected pre-transition
+// word (loaded if null); the claims test is elided when it is a claim-free
+// constant. May add basic blocks; the builder is left at the merge point,
+// splitting the current block if it is mid-block. Returns the observed
+// pre-transition word.
+static inline llvm::Value *emit_gc_state_set_unsafe(llvm::IRBuilder<> &builder, llvm::Value *ptls,
+                                                    llvm::Value *old_state, bool *CFGModified=nullptr)
+{
+    using namespace llvm;
+    LLVMContext &C = builder.getContext();
+    Type *T_int8 = Type::getInt8Ty(C);
+    Value *gc_state = emit_gc_state_ptr(builder, ptls);
     if (old_state == nullptr) {
         old_state = builder.CreateLoad(T_int8, gc_state, "old_state");
         cast<LoadInst>(old_state)->setOrdering(AtomicOrdering::Monotonic);
     }
-    builder.CreateAlignedStore(state, gc_state, Align(sizeof(void*)))->setOrdering(AtomicOrdering::Release);
-    if (auto *C = dyn_cast<ConstantInt>(old_state))
-        if (auto *C2 = dyn_cast<ConstantInt>(state))
-            if (C->getZExtValue() == C2->getZExtValue())
-                return old_state;
+    Function *F = builder.GetInsertBlock()->getParent();
+    BasicBlock *headBB = builder.GetInsertBlock();
+    BasicBlock *contBB;
+    if (builder.GetInsertPoint() == headBB->end()) {
+        contBB = BasicBlock::Create(C, "gc_unsafe_cont", F);
+    }
+    else {
+        contBB = headBB->splitBasicBlock(builder.GetInsertPoint(), "gc_unsafe_cont");
+        headBB->getTerminator()->eraseFromParent();
+    }
+    builder.SetInsertPoint(headBB);
+    BasicBlock *slowBB = BasicBlock::Create(C, "gc_unsafe_slow", F, contBB);
+    auto *old_c = dyn_cast<ConstantInt>(old_state);
+    bool old_claim_free = old_c && (old_c->getZExtValue() & JL_GC_STATE_CLAIMS) == 0;
+    if (!old_claim_free) {
+        // only attempt the exchange on an unclaimed expected word: exchanging
+        // a claimed word for UNSAFE would drop the claim
+        BasicBlock *tryBB = BasicBlock::Create(C, "gc_unsafe_try", F, slowBB);
+        Value *claims = builder.CreateAnd(old_state, ConstantInt::get(T_int8, JL_GC_STATE_CLAIMS));
+        Value *unclaimed = builder.CreateICmpEQ(claims, ConstantInt::get(T_int8, 0));
+        builder.CreateCondBr(unclaimed, tryBB, slowBB);
+        builder.SetInsertPoint(tryBB);
+    }
+    auto *cx = builder.CreateAtomicCmpXchg(gc_state, old_state,
+            ConstantInt::get(T_int8, JL_GC_STATE_UNSAFE),
+            Align(1), AtomicOrdering::AcquireRelease, AtomicOrdering::Monotonic);
+    builder.CreateCondBr(builder.CreateExtractValue(cx, 1), contBB, slowBB);
+    builder.SetInsertPoint(slowBB);
+    emit_gc_unsafe_slow_call(builder, ptls);
+    builder.CreateBr(contBB);
+    builder.SetInsertPoint(contBB, contBB->getFirstInsertionPt());
+    if (CFGModified)
+        *CFGModified = true;
+    return old_state;
+}
+
+// Claim-preserving publish of a stopped state from a possibly-claimed stopped
+// state: a compare-exchange loop over `(cur & CLAIMS) | state`. May add basic
+// blocks; the builder is left at the merge point.
+static inline void emit_gc_state_set_stopped(llvm::IRBuilder<> &builder, llvm::Value *ptls,
+                                             llvm::Value *state, llvm::Value *old_state)
+{
+    using namespace llvm;
+    LLVMContext &C = builder.getContext();
+    Type *T_int8 = state->getType();
+    Value *gc_state = emit_gc_state_ptr(builder, ptls);
+    Function *F = builder.GetInsertBlock()->getParent();
+    BasicBlock *headBB = builder.GetInsertBlock();
+    BasicBlock *loopBB = BasicBlock::Create(C, "gc_state_cas", F);
+    BasicBlock *contBB = BasicBlock::Create(C, "gc_state_cont", F);
+    builder.CreateBr(loopBB);
+    builder.SetInsertPoint(loopBB);
+    PHINode *cur = builder.CreatePHI(T_int8, 2);
+    cur->addIncoming(old_state, headBB);
+    Value *keep = builder.CreateAnd(cur, ConstantInt::get(T_int8, JL_GC_STATE_CLAIMS));
+    Value *next = builder.CreateOr(keep, state);
+    auto *cx = builder.CreateAtomicCmpXchg(gc_state, cur, next,
+            Align(1), AtomicOrdering::AcquireRelease, AtomicOrdering::Monotonic);
+    cur->addIncoming(builder.CreateExtractValue(cx, 0), loopBB);
+    builder.CreateCondBr(builder.CreateExtractValue(cx, 1), contBB, loopBB);
+    builder.SetInsertPoint(contBB);
+}
+
+// Publish a new gc_state at a compiled transition boundary, then emit the
+// conditional safepoint poll. Becoming runnable is a checked transition (see
+// emit_gc_state_set_unsafe); publishing a stopped state preserves any claim,
+// as a plain store when the previous state is known to be UNSAFE at compile
+// time (a running thread is never claimed, so its word is exactly UNSAFE).
+static inline llvm::Value *emit_gc_state_set(llvm::IRBuilder<> &builder, llvm::Type *T_size, llvm::Value *ptls, llvm::Value *state, llvm::Value *old_state, bool final)
+{
+    using namespace llvm;
+    Type *T_int8 = state->getType();
+    auto *state_c = dyn_cast<ConstantInt>(state);
+    auto *old_c = dyn_cast_or_null<ConstantInt>(old_state);
+    if (state_c && state_c->isZero()) {
+        old_state = emit_gc_state_set_unsafe(builder, ptls, old_state);
+    }
+    else if (old_c && old_c->isZero()) {
+        Value *gc_state = emit_gc_state_ptr(builder, ptls);
+        builder.CreateAlignedStore(state, gc_state, Align(sizeof(void*)))->setOrdering(AtomicOrdering::Release);
+    }
+    else {
+        if (old_state == nullptr) {
+            Value *gc_state = emit_gc_state_ptr(builder, ptls);
+            old_state = builder.CreateLoad(T_int8, gc_state, "old_state");
+            cast<LoadInst>(old_state)->setOrdering(AtomicOrdering::Monotonic);
+        }
+        emit_gc_state_set_stopped(builder, ptls, state, old_state);
+    }
+    if (old_c && state_c && old_c->getZExtValue() == state_c->getZExtValue())
+        return old_state;
     BasicBlock *passBB = BasicBlock::Create(builder.getContext(), "safepoint", builder.GetInsertBlock()->getParent());
     BasicBlock *exitBB = BasicBlock::Create(builder.getContext(), "after_safepoint", builder.GetInsertBlock()->getParent());
-    builder.CreateCondBr(builder.CreateICmpEQ(old_state, state, "is_new_state"), // Safepoint whenever we do not change the GC state
+    builder.CreateCondBr(builder.CreateICmpNE(old_state, state, "is_new_state"), // Safepoint whenever we change the GC state (JuliaLang/julia#62636)
                          passBB, exitBB);
     builder.SetInsertPoint(passBB);
     MDNode *tbaa = get_tbaa_const(builder.getContext());

@@ -1547,7 +1547,7 @@ struct JuliaOJIT::DLSymOptimizer {
         auto uit = user_symbols.find(lib);
         if (uit == user_symbols.end()) {
             jl_task_t *ct = jl_current_task;
-            int8_t gc_state = jl_gc_unsafe_enter(ct->ptls);
+            uint8_t gc_state = jl_gc_unsafe_enter(ct->ptls);
             void *handle = jl_get_library_(libname, 0);
             jl_gc_unsafe_leave(ct->ptls, gc_state);
             if (!handle)

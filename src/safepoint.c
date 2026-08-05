@@ -126,6 +126,32 @@ void jl_safepoint_init(void)
     jl_safepoint_pages = addr;
 }
 
+// Claim `ptls->gc_state`, making the thread ineligible to be resumed.
+// Returns 0 if it is still running Julia code.
+static int jl_safepoint_claim_thread(jl_ptls_t ptls) JL_NOTSAFEPOINT
+{
+    while (1) {
+        uint8_t s = jl_atomic_load_acquire(&ptls->gc_state);
+        // claims are only ever observable on stopped-state words: becoming
+        // runnable is a checked transition (the crash path is the sole,
+        // process-fatal exception)
+        assert(!(s & JL_GC_STATE_CLAIMS) || (s & JL_GC_STATE_MASK) == JL_GC_STATE_WAITING ||
+               (s & JL_GC_STATE_MASK) == JL_GC_STATE_SAFE);
+        if (s & JL_GC_STATE_CLAIMED)
+            return 1; // already claimed by us for this stop
+        uint8_t base = s & JL_GC_STATE_MASK;
+        if (base == JL_GC_STATE_UNSAFE)
+            return 0; // still running Julia code
+        if (base != JL_GC_STATE_WAITING && base != JL_GC_STATE_SAFE)
+            return 1; // a collector thread: already stopped, nothing to claim
+        if (jl_atomic_cmpswap(&ptls->gc_state, &s, (uint8_t)(s | JL_GC_STATE_CLAIMED)))
+            return 1;
+    // lost the race against a thread leaving a safepoint from a previous GC
+    // (e.g. it was in JL_GC_STATE_WAITING on its way back to JL_GC_STATE_UNSAFE)
+    // we must wait for it to hit a safepoint again
+    }
+}
+
 extern void jl_gc_wait_for_the_world(jl_ptls_t* gc_all_tls_states, int gc_n_threads) JL_CANSAFEPOINT
 {
     JL_TIMING(GC, GC_Stop);
@@ -145,13 +171,13 @@ extern void jl_gc_wait_for_the_world(jl_ptls_t* gc_all_tls_states, int gc_n_thre
             // We're currently also using atomic store release in mutator threads
             // (in jl_gc_state_set), but we may want to use signals to flush the
             // memory operations on those threads lazily instead.
-            while (!jl_atomic_load_relaxed(&ptls2->gc_state) || !jl_atomic_load_acquire(&ptls2->gc_state)) {
+            while (!jl_safepoint_claim_thread(ptls2)) {
                 // Use system mutexes rather than spin locking to minimize wasted CPU time
                 // while we wait for other threads reach a safepoint.
                 // This is particularly important when run under rr.
                 if (jl_options.timeout_for_safepoint_straggler_s == -1) { // timeout was not specified: no need to dump the backtrace
                     uv_mutex_lock(&safepoint_lock);
-                    if (!jl_atomic_load_relaxed(&ptls2->gc_state)) {
+                    if ((jl_atomic_load_relaxed(&ptls2->gc_state) & JL_GC_STATE_MASK) == JL_GC_STATE_UNSAFE) {
                         uv_cond_wait(&safepoint_cond_begin, &safepoint_lock);
                     }
                     uv_mutex_unlock(&safepoint_lock);
@@ -160,7 +186,7 @@ extern void jl_gc_wait_for_the_world(jl_ptls_t* gc_all_tls_states, int gc_n_thre
                     const int64_t timeout = jl_options.timeout_for_safepoint_straggler_s * 1000000000LL; // convert to nanoseconds
                     int ret = 0;
                     uv_mutex_lock(&safepoint_lock);
-                    if (!jl_atomic_load_relaxed(&ptls2->gc_state)) {
+                    if ((jl_atomic_load_relaxed(&ptls2->gc_state) & JL_GC_STATE_MASK) == JL_GC_STATE_UNSAFE) {
                         ret = uv_cond_timedwait(&safepoint_cond_begin, &safepoint_lock, timeout);
                     }
                     uv_mutex_unlock(&safepoint_lock);
@@ -184,7 +210,7 @@ extern void jl_gc_wait_for_the_world(jl_ptls_t* gc_all_tls_states, int gc_n_thre
 int jl_safepoint_start_gc(jl_task_t *ct)
 {
     // The thread should have just set this before entry
-    assert(jl_atomic_load_relaxed(&ct->ptls->gc_state) == JL_GC_STATE_WAITING);
+    assert((jl_atomic_load_relaxed(&ct->ptls->gc_state) & JL_GC_STATE_MASK) == JL_GC_STATE_WAITING);
     uv_mutex_lock(&safepoint_lock);
     uv_cond_broadcast(&safepoint_cond_begin);
     // make sure we are permitted to run GC now (we might be required to stop instead)
@@ -221,6 +247,15 @@ void jl_safepoint_end_gc(void)
 {
     assert(jl_atomic_load_relaxed(&jl_gc_running));
     uv_mutex_lock(&safepoint_lock);
+    // Release the claims taken by jl_gc_wait_for_the_world, so that threads
+    // are allowed to resume.
+    int n_tls = jl_atomic_load_acquire(&jl_n_threads);
+    jl_ptls_t *all_tls = jl_atomic_load_relaxed(&jl_all_tls_states);
+    for (int i = 0; i < n_tls; i++) {
+        jl_ptls_t ptls2 = all_tls[i];
+        if (ptls2 != NULL)
+            jl_atomic_fetch_and_relaxed(&ptls2->gc_state, (uint8_t)~JL_GC_STATE_CLAIMED);
+    }
     // Need to reset the page protection before resetting the flag since
     // the thread will trigger a segfault immediately after returning from
     // the signal handler.
@@ -235,14 +270,45 @@ void jl_set_gc_and_wait(jl_task_t *ct)
 {
     // reading own gc state doesn't need atomic ops since no one else
     // should store to it.
-    int8_t state = jl_atomic_load_relaxed(&ct->ptls->gc_state);
-    jl_atomic_store_release(&ct->ptls->gc_state, JL_GC_STATE_WAITING);
+    uint8_t state = jl_atomic_load_relaxed(&ct->ptls->gc_state) & JL_GC_STATE_MASK;
+    // claim-preserving swap: we may already be claimed, e.g. claimed while SAFE
+    // and then trapped on the safepoint poll while publishing UNSAFE on the way
+    // out of a ccall
+    jl_gc_state_swap_unchecked(ct->ptls, JL_GC_STATE_WAITING);
     uv_mutex_lock(&safepoint_lock);
     uv_cond_broadcast(&safepoint_cond_begin);
     uv_mutex_unlock(&safepoint_lock);
-    jl_safepoint_wait_gc(ct);
-    jl_atomic_store_release(&ct->ptls->gc_state, state);
+    // if we did not make much progress but other threads did, further STW stops
+    // may claim us while we are still parked for an earlier one. A claimed
+    // thread must never publish a running state, so keep waiting until we can
+    // leave with no claim outstanding; on failure the word is untouched and we
+    // are still in JL_GC_STATE_WAITING (as jl_safepoint_wait_gc asserts).
+    do {
+        jl_safepoint_wait_gc(ct);
+    } while (!jl_gc_state_try_swap(ct->ptls, state));
     jl_safepoint_wait_thread_resume(ct); // block in thread-suspend now if requested, after clearing the gc_state
+}
+
+JL_DLLEXPORT void jl_gc_state_set_unsafe_slow(jl_ptls_t ptls)
+{
+    jl_task_t *ct = jl_atomic_load_relaxed(&ptls->current_task);
+    while (!jl_gc_state_try_swap(ptls, JL_GC_STATE_UNSAFE))
+        jl_safepoint_wait_gc(ct);
+}
+
+// Restore a saved gc_state at a codegen-emitted transition boundary
+// (cfunction return). Checked for UNSAFE, claim-preserving otherwise, and
+// polls, matching jl_gc_state_set.
+JL_DLLEXPORT void jl_gc_state_restore(jl_ptls_t ptls, uint8_t state)
+{
+    if (state == JL_GC_STATE_UNSAFE) {
+        if (!jl_gc_state_try_swap(ptls, JL_GC_STATE_UNSAFE))
+            jl_gc_state_set_unsafe_slow(ptls);
+    }
+    else {
+        jl_gc_state_swap_unchecked(ptls, state);
+    }
+    jl_gc_safepoint_(ptls);
 }
 
 // this is the core of jl_set_gc_and_wait
@@ -251,7 +317,7 @@ void jl_safepoint_wait_gc(jl_task_t *ct) JL_NOTSAFEPOINT
     if (ct) {
         JL_TIMING_SUSPEND_TASK(GC_SAFEPOINT, ct);
         // The thread should have set this already
-        assert(jl_atomic_load_relaxed(&ct->ptls->gc_state) != JL_GC_STATE_UNSAFE);
+        assert((jl_atomic_load_relaxed(&ct->ptls->gc_state) & JL_GC_STATE_MASK) != JL_GC_STATE_UNSAFE);
     }
     // Use normal volatile load in the loop for speed until GC finishes.
     // Then use an acquire load to make sure the GC result is visible on this thread.
@@ -274,24 +340,39 @@ void jl_safepoint_wait_thread_resume(jl_task_t *ct)
     // will observe the change to the safepoint, even though the other thread
     // might have already observed our gc_state.
     // if (!jl_atomic_load_relaxed(&ct->ptls->suspend_count)) return;
-    int8_t state = jl_atomic_load_relaxed(&ct->ptls->gc_state);
-    jl_atomic_store_release(&ct->ptls->gc_state, JL_GC_STATE_WAITING);
-    uv_mutex_lock(&ct->ptls->sleep_lock);
-    if (jl_atomic_load_relaxed(&ct->ptls->suspend_count)) {
-        // defer this broadcast until we determine whether uv_cond_wait is really going to be needed
-        uv_mutex_unlock(&ct->ptls->sleep_lock);
-        uv_mutex_lock(&safepoint_lock);
-        uv_cond_broadcast(&safepoint_cond_begin);
-        uv_mutex_unlock(&safepoint_lock);
+    uint8_t state = jl_atomic_load_relaxed(&ct->ptls->gc_state) & JL_GC_STATE_MASK;
+    // claim-preserving swap: a collection may have claimed us while parked
+    jl_gc_state_swap_unchecked(ct->ptls, JL_GC_STATE_WAITING);
+    for (;;) {
         uv_mutex_lock(&ct->ptls->sleep_lock);
-        while (jl_atomic_load_relaxed(&ct->ptls->suspend_count))
-            uv_cond_wait(&ct->ptls->wake_signal, &ct->ptls->sleep_lock);
+        if (jl_atomic_load_relaxed(&ct->ptls->suspend_count)) {
+            // defer this broadcast until we determine whether uv_cond_wait is really going to be needed
+            uv_mutex_unlock(&ct->ptls->sleep_lock);
+            uv_mutex_lock(&safepoint_lock);
+            uv_cond_broadcast(&safepoint_cond_begin);
+            uv_mutex_unlock(&safepoint_lock);
+            uv_mutex_lock(&ct->ptls->sleep_lock);
+            while (jl_atomic_load_relaxed(&ct->ptls->suspend_count))
+                uv_cond_wait(&ct->ptls->wake_signal, &ct->ptls->sleep_lock);
+        }
+        // must exit gc while still holding the mutex_unlock, so we know other
+        // threads in jl_safepoint_suspend_thread will observe this thread in
+        // the correct GC state, and not still stuck in JL_GC_STATE_WAITING.
+        // The try_swap fails, leaving the word untouched, if we were claimed by
+        // another STW before making our GC state transition: a claimed thread
+        // must never publish a running state.
+        int resumed = jl_gc_state_try_swap(ct->ptls, state);
+        uv_mutex_unlock(&ct->ptls->sleep_lock);
+        if (resumed)
+            break;
+        // Park until the GC is done with us -- it removes the
+        // `JL_GC_STATE_CLAIMED` bit when it is -- then re-check both the
+        // suspend count and the claim: either may recur before we get to run.
+        // sleep_lock must be unlocked above before we can wait here, since
+        // jl_safepoint_wait_gc acquires safepoint_lock and the established
+        // order is safepoint_lock -> sleep_lock (jl_safepoint_suspend_thread).
+        jl_safepoint_wait_gc(ct);
     }
-    // must exit gc while still holding the mutex_unlock, so we know other
-    // threads in jl_safepoint_suspend_thread will observe this thread in the
-    // correct GC state, and not still stuck in JL_GC_STATE_WAITING
-    jl_atomic_store_release(&ct->ptls->gc_state, state);
-    uv_mutex_unlock(&ct->ptls->sleep_lock);
 }
 // This takes the sleep lock and puts the thread in GC_SAFE
 void jl_safepoint_take_sleep_lock(jl_ptls_t ptls)
@@ -352,7 +433,7 @@ int jl_safepoint_suspend_thread(int tid, int waitstate)
             uv_mutex_lock(&safepoint_lock);
         }
         while (jl_atomic_load_acquire(&ptls2->suspend_count) != 0) {
-            int8_t state2 = jl_atomic_load_acquire(&ptls2->gc_state);
+            uint8_t state2 = jl_atomic_load_acquire(&ptls2->gc_state) & JL_GC_STATE_MASK;
             if (waitstate <= 2 && state2 != JL_GC_STATE_UNSAFE)
                 break;
             if (waitstate == 3 && state2 == JL_GC_STATE_WAITING)

@@ -72,7 +72,7 @@ jl_code_instance_t *jl_engine_reserve(jl_method_instance_t *mi, jl_value_t *owne
     int16_t tid = jl_atomic_load_relaxed(&ct->tid);
     int cond = 0;
     {
-        int8_t gc_state = jl_gc_safe_enter(ct->ptls); // contains jl_gc_safepoint after enter
+        uint8_t gc_state = jl_gc_safe_enter(ct->ptls); // contains jl_gc_safepoint after enter
         uv_mutex_lock(&engine_lock);
         size_t max_tid = awaiting.len;
         if (max_tid < (size_t)tid + 1) {

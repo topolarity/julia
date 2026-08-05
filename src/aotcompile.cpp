@@ -2698,7 +2698,7 @@ void jl_get_llvmf_defn_impl(jl_llvmf_dump_t *dump, jl_method_instance_t *mi, jl_
                 decl_names.specptr = decls->specptr ? decls->specptr->getName() : "";
                 // if compilation succeeded, prepare to return the result
                 if (!jl_options.image_codegen) {
-                    int8_t gc_state = jl_gc_safe_enter(ct->ptls);
+                    uint8_t gc_state = jl_gc_safe_enter(ct->ptls);
                     optimizeDLSyms(output.get_module());
                     jl_gc_safe_leave(ct->ptls, gc_state);
                 }

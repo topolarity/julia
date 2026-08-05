@@ -2553,7 +2553,7 @@ struct _jl_handler_t {
     struct _jl_reset_ctx_t *reset_ctx;
     jl_value_t *bound_cancel_token;
     sig_atomic_t defer_signal;
-    int8_t gc_state;
+    uint8_t gc_state;
 };
 
 #define JL_TASK_STATE_RUNNABLE 0

@@ -172,11 +172,22 @@ typedef struct _jl_tls_states_t {
 #define JL_GC_STATE_SAFE 2
     // gc_state = 2 means the thread is running unmanaged code that can be
     //              executed at the same time with the GC.
+#define JL_GC_STATE_MASK 0x3f
+    //              a mask to distinguish the states above from the claim flag(s)
+    //              below, which mark the GC-side "claims" on the thread.
+
+#define JL_GC_STATE_CLAIMED 0x80
+    //              marks when a thread is ineligible to be resumed due to
+    //              an active STW period.
+#define JL_GC_STATE_CLAIMS (JL_GC_STATE_CLAIMED)
+    //              the set of all claim flags. Only the stopping thread sets
+    //              them, and only jl_safepoint_end_gc clears them
+
 #define JL_GC_PARALLEL_COLLECTOR_THREAD 3
     // gc_state = 3 means the thread is a parallel collector thread (i.e. never runs Julia code)
 #define JL_GC_CONCURRENT_COLLECTOR_THREAD 4
     // gc_state = 4 means the thread is a concurrent collector thread (background sweeper thread that never runs Julia code)
-    _Atomic(int8_t) gc_state; // read from foreign threads
+    _Atomic(uint8_t) gc_state; // read from foreign threads
     // execution of certain impure
     // statements is prohibited from certain
     // callbacks (such as generated functions)
@@ -552,20 +563,69 @@ void jl_sigint_safepoint(jl_ptls_t tls);
         (void)safepoint_load;                                                  \
     } while (0)
 #endif
-STATIC_INLINE int8_t jl_gc_state_set(jl_ptls_t ptls, int8_t state,
-                                     int8_t old_state)
+
+// Atomically store `state` into `ptls->gc_state` while preserving any claim(s)
+// the collector has placed on this thread, and return the previous value.
+//
+// Must NOT be used to publish JL_GC_STATE_UNSAFE: becoming runnable is a
+// checked transition (jl_gc_state_try_swap / jl_gc_state_set), so that a
+// claimed word never carries a runnable state. The sole exception is the
+// fatal-error path, which knowingly resumes while the process is crashing.
+STATIC_INLINE uint8_t jl_gc_state_swap_unchecked(jl_ptls_t ptls, uint8_t state) JL_NOTSAFEPOINT
+{
+    assert((state & JL_GC_STATE_CLAIMS) == 0); // callers pass a state, never a claim
+    uint8_t s = jl_atomic_load_relaxed(&ptls->gc_state);
+    while (!jl_atomic_cmpswap(&ptls->gc_state, &s,
+                              (uint8_t)((s & JL_GC_STATE_CLAIMS) | state)))
+        ; // `s` is reloaded with the observed value on failure
+    return s;
+}
+
+// Publish `state` only if no claim is outstanding. If the collector has
+// claimed this thread the word is left untouched -- the thread remains in its
+// claimed, stopped state -- and 0 is returned: the caller must wait for the
+// collection to end and retry. This is the only safe way to leave a stopped
+// state on a path that cannot poll a safepoint.
+STATIC_INLINE int jl_gc_state_try_swap(jl_ptls_t ptls, uint8_t state) JL_NOTSAFEPOINT
+{
+    assert((state & JL_GC_STATE_CLAIMS) == 0);
+    uint8_t s = jl_atomic_load_relaxed(&ptls->gc_state);
+    do {
+        if (s & JL_GC_STATE_CLAIMS)
+            return 0;
+    } while (!jl_atomic_cmpswap(&ptls->gc_state, &s, state));
+    return 1;
+}
+
+// Slow path of a checked transition to JL_GC_STATE_UNSAFE: parks until no
+// claim is outstanding and UNSAFE has been published. (Also the slow path of
+// the codegen-emitted ccall/cfunction transitions.)
+JL_DLLEXPORT void jl_gc_state_set_unsafe_slow(jl_ptls_t ptls);
+
+STATIC_INLINE uint8_t jl_gc_state_set(jl_ptls_t ptls, uint8_t state,
+                                      uint8_t old_state)
 {
     assert(old_state != JL_GC_PARALLEL_COLLECTOR_THREAD);
     assert(old_state != JL_GC_CONCURRENT_COLLECTOR_THREAD);
-    jl_atomic_store_release(&ptls->gc_state, state);
-    if (state == JL_GC_STATE_UNSAFE || old_state == JL_GC_STATE_UNSAFE)
+    if (state == JL_GC_STATE_UNSAFE) {
+        // becoming runnable is a checked transition: refuse while claimed and
+        // park instead, so a claimed word never carries a runnable state
+        if (!jl_gc_state_try_swap(ptls, JL_GC_STATE_UNSAFE))
+            jl_gc_state_set_unsafe_slow(ptls);
         jl_gc_safepoint_(ptls);
+    }
+    else {
+        jl_gc_state_swap_unchecked(ptls, state);
+        if (old_state == JL_GC_STATE_UNSAFE)
+            jl_gc_safepoint_(ptls);
+    }
     return old_state;
 }
-STATIC_INLINE int8_t jl_gc_state_save_and_set(jl_ptls_t ptls,
-                                              int8_t state)
+STATIC_INLINE uint8_t jl_gc_state_save_and_set(jl_ptls_t ptls,
+                                               uint8_t state)
 {
-    return jl_gc_state_set(ptls, state, jl_atomic_load_relaxed(&ptls->gc_state));
+    return jl_gc_state_set(ptls, state,
+                           jl_atomic_load_relaxed(&ptls->gc_state) & JL_GC_STATE_MASK);
 }
 
 // these might not be a safepoint (if they are no-op safe=>safe transitions), but we have to assume it could be (statically)

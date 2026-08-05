@@ -149,7 +149,7 @@ void ObjCache::initDB()
     // Read DEPOT_PATH before taking ObjCache::Lock so we can enter a GC-unsafe
     // region to read the global.
     jl_task_t *ct = jl_current_task;
-    int8_t gc_state = jl_gc_unsafe_enter(ct->ptls);
+    uint8_t gc_state = jl_gc_unsafe_enter(ct->ptls);
     const char *Enable = getenv("JULIA_OBJCACHE");
     auto CachePath = getCachePath();
     jl_gc_unsafe_leave(ct->ptls, gc_state);

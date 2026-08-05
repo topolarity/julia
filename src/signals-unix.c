@@ -529,7 +529,7 @@ JL_NO_ASAN static void segv_handler(int sig, siginfo_t *info, void *context) JL_
         return;
     }
     jl_task_t *ct = jl_get_current_task();
-    if (ct == NULL || ct->ptls == NULL || jl_atomic_load_relaxed(&ct->ptls->gc_state) == JL_GC_STATE_WAITING) {
+    if (ct == NULL || ct->ptls == NULL || (jl_atomic_load_relaxed(&ct->ptls->gc_state) & JL_GC_STATE_MASK) == JL_GC_STATE_WAITING) {
         sigdie_handler(sig, info, context);
         return;
     }
@@ -859,6 +859,10 @@ void usr2_handler(int sig, siginfo_t *info, void *ctx) JL_CANSAFEPOINT
             jl_atomic_load_relaxed(&((jl_cancel_source_t*)bound)->state) != 0;
         if (reset_ctx != NULL && reset_ctx->sp != 0 &&
             (request == 6 || bound_cancelled) &&
+            // Deliberately NOT masked with JL_GC_STATE_MASK: a claimed thread
+            // is counted as stopped by a collection in progress and must not
+            // be redirected back into Julia code, so only an exactly-UNSAFE
+            // (and therefore unclaimed) thread is eligible.
             jl_atomic_load_relaxed(&ptls->gc_state) == JL_GC_STATE_UNSAFE) {
             // Abandon the interrupted register state and longjmp to the
             // reset point, whose re-executed check observes the cancellation

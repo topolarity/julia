@@ -164,7 +164,7 @@ JL_TSA_ANNOTATE_LOCK(std::shared_lock, shared_lock, std::shared_mutex);
 // since we nearly always want that combination together
 class jl_unique_gcsafe_lock {
 public:
-    int8_t gc_state;
+    uint8_t gc_state;
     std::unique_lock<std::mutex> native;
     explicit jl_unique_gcsafe_lock(std::mutex &native) JL_CANSAFEPOINT_LEAVE
     {
