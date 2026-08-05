@@ -185,6 +185,8 @@ extern "C" {
     pub fn jl_gc_get_thread_finalizer_list(tls: OpaquePointer) -> Address;
     pub fn jl_gc_get_to_finalize_list() -> Address;
     pub fn jl_gc_mmtk_finalizers_lock();
+    pub fn jl_gc_mmtk_detach_malloced_memory() -> usize;
+    pub fn jl_gc_mmtk_sweep_malloced_memory_detached();
     pub fn jl_gc_mmtk_finalizers_unlock();
     pub fn jl_gc_get_marked_finalizers_list() -> Address;
     pub fn arraylist_grow(a: Address, n: usize);

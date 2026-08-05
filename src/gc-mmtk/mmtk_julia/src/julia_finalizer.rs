@@ -77,14 +77,29 @@ pub fn scan_finalizers_in_rust<T: ObjectTracer>(tracer: &mut T) {
             .filter(|p| !p.current_collection_is_user_triggered())
         {
             let nursery = crate::collection::is_current_gc_nursery();
-            // Nothing registered: take the in-pause path (it is O(0) then,
-            // and skipping the gate keeps warm line reuse unthrottled).
+            // CONCURRENT MALLOCED SWEEP: detach the per-thread mallocarray
+            // lists here (VMRefClosure stage), strictly before the Release
+            // bucket where plan.release() reads the reclaim gate to defer
+            // the LOS release -- a later gate-set could let LOS free
+            // malloced owners' headers in-pause.
+            let malloced = unsafe { crate::jl_gc_mmtk_detach_malloced_memory() };
             let mut stealable = if nursery { 0 } else { marked_finalizers_list.len };
             for mutator in <JuliaVM as VMBinding>::VMActivePlan::mutators() {
                 stealable += ArrayListT::thread_local_finalizer_list(mutator).len;
             }
-            if stealable == 0 {
-                // Fall through to the in-pause path below.
+            if stealable == 0 && malloced == 0 {
+                // Nothing detached anywhere: take the in-pause path (it is
+                // O(0) then, and skipping the gate keeps warm reuse
+                // unthrottled).
+            } else if stealable == 0 {
+                // Malloced entries only: defer the sweep packet with empty
+                // finalizer lists.
+                plan.finalizer_defer_packet(Box::new(ConcurrentFinalizerSweep {
+                    lists: Vec::new(),
+                    marked: StolenList::Copied(Vec::new()),
+                    full: !nursery,
+                }));
+                return;
             } else {
             let mut lists = Vec::new();
             for mutator in <JuliaVM as VMBinding>::VMActivePlan::mutators() {
@@ -590,7 +605,9 @@ impl mmtk::scheduler::GCWork<JuliaVM> for ConcurrentFinalizerSweep {
             StolenList::Copied(Vec::new()),
         ));
 
-        // Deferred LOS release, then lift the reuse gate.
+        // Concurrent malloced-memory sweep (detached in-pause), then the
+        // deferred LOS release, then lift the reuse gate.
+        unsafe { crate::jl_gc_mmtk_sweep_malloced_memory_detached() };
         memory_manager::concurrent_finalizer_los_release(mmtk, self.full);
         plan.finalizer_sweep_done();
     }

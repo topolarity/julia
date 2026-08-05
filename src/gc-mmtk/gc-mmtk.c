@@ -799,6 +799,101 @@ JL_DLLEXPORT void jl_gc_sweep_weak_processing(void) JL_NOTSAFEPOINT
     uv_mutex_unlock(&orphaned_weak_processing_lock);
 }
 
+// CONCURRENT MALLOCED-MEMORY SWEEP: like the finalizer-list sweep, the
+// classification of tracked malloc'd buffers scales with their count
+// (append: ~1M entries, 72-99ms serial in-pause packets), so the pause
+// only detaches the per-thread lists (O(threads) buffer steals) and the
+// deferred sweep packet classifies against the stable post-trace marks.
+// Survivors accumulate in a GC-owned list re-swept every cycle.  The
+// reclaim gate (and deferred LOS release) keeps dead owners' headers
+// intact until the packet completes.
+static arraylist_t malloced_staging;   // pairs: (items ptr, len)
+static arraylist_t malloced_survivors; // same entry format as ptls lists
+static int malloced_lists_init = 0;
+
+JL_DLLEXPORT size_t jl_gc_mmtk_detach_malloced_memory(void) JL_NOTSAFEPOINT
+{
+    static int disabled = -1;
+    if (disabled == -1)
+        disabled = getenv("MMTK_NO_MALLOC_DETACH") != NULL;
+    if (disabled)
+        return 0;
+    if (!malloced_lists_init) {
+        arraylist_new(&malloced_staging, 0);
+        arraylist_new(&malloced_survivors, 0);
+        malloced_lists_init = 1;
+    }
+    size_t staged = 0;
+    void* iter = mmtk_new_mutator_iterator();
+    jl_ptls_t ptls2 = (jl_ptls_t)mmtk_get_next_mutator_tls(iter);
+    while (ptls2 != NULL) {
+        // NB: mallocarrays is a small_arraylist_t (uint32_t len/max,
+        // 5-slot inline space) -- treating it as arraylist_t corrupts the
+        // adjacent gc_tls_common fields.
+        small_arraylist_t *list = &ptls2->gc_tls_common.heap.mallocarrays;
+        size_t len = list->len;
+        if (len > 0) {
+            void **items;
+            if (list->items == &list->_space[0]) {
+                items = (void**)malloc_s(len * sizeof(void*));
+                memcpy(items, list->items, len * sizeof(void*));
+            }
+            else {
+                items = list->items;
+                list->items = &list->_space[0];
+                list->max = SMALL_AL_N_INLINE;
+            }
+            list->len = 0;
+            arraylist_push(&malloced_staging, (void*)items);
+            arraylist_push(&malloced_staging, (void*)len);
+            staged += len;
+        }
+        ptls2 = (jl_ptls_t)mmtk_get_next_mutator_tls(iter);
+    }
+    mmtk_close_mutator_iterator(iter);
+    return staged + malloced_survivors.len;
+}
+
+static void sweep_malloced_buf(void **lst, size_t l, arraylist_t *out) JL_NOTSAFEPOINT
+{
+    for (size_t n = 0; n < l; n++) {
+        jl_genericmemory_t *m = (jl_genericmemory_t*)((uintptr_t)lst[n] & ~1);
+        if (mmtk_is_live_object(m))
+            arraylist_push(out, lst[n]);
+        else
+            jl_gc_free_memory(m, (uintptr_t)lst[n] & 1);
+    }
+}
+
+JL_DLLEXPORT void jl_gc_mmtk_sweep_malloced_memory_detached(void) JL_NOTSAFEPOINT
+{
+    if (!malloced_lists_init)
+        return;
+    // Re-filter the survivors in place first.
+    size_t n = 0, l = malloced_survivors.len;
+    void **lst = malloced_survivors.items;
+    while (n < l) {
+        jl_genericmemory_t *m = (jl_genericmemory_t*)((uintptr_t)lst[n] & ~1);
+        if (mmtk_is_live_object(m)) {
+            n++;
+        }
+        else {
+            jl_gc_free_memory(m, (uintptr_t)lst[n] & 1);
+            l--;
+            lst[n] = lst[l];
+        }
+    }
+    malloced_survivors.len = l;
+    // Then classify the detached buffers.
+    for (size_t i = 0; i + 1 < malloced_staging.len; i += 2) {
+        void **items = (void**)malloced_staging.items[i];
+        size_t len = (size_t)malloced_staging.items[i + 1];
+        sweep_malloced_buf(items, len, &malloced_survivors);
+        free(items);
+    }
+    malloced_staging.len = 0;
+}
+
 JL_DLLEXPORT void jl_gc_mmtk_sweep_malloced_memory(void) JL_NOTSAFEPOINT
 {
     void* iter = mmtk_new_mutator_iterator();
@@ -824,6 +919,9 @@ JL_DLLEXPORT void jl_gc_mmtk_sweep_malloced_memory(void) JL_NOTSAFEPOINT
         ptls2 = (jl_ptls_t)mmtk_get_next_mutator_tls(iter);
     }
     mmtk_close_mutator_iterator(iter);
+    // User-triggered/exit collections sweep synchronously: include the
+    // GC-owned survivor list and anything a prior pause left staged.
+    jl_gc_mmtk_sweep_malloced_memory_detached();
 }
 
 #define jl_genericmemory_elsize(a) (((jl_datatype_t*)jl_typetagof(a))->layout->size)

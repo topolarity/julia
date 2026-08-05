@@ -298,8 +298,20 @@ impl Default for SweepVMSpecific {
 
 impl<VM: VMBinding> GCWork<VM> for SweepVMSpecific {
     fn do_work(&mut self, _worker: &mut GCWorker<VM>, _mmtk: &'static MMTK<VM>) {
-        // call sweep malloced arrays, cancellation-source child lists, and sweep stack pools
-        unsafe { jl_gc_mmtk_sweep_malloced_memory() }
+        // Malloced-memory sweep: when the finalizer phase detached the
+        // lists (gate up), the deferred packet sweeps them concurrently;
+        // the synchronous path remains for user-triggered collections and
+        // non-concurrent plans.
+        #[cfg(feature = "concurrentimmix")]
+        let deferred = crate::SINGLETON
+            .get_plan()
+            .concurrent()
+            .is_some_and(|p| p.finalizer_sweep_pending());
+        #[cfg(not(feature = "concurrentimmix"))]
+        let deferred = false;
+        if !deferred {
+            unsafe { jl_gc_mmtk_sweep_malloced_memory() }
+        }
         unsafe { crate::jl_gc_sweep_weak_processing() }
         unsafe { jl_gc_sweep_stack_pools_and_mtarraylist_buffers() }
         self.swept = true;
