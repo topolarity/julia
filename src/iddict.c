@@ -171,7 +171,8 @@ jl_value_t *jl_eqtable_pop(jl_genericmemory_t *h, jl_value_t *key, jl_value_t *d
         return deflt;
     jl_value_t *val = jl_atomic_load_relaxed(bp);
     // Deletion barrier: snapshot the overwritten key/value for SATB collectors.
-    jl_gc_wb(h, NULL);
+    jl_gc_wb_slot_pre(h, (void**)(bp - 1), jl_nothing);
+    jl_gc_wb_slot_pre(h, (void**)bp, NULL);
     jl_atomic_store_relaxed(bp - 1, jl_nothing); // clear the key
     jl_atomic_store_relaxed(bp, NULL); // and the value (briefly corrupting the table)
     return val;

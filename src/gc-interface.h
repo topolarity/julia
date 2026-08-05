@@ -309,6 +309,12 @@ STATIC_INLINE void jl_gc_wb_back(const void *ptr) JL_NOTSAFEPOINT;
 // in different GC generations (i.e. if the first argument points to an old object and the
 // second argument points to a young object), and if so, call the write barrier slow-path.
 STATIC_INLINE void jl_gc_wb(const void *parent, const void *ptr) JL_NOTSAFEPOINT;
+// Slot-precise pre-store barrier: identical duties to `jl_gc_wb`, but called
+// BEFORE the store with the store address, letting SATB collectors capture
+// only the overwritten slot's old value on large objects instead of
+// snapshotting the whole object on the mutator thread.  Collectors with no
+// use for the slot treat it exactly as `jl_gc_wb(parent, newval)`.
+STATIC_INLINE void jl_gc_wb_slot_pre(const void *parent, void **slot, const void *newval) JL_NOTSAFEPOINT;
 // Freshly allocated objects are known to be in the young generation until the next safepoint,
 // so write barriers can be omitted until the next allocation. This function is a no-op that
 // can be used to annotate that a write barrier would be required were it not for this property

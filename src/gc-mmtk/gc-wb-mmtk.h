@@ -20,6 +20,7 @@ extern void* MMTK_SIDE_LOG_BIT_BASE_ADDRESS;
 // consumed outside marking, which lets all arming happen off-pause.
 extern uint8_t MMTK_SATB_MARKING_ACTIVE;
 extern void mmtk_gc_wb_slots_pre(void* mutator, void** slots, size_t n);
+JL_DLLEXPORT void jl_gc_queue_root_slot(const struct _jl_value_t *parent, void **slot);
 
 #define MMTK_OBJECT_BARRIER (1)
 // Stickyimmix needs write barrier. Immix does not need write barrier.
@@ -70,6 +71,28 @@ STATIC_INLINE void mmtk_gc_wb_fast(const void *parent, const void *ptr) JL_NOTSA
 STATIC_INLINE void jl_gc_wb(const void *parent, const void *ptr) JL_NOTSAFEPOINT
 {
     mmtk_gc_wb_fast(parent, ptr);
+}
+
+// SLOT-PRECISE pre-store barrier for C store sites: call BEFORE writing
+// `*slot`.  Same armed check as `jl_gc_wb`, but the slow path receives the
+// store address, so during concurrent marking a large object captures only
+// this slot's old value instead of a whole-object field snapshot on the
+// mutator (measured: 4-12ms per capture on the 1MB Tuple typename-cache
+// svec).  Outside marking, and for small objects, behavior matches
+// `jl_gc_wb` (remset + log).  `newval` is unused here; the stock variant
+// consumes it.
+STATIC_INLINE void jl_gc_wb_slot_pre(const void *parent, void **slot, const void *newval) JL_NOTSAFEPOINT
+{
+    (void)newval;
+    if (MMTK_NEEDS_WRITE_BARRIER == MMTK_OBJECT_BARRIER) {
+        intptr_t addr = (intptr_t) (void*) parent;
+        uint8_t* meta_addr = (uint8_t*) (MMTK_SIDE_LOG_BIT_BASE_ADDRESS) + (addr >> 6);
+        intptr_t shift = (addr >> 3) & 0b111;
+        uint8_t byte_val = *meta_addr;
+        if (((byte_val >> shift) & 1) == 1) {
+            jl_gc_queue_root_slot((const struct _jl_value_t*)parent, slot);
+        }
+    }
 }
 
 STATIC_INLINE void jl_gc_wb_back(const void *ptr) JL_NOTSAFEPOINT // ptr isa jl_value_t*

@@ -18,6 +18,14 @@ STATIC_INLINE void jl_gc_wb(const void *parent, const void *ptr) JL_NOTSAFEPOINT
         jl_gc_wb_cold(parent, ptr);
 }
 
+// Slot-precise variant used by C store sites that know the store address;
+// the stock barrier has no use for it and degrades to `jl_gc_wb`.
+STATIC_INLINE void jl_gc_wb_slot_pre(const void *parent, void **slot, const void *newval) JL_NOTSAFEPOINT
+{
+    (void)slot;
+    jl_gc_wb(parent, newval);
+}
+
 STATIC_INLINE void jl_gc_wb_back(const void *ptr) JL_NOTSAFEPOINT // ptr isa jl_value_t*
 {
     // if ptr is old
