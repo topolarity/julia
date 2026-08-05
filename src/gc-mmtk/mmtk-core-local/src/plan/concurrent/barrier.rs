@@ -214,6 +214,26 @@ impl<VM: VMBinding, P: ConcurrentPlan<VM = VM> + PlanTraceObject<VM>, const KIND
     }
 
     fn object_probable_write_slow(&mut self, obj: ObjectReference) {
+        if crate::diag::mutgc_enabled() {
+            let t0 = crate::diag::now_ns();
+            let mut slots: u64 = 0;
+            crate::plan::tracing::SlotIterator::<VM>::iterate_fields(obj, self.tls.0, |s| {
+                slots += 1;
+                self.enqueue_node(Some(obj), s, None);
+            });
+            let d = crate::diag::now_ns().saturating_sub(t0);
+            crate::diag::record_satb_capture(d, slots);
+            if d >= crate::diag::mutgc_outlier_ns() {
+                eprintln!(
+                    "[satb-outlier] obj={:?} slots={} dur={:.3}ms",
+                    obj, slots, d as f64 / 1e6
+                );
+                if slots >= 1024 {
+                    <VM::VMObjectModel as crate::vm::ObjectModel<VM>>::dump_object(obj);
+                }
+            }
+            return;
+        }
         crate::plan::tracing::SlotIterator::<VM>::iterate_fields(obj, self.tls.0, |s| {
             self.enqueue_node(Some(obj), s, None);
         });

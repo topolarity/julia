@@ -163,8 +163,28 @@ impl ObjectModel<JuliaVM> for VMObjectModel {
         object.to_raw_address()
     }
 
-    fn dump_object(_object: ObjectReference) {
-        unimplemented!()
+    fn dump_object(object: ObjectReference) {
+        // Debug/diagnostic only (satb-outlier attribution): print the Julia
+        // type of the object via `jl_`'s static show, and the length for
+        // genericmemory.  Must not allocate on the Julia heap.
+        extern "C" {
+            fn jl_(v: *mut ::std::os::raw::c_void);
+        }
+        unsafe {
+            let addr = object.to_raw_address();
+            let vt = crate::julia_scanning::mmtk_jl_typeof(addr);
+            if vt.is_null() {
+                eprintln!("  [outlier-type] <null typeof>");
+                return;
+            }
+            if (*vt).name == crate::julia_scanning::jl_genericmemory_typename {
+                let m = addr.to_ptr::<crate::julia_types::jl_genericmemory_t>();
+                eprint!("  [outlier-type] Memory len={} of ", (*m).length);
+            } else {
+                eprint!("  [outlier-type] ");
+            }
+            jl_(vt as *mut ::std::os::raw::c_void);
+        }
     }
 }
 

@@ -882,7 +882,16 @@ pub extern "C" fn mmtk_object_reference_write_slow_slot(
             // both flooded the scheduler and let single-value packets with
             // huge transitive scans land in the FinalMark pause.
             use mmtk::MutatorContext;
-            mutator.barrier().satb_enqueue_value(obj);
+            if mmtk::diag::mutgc_enabled() {
+                let t0 = mmtk::diag::now_ns();
+                mutator.barrier().satb_enqueue_value(obj);
+                let d = mmtk::diag::now_ns().saturating_sub(t0);
+                mmtk::diag::MUT_SLOTCAP_NS.fetch_add(d, atomic::Ordering::Relaxed);
+                mmtk::diag::MUT_SLOTCAP_N.fetch_add(1, atomic::Ordering::Relaxed);
+                mmtk::diag::record_max(&mmtk::diag::MUT_SLOTCAP_MAX_NS, d);
+            } else {
+                mutator.barrier().satb_enqueue_value(obj);
+            }
         }
         return;
     }

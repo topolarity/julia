@@ -138,6 +138,7 @@ pub mod diag {
     pub static TRIAGE_POOLED: AtomicU64 = AtomicU64::new(0);
     pub static POOL_POPS: AtomicU64 = AtomicU64::new(0);
     pub static CLEAN_BLOCKS: AtomicU64 = AtomicU64::new(0);
+    pub static REUSED_BLOCKS: AtomicU64 = AtomicU64::new(0);
     /// Nursery (minor) sweep results: blocks released / kept, lines freed.
     pub static NURSERY_SWEPT_BLOCKS: std::sync::atomic::AtomicUsize =
         std::sync::atomic::AtomicUsize::new(0);
@@ -158,6 +159,92 @@ pub mod diag {
     pub fn pacer_trace_enabled() -> bool {
         static ON: OnceLock<bool> = OnceLock::new();
         *ON.get_or_init(|| std::env::var_os("MMTK_PACER_TRACE").is_some())
+    }
+    /// MUTATOR-SHOULDERED GC WORK (MMTK_MUTGC): cumulative time the mutator
+    /// thread spends doing GC work outside pauses -- SATB whole-object
+    /// capture, slot-precise capture, and lazy triage (TRIAGE_* above).
+    /// Histogram buckets: <1us, <10us, <100us, <1ms, <10ms, >=10ms.
+    pub static MUT_SATB_NS: AtomicU64 = AtomicU64::new(0);
+    pub static MUT_SATB_N: AtomicU64 = AtomicU64::new(0);
+    pub static MUT_SATB_MAX_NS: AtomicU64 = AtomicU64::new(0);
+    pub static MUT_SATB_SLOTS: AtomicU64 = AtomicU64::new(0);
+    pub static MUT_SATB_SLOTS_MAX: AtomicU64 = AtomicU64::new(0);
+    pub static MUT_SATB_HIST: [AtomicU64; 6] = [
+        AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+        AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+    ];
+    /// Per-requester counts of concurrent-cycle requests (pacer forensics).
+    pub static PACER_REQ_MINOR: AtomicU64 = AtomicU64::new(0);
+    pub static PACER_REQ_OVERGOAL: AtomicU64 = AtomicU64::new(0);
+    pub static PACER_REQ_PROMO: AtomicU64 = AtomicU64::new(0);
+    pub static PACER_REQ_HEADROOM: AtomicU64 = AtomicU64::new(0);
+    pub static PACER_REQ_FLOAT: AtomicU64 = AtomicU64::new(0);
+    pub static MUT_SLOTCAP_NS: AtomicU64 = AtomicU64::new(0);
+    pub static MUT_SLOTCAP_N: AtomicU64 = AtomicU64::new(0);
+    pub static MUT_SLOTCAP_MAX_NS: AtomicU64 = AtomicU64::new(0);
+    pub fn mutgc_enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| {
+            let on = std::env::var_os("MMTK_MUTGC").is_some();
+            if on {
+                unsafe { libc::atexit(print_mutgc_summary) };
+            }
+            on
+        })
+    }
+    /// Outlier threshold for per-capture [satb-outlier] prints (us).
+    pub fn mutgc_outlier_ns() -> u64 {
+        static V: OnceLock<u64> = OnceLock::new();
+        *V.get_or_init(|| {
+            std::env::var("MMTK_MUTGC_OUTLIER_US")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(100)
+                * 1000
+        })
+    }
+    pub fn record_satb_capture(ns: u64, slots: u64) {
+        MUT_SATB_NS.fetch_add(ns, Ordering::Relaxed);
+        MUT_SATB_N.fetch_add(1, Ordering::Relaxed);
+        MUT_SATB_SLOTS.fetch_add(slots, Ordering::Relaxed);
+        record_max(&MUT_SATB_MAX_NS, ns);
+        record_max(&MUT_SATB_SLOTS_MAX, slots);
+        let b = match ns {
+            0..=999 => 0,
+            1_000..=9_999 => 1,
+            10_000..=99_999 => 2,
+            100_000..=999_999 => 3,
+            1_000_000..=9_999_999 => 4,
+            _ => 5,
+        };
+        MUT_SATB_HIST[b].fetch_add(1, Ordering::Relaxed);
+    }
+    extern "C" fn print_mutgc_summary() {
+        let ms = |v: u64| v as f64 / 1e6;
+        let h: Vec<u64> = MUT_SATB_HIST.iter().map(|x| x.load(Ordering::Relaxed)).collect();
+        eprintln!(
+            "[mutgc] satb_capture: n={} total={:.1}ms max={:.3}ms slots={} slots_max={} hist(<1us,<10us,<100us,<1ms,<10ms,>=10ms)={:?}",
+            MUT_SATB_N.load(Ordering::Relaxed),
+            ms(MUT_SATB_NS.load(Ordering::Relaxed)),
+            ms(MUT_SATB_MAX_NS.load(Ordering::Relaxed)),
+            MUT_SATB_SLOTS.load(Ordering::Relaxed),
+            MUT_SATB_SLOTS_MAX.load(Ordering::Relaxed),
+            h,
+        );
+        eprintln!(
+            "[mutgc] slot_capture: n={} total={:.1}ms max={:.3}ms",
+            MUT_SLOTCAP_N.load(Ordering::Relaxed),
+            ms(MUT_SLOTCAP_NS.load(Ordering::Relaxed)),
+            ms(MUT_SLOTCAP_MAX_NS.load(Ordering::Relaxed)),
+        );
+        eprintln!(
+            "[mutgc] lazy_triage: chunks={} total={:.1}ms max={:.3}ms freed_blk={} pooled_blk={}",
+            TRIAGE_CHUNKS.load(Ordering::Relaxed),
+            ms(TRIAGE_NS_TOTAL.load(Ordering::Relaxed)),
+            ms(TRIAGE_MAX_NS.load(Ordering::Relaxed)),
+            TRIAGE_FREED.load(Ordering::Relaxed),
+            TRIAGE_POOLED.load(Ordering::Relaxed),
+        );
     }
     pub fn record_max(s: &AtomicU64, v: u64) {
         let mut c = s.load(Ordering::Relaxed);
