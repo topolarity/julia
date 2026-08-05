@@ -23,8 +23,6 @@ pub struct ProcessSlots<T: Trace> {
 }
 
 impl<T: Trace> ProcessSlots<T> {
-    const SCAN_OBJECTS_IMMEDIATELY: bool = true;
-
     pub fn new(slots: Vec<SlotOfTrace<T>>, bucket: WorkBucketStage) -> Self {
         Self { slots, bucket }
     }
@@ -48,20 +46,6 @@ impl<T: Trace> ProcessSlots<T> {
         queue
     }
 
-    fn flush(&mut self, worker: &mut GCWorker<T::VM>, mut queue: VectorQueue<ObjectReference>) {
-        if queue.is_empty() {
-            return;
-        }
-
-        let queued_objects = queue.take();
-        let mut work = ProcessNodes::<T>::new(queued_objects, self.bucket);
-
-        if Self::SCAN_OBJECTS_IMMEDIATELY {
-            work.do_work(worker, worker.mmtk);
-        } else {
-            worker.add_work(self.bucket, work);
-        }
-    }
 }
 
 impl<T: Trace> GCWork<T::VM> for ProcessSlots<T> {
@@ -78,9 +62,30 @@ impl<T: Trace> GCWork<T::VM> for ProcessSlots<T> {
             }
         }
 
-        let queue = self.process_slots(worker, trace);
-
-        self.flush(worker, queue);
+        // SERIAL-CHAIN DRAIN: process slots -> scan the discovered nodes
+        // inline -> take their end-of-scan slot remainder back into THIS
+        // packet and loop.  On chain-shaped graphs (a linked list), every
+        // scan discovers exactly one outgoing slot; without the drain each
+        // hop round-trips the scheduler as a one-slot ProcessSlots packet
+        // (measured: 240k packets at ~190ns dispatch each inside a single
+        // nursery pause -- 46-82ms of pure scheduler tax).  Parallelism is
+        // unaffected: capacity-triggered spills inside the scan still
+        // publish full packets for other workers; only the (typically tiny)
+        // residual stays here.
+        let mut queue = self.process_slots(worker, trace);
+        loop {
+            if queue.is_empty() {
+                return;
+            }
+            let mut work = ProcessNodes::<T>::new(queue.take(), self.bucket);
+            let residual = work.run_inline(worker, mmtk);
+            if residual.is_empty() {
+                return;
+            }
+            self.slots = residual;
+            let trace = T::from_mmtk(mmtk);
+            queue = self.process_slots(worker, trace);
+        }
     }
 }
 
@@ -113,6 +118,7 @@ impl<T: Trace> ProcessNodes<T> {
         worker: &mut GCWorker<T::VM>,
         tls: VMWorkerThread,
         trace: &T,
+        mut residual: Option<&mut Vec<SlotOfTrace<T>>>,
     ) -> Vec<ObjectReference> {
         // We record objects that don't support slot-enqueuing tracing and process them later.
         let mut scan_later = Vec::new();
@@ -164,10 +170,33 @@ impl<T: Trace> ProcessNodes<T> {
         }
 
         if !slots.is_empty() {
-            flush(&mut slots, worker);
+            if let Some(res) = residual.as_deref_mut() {
+                // Inline-drain caller (ProcessSlots): hand back the
+                // remainder instead of packaging a tiny packet.
+                *res = slots.take();
+            } else {
+                flush(&mut slots, worker);
+            }
         }
 
         scan_later
+    }
+
+    /// Identical to `do_work`, except the end-of-scan slot remainder is
+    /// returned to the caller (`ProcessSlots`' serial-chain drain) instead
+    /// of being published as a work packet.  Capacity-triggered spills
+    /// inside the scan still publish full packets.
+    fn run_inline(
+        &mut self,
+        worker: &mut GCWorker<T::VM>,
+        mmtk: &'static MMTK<T::VM>,
+    ) -> Vec<SlotOfTrace<T>> {
+        let tls = worker.tls;
+        let trace = T::from_mmtk(mmtk);
+        let mut residual = Vec::new();
+        let scan_later = self.try_enqueue_slots(worker, tls, &trace, Some(&mut residual));
+        self.do_node_enqueuing_tracing(worker, tls, trace, scan_later);
+        residual
     }
 
     fn do_node_enqueuing_tracing(
@@ -206,7 +235,7 @@ impl<T: Trace> GCWork<T::VM> for ProcessNodes<T> {
         let trace = T::from_mmtk(mmtk);
 
         // Go through the object list and scan objects that supports slot-enququing.
-        let scan_later = self.try_enqueue_slots(worker, tls, &trace);
+        let scan_later = self.try_enqueue_slots(worker, tls, &trace, None);
 
         let total_objects = self.objects.len();
         let scan_and_trace = scan_later.len();
