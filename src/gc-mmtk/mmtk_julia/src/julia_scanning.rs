@@ -7,6 +7,7 @@ use memoffset::offset_of;
 use mmtk::util::{Address, ObjectReference};
 use mmtk::vm::slot::SimpleSlot;
 use mmtk::vm::SlotVisitor;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
@@ -142,8 +143,13 @@ pub unsafe fn scan_julia_object<SV: SlotVisitor<JuliaVMSlot>>(obj: Address, clos
             // m.usings.items may be inlined in the module when the array list size <= AL_N_INLINE (cf. arraylist_new)
             // In that case it may be an mmtk object and not a malloced address.
             // If it is an mmtk object, (*m).usings.items will then be an internal pointer to the module
-            // which means we will need to trace and update it if the module moves
-            if mmtk_object_is_managed_by_mmtk((*m).usings.items as usize) {
+            // which means we will need to trace and update it if the module moves.
+            // As above, this is a move fixup only (the module itself is `obj`),
+            // and items can be swapped by a running mutator (arraylist_grow),
+            // so only emit it while the world is stopped.
+            if AtomicBool::load(&crate::WORLD_HAS_STOPPED, Ordering::SeqCst)
+                && mmtk_object_is_managed_by_mmtk((*m).usings.items as usize)
+            {
                 let offset = OFFSET_OF_INLINED_SPACE_IN_MODULE;
                 let slot = Address::from_ptr(::std::ptr::addr_of!((*m).usings.items));
                 process_offset_slot(closure, slot, offset);
@@ -237,21 +243,33 @@ pub unsafe fn scan_julia_object<SV: SlotVisitor<JuliaVMSlot>>(obj: Address, clos
     }
     let vt = vtag.to_ptr::<jl_datatype_t>();
     if (*vt).name == jl_array_typename {
-        let a = obj.to_ptr::<jl_array_t>();
-        let memref = (*a).ref_;
+        // If ref_.mem moves, the derived pointer ref_.ptr_or_offset must be
+        // updated as well: an OffsetSlot whose offset comes from the
+        // (ptr_or_offset, mem) pair. Only emit it while the world is stopped:
+        // a running mutator can swap the pair (jl_array_grow installs a new
+        // mem and a new, possibly malloc-backed, data pointer), and the
+        // offset captured here is applied to a re-read of ptr_or_offset when
+        // the slot is processed, so a stale offset can be combined with a
+        // fresh pointer, fabricating an address that was never an object.
+        // Skipping it outside pauses loses nothing: liveness of mem is
+        // covered by the ordinary field scan below, and objects only move
+        // while the world is stopped.
+        if AtomicBool::load(&crate::WORLD_HAS_STOPPED, Ordering::SeqCst) {
+            let a = obj.to_ptr::<jl_array_t>();
+            let memref = (*a).ref_;
 
-        let ptr_or_offset = memref.ptr_or_offset;
-        // if the object moves its pointer inside the array object (void* ptr_or_offset) needs to be updated as well
-        if mmtk_object_is_managed_by_mmtk(ptr_or_offset as usize) {
-            let ptr_or_ref_slot = Address::from_ptr(::std::ptr::addr_of!((*a).ref_.ptr_or_offset));
-            let mem_addr_as_usize = memref.mem as usize;
-            let ptr_or_offset_as_usize = ptr_or_offset as usize;
-            if ptr_or_offset_as_usize > mem_addr_as_usize {
-                let offset = ptr_or_offset_as_usize - mem_addr_as_usize;
+            let ptr_or_offset = memref.ptr_or_offset;
+            if mmtk_object_is_managed_by_mmtk(ptr_or_offset as usize) {
+                let ptr_or_ref_slot = Address::from_ptr(::std::ptr::addr_of!((*a).ref_.ptr_or_offset));
+                let mem_addr_as_usize = memref.mem as usize;
+                let ptr_or_offset_as_usize = ptr_or_offset as usize;
+                if ptr_or_offset_as_usize > mem_addr_as_usize {
+                    let offset = ptr_or_offset_as_usize - mem_addr_as_usize;
 
-                // Only update the offset pointer if the offset is valid (> 0)
-                if offset > 0 {
-                    process_offset_slot(closure, ptr_or_ref_slot, offset);
+                    // Only update the offset pointer if the offset is valid (> 0)
+                    if offset > 0 {
+                        process_offset_slot(closure, ptr_or_ref_slot, offset);
+                    }
                 }
             }
         }
