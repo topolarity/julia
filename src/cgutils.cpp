@@ -2688,7 +2688,15 @@ static jl_cgval_t typed_store(jl_codectx_t &ctx,
                 return;
 #endif
             assert(r != nullptr);
+#ifdef MMTK_PLAN_CONCURRENTIMMIX
+            // RANGE-PRECISE SATB: pass the store address so the slow path
+            // can capture just this slot's old value for large objects
+            // instead of snapshotting the whole object on the mutator.
+            ctx.builder.CreateCall(prepare_call(jl_write_barrier_slot_func),
+                { maybe_decay_untracked(ctx, parent), ptr });
+#else
             emit_write_barrier(ctx, parent, r);
+#endif
         }
         else if (r) {
             Value *wbval = r;

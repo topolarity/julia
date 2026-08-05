@@ -31,7 +31,7 @@ JuliaPassContext::JuliaPassContext()
         pgcstack_getter(nullptr), adoptthread_func(nullptr), gcroot_flush_func(nullptr),
         gc_preserve_begin_func(nullptr), gc_preserve_end_func(nullptr),
         pointer_from_objref_func(nullptr), gc_loaded_func(nullptr), alloc_obj_func(nullptr),
-        typeof_func(nullptr), blackbox_func(nullptr), write_barrier_func(nullptr), pop_handler_noexcept_func(nullptr),
+        typeof_func(nullptr), blackbox_func(nullptr), write_barrier_func(nullptr), write_barrier_slot_func(nullptr), pop_handler_noexcept_func(nullptr),
         call_func(nullptr), call2_func(nullptr), call3_func(nullptr), module(nullptr)
 {
 }
@@ -57,6 +57,7 @@ void JuliaPassContext::initFunctions(Module &M)
     typeof_func = M.getFunction("julia.typeof");
     blackbox_func = M.getFunction("julia.blackbox");
     write_barrier_func = M.getFunction("julia.write_barrier");
+    write_barrier_slot_func = M.getFunction("julia.write_barrier_slot");
     alloc_obj_func = M.getFunction("julia.gc_alloc_obj");
     pop_handler_noexcept_func = M.getFunction(XSTR(jl_pop_handler_noexcept));
     call_func = M.getFunction("julia.call");
@@ -262,6 +263,7 @@ namespace jl_well_known {
     static const char *GC_BIG_ALLOC_NAME = XSTR(jl_gc_big_alloc);
     static const char *GC_SMALL_ALLOC_NAME = XSTR(jl_gc_small_alloc);
     static const char *GC_QUEUE_ROOT_NAME = XSTR(jl_gc_queue_root);
+    static const char *GC_QUEUE_ROOT_SLOT_NAME = XSTR(jl_gc_queue_root_slot);
     static const char *GC_ALLOC_TYPED_NAME = XSTR(jl_gc_alloc_typed);
 
     using jl_intrinsics::addGCAllocAttributes;
@@ -296,6 +298,23 @@ namespace jl_well_known {
                 GC_SMALL_ALLOC_NAME);
             smallAllocFunc->addFnAttr(Attribute::getWithAllocSizeArgs(ctx, 2, None));
             return addGCAllocAttributes(smallAllocFunc);
+        });
+
+    const WellKnownFunctionDescription GCQueueRootSlot(
+        GC_QUEUE_ROOT_SLOT_NAME,
+        [](Type *T_size) {
+            auto &ctx = T_size->getContext();
+            auto T_prjlvalue = JuliaType::get_prjlvalue_ty(ctx);
+            auto T_pslot = PointerType::getUnqual(ctx);
+            auto func = Function::Create(
+                FunctionType::get(
+                    Type::getVoidTy(ctx),
+                    { T_prjlvalue, T_pslot },
+                    false),
+                Function::ExternalLinkage,
+                GC_QUEUE_ROOT_SLOT_NAME);
+            func->setMemoryEffects(MemoryEffects::inaccessibleOrArgMemOnly());
+            return func;
         });
 
     const WellKnownFunctionDescription GCQueueRoot(

@@ -119,6 +119,50 @@ Value* FinalLowerGC::lowerGCAllocBytes(CallInst *target, Function &F)
 }
 
 
+// RANGE-PRECISE SATB: same armed check as lowerWriteBarrier, but the slow
+// path receives the store address so the runtime can capture only that
+// slot's old value for large objects (the whole-object snapshot stalls the
+// mutator O(object size)).
+void FinalLowerGC::lowerWriteBarrierSlot(CallInst *target, Function &F) {
+    auto parent = target->getArgOperand(0);
+    auto slot = target->getArgOperand(1);
+    IRBuilder<> builder(target);
+    builder.SetCurrentDebugLocation(target->getDebugLoc());
+    if (MMTK_NEEDS_WRITE_BARRIER == MMTK_OBJECT_BARRIER) {
+        auto i8_ty = Type::getInt8Ty(F.getContext());
+        auto intptr_ty = T_size;
+        auto i8_ptr_ty = PointerType::getUnqual(F.getContext());
+        F.getParent()->getOrInsertGlobal("MMTK_SIDE_LOG_BIT_BASE_ADDRESS", i8_ptr_ty);
+        auto metadata_base_global = F.getParent()->getNamedGlobal("MMTK_SIDE_LOG_BIT_BASE_ADDRESS");
+        auto metadata_base_load = builder.CreateAlignedLoad(
+            i8_ptr_ty, metadata_base_global, Align(sizeof(void *)), "mmtk_side_log_bit_base");
+        metadata_base_load->setMetadata(llvm::LLVMContext::MD_tbaa, get_tbaa_const(F.getContext()));
+        metadata_base_load->setMetadata(llvm::LLVMContext::MD_invariant_load,
+                                        llvm::MDNode::get(F.getContext(), {}));
+        auto parent_val = builder.CreatePtrToInt(parent, intptr_ty);
+        auto shr = builder.CreateLShr(parent_val, ConstantInt::get(intptr_ty, 6));
+        auto metadata_ptr = builder.CreateGEP(i8_ty, metadata_base_load, shr);
+        auto shift = builder.CreateAnd(builder.CreateLShr(parent_val, ConstantInt::get(intptr_ty, 3)), ConstantInt::get(intptr_ty, 7));
+        auto shift_i8 = builder.CreateTruncOrBitCast(shift, i8_ty);
+        auto load_i8 = builder.CreateAlignedLoad(i8_ty, metadata_ptr, Align());
+        auto shifted_load_i8 = builder.CreateLShr(load_i8, shift_i8);
+        auto masked = builder.CreateAnd(shifted_load_i8, ConstantInt::get(i8_ty, 1));
+        auto is_unlogged = builder.CreateICmpEQ(masked, ConstantInt::get(i8_ty, 1));
+        MDBuilder MDB(F.getContext());
+        SmallVector<uint32_t, 2> Weights{1, 9};
+        auto mayTriggerSlowpath = SplitBlockAndInsertIfThen(is_unlogged, target, false, MDB.createBranchWeights(Weights));
+        builder.SetInsertPoint(mayTriggerSlowpath);
+        // The slot arrives in whatever address space the store target used
+        // (Derived/Loaded); erase it for the C callee.  Legal here: the GC
+        // invariant verifier ran before this pass, and RemoveJuliaAddrspaces
+        // strips the cast afterwards.  `parent` keeps the object rooted
+        // across the call.
+        auto slot0 = builder.CreatePointerBitCastOrAddrSpaceCast(
+            slot, PointerType::getUnqual(F.getContext()));
+        builder.CreateCall(getOrDeclare(jl_well_known::GCQueueRootSlot), { parent, slot0 });
+    }
+}
+
 void FinalLowerGC::lowerWriteBarrier(CallInst *target, Function &F) {
     auto parent = target->getArgOperand(0);
     IRBuilder<> builder(target);

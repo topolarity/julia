@@ -46,6 +46,9 @@ impl BarrierSelector {
 /// As a performance optimization, the binding may also choose to port the fast-path to the VM side,
 /// and call the slow-path (`object_reference_write_slow`) only if necessary.
 pub trait Barrier<VM: VMBinding>: 'static + Send + Downcast {
+    /// See [`BarrierSemantics::enqueue_satb_value`].
+    fn satb_enqueue_value(&mut self, _obj: crate::util::ObjectReference) {}
+
     /// Flush thread-local states like buffers or remembered sets.
     fn flush(&mut self) {}
 
@@ -149,6 +152,11 @@ impl<VM: VMBinding> Barrier<VM> for NoBarrier {}
 /// A barrier is a combination of fast-path behaviour + slow-path semantics.
 /// The fast-path code will decide whether to call the slow-path calls.
 pub trait BarrierSemantics: 'static + Send {
+    /// RANGE/SLOT-PRECISE SATB: enqueue a single captured old value into
+    /// this mutator's SATB buffer (batched; flushed at capacity and by the
+    /// ragged pre-flush).  Default: no-op for non-SATB semantics.
+    fn enqueue_satb_value(&mut self, _obj: crate::util::ObjectReference) {}
+
     type VM: VMBinding;
 
     const UNLOG_BIT_SPEC: MetadataSpec =
@@ -297,6 +305,10 @@ impl<S: BarrierSemantics> SATBBarrier<S> {
 }
 
 impl<S: BarrierSemantics> Barrier<S::VM> for SATBBarrier<S> {
+    fn satb_enqueue_value(&mut self, obj: crate::util::ObjectReference) {
+        self.semantics.enqueue_satb_value(obj);
+    }
+
     fn flush(&mut self) {
         self.semantics.flush();
     }

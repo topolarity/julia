@@ -209,6 +209,12 @@ pub extern "C" fn mmtk_notify_task_resume(
             || task.is_null()
             || mutator.is_null()
         {
+            if std::env::var_os("MMTK_SNAP_TRACE").is_some() && !task.is_null() {
+                eprintln!(
+                    "[snap] HOOK-SKIP task={:#x} marking_flag=false",
+                    task as usize
+                );
+            }
             return;
         }
 
@@ -817,25 +823,90 @@ pub extern "C" fn mmtk_concurrent_finalizer_sweep_pending() -> i32 {
 /// bit before calling.  Packets are capped so no single work unit scales
 /// beyond the mutation.
 #[no_mangle]
-pub extern "C" fn mmtk_gc_wb_slots_pre(slots: *const Address, n: usize) {
+pub extern "C" fn mmtk_gc_wb_slots_pre(
+    mutator: &'static mut Mutator<JuliaVM>,
+    slots: *const Address,
+    n: usize,
+) {
     use mmtk::util::ObjectReference;
+    use mmtk::MutatorContext;
     if n == 0 || !crate::collection::CONCURRENT_MARKING_ACTIVE.load(atomic::Ordering::SeqCst) {
         return;
     }
-    let Some(plan) = crate::SINGLETON.get_plan().concurrent() else {
-        return;
-    };
-    const CAP: usize = 4096;
-    let mut buf: Vec<ObjectReference> = Vec::with_capacity(n.min(CAP));
     for i in 0..n {
         let v = unsafe { *slots.add(i) };
         if let Some(obj) = ObjectReference::from_raw_address(v) {
-            buf.push(obj);
-            if buf.len() == CAP {
-                plan.satb_capture_values(std::mem::take(&mut buf));
-                buf.reserve(CAP.min(n - i));
-            }
+            mutator.barrier().satb_enqueue_value(obj);
         }
     }
-    plan.satb_capture_values(buf);
+}
+
+/// RANGE-PRECISE SATB for JIT-lowered single-slot stores: during marking,
+/// large objects capture only the overwritten slot's old value (handed to
+/// concurrent workers) and stay unlogged so every armed write pays O(1);
+/// small objects keep the amortized whole-object snapshot + log.
+#[no_mangle]
+pub extern "C" fn mmtk_object_reference_write_slow_slot(
+    mutator: &'static mut Mutator<JuliaVM>,
+    src: ObjectReference,
+    slot: Address,
+) {
+    // Largeness must be measured as SCAN cost, not object size: a Julia
+    // genericmemory object is a small {length, ptr} header whose separately
+    // allocated data the snapshot scan walks -- get_current_size() would
+    // classify an 80MB array as tiny and take the whole-object path.
+    #[inline]
+    fn snapshot_scan_cost(src: ObjectReference) -> usize {
+        use mmtk::vm::ObjectModel;
+        let addr = src.to_raw_address();
+        unsafe {
+            let vt = crate::julia_scanning::mmtk_jl_typeof(addr);
+            if !vt.is_null()
+                && (*vt).name == crate::julia_scanning::jl_genericmemory_typename
+            {
+                let m = addr.to_ptr::<crate::julia_types::jl_genericmemory_t>();
+                return (*m).length as usize * 8;
+            }
+        }
+        crate::object_model::VMObjectModel::get_current_size(src)
+    }
+    const LARGE_OBJECT_BYTES: usize = 16 * 1024;
+    if !slot.is_zero()
+        && crate::collection::CONCURRENT_MARKING_ACTIVE.load(atomic::Ordering::SeqCst)
+        && snapshot_scan_cost(src) > LARGE_OBJECT_BYTES
+    {
+        let old = unsafe { slot.load::<Address>() };
+        if let Some(obj) = mmtk::util::ObjectReference::from_raw_address(old) {
+            // Batched into this mutator's SATB buffer (drained at capacity
+            // and by the ragged pre-flush) -- a packet per captured value
+            // both flooded the scheduler and let single-value packets with
+            // huge transitive scans land in the FinalMark pause.
+            use mmtk::MutatorContext;
+            mutator.barrier().satb_enqueue_value(obj);
+        }
+        return;
+    }
+    use mmtk::MutatorContext;
+    mutator.barrier().object_reference_write_slow(
+        src,
+        crate::slots::JuliaVMSlot::Simple(mmtk::vm::slot::SimpleSlot::from_address(Address::ZERO)),
+        None.into(),
+    );
+}
+
+/// RAGGED PRE-FLUSH mutator poll: called from the allocation slow path and
+/// the malloc poll while marking is active (the C side gates on
+/// MMTK_SATB_MARKING_ACTIVE, so this is free otherwise).
+#[no_mangle]
+pub extern "C" fn mmtk_ragged_flush_poll(mutator: &'static mut Mutator<JuliaVM>) {
+    thread_local! {
+        static LAST_ROUND: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+    if let Some(plan) = crate::SINGLETON.get_plan().concurrent() {
+        let round = plan.ragged_round_id();
+        if round != 0 && LAST_ROUND.with(|c| c.get()) != round {
+            LAST_ROUND.with(|c| c.set(round));
+            plan.ragged_flush_poll(mutator);
+        }
+    }
 }

@@ -1044,6 +1044,16 @@ JL_DLLEXPORT void* jl_gc_get_marked_finalizers_list(void) {
 // CONCURRENT FINALIZER SWEEP: the deferred sweep packet appends to
 // to_finalize / finalizer_list_marked while the mutator may run
 // finalizers (which mutate to_finalize under this same lock).
+// RANGE-PRECISE SATB (JIT single-slot stores): the lowered write barrier
+// passes the store address so large objects capture only the overwritten
+// slot's old value instead of a whole-object snapshot on the mutator.
+JL_DLLEXPORT void jl_gc_queue_root_slot(const struct _jl_value_t *ptr, void **slot)
+{
+    jl_ptls_t ptls = jl_current_task->ptls;
+    extern void mmtk_object_reference_write_slow_slot(void *mutator, const void *parent, void **slot);
+    mmtk_object_reference_write_slow_slot(&ptls->gc_tls.mmtk_mutator, ptr, slot);
+}
+
 JL_DLLEXPORT void jl_gc_mmtk_finalizers_lock(void) {
     JL_LOCK_NOGC(&finalizers_lock);
 }

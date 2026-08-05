@@ -48,6 +48,12 @@ Value* FinalLowerGC::lowerGCAllocBytes(CallInst *target, Function &F)
     return newI;
 }
 
+void FinalLowerGC::lowerWriteBarrierSlot(CallInst *target, Function &F) {
+    // Stock codegen never emits julia.write_barrier_slot (it is
+    // ConcurrentImmix-only); lower conservatively if ever encountered.
+    lowerWriteBarrier(target, F);
+}
+
 void FinalLowerGC::lowerWriteBarrier(CallInst *target, Function &F) {
     auto parent = target->getArgOperand(0);
     // A NULL child means a field is being cleared (e.g. memoryrefunset!): no

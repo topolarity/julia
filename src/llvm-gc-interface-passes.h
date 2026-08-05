@@ -411,6 +411,7 @@ private:
 
     // Lowers a `julia.write_barrier` function.
     void lowerWriteBarrier(CallInst *target, Function &F);
+    void lowerWriteBarrierSlot(CallInst *target, Function &F);
 
     // Check if the pass should be run
     bool shouldRunFinalGC();

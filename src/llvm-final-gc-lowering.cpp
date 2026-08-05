@@ -134,6 +134,7 @@ bool FinalLowerGC::shouldRunFinalGC()
     should_run |= hasUse(*this, jl_intrinsics::queueGCRoot);
     should_run |= hasUse(*this, jl_intrinsics::safepoint);
     should_run |= (write_barrier_func && !write_barrier_func->use_empty());
+    should_run |= (write_barrier_slot_func && !write_barrier_slot_func->use_empty());
     return should_run;
 }
 
@@ -144,6 +145,7 @@ bool FinalLowerGC::runOnFunction(Function &F)
 
     auto gc_alloc_bytes = getOrNull(jl_intrinsics::GCAllocBytes);
     SmallVector<CallInst*, 0> write_barriers;
+    SmallVector<CallInst*, 0> write_barriers_slot;
     SmallVector<CallInst*, 0> alloc_bytes;
 
     if (!pgcstack || !shouldRunFinalGC())
@@ -172,6 +174,10 @@ bool FinalLowerGC::runOnFunction(Function &F)
                 assert(CI->arg_size() >= 1);
                 write_barriers.push_back(CI);
             }
+            if (write_barrier_slot_func && callee == write_barrier_slot_func) {
+                assert(CI->arg_size() == 2);
+                write_barriers_slot.push_back(CI);
+            }
             if (gc_alloc_bytes && callee == gc_alloc_bytes) {
                 assert(CI->arg_size() >= 1);
                 alloc_bytes.push_back(CI);
@@ -197,6 +203,12 @@ bool FinalLowerGC::runOnFunction(Function &F)
     if(write_barrier_func) {
         for (auto CI : write_barriers) {
             lowerWriteBarrier(CI, F);
+            CI->eraseFromParent();
+        }
+    }
+    if (write_barrier_slot_func) {
+        for (auto CI : write_barriers_slot) {
+            lowerWriteBarrierSlot(CI, F);
             CI->eraseFromParent();
         }
     }

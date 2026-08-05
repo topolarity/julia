@@ -130,6 +130,16 @@ impl<VM: VMBinding, P: ConcurrentPlan<VM = VM> + PlanTraceObject<VM>, const KIND
 impl<VM: VMBinding, P: ConcurrentPlan<VM = VM> + PlanTraceObject<VM>, const KIND: TraceKind>
     BarrierSemantics for SATBBarrierSemantics<VM, P, KIND>
 {
+    fn enqueue_satb_value(&mut self, obj: ObjectReference) {
+        if !self.should_create_satb_packets() {
+            return;
+        }
+        self.satb.push(obj);
+        if self.satb.is_full() {
+            self.flush_satb();
+        }
+    }
+
     type VM = VM;
 
     #[cold]
