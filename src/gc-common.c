@@ -291,29 +291,45 @@ void run_finalizers(jl_task_t *ct, int finalizers_thread)
     // will flush it.
     if (to_finalize.len == 0)
         return;
-    JL_LOCK_NOGC(&finalizers_lock);
-    if (to_finalize.len == 0) {
-        JL_UNLOCK_NOGC(&finalizers_lock);
-        return;
-    }
-    arraylist_t copied_list;
-    memcpy(&copied_list, &to_finalize, sizeof(copied_list));
-    if (to_finalize.items == to_finalize._space) {
-        copied_list.items = copied_list._space;
-    }
-    jl_atomic_store_relaxed(&jl_gc_have_pending_finalizers, 0);
-    arraylist_new(&to_finalize, 0);
-
     uint64_t save_rngState[JL_RNG_SIZE];
     memcpy(&save_rngState[0], &ct->rngState[0], sizeof(save_rngState));
     jl_rng_split(ct->rngState, finalizer_rngState);
 
-    // This releases the finalizers lock.
-    int8_t was_in_finalizer = ct->ptls->in_finalizer;
-    ct->ptls->in_finalizer = !finalizers_thread;
-    jl_gc_run_finalizers_in_list(ct, &copied_list);
-    ct->ptls->in_finalizer = was_in_finalizer;
-    arraylist_free(&copied_list);
+    // BOUNDED-FRAME DRAIN: pop and run finalizers in bounded batches from
+    // the tail of `to_finalize` (newest first, preserving the documented
+    // reverse-addition order).  The remainder stays in `to_finalize`,
+    // which the GC scans as roots, so nothing is ever unrooted -- and no
+    // pause can see more than O(batch) slots in the drain's GC frame.
+    // Rooting the whole backlog as one frame let a single gcframe reach
+    // 4.9M slots, and every collection during the drain re-scanned it
+    // (30-90ms added to otherwise sub-ms pauses).
+    const size_t FINALIZER_BATCH_ENTRIES = 8192; // 4096 (obj, fn) pairs
+    for (;;) {
+        JL_LOCK_NOGC(&finalizers_lock);
+        size_t len = to_finalize.len;
+        if (len == 0) {
+            jl_atomic_store_relaxed(&jl_gc_have_pending_finalizers, 0);
+            JL_UNLOCK_NOGC(&finalizers_lock);
+            break;
+        }
+        size_t take = len < FINALIZER_BATCH_ENTRIES ? len : FINALIZER_BATCH_ENTRIES;
+        arraylist_t batch;
+        arraylist_new(&batch, take + 2);
+        memcpy(batch.items, to_finalize.items + (len - take), take * sizeof(void*));
+        batch.len = take;
+        // Clear the popped tail (the concurrent finalizer sweep reads this
+        // list under the same lock; stale entries must not be revisited).
+        memset(to_finalize.items + (len - take), 0, take * sizeof(void*));
+        to_finalize.len = len - take;
+        jl_atomic_store_relaxed(&jl_gc_have_pending_finalizers, to_finalize.len != 0);
+
+        int8_t was_in_finalizer = ct->ptls->in_finalizer;
+        ct->ptls->in_finalizer = !finalizers_thread;
+        // This releases the finalizers lock.
+        jl_gc_run_finalizers_in_list(ct, &batch);
+        ct->ptls->in_finalizer = was_in_finalizer;
+        arraylist_free(&batch);
+    }
 
     memcpy(&ct->rngState[0], &save_rngState[0], sizeof(save_rngState));
 }
