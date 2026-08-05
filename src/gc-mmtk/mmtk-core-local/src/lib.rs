@@ -287,6 +287,39 @@ pub mod diag {
             REUSED_BLOCKS.load(Ordering::Relaxed),
         );
     }
+    /// Env-gated (MMTK_PAUSE_PKT_HIST) per-pause packet-type histogram:
+    /// counts and total ns per packet type executed while a pause is
+    /// active.  Dumped and cleared at pause end by the binding.
+    pub static PKT_HIST: std::sync::Mutex<Vec<(&'static str, u64, u64)>> =
+        std::sync::Mutex::new(Vec::new());
+    pub fn pkt_hist_enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("MMTK_PAUSE_PKT_HIST").is_some())
+    }
+    pub fn pkt_hist_record(name: &'static str, ns: u64) {
+        let mut h = PKT_HIST.lock().unwrap();
+        for e in h.iter_mut() {
+            if e.0 == name {
+                e.1 += 1;
+                e.2 += ns;
+                return;
+            }
+        }
+        h.push((name, 1, ns));
+    }
+    pub fn pkt_hist_dump() {
+        let mut h = PKT_HIST.lock().unwrap();
+        if h.is_empty() {
+            return;
+        }
+        h.sort_by_key(|e| std::cmp::Reverse(e.1));
+        let line: Vec<String> = h
+            .iter()
+            .map(|(n, c, ns)| format!("{}:n={},ms={:.1}", n, c, *ns as f64 / 1e6))
+            .collect();
+        eprintln!("[pkt-hist] {}", line.join(" "));
+        h.clear();
+    }
     pub fn record_max(s: &AtomicU64, v: u64) {
         let mut c = s.load(Ordering::Relaxed);
         while v > c {

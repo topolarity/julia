@@ -247,6 +247,10 @@ impl Collection<JuliaVM> for VMCollection {
                     crate::STW_KIND_MAX_AT[k.min(4)]
                         .store(crate::GC_COUNT_TOTAL.load(Ordering::SeqCst) as u64, Ordering::SeqCst);
                 }
+                // Per-pause packet-type histogram (MMTK_PAUSE_PKT_HIST).
+                if mmtk::diag::pkt_hist_enabled() {
+                    mmtk::diag::pkt_hist_dump();
+                }
                 // Root-scan anatomy: per-pause breakdown of the in-pause root
                 // work by class (env-gated; used to size the Init floor).
                 {

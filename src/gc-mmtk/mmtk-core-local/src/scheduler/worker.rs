@@ -271,6 +271,9 @@ impl<VM: VMBinding> GCWorker<VM> {
                 let __d = crate::diag::now_ns().saturating_sub(__t0);
                 crate::diag::record_max(&crate::diag::PKT_MAX_ANY_NS, __d);
                 if crate::diag::PAUSE_ACTIVE.load(O::Relaxed) {
+                    if crate::diag::pkt_hist_enabled() {
+                        crate::diag::pkt_hist_record(typename, __d);
+                    }
                     crate::diag::PAUSE_PKT_SUM_NS.fetch_add(__d, O::Relaxed);
                     crate::diag::PAUSE_PKT_N.fetch_add(1, O::Relaxed);
                     crate::diag::record_max(&crate::diag::PAUSE_PKT_MAX_NS, __d);
