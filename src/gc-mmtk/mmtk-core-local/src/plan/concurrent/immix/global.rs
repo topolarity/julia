@@ -568,12 +568,17 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
                     self.immix_space.pending_len(),
                 );
                 eprintln!(
-                    "[pacer-req] minor={} overgoal={} promo={} headroom={} float={}",
+                    "[pacer-req] minor={} overgoal={} promo={} headroom={} float={} | live_prev_pg={} live_now_pg={} float_pg={} headroom_pg={:?} total_pg={}",
                     crate::diag::PACER_REQ_MINOR.load(Ordering::Relaxed),
                     crate::diag::PACER_REQ_OVERGOAL.load(Ordering::Relaxed),
                     crate::diag::PACER_REQ_PROMO.load(Ordering::Relaxed),
                     crate::diag::PACER_REQ_HEADROOM.load(Ordering::Relaxed),
                     crate::diag::PACER_REQ_FLOAT.load(Ordering::Relaxed),
+                    self.immix_space.live_prev_pages(),
+                    self.immix_space.live_now_pages(),
+                    self.immix_space.float_pages(),
+                    self.base().gc_trigger.policy.concurrent_headroom_pages(),
+                    self.get_total_pages(),
                 );
             }
         }
