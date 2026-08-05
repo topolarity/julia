@@ -111,6 +111,15 @@ impl Block {
     pub const MARK_TABLE: SideMetadataSpec =
         crate::util::metadata::side_metadata::spec_defs::IX_BLOCK_MARK;
 
+    /// `pending_blocks` membership flag.  A block cycling between the free
+    /// pool and the allocator many times within one marking window must
+    /// appear in the pending list once, not once per claim (measured:
+    /// tree_mutable banked 2.3M duplicate entries = 29.5ms of redundant
+    /// arming inside the FinalMark release).  Set at push, cleared when the
+    /// list is drained; the flag is the membership invariant.
+    pub const PENDING_TABLE: SideMetadataSpec =
+        crate::util::metadata::side_metadata::spec_defs::IX_BLOCK_PENDING;
+
     /// Get the chunk containing the block.
     pub fn chunk(&self) -> Chunk {
         Chunk::from_unaligned_address(self.0)
@@ -140,6 +149,18 @@ impl Block {
     const DEFRAG_SOURCE_STATE: u8 = u8::MAX;
 
     /// Test if the block is marked for defragmentation.
+    /// Atomically set the pending-list membership flag; returns true if the
+    /// block was already pending (caller must not push a duplicate).
+    pub fn test_and_set_pending(&self) -> bool {
+        Self::PENDING_TABLE.fetch_or_atomic::<u8>(self.start(), 1, Ordering::SeqCst) != 0
+    }
+
+    /// Clear the pending-list membership flag (list drain).  Drains happen
+    /// only inside pauses; the resume rendezvous publishes the stores.
+    pub fn clear_pending(&self) {
+        Self::PENDING_TABLE.store_atomic::<u8>(self.start(), 0, Ordering::Relaxed);
+    }
+
     pub fn is_defrag_source(&self) -> bool {
         let byte = Self::DEFRAG_STATE_TABLE.load_atomic::<u8>(self.start(), Ordering::SeqCst);
         // The byte should be 0 (not defrag source) or 255 (defrag source) if this is a major defrag GC, as we set the values in PrepareBlockState.

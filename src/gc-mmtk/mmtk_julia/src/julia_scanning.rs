@@ -469,6 +469,17 @@ pub unsafe fn mmtk_scan_gcstack<EV: SlotVisitor<JuliaVMSlot>>(
         offset = (*ta).ctx.stkbuf as isize - lb as isize;
     }
 
+    // DIAG (MMTK_STACK_DIAG): per-frame accounting for anomalous scans --
+    // which frames carry the roots when a walk explodes (measured: one
+    // pollard minor scanned 5.5M slots; composition unknown).
+    let stack_diag = {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("MMTK_STACK_DIAG").is_some())
+    };
+    let mut diag_frames: Vec<(usize, usize)> = Vec::new();
+    let mut diag_total: usize = 0;
+    let mut diag_depth: usize = 0;
+
     if !s.is_null() {
         let s_nroots_addr = ::std::ptr::addr_of!((*s).nroots);
         let mut nroots = read_stack(Address::from_ptr(s_nroots_addr), offset, lb, ub);
@@ -476,6 +487,13 @@ pub unsafe fn mmtk_scan_gcstack<EV: SlotVisitor<JuliaVMSlot>>(
         let mut nr = nroots >> 2;
 
         loop {
+            if stack_diag {
+                diag_total += nr as usize;
+                diag_depth += 1;
+                if nr as usize > 10000 {
+                    diag_frames.push((s as usize, nr as usize));
+                }
+            }
             let rts = Address::from_mut_ptr(s).shift::<Address>(2);
             let mut i = 0;
             while i < nr {
@@ -521,6 +539,22 @@ pub unsafe fn mmtk_scan_gcstack<EV: SlotVisitor<JuliaVMSlot>>(
             nroots = new_nroots;
             nr = nroots >> 2;
             continue;
+        }
+        if stack_diag && diag_total > 100_000 {
+            diag_frames.sort_by_key(|e| std::cmp::Reverse(e.1));
+            let top: Vec<String> = diag_frames
+                .iter()
+                .take(5)
+                .map(|(a, n)| format!("{:#x}:nr={}", a, n))
+                .collect();
+            eprintln!(
+                "[stack-diag] task={:#x} total_slots={} depth={} big_frames={} top=[{}]",
+                ta as usize,
+                diag_total,
+                diag_depth,
+                diag_frames.len(),
+                top.join(" ")
+            );
         }
     }
 

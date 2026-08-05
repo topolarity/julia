@@ -74,6 +74,11 @@ pub struct ConcurrentImmix<VM: VMBinding> {
     /// workloads the continuous concurrent cycles that actually serve them.
     minor_backoff: std::sync::atomic::AtomicUsize,
     live_at_last_pause: std::sync::atomic::AtomicUsize,
+    /// WHOLESALE-MINOR decision inputs: census minors record their object
+    /// survival here (percent); wholesale minors keep the last value.  A
+    /// periodic census probe re-measures.
+    last_minor_survival_pct: std::sync::atomic::AtomicUsize,
+    minor_seq: std::sync::atomic::AtomicUsize,
     mark_dur_ns: AtomicU64,
     gc_end_ns: AtomicU64,
     /// ALWAYS-ON BARRIER: remembered set accumulated between collections (old
@@ -157,9 +162,17 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
             let total = self.get_total_pages();
             let live = self.immix_space.live_prev_pages();
             let scaled = total.saturating_sub(live) / 6;
-            let threshold = Self::nursery_threshold_pages()
-                .min(scaled)
-                .max(1024 /* 4 MB floor */);
+            // The 4MB floor applies to the HEURISTIC path only; an explicit
+            // MMTK_NURSERY_MB is respected verbatim (it silently clamped
+            // sub-4MB settings, which invalidated small-nursery pause
+            // experiments).
+            let threshold = if std::env::var_os("MMTK_NURSERY_MB").is_some() {
+                Self::nursery_threshold_pages()
+            } else {
+                Self::nursery_threshold_pages()
+                    .min(scaled)
+                    .max(1024 /* 4 MB floor */)
+            };
             // External quanta count toward the nursery: counted-malloc
             // growth (net vm_live_bytes since the last collection) and LOS
             // growth.  See the snapshot fields for the rationale.
@@ -172,7 +185,22 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
                 .get_los()
                 .reserved_pages()
                 .saturating_sub(self.los_pages_at_last_gc.load(Ordering::Relaxed));
-            let backoff = self.minor_backoff.load(Ordering::Relaxed);
+            // EXPERIMENT KNOB (MMTK_BOUNDED_MINORS): always-on minors at the
+            // configured nursery size -- no futility backoff, no size-guard
+            // suppression.  Bounds the traced young set by construction
+            // (every minor promotes what it traces, so young-since-last-
+            // minor <= nursery + epsilon); the cost is futile minors on
+            // ~100%-survival workloads, to be absorbed by a concurrent
+            // second generation later.
+            let bounded = {
+                static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                *ON.get_or_init(|| std::env::var_os("MMTK_BOUNDED_MINORS").is_some())
+            };
+            let backoff = if bounded {
+                1
+            } else {
+                self.minor_backoff.load(Ordering::Relaxed)
+            };
             let claimed = self.immix_space.nursery_claimed_pages();
             // PAUSE-BOUND GUARD: an STW minor must trace the live young set
             // in-pause, so its worst case scales with nursery size -- a
@@ -187,8 +215,36 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
             // heap nursery, and their minors' trace cost does not scale
             // with counted-malloc volume.
             const MAX_MINOR_NURSERY_PAGES: usize = 32768; // 128 MB
-            if claimed <= MAX_MINOR_NURSERY_PAGES
-                && claimed / backoff + malloc_pages + los_pages >= threshold
+            // SPLIT THRESHOLDS: the heap nursery and external (counted-
+            // malloc/LOS) pressure have different scales -- a small heap
+            // nursery bounds census-minor trace time, while external
+            // pressure only needs the malloc-reclaim cadence (its minors'
+            // trace cost does not scale with malloc volume).  Conflating
+            // them made a 1MB nursery fire a minor per MB of malloc
+            // (pidigits: 101k pauses).
+            let t_ext = threshold.max(1024 /* 4 MB */);
+            // CENSUS SAMPLING: the every-16th census probe re-traces the
+            // live young set, serially where it is chain-shaped (measured:
+            // list's 1MB census probe = 10.9-14.2ms while the wholesale
+            // minors around it stay sub-ms).  The probe is a survival
+            // SAMPLE: a quarter-size nursery measures the same ratio at a
+            // quarter of the serial trace cost, so shrink the trigger for
+            // the minor that will run the probe.
+            let next_census = self
+                .minor_seq
+                .load(std::sync::atomic::Ordering::Relaxed)
+                % 16
+                == 0;
+            let surv = self
+                .last_minor_survival_pct
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let threshold = if next_census && surv >= 88 {
+                (threshold / 4).max(64)
+            } else {
+                threshold
+            };
+            if (bounded || claimed <= MAX_MINOR_NURSERY_PAGES)
+                && (claimed / backoff >= threshold || malloc_pages + los_pages >= t_ext)
             {
                 self.minor_due.store(true, Ordering::Release);
                 crate::diag::PACER_REQ_MINOR.fetch_add(1, Ordering::Relaxed);
@@ -392,6 +448,15 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
 
         self.current_pause.store(Some(pause), Ordering::SeqCst);
 
+        // WHOLESALE: the flag describes THIS pause only; reset it before the
+        // per-kind scheduling (the Nursery arm stores its own decision).  A
+        // stale `true` carried from a wholesale minor into a Full pause
+        // skipped the VM-specific sweeps there, so dead tasks stayed in
+        // `live_tasks` while the Full's lazy sweep reclaimed their memory --
+        // the next pause's root scan walked a clobbered task (measured: Pkg
+        // precompile segfault in `mmtk_scan_gcstack`, gcframe pointer 0x3e8).
+        crate::diag::WHOLESALE_MINOR.store(false, std::sync::atomic::Ordering::SeqCst);
+
         probe!(mmtk, concurrent_pause_determined, pause as usize);
 
         match pause {
@@ -408,10 +473,40 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
             Pause::InitialMark => self.schedule_concurrent_marking_initial_pause(scheduler),
             Pause::FinalMark => self.schedule_concurrent_marking_final_pause(scheduler),
             Pause::Nursery => {
-                // Minors process weak refs/finalizers (dead nursery weakrefs
-                // must clear); InitialMark disables these buckets for the
-                // concurrent cycle, so re-enable like Full does.
-                self.set_ref_closure_buckets_enabled(true);
+                // WHOLESALE-MINOR decision: promote-by-splice (no trace)
+                // when the nursery is too big to trace within the pause
+                // budget, or when the last census measured near-total
+                // survival (tracing reclaims nothing; serial-chain heaps
+                // cannot even keep up with allocation).  A periodic census
+                // probe (every 16th minor) re-measures survival.  Census
+                // minors are therefore bounded-by-construction: they only
+                // ever trace small, incompletely-surviving nurseries.
+                const CENSUS_BOUND_PAGES: usize = 2048; // 8 MB
+                let claimed = self.immix_space.nursery_claimed_pages();
+                let seq = self
+                    .minor_seq
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let surv = self
+                    .last_minor_survival_pct
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                // The remset drain is O(entries) WITH SCANNING for a census
+                // minor -- unbounded when a mutation-heavy, allocation-free
+                // phase accumulates it (measured: a traversal writing ~2-3M
+                // old objects' fields with no allocation polls produced a
+                // 4.6s remset scan in the next minor).  Wholesale needs only
+                // the re-arm, so an oversized remset routes there.
+                const REMSET_BOUND_ENTRIES: usize = 16384;
+                let remset_len = self.remset.lock().unwrap().len();
+                let wholesale = (claimed > CENSUS_BOUND_PAGES
+                    || remset_len > REMSET_BOUND_ENTRIES
+                    || (surv >= 88 && seq % 16 != 0))
+                    && std::env::var_os("MMTK_NO_WHOLESALE").is_none();
+                crate::diag::WHOLESALE_MINOR
+                    .store(wholesale, std::sync::atomic::Ordering::SeqCst);
+                // Wholesale keeps every nursery object alive, so mark-keyed
+                // ref/finalizer processing must not run (it would clear
+                // weakrefs to live-but-unmarked objects).
+                self.set_ref_closure_buckets_enabled(!wholesale);
                 scheduler.schedule_common_work::<
                     crate::plan::concurrent::immix::gc_work::ConcurrentImmixNurseryGCWorkContext<VM>,
                 >(self);
@@ -480,6 +575,19 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
         match pause {
             Pause::InitialMark => (),
             Pause::Nursery => {
+                if crate::diag::WHOLESALE_MINOR.load(std::sync::atomic::Ordering::SeqCst) {
+                    // WHOLESALE: promote the whole nursery by splice; every
+                    // mark-keyed sweep (census, VM-specific) is skipped --
+                    // nothing was marked, everything lives.  The LOS logical
+                    // nursery is promoted wholesale too: wholesale-promoted
+                    // immix objects are never scanned, so their pre-existing
+                    // edges to young LOS objects would otherwise be
+                    // invisible to the next census minor's trace and its
+                    // LOS sweep would free live objects.
+                    self.immix_space.wholesale_promote_nursery();
+                    self.common.get_los().promote_all_young();
+                    return;
+                }
                 // In-pause nursery sweep: reclaims dead nursery lines and
                 // feeds them straight back to the allocator (the warm-reuse
                 // locality mechanism).  LOS sweeps its logical nursery.
@@ -580,9 +688,17 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
                 use std::sync::atomic::Ordering::Relaxed;
                 let live_now = self.immix_space.live_now_pages();
                 let prev = self.live_at_last_pause.swap(live_now, Relaxed);
-                if pause == Pause::Nursery {
+                if pause == Pause::Nursery
+                    && !crate::diag::WHOLESALE_MINOR.load(Relaxed)
+                {
                     let promoted = live_now.saturating_sub(prev);
                     let nursery = self.immix_space.last_minor_claimed_pages();
+                    crate::diag::MINOR_CLAIMED_PG.store(nursery as u64, Relaxed);
+                    crate::diag::MINOR_PROMO_PG.store(promoted as u64, Relaxed);
+                    if nursery > 0 {
+                        self.last_minor_survival_pct
+                            .store((promoted * 100 / nursery).min(100), Relaxed);
+                    }
                     let b = self.minor_backoff.load(Relaxed);
                     let new_b = if nursery > 0 && promoted >= nursery - nursery / 8 {
                         (b * 2).min(64)
@@ -757,6 +873,13 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
             }
             Pause::Nursery => {
                 debug_assert!(!self.concurrent_marking_in_progress());
+                // WHOLESALE: nothing young survives unpromoted, so the
+                // remset needs no old->young scan -- re-arm only, like
+                // InitialMark (O(entries) with a tiny constant).
+                if crate::diag::WHOLESALE_MINOR.load(Ordering::SeqCst) {
+                    self.drain_remset_rearm();
+                    return;
+                }
                 // Collect the mutators' remset buffers and schedule the
                 // entries as the minor's extra roots.  ProcessModBuf re-arms
                 // each entry and scans it for old->young edges; both happen
@@ -958,6 +1081,8 @@ impl<VM: VMBinding> ConcurrentImmix<VM> {
             mark_start_ns: AtomicU64::new(0),
             minor_backoff: std::sync::atomic::AtomicUsize::new(1),
             live_at_last_pause: std::sync::atomic::AtomicUsize::new(0),
+            last_minor_survival_pct: std::sync::atomic::AtomicUsize::new(0),
+            minor_seq: std::sync::atomic::AtomicUsize::new(0),
             mark_dur_ns: AtomicU64::new(0),
             gc_end_ns: AtomicU64::new(0),
             remset: std::sync::Mutex::new(Vec::new()),
@@ -983,13 +1108,27 @@ impl<VM: VMBinding> ConcurrentImmix<VM> {
     /// edges.)
     fn drain_remset_rearm(&self) {
         let entries = std::mem::take(&mut *self.remset.lock().unwrap());
-        for obj in entries {
-            VM::VMObjectModel::GLOBAL_LOG_BIT_SPEC.store_atomic::<VM, u8>(
-                obj,
-                1,
-                None,
-                Ordering::SeqCst,
-            );
+        if entries.is_empty() {
+            return;
+        }
+        // The re-arm is a per-entry side-metadata store with no ordering
+        // requirement among entries; the pause's resume rendezvous publishes
+        // the stores to mutators.  Done inline it serializes the pause
+        // (measured: 6.2M entries = 242ms inside StopMutators on strings'
+        // pointer-flipping SortTree phase), so fan it out over the in-pause
+        // Prepare bucket, which completes before mutators resume.
+        const REARM_CHUNK: usize = 65536;
+        let entries = std::sync::Arc::new(entries);
+        let scheduler = &self.base().scheduler;
+        let mut start = 0;
+        while start < entries.len() {
+            let end = (start + REARM_CHUNK).min(entries.len());
+            scheduler.work_buckets[WorkBucketStage::Prepare].add(RearmRemset::<VM> {
+                entries: entries.clone(),
+                range: start..end,
+                _p: std::marker::PhantomData,
+            });
+            start = end;
         }
     }
 
@@ -1266,7 +1405,30 @@ impl<VM: VMBinding> ConcurrentPlan for ConcurrentImmix<VM> {
     }
 
     fn append_remset(&self, buf: Vec<ObjectReference>) {
-        self.remset.lock().unwrap().extend(buf);
+        let len = {
+            let mut rs = self.remset.lock().unwrap();
+            rs.extend(buf);
+            rs.len()
+        };
+        // BOUNDED REMSET DEBT: the remset is deferred pause work (one
+        // side-metadata re-arm or old->young scan per entry), and a
+        // pointer-write-heavy, allocation-free mutator phase can grow it
+        // without ever reaching an allocation poll (measured: strings'
+        // SortTree banked 6.2M entries = 242ms serial / 25ms parallel in
+        // one minor).  Cap the debt: request an async minor when the
+        // pending drain crosses ~2.5ms of parallel re-arm work (~24.5ns
+        // CPU/entry at ~5.5x effective parallelism); the mutator parks at
+        // its next safepoint (measured sub-ms even in SortTree).  The
+        // wholesale decision sees the oversized remset and takes the
+        // re-arm-only path.
+        const REMSET_DRAIN_TRIGGER_ENTRIES: usize = 512 * 1024;
+        if len >= REMSET_DRAIN_TRIGGER_ENTRIES
+            && self.current_pause().is_none()
+            && !self.concurrent_marking_in_progress()
+        {
+            self.minor_due.store(true, Ordering::SeqCst);
+            self.base().gc_trigger.request();
+        }
     }
 
     fn enqueue_satb_values(&self, values: Vec<crate::util::ObjectReference>) {
@@ -1278,5 +1440,29 @@ impl<VM: VMBinding> ConcurrentPlan for ConcurrentImmix<VM> {
         // traced before the weak-ref/finalizer stages read mark bits.
         self.base().scheduler.work_buckets[WorkBucketStage::Closure]
             .add(ProcessModBufSATB::<VM, Self, TRACE_KIND_FAST>::new(values));
+    }
+}
+
+/// Re-arm a range of drained remset entries (see `drain_remset_rearm`): one
+/// unlog-bit store per entry, fanned out across workers so a large remset
+/// (millions of entries after a pointer-write-heavy, allocation-free mutator
+/// phase) does not serialize the pause.  Relaxed suffices: entries are
+/// disjoint objects and the pause's resume rendezvous publishes the stores.
+struct RearmRemset<VM: VMBinding> {
+    entries: std::sync::Arc<Vec<ObjectReference>>,
+    range: std::ops::Range<usize>,
+    _p: std::marker::PhantomData<VM>,
+}
+
+impl<VM: VMBinding> GCWork<VM> for RearmRemset<VM> {
+    fn do_work(&mut self, _worker: &mut GCWorker<VM>, _mmtk: &'static crate::MMTK<VM>) {
+        for obj in &self.entries[self.range.clone()] {
+            // Whole-byte set with test-before-store: neighbors of a remset
+            // entry are mature (or promoted by this pause), so unlogging the
+            // byte is safe, and densely-logged runs degrade to plain loads
+            // instead of RMW ping-pong between workers.
+            VM::VMObjectModel::GLOBAL_LOG_BIT_SPEC
+                .mark_byte_as_unlogged::<VM>(*obj, Ordering::Relaxed);
+        }
     }
 }

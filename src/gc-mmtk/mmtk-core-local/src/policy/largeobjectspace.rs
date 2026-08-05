@@ -327,6 +327,26 @@ impl<VM: VMBinding> LargeObjectSpace<VM> {
         }
     }
 
+    /// WHOLESALE MINOR (see the concurrent plan): promote every logical-
+    /// nursery object without a trace -- exactly `trace_object`'s promotion
+    /// side effects (mark, nursery-bit clear, treadmill move, unlog) with
+    /// no scanning.  Required because wholesale-promoted immix objects are
+    /// never scanned, so a pre-existing edge to a young LOS object is
+    /// invisible to later census minors: leaving the LOS object in the
+    /// nursery let the next census sweep free it live (measured: inference
+    /// buffer corruption on tree_immutable).
+    pub fn promote_all_young(&self) {
+        for object in self.treadmill.collect_nursery() {
+            if self.test_and_mark(object, self.mark_state) {
+                self.treadmill.copy(object, true);
+                if self.common.unlog_traced_object {
+                    VM::VMObjectModel::GLOBAL_LOG_BIT_SPEC
+                        .mark_as_unlogged::<VM>(object, Ordering::SeqCst);
+                }
+            }
+        }
+    }
+
     // Allow nested-if for this function to make it clear that test_and_mark() is only executed
     // for the outer condition is met.
     #[allow(clippy::collapsible_if)]

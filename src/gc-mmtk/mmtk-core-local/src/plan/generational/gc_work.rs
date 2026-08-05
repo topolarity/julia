@@ -55,6 +55,13 @@ impl<VM: VMBinding, P: GenerationalPlanExt<VM> + PlanTraceObject<VM>, const KIND
         object: ObjectReference,
         queue: &mut Q,
     ) -> ObjectReference {
+        // WHOLESALE MINOR: everything is treated as mature -- the pause
+        // promotes the whole nursery by splice instead of tracing it (cost
+        // O(blocks), for nurseries too big or too surviving to trace within
+        // the pause budget).  Roots degrade to per-slot no-ops here.
+        if crate::diag::WHOLESALE_MINOR.load(Ordering::Relaxed) {
+            return object;
+        }
         self.plan
             .trace_object_nursery::<_, KIND>(queue, object, worker)
     }

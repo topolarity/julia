@@ -298,6 +298,13 @@ impl Default for SweepVMSpecific {
 
 impl<VM: VMBinding> GCWork<VM> for SweepVMSpecific {
     fn do_work(&mut self, _worker: &mut GCWorker<VM>, _mmtk: &'static MMTK<VM>) {
+        // WHOLESALE MINOR: nothing was marked and everything lives -- every
+        // mark-keyed sweep below would free live data.  Skip entirely; the
+        // next census/major collection performs them against real marks.
+        if mmtk::diag::WHOLESALE_MINOR.load(std::sync::atomic::Ordering::SeqCst) {
+            self.swept = true;
+            return;
+        }
         // Malloced-memory sweep: when the finalizer phase detached the
         // lists (gate up), the deferred packet sweeps them concurrently;
         // the synchronous path remains for user-triggered collections and

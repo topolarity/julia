@@ -75,11 +75,11 @@ pub struct ImmixSpace<VM: VMBinding> {
     /// free}.  `pending` collects blocks abandoned by allocator resets and is
     /// spliced into `unswept` only at FinalMark, so everything in `unswept`
     /// has survived a full marking and is safe to triage at any time.
-    unswept_blocks: std::sync::Mutex<Vec<Block>>,
+    unswept_blocks: std::sync::Mutex<BlockSegQueue>,
     /// PATH 2: blocks listed at the LAST FinalMark.  Their garbage is still
     /// epoch-marked (SATB float): neither reclaimable nor worth triaging until
     /// the next FinalMark ages them into `unswept_blocks`.
-    unswept_young: std::sync::Mutex<Vec<Block>>,
+    unswept_young: std::sync::Mutex<BlockSegQueue>,
     /// LEG 1 (fewer in-pause work items): packets generated at FinalMark that
     /// only need to complete before the NEXT pause (unlog-bit clearing,
     /// mark-bit clearing).  Drained into the always-open bucket by the plan's
@@ -355,6 +355,78 @@ impl<VM: VMBinding> crate::policy::gc_work::PolicyTraceObject<VM> for ImmixSpace
     }
 }
 
+/// Segmented block queue for the lazy-sweep aging pipeline.  Whole-list
+/// splices (FinalMark aging: the entire marking window's claimed float,
+/// measured 2.3M blocks / 19.6GB on tree_mutable) are O(1) segment moves
+/// instead of flat-Vec element copies (measured 15-26ms of memcpy + faults
+/// inside the pause), and segments are Arc-shared so in-pause metadata
+/// packets can read the block list without copying it.  Consumers take from
+/// an owned working tail; segments are unwrapped into it one at a time
+/// (packet refs are dropped by pause end, so `try_unwrap` normally moves).
+pub(crate) struct BlockSegQueue {
+    segs: Vec<std::sync::Arc<Vec<Block>>>,
+    tail: Vec<Block>,
+    len: usize,
+}
+
+impl BlockSegQueue {
+    fn new() -> Self {
+        Self {
+            segs: Vec::new(),
+            tail: Vec::new(),
+            len: 0,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn push(&mut self, b: Block) {
+        self.tail.push(b);
+        self.len += 1;
+    }
+
+    fn push_seg(&mut self, s: std::sync::Arc<Vec<Block>>) {
+        if !s.is_empty() {
+            self.len += s.len();
+            self.segs.push(s);
+        }
+    }
+
+    fn append_all(&mut self, other: &mut Self) {
+        self.len += other.len;
+        other.len = 0;
+        self.segs.append(&mut other.segs);
+        if !other.tail.is_empty() {
+            self.segs
+                .push(std::sync::Arc::new(std::mem::take(&mut other.tail)));
+        }
+    }
+
+    /// Take up to `budget` blocks off the working tail, refilling it from
+    /// the newest segment when empty.
+    fn take_up_to(&mut self, budget: usize) -> Vec<Block> {
+        if self.tail.is_empty() {
+            while let Some(seg) = self.segs.pop() {
+                let v = std::sync::Arc::try_unwrap(seg).unwrap_or_else(|a| (*a).clone());
+                if !v.is_empty() {
+                    self.tail = v;
+                    break;
+                }
+            }
+        }
+        let n = self.tail.len().min(budget);
+        let taken = self.tail.split_off(self.tail.len() - n);
+        self.len -= taken.len();
+        taken
+    }
+}
+
 impl<VM: VMBinding> ImmixSpace<VM> {
     #[allow(unused)]
     const UNMARKED_STATE: u8 = 0;
@@ -366,6 +438,7 @@ impl<VM: VMBinding> ImmixSpace<VM> {
             vec![
                 MetadataSpec::OnSide(Block::DEFRAG_STATE_TABLE),
                 MetadataSpec::OnSide(Block::MARK_TABLE),
+                MetadataSpec::OnSide(Block::PENDING_TABLE),
                 *VM::VMObjectModel::LOCAL_MARK_BIT_SPEC,
                 *VM::VMObjectModel::LOCAL_FORWARDING_BITS_SPEC,
                 *VM::VMObjectModel::LOCAL_FORWARDING_POINTER_SPEC,
@@ -377,6 +450,7 @@ impl<VM: VMBinding> ImmixSpace<VM> {
                 MetadataSpec::OnSide(Line::MARK_TABLE),
                 MetadataSpec::OnSide(Block::DEFRAG_STATE_TABLE),
                 MetadataSpec::OnSide(Block::MARK_TABLE),
+                MetadataSpec::OnSide(Block::PENDING_TABLE),
                 *VM::VMObjectModel::LOCAL_MARK_BIT_SPEC,
                 *VM::VMObjectModel::LOCAL_FORWARDING_BITS_SPEC,
                 *VM::VMObjectModel::LOCAL_FORWARDING_POINTER_SPEC,
@@ -447,8 +521,8 @@ impl<VM: VMBinding> ImmixSpace<VM> {
             line_mark_state: AtomicU8::new(Line::RESET_MARK_STATE),
             line_unavail_state: AtomicU8::new(Line::RESET_MARK_STATE),
             lines_consumed: AtomicUsize::new(0),
-            unswept_blocks: std::sync::Mutex::new(Vec::new()),
-            unswept_young: std::sync::Mutex::new(Vec::new()),
+            unswept_blocks: std::sync::Mutex::new(BlockSegQueue::new()),
+            unswept_young: std::sync::Mutex::new(BlockSegQueue::new()),
             deferred_post_pause_packets: std::sync::Mutex::new(Vec::new()),
             live_bytes: &LIVE_BYTES_TOTAL,
             finalizer_reclaim_gate: std::sync::atomic::AtomicBool::new(false),
@@ -672,7 +746,7 @@ impl<VM: VMBinding> ImmixSpace<VM> {
             let mut young = self.unswept_young.lock().unwrap();
             {
                 let mut unswept = self.unswept_blocks.lock().unwrap();
-                unswept.append(&mut young);
+                unswept.append_all(&mut young);
                 if !unswept.is_empty() {
                     self.unswept_nonempty.store(true, Ordering::Relaxed);
                 }
@@ -684,8 +758,11 @@ impl<VM: VMBinding> ImmixSpace<VM> {
             while let Some(b) = self.reusable_blocks.pop() {
                 young.push(b);
             }
+            let trel0 = crate::diag::now_ns();
+            let mut npend = 0usize;
             {
                 let mut pending = self.pending_blocks.lock().unwrap();
+                npend = pending.len();
                 // ALWAYS-ON BARRIER: promote the cycle's float.  Blocks
                 // claimed since InitialMark hold allocate-black objects
                 // (marked-live, never traced, so never trace-armed); after
@@ -693,24 +770,49 @@ impl<VM: VMBinding> ImmixSpace<VM> {
                 // Arm them IN-PAUSE: once mutators resume, a disarmed old
                 // object's write would skip the barrier.  (Blocks claimed
                 // before InitialMark were armed in that pause; re-arming is
-                // idempotent.)
-                if self.common.needs_log_bit {
-                    let unlog = VM::VMObjectModel::GLOBAL_LOG_BIT_SPEC.extract_side_spec();
-                    for block in pending.iter() {
-                        unlog.bset_metadata(block.start(), Block::BYTES);
-                    }
+                // idempotent.)  Minors are forbidden during marking, so this
+                // list holds the WHOLE window's claimed float -- measured
+                // 2.3M distinct blocks (19.6GB) on tree_mutable, 58ms if
+                // armed inline -- so the metadata work fans out over the
+                // in-pause Release bucket (range-coalesced: claim order is
+                // near address order, so per-packet memsets merge into long
+                // runs).  The list splice itself stays O(1)-ish (one copy).
+                let blocks = std::sync::Arc::new(std::mem::take(&mut *pending));
+                const ARM_CHUNK: usize = 65536;
+                let mut start = 0;
+                while start < blocks.len() {
+                    let end = (start + ARM_CHUNK).min(blocks.len());
+                    self.scheduler().work_buckets[WorkBucketStage::Release].add(
+                        ArmFloatBlocks::<VM> {
+                            blocks: blocks.clone(),
+                            range: start..end,
+                            needs_log_bit: self.common.needs_log_bit,
+                            _p: std::marker::PhantomData,
+                        },
+                    );
+                    start = end;
                 }
-                young.append(&mut pending);
+                young.push_seg(blocks.clone());
             }
-            young.append(&mut self.full_blocks.lock().unwrap());
+            young.push_seg(std::sync::Arc::new(std::mem::take(
+                &mut *self.full_blocks.lock().unwrap(),
+            )));
             // Uncensused nursery-list blocks were re-proven by this major
             // (traced + line-marked); their object-mark census is invalid
             // after the InitialMark clear, so route them through the regular
             // line-census aging pipeline instead.
-            young.append(&mut self.unswept_nursery.lock().unwrap());
+            young.push_seg(std::sync::Arc::new(std::mem::take(
+                &mut *self.unswept_nursery.lock().unwrap(),
+            )));
             self.nursery_unswept_nonempty
                 .store(false, std::sync::atomic::Ordering::Relaxed);
             drop(young);
+            if std::env::var_os("MMTK_STOP_WAIT_TRACE").is_some() {
+                let d = crate::diag::now_ns().saturating_sub(trel0);
+                if d > 1_000_000 {
+                    eprintln!("[rel-arm] {} pending blocks {:.1}ms", npend, d as f64 / 1e6);
+                }
+            }
             self.nursery_lines_claimed
                 .store(0, Ordering::Relaxed);
             self.float_lines_claimed
@@ -1025,7 +1127,9 @@ impl<VM: VMBinding> ImmixSpace<VM> {
     /// next FinalMark, by which time its owner has been reset and its live
     /// contents are line-marked.
     pub fn record_acquired(&self, block: Block) {
-        self.pending_blocks.lock().unwrap().push(block);
+        if !block.test_and_set_pending() {
+            self.pending_blocks.lock().unwrap().push(block);
+        }
     }
 
     /// FIX E: triage up to `budget` unswept blocks (allocation-driven lazy
@@ -1147,8 +1251,62 @@ impl<VM: VMBinding> ImmixSpace<VM> {
     /// worker-side cache affinity (the trace workers wrote the marks it
     /// reads) -- measured: serial-in-pause cost ~0.35ms/pause and
     /// claim-time (mutator) cost ~2x that in cross-CCX metadata fills.
+    /// WHOLESALE MINOR (see the plan): promote the entire nursery by
+    /// splice -- arm every pending block (its objects are old after this
+    /// pause; their mutations must log) and age it into the young unswept
+    /// generation, where the NEXT major's trace re-proves it before any
+    /// line-census triage may touch it (the same safety argument as the
+    /// FinalMark float splice).  No census, no reclaim: everything lives.
+    pub(crate) fn wholesale_promote_nursery(&self) {
+        let mut pending = self.pending_blocks.lock().unwrap();
+        let claimed = self
+            .nursery_lines_claimed
+            .swap(0, std::sync::atomic::Ordering::Relaxed);
+        self.last_minor_claimed
+            .store(claimed, std::sync::atomic::Ordering::Relaxed);
+        self.float_lines_claimed
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        let state = self.line_mark_state.load(Ordering::Acquire);
+        for block in pending.iter() {
+            // Mirror the allocate-black PATH-1 treatment: promoted objects
+            // must read as MATURE to the mark-based nursery test (measured:
+            // without this, the next census minor traced the entire
+            // accumulated wholesale backlog -- 153ms), and their lines must
+            // read live to the census/triage until the next major re-proves
+            // them.  The next InitialMark clears object marks in-pause
+            // before its trace, so saturation cannot cause stale skips.
+            block.set_state(BlockState::Marked);
+            Line::initialize_mark_table_as_marked::<VM>(block.start_line()..block.end_line());
+            Line::bulk_set_line_mark_states(state, block.start_line()..block.end_line());
+            // Saturate the OBJECT mark bits as well.  Live-mature => marked
+            // is the standing invariant between collections: the VM-specific
+            // sweeps (mallocarrays, stack pools) and the census young-test
+            // read per-object marks, so a promoted-but-unmarked object's
+            // malloc'd resources are freed by the next census minor while
+            // the owner lives (measured: Pkg precompile crashed in
+            // mmtk_scan_gcstack / munmap_chunk abort -- a live task's freed
+            // stack).  Dead objects saturate too; wholesale semantics
+            // already keep the whole block until the next major re-proves it.
+            VM::VMObjectModel::LOCAL_MARK_BIT_SPEC
+                .extract_side_spec()
+                .bset_metadata(block.start(), Block::BYTES);
+            block.clear_pending();
+        }
+        if self.common.needs_log_bit {
+            let unlog = VM::VMObjectModel::GLOBAL_LOG_BIT_SPEC.extract_side_spec();
+            for block in pending.iter() {
+                unlog.bset_metadata(block.start(), Block::BYTES);
+            }
+        }
+        let mut young = self.unswept_young.lock().unwrap();
+        young.push_seg(std::sync::Arc::new(std::mem::take(&mut *pending)));
+    }
+
     pub(crate) fn sweep_nursery_blocks(&self) {
         let blocks: Vec<Block> = std::mem::take(&mut *self.pending_blocks.lock().unwrap());
+        for block in blocks.iter() {
+            block.clear_pending();
+        }
         let claimed = self
             .nursery_lines_claimed
             .swap(0, std::sync::atomic::Ordering::Relaxed);
@@ -1414,13 +1572,11 @@ impl<VM: VMBinding> ImmixSpace<VM> {
     fn lazy_triage_some_inner(&self, budget: usize) -> bool {
         let blocks: Vec<Block> = {
             let mut q = self.unswept_blocks.lock().unwrap();
-            let n = q.len().min(budget);
-            if n == 0 {
+            let taken = q.take_up_to(budget);
+            if taken.is_empty() {
                 self.unswept_nonempty.store(false, Ordering::Relaxed);
                 return false;
             }
-            let at = q.len() - n;
-            let taken = q.split_off(at);
             if q.is_empty() {
                 self.unswept_nonempty.store(false, Ordering::Relaxed);
             }
@@ -1431,7 +1587,10 @@ impl<VM: VMBinding> ImmixSpace<VM> {
         let unavail = self.line_unavail_state.load(Ordering::Acquire);
         // BISECT: idle-window only (during marking cur != unavail)
         if cur != unavail {
-            self.unswept_blocks.lock().unwrap().append(&mut { blocks });
+            self.unswept_blocks
+                .lock()
+                .unwrap()
+                .push_seg(std::sync::Arc::new(blocks));
             self.unswept_nonempty.store(true, Ordering::Relaxed);
             return false;
         }
@@ -1506,7 +1665,9 @@ impl<VM: VMBinding> ImmixSpace<VM> {
                 // Traced while pool-resident (marking is running): its hole
                 // census is stale; send it back through the unswept pipeline.
                 BlockState::Marked => {
-                    self.pending_blocks.lock().unwrap().push(block);
+                    if !block.test_and_set_pending() {
+                        self.pending_blocks.lock().unwrap().push(block);
+                    }
                     continue;
                 }
                 _ => unreachable!("{:?} {:?}", block, block.get_state()),
@@ -2259,6 +2420,43 @@ impl ClearVOBitsAfterPrepare {
             .filter(|block| block.get_state() != BlockState::Unallocated)
         {
             block.clear_vo_bits_for_unmarked_regions(line_mark_state);
+        }
+    }
+}
+
+
+/// FinalMark float promotion, fanned out (see the pending-blocks splice in
+/// `ImmixSpace::release`): arm the unlog bits of a range of float blocks and
+/// clear their pending-list flags.  Consecutive blocks coalesce into single
+/// metadata memsets.  Runs in the in-pause Release bucket, so the arming is
+/// complete before mutators resume.
+struct ArmFloatBlocks<VM: VMBinding> {
+    blocks: std::sync::Arc<Vec<Block>>,
+    range: std::ops::Range<usize>,
+    needs_log_bit: bool,
+    _p: std::marker::PhantomData<VM>,
+}
+
+impl<VM: VMBinding> GCWork<VM> for ArmFloatBlocks<VM> {
+    fn do_work(&mut self, _worker: &mut GCWorker<VM>, _mmtk: &'static crate::MMTK<VM>) {
+        let slice = &self.blocks[self.range.clone()];
+        if self.needs_log_bit {
+            let unlog = VM::VMObjectModel::GLOBAL_LOG_BIT_SPEC.extract_side_spec();
+            let mut i = 0;
+            while i < slice.len() {
+                let run_start = slice[i].start();
+                let mut run_end = run_start + Block::BYTES;
+                let mut j = i + 1;
+                while j < slice.len() && slice[j].start() == run_end {
+                    run_end = run_end + Block::BYTES;
+                    j += 1;
+                }
+                unlog.bset_metadata(run_start, run_end - run_start);
+                i = j;
+            }
+        }
+        for b in slice {
+            b.clear_pending();
         }
     }
 }

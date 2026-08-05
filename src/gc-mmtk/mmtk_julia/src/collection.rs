@@ -67,10 +67,11 @@ impl Collection<JuliaVM> for VMCollection {
         // Requesting mutators have merely parked in block_for_gc.
         let sw0 = crate::now_ns();
         unsafe { crate::jl_mmtk_gc_stw_begin() };
-        crate::record_max(
-            &crate::STOP_WAIT_MAX_NS,
-            crate::now_ns().saturating_sub(sw0),
-        );
+        let sw = crate::now_ns().saturating_sub(sw0);
+        crate::record_max(&crate::STOP_WAIT_MAX_NS, sw);
+        if sw > 1_000_000 && std::env::var_os("MMTK_STOP_WAIT_TRACE").is_some() {
+            eprintln!("[stop-wait] {:.1}ms", sw as f64 / 1e6);
+        }
         AtomicBool::store(&WORLD_HAS_STOPPED, true, Ordering::SeqCst);
 
         trace!("Stopped the world!");
@@ -261,7 +262,7 @@ impl Collection<JuliaVM> for VMCollection {
                     {
                         let us = |v: u64| v as f64 / 1000.0;
                         eprintln!(
-                            "[roots] kind={} dur={:.1}us mut={:.1}us(max {:.1}us, n={}) stack={:.1}us(tasks={} slots={}) vm={:.1}us prep={:.1}us prepmut={:.1}us prep[imm={:.1} los={:.1} nm={:.1} base={:.1}]us pkt_sum={:.1}us pkt_n={}",
+                            "[roots] kind={} dur={:.1}us mut={:.1}us(max {:.1}us, n={}) stack={:.1}us(tasks={} slots={}) vm={:.1}us prep={:.1}us prepmut={:.1}us prep[imm={:.1} los={:.1} nm={:.1} base={:.1}]us pkt_sum={:.1}us pkt_n={} claimed_pg={} promo_pg={}",
                             k,
                             us(d),
                             us(mmtk::diag::ROOTS_MUT_NS.load(Ordering::SeqCst)),
@@ -279,6 +280,8 @@ impl Collection<JuliaVM> for VMCollection {
                             us(mmtk::diag::PREP_BASE_NS.load(Ordering::SeqCst)),
                             us(mmtk::diag::PAUSE_PKT_SUM_NS.load(Ordering::SeqCst)),
                             mmtk::diag::PAUSE_PKT_N.load(Ordering::SeqCst),
+                            mmtk::diag::MINOR_CLAIMED_PG.load(Ordering::SeqCst),
+                            mmtk::diag::MINOR_PROMO_PG.load(Ordering::SeqCst),
                         );
                     }
                 }

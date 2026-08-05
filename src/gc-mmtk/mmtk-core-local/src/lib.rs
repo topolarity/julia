@@ -160,6 +160,14 @@ pub mod diag {
     /// hole cache to detect that a pause (and thus a possible remote
     /// allocator reset) happened since the holes were scanned.
     pub static PAUSE_EPOCH: AtomicU64 = AtomicU64::new(0);
+    /// Last minor's nursery size and promoted mass (pages), for anatomy.
+    /// WHOLESALE MINOR: the current Nursery pause promotes the entire
+    /// nursery without tracing (see the plan's schedule_collection).  The
+    /// nursery trace no-ops, and every mark-keyed sweep must be skipped.
+    pub static WHOLESALE_MINOR: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    pub static MINOR_CLAIMED_PG: AtomicU64 = AtomicU64::new(0);
+    pub static MINOR_PROMO_PG: AtomicU64 = AtomicU64::new(0);
     pub static CLAIM_NS: AtomicU64 = AtomicU64::new(0);
     pub static CLAIM_N: AtomicU64 = AtomicU64::new(0);
     pub static CLAIM_MAX_NS: AtomicU64 = AtomicU64::new(0);
@@ -260,6 +268,12 @@ pub mod diag {
             MUT_SLOTCAP_N.load(Ordering::Relaxed),
             ms(MUT_SLOTCAP_NS.load(Ordering::Relaxed)),
             ms(MUT_SLOTCAP_MAX_NS.load(Ordering::Relaxed)),
+        );
+        eprintln!(
+            "[mutgc] trigger_latency: n={} total={:.1}ms max={:.1}ms",
+            LAT_COUNT.load(Ordering::Relaxed),
+            ms(LAT_TOTAL_NS.load(Ordering::Relaxed)),
+            ms(LAT_MAX_NS.load(Ordering::Relaxed)),
         );
         eprintln!(
             "[mutgc] lazy_triage: chunks={} total={:.1}ms max={:.3}ms freed_blk={} pooled_blk={}",
