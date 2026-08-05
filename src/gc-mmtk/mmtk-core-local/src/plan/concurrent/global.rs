@@ -61,6 +61,23 @@ pub trait ConcurrentPlan: Plan {
     fn satb_capture_values(&self, _values: Vec<crate::util::ObjectReference>) {
         unimplemented!()
     }
+    /// RAGGED PRE-FLUSH (Go's gcMarkDone): called by the last-parked
+    /// worker when concurrent work has drained and a FinalMark would be
+    /// requested.  Returns true when the FinalMark may proceed (a flush
+    /// round completed quietly or timed out); otherwise opens/continues a
+    /// flush epoch that mutators acknowledge from their poll sites, and
+    /// the last acknowledgment raises the GC request itself.
+    fn ragged_flush_ready(&self) -> bool {
+        true
+    }
+    /// Mutator-side poll: flush this mutator's SATB buffer if a flush
+    /// epoch is open that it has not yet acknowledged.
+    fn ragged_flush_poll(&self, _mutator: &mut crate::Mutator<Self::VM>) {}
+    /// Identifier of the open flush round (0 = none); used by bindings to
+    /// acknowledge each round at most once per mutator.
+    fn ragged_round_id(&self) -> u64 {
+        0
+    }
     /// GO-STYLE TERMINATION: whether the current FinalMark pause was
     /// aborted (over-budget SATB work found at the flush; marking
     /// continues).  Release/finalizer/weak-ref processing must all no-op.

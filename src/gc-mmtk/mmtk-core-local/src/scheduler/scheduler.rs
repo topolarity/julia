@@ -608,7 +608,12 @@ impl<VM: VMBinding> GCWorkScheduler<VM> {
             // the next mutator poll after re-enable raises the FinalMark
             // request through the ordinary (gated) trigger path.
             let ready_for_final_mark = cp_opt.is_some_and(|cp| cp.concurrent_work_in_progress())
-                && <VM as crate::vm::VMBinding>::VMCollection::is_collection_enabled();
+                && <VM as crate::vm::VMBinding>::VMCollection::is_collection_enabled()
+                // RAGGED PRE-FLUSH: before the FinalMark request, run a
+                // mutator buffer-flush round so late-logged objects are
+                // drained concurrently (Go's gcMarkDone); the pause-time
+                // flush + detect-and-abort remain as the backstop.
+                && cp_opt.is_some_and(|cp| cp.ragged_flush_ready());
             if ready_for_final_mark {
                 crate::diag::NOREQ_CM_ACTIVE.fetch_add(1, DO::SeqCst);
             }

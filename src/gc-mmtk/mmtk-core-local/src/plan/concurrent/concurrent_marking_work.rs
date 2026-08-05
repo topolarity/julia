@@ -185,6 +185,8 @@ impl<VM: VMBinding, P: ConcurrentPlan<VM = VM> + PlanTraceObject<VM>, const KIND
     GCWork<VM> for ProcessModBufSATB<VM, P, KIND>
 {
     fn do_work(&mut self, worker: &mut GCWorker<VM>, mmtk: &'static MMTK<VM>) {
+        let __t0 = crate::diag::now_ns();
+        let __n = self.nodes.as_ref().map(|v| v.len()).unwrap_or(0);
         if let Some(nodes) = &self.nodes {
             use crate::vm::ObjectModel;
             let bytes: usize = nodes
@@ -209,6 +211,13 @@ impl<VM: VMBinding, P: ConcurrentPlan<VM = VM> + PlanTraceObject<VM>, const KIND
             return;
         };
         GCWork::do_work(&mut w, worker, mmtk);
+        {
+            let __d = crate::diag::now_ns().saturating_sub(__t0);
+            if __d > 10_000_000 && std::env::var_os("MMTK_SNAP_TRACE").is_some() {
+                eprintln!("[modbuf] SLOW {}us nodes={}", __d / 1000, __n);
+            }
+        }
+
     }
 }
 

@@ -72,6 +72,13 @@ pub struct ConcurrentImmix<VM: VMBinding> {
     /// `schedule_collection`; a major request wins over a minor one.
     minor_due: AtomicBool,
     major_due: AtomicBool,
+    /// RAGGED PRE-FLUSH state: epoch counter (0 = no round open), ack
+    /// count, and round start time for the timeout (mutators that never
+    /// poll -- non-allocating loops -- must not stall the FinalMark; the
+    /// in-pause flush plus detect-and-abort backstop covers them).
+    ragged_epoch: std::sync::atomic::AtomicUsize,
+    ragged_acks: std::sync::atomic::AtomicUsize,
+    ragged_start_ns: AtomicU64,
     /// GO-STYLE TERMINATION: set when a FinalMark pause found over-budget
     /// SATB work at the flush and aborted (marking continues; the pause's
     /// release/ref stages no-op; the next pause retries FinalMark).
@@ -166,8 +173,17 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
                     }
                     return true;
                 }
-                info!("Heap trigger during concurrent marking: hastening FinalMark (async)");
-                self.base().gc_trigger.request();
+                // Advisory pressure during marking: do NOT request the
+                // FinalMark from here.  The pause cannot legitimately
+                // complete before the concurrent drain finishes, so an
+                // early request only bypasses the ragged pre-flush and
+                // races the drain -- the flushed work (e.g. a logged
+                // array's transitive scan) then lands inside the pause
+                // (measured: 370-410ms FinalMarks).  The all-parked
+                // self-trigger requests the pause the moment the drain is
+                // actually complete; allocation proceeds from headroom
+                // meanwhile.
+                info!("Heap trigger during concurrent marking: deferring to drained self-trigger");
                 return false;
             }
             // Reserved-based pressure while aged reclaimable memory exists is
@@ -862,6 +878,9 @@ impl<VM: VMBinding> ConcurrentImmix<VM> {
             remset: std::sync::Mutex::new(Vec::new()),
             minor_due: AtomicBool::new(false),
             final_mark_aborted: AtomicBool::new(false),
+            ragged_epoch: std::sync::atomic::AtomicUsize::new(0),
+            ragged_acks: std::sync::atomic::AtomicUsize::new(0),
+            ragged_start_ns: AtomicU64::new(0),
             major_due: AtomicBool::new(false),
             malloc_pages_at_last_gc: std::sync::atomic::AtomicUsize::new(0),
             los_pages_at_last_gc: std::sync::atomic::AtomicUsize::new(0),
@@ -1076,6 +1095,62 @@ impl<VM: VMBinding> ConcurrentPlan for ConcurrentImmix<VM> {
 
     fn final_mark_aborted(&self) -> bool {
         self.final_mark_aborted.load(Ordering::SeqCst)
+    }
+
+    fn ragged_flush_ready(&self) -> bool {
+        use crate::vm::ActivePlan;
+        const RAGGED_TIMEOUT_NS: u64 = 2_000_000;
+        let now = crate::diag::now_ns();
+        let ep = self.ragged_epoch.load(Ordering::SeqCst);
+        if ep == 0 {
+            // Open a round: mutators flush+ack from their poll sites; the
+            // last ack raises the GC request (see ragged_flush_poll).
+            self.ragged_acks.store(0, Ordering::SeqCst);
+            self.ragged_start_ns.store(now, Ordering::SeqCst);
+            self.ragged_epoch.store(1, Ordering::SeqCst);
+            return false;
+        }
+        let done = self.ragged_acks.load(Ordering::SeqCst)
+            >= <VM as VMBinding>::VMActivePlan::number_of_mutators()
+            || now.saturating_sub(self.ragged_start_ns.load(Ordering::SeqCst))
+                > RAGGED_TIMEOUT_NS;
+        if done {
+            // Reset for the next cycle's round.
+            self.ragged_epoch.store(0, Ordering::SeqCst);
+        }
+        done
+    }
+
+    fn ragged_round_id(&self) -> u64 {
+        if self.ragged_epoch.load(Ordering::SeqCst) == 0 {
+            return 0;
+        }
+        self.ragged_start_ns.load(Ordering::SeqCst)
+    }
+
+    fn ragged_flush_poll(&self, mutator: &mut crate::Mutator<VM>) {
+        if self.ragged_epoch.load(Ordering::SeqCst) == 0
+            || !self.concurrent_marking_in_progress()
+        {
+            return;
+        }
+        mutator.barrier.flush();
+        let acks = self.ragged_acks.fetch_add(1, Ordering::SeqCst) + 1;
+        use crate::vm::ActivePlan;
+        if acks >= <VM as VMBinding>::VMActivePlan::number_of_mutators() {
+            // Do NOT request the pause here: a direct request schedules
+            // StopMutators immediately, racing the concurrent drain of the
+            // work this very round just flushed (measured: a flushed
+            // wrapper's 400ms cascade landing in-pause).  Quiet acks are
+            // not "drained" -- only the all-parked self-trigger, which by
+            // construction fires when every bucket is empty, may request
+            // the FinalMark.  Just make sure the workers are awake to
+            // drain and re-evaluate.
+            self.base()
+                .scheduler
+                .worker_monitor
+                .notify_work_available(true);
+        }
     }
 
     fn satb_capture_values(&self, values: Vec<crate::util::ObjectReference>) {

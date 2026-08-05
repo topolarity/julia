@@ -407,6 +407,12 @@ impl GCStackSnapshots {
             let running = unsafe { !(*task).ptls.is_null() };
             let disabled = unsafe { crate::jl_get_gc_disable_counter() } > 0;
             if !in_pause && (running || disabled) {
+                if std::env::var_os("MMTK_SNAP_TRACE").is_some() {
+                    eprintln!(
+                        "[snap] DEFER task={:#x} running={} disabled={}",
+                        task_key, running, disabled
+                    );
+                }
                 self.pending_rescan.insert(task_key, ());
                 return None;
             }
@@ -439,6 +445,9 @@ impl GCStackSnapshots {
     }
 
     fn capture_snapshot_who(&self, task: *const _jl_task_t, who: &str) -> Arc<[ObjectReference]> {
+        if std::env::var_os("MMTK_SNAP_TRACE").is_some() {
+            eprintln!("[snap] CAPTURE task={:#x} who={}", task as usize, who);
+        }
         let mut snapshot_roots = StackRootBuffer { buffer: vec![] };
         unsafe {
             crate::julia_scanning::mmtk_scan_gcstack(task, &mut snapshot_roots);
@@ -477,6 +486,9 @@ impl GCStackSnapshots {
     }
 
     pub fn clear_snapshots(&self) {
+        if std::env::var_os("MMTK_SNAP_TRACE").is_some() {
+            eprintln!("[snap] CLEAR n={}", self.snapshots.len());
+        }
         self.snapshots.clear();
         self.task_scan_locks.clear();
         self.pending_rescan.clear();
