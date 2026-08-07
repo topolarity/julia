@@ -315,6 +315,8 @@
     XX(jl_module_globalref) \
     XX(jl_module_import) \
     XX(jl_module_is_open) \
+    XX(jl_root_module_finalize) \
+    XX(jl_root_module_new_typenames) \
     XX(jl_module_name) \
     XX(jl_module_names) \
     XX(jl_module_parent) \

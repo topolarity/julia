@@ -123,13 +123,19 @@ module is open according to the runtime. All of its submodules share the same
 canonicalizes any module argument to its registered root module, using the same
 root boundary as `Base.moduleroot` (including roots such as `Base.Compiler`
 whose parent pointer alone is insufficient). Openness therefore cannot diverge
-between a package and one of its submodules. This is deliberately
-instance-relative and context-sensitive:
+between a package and one of its submodules.
+
+Root modules record a distinct monotonic `finalized` fact when their source
+construction transaction is complete. Finalization is not itself openness:
+openness is derived from finalization and the current execution context. This
+is deliberately instance-relative and context-sensitive:
 
 - outside incremental output generation, all modules are open, including while
   final-application initializers and later runtime code execute;
-- during incremental output generation, modules belonging to the current
-  output transaction are open; and
+- during incremental output generation, an unfinalized root belonging to the
+  current output transaction is open;
+- during incremental output generation, a finalized root is closed even when
+  its modules remain in an initializer worklist; and
 - restored dependency modules do not belong to that transaction and are closed
   while their initializers run during downstream precompilation, where their
   heap side effects are largely discarded.
@@ -141,20 +147,24 @@ instance and may then acquire more requirements under that runtime policy.
 
 ### Relationship to module initialization order
 
-The existing runtime notion of module openness is the union of two cases:
+The runtime notion of module openness is the union of two cases:
 
 1. Julia is not generating incremental output, in which case every module is
    open; or
-2. Julia is generating incremental output and the module belongs to the current
-   output transaction.
+2. Julia is generating incremental output, the root is not finalized, and it
+   belongs to the current output transaction.
 
 During incremental output generation, `jl_current_modules` contains modules
 whose top-level evaluation is active. `jl_module_init_order` retains newly
-completed modules in definition-finished order, so their durable top-level
-effects can continue to be admitted and so they can later be serialized as the
-current image's module worklist. At compiler-output finalization, that list is
-filtered to modules which actually define `__init__` and serialized as the
-initializer order.
+completed modules in definition-finished order so they can later be serialized
+as the current image's module worklist. A root can be finalized while its
+modules remain in this list, which is necessary when one output transaction
+builds more than one package. For a managed root, being unfinalized implies
+membership in the current output transaction; the runtime treats violation of
+that implication as an internal invariant failure rather than another semantic
+openness state. At compiler-output finalization, the list is filtered to
+modules which actually define `__init__` and serialized as the initializer
+order.
 
 Restoring an incremental image yields a separate image-local initializer vector
 which `Base.register_restored_modules` executes directly. It is not merged into

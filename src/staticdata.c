@@ -539,6 +539,11 @@ static void jl_queue_for_serialization_(jl_serializer_state *s, jl_value_t *v, i
 
 static void jl_queue_module_for_serialization(jl_serializer_state *s, jl_module_t *m) JL_CANSAFEPOINT JL_GC_DISABLED
 {
+    jl_module_t *root = jl_module_root(m);
+    if (m == root && (m == jl_core_module || m == jl_base_module ||
+                      m->uuid.hi != 0 || m->uuid.lo != 0))
+        assert(m->finalized &&
+               "root module must be finalized before serialization");
     jl_queue_for_serialization(s, m->name);
     jl_queue_for_serialization(s, m->parent);
     if (!jl_options.strip_metadata)
@@ -1262,6 +1267,11 @@ static void jl_write_module(jl_serializer_state *s, uintptr_t item, jl_module_t 
     newm->package_requires = NULL;
     arraylist_push(&s->relocs_list, (void*)(reloc_offset + offsetof(jl_module_t, package_requires)));
     arraylist_push(&s->relocs_list, (void*)backref_id(s, m->package_requires, s->link_ids_relocs));
+    // New TypeNames are processed before image construction. The list is
+    // transient root-module loading state and is empty after finalization.
+    newm->new_typenames = NULL;
+    arraylist_push(&s->relocs_list, (void*)(reloc_offset + offsetof(jl_module_t, new_typenames)));
+    arraylist_push(&s->relocs_list, (void*)backref_id(s, jl_nothing, s->link_ids_relocs));
 
     // After reload, everything that has happened in this process happened semantically at
     // (for .incremental) or before jl_require_world, so reset this flag.

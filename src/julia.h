@@ -637,6 +637,7 @@ typedef struct {
     _Atomic(jl_svec_t*) cache;        // sorted array
     _Atomic(jl_svec_t*) linearcache;  // unsorted array
     jl_array_t *partial;     // incomplete instantiations of this type
+    jl_value_t *dispatch_closed_in;
     intptr_t hash;
     _Atomic(int32_t) max_args;  // max # of non-vararg arguments in a signature with this type as the function
     int32_t n_uninitialized;
@@ -938,7 +939,7 @@ typedef struct {
 } jl_uuid_t;
 
 // Reading or writing requires `lock`:
-//   scanned_methods, package_requires, usings
+//   scanned_methods, package_requires, new_typenames, finalized, usings
 // Reading or writing requires `Base.require_lock`:
 //   uuid
 // Reading or writing requires `world_counter_lock`:
@@ -957,6 +958,8 @@ typedef struct _jl_module_t {
     jl_value_t *usings_backedges;
     jl_value_t *scanned_methods;
     jl_value_t *package_requires; // direct requirements of the package containing this module
+    // New TypeNames accumulated anywhere under this root module.
+    jl_value_t *new_typenames;
     // hidden fields:
     arraylist_t usings; /* arraylist of struct jl_module_using */  // modules with all bindings potentially imported
     jl_uuid_t build_id;
@@ -967,6 +970,7 @@ typedef struct _jl_module_t {
     int8_t compile;
     int8_t infer;
     uint8_t istopmod;
+    uint8_t finalized; // source construction of this root module is complete
     int8_t max_methods;
     // If cleared no binding partition in this module has PARTITION_FLAG_EXPORTED and min_world > jl_require_world.
     _Atomic(int8_t) export_set_changed_since_require_world;
@@ -2235,6 +2239,8 @@ JL_DLLEXPORT jl_value_t *jl_get_module_scanned_methods(jl_module_t *m);
 JL_DLLEXPORT int jl_module_is_open(jl_module_t *m) JL_CANSAFEPOINT;
 JL_DLLEXPORT jl_value_t *jl_module_package_requires(jl_module_t *m);
 JL_DLLEXPORT void jl_module_add_package_require(jl_module_t *m, jl_module_t *target) JL_CANSAFEPOINT;
+JL_DLLEXPORT jl_value_t *jl_root_module_new_typenames(jl_module_t *m) JL_CANSAFEPOINT;
+JL_DLLEXPORT void jl_root_module_finalize(jl_module_t *m) JL_CANSAFEPOINT;
 JL_DLLEXPORT jl_value_t *jl_get_module_binding_or_nothing(jl_module_t *m, jl_sym_t *s) JL_CANSAFEPOINT;
 
 // get binding for reading

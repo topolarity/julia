@@ -292,6 +292,7 @@ include("toml/toml.jl")
 include("linking.jl")
 include("loading.jl")
 include("packagegraph.jl")
+include("packagetype.jl")
 
 # BinaryPlatforms, used by Artifacts.  Needs `Sort`.
 include("binaryplatforms.jl")

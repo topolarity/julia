@@ -2306,6 +2306,9 @@ STATIC_INLINE void gc_mark_module_binding(jl_ptls_t ptls, jl_module_t *mb_parent
     gc_assert_parent_validity((jl_value_t *)mb_parent, (jl_value_t *)mb_parent->package_requires);
     gc_try_claim_and_push(mq, (jl_value_t *)mb_parent->package_requires, &nptr);
     gc_heap_snapshot_record_binding_partition_edge((jl_value_t*)mb_parent, mb_parent->package_requires);
+    gc_assert_parent_validity((jl_value_t *)mb_parent, (jl_value_t *)mb_parent->new_typenames);
+    gc_try_claim_and_push(mq, (jl_value_t *)mb_parent->new_typenames, &nptr);
+    gc_heap_snapshot_record_binding_partition_edge((jl_value_t*)mb_parent, mb_parent->new_typenames);
     size_t nusings = module_usings_length(mb_parent);
     if (nusings > 0) {
         // this is only necessary because bindings for "using" modules

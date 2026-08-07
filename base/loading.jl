@@ -3024,6 +3024,7 @@ function __require_prelocked(pkg::PkgId, env)
             ccall(:jl_set_module_uuid, Cvoid, (Any, NTuple{2, UInt64}), __toplevel__, old_uuid)
         end
     end
+    loaded isa Module && _finalize_root_module(loaded)
     return loaded
 end
 
@@ -3399,6 +3400,7 @@ function include_package_for_output(pkg::PkgId, input::String, syntax_version::V
     # check that the package defined the expected module so we can give a nice error message if not
     m = maybe_root_module(pkg)
     m isa Module || check_package_module_loaded_error(pkg)
+    _finalize_root_module(m)
 
     # Re-populate the runtime's newly-inferred array, which will be included
     # in the output. We removed it above to avoid including any code we may

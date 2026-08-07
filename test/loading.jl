@@ -1352,6 +1352,89 @@ end
     end
 end
 
+# TypeName dispatch closure is finalized per package root and survives pkgimages.
+@testset "TypeName dispatch closure" begin
+    mkdepottempdir() do depot mktempdir() do env
+        pkgdir = joinpath(env, "DispatchClosed")
+        mkpath(joinpath(pkgdir, "src"))
+        write(joinpath(pkgdir, "Project.toml"), """
+            name = "DispatchClosed"
+            uuid = "55555555-5555-5555-5555-555555555555"
+            version = "1.0.0"
+            """)
+        write(joinpath(pkgdir, "src", "DispatchClosed.jl"), """
+            module DispatchClosed
+
+            abstract type UnusedAbstract end
+            struct Concrete end
+
+            abstract type UsedAbstract end
+            (::UsedAbstract)(x) = x
+
+            abstract type UsedParent end
+            (::UsedParent)(x) = x
+            abstract type InheritingChild <: UsedParent end
+
+            abstract type UnusedParent end
+            abstract type UsedChild <: UnusedParent end
+            (::UsedChild)(x) = x
+
+            module Nested
+            abstract type NestedUnused end
+            abstract type NestedUsed end
+            end
+            (::Nested.NestedUsed)(x) = x
+
+            end
+            """)
+        write(joinpath(env, "Project.toml"), """
+            [deps]
+            DispatchClosed = "55555555-5555-5555-5555-555555555555"
+            """)
+        write(joinpath(env, "Manifest.toml"), """
+            julia_version = "1.14.0"
+            manifest_format = "2.0"
+
+            [[deps.DispatchClosed]]
+            path = "DispatchClosed"
+            uuid = "55555555-5555-5555-5555-555555555555"
+            version = "1.0.0"
+            """)
+
+        check_dispatch_closed_in = """
+            using DispatchClosed
+            root = DispatchClosed
+            DispatchClosed.UnusedAbstract.name.dispatch_closed_in === nothing ||
+                error("unused abstract row was not left open")
+            DispatchClosed.Concrete.name.dispatch_closed_in === root ||
+                error("concrete row was not closed in its package root")
+            DispatchClosed.UsedAbstract.name.dispatch_closed_in === root ||
+                error("abstract row used by a method was not closed")
+            DispatchClosed.InheritingChild.name.dispatch_closed_in === root ||
+                error("subtype did not inherit dispatch closure")
+            DispatchClosed.UnusedParent.name.dispatch_closed_in === nothing ||
+                error("unused abstract parent row was not left open")
+            DispatchClosed.UsedChild.name.dispatch_closed_in === root ||
+                error("abstract child used by a method was not closed")
+            DispatchClosed.Nested.NestedUnused.name.dispatch_closed_in === nothing ||
+                error("nested unused abstract row was not left open")
+            DispatchClosed.Nested.NestedUsed.name.dispatch_closed_in === root ||
+                error("nested row used by a method did not name the package root")
+            DispatchClosed.Nested.NestedUsed.name.module === DispatchClosed.Nested ||
+                error("TypeName defining module was unexpectedly changed")
+            """
+        load_path = join((env, "@stdlib"), Sys.iswindows() ? ';' : ':')
+        for flags in (`--compiled-modules=no`, `--compiled-modules=yes`,
+                `--compiled-modules=existing`)
+            cmd = addenv(`$(Base.julia_cmd()) --startup-file=no $flags -e $check_dispatch_closed_in`,
+                "JULIA_DEPOT_PATH" => depot,
+                "JULIA_LOAD_PATH" => load_path,
+            )
+            @test success(pipeline(cmd; stdout, stderr))
+        end
+    end end
+end
+
 @testset "Extensions" begin
     test_ext = """
     function test_ext(parent::Module, ext::Symbol)

@@ -2353,6 +2353,7 @@ static void jl_set_datatype_super(jl_datatype_t *tt, jl_value_t *super) JL_CANSA
         jl_errorf("invalid subtyping in definition of %s: a type cannot subtype itself.", type_name);
     jl_check_valid_supertype(super, type_name);
     jl_gc_write(tt, tt->super, jl_datatype_t, (jl_datatype_t*)super);
+    jl_init_dispatch_closed_in(tt);
 }
 
 JL_CALLABLE(jl_f__setsuper)
@@ -2869,6 +2870,7 @@ void jl_init_primitives(void) JL_GC_DISABLED
                 if (jl_is_datatype(v)) {
                     jl_datatype_t *tt = (jl_datatype_t*)v;
                     tt->name->module = core;
+                    jl_init_dispatch_closed_in(tt);
                 }
             }
         }

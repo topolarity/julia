@@ -2,6 +2,12 @@
 
 Base.include("Base.jl") # finish populating Base (currently just has the Compiler)
 
+# Core, Compiler, and Base do not pass through `Base.require` while building the
+# system image, so finalize their root-module loading state explicitly.
+Base._finalize_root_module(Core)
+Base._finalize_root_module(Base.Compiler)
+Base._finalize_root_module(Base)
+
 # Set up Main module by importing from Base
 using .Base
 using .Base.MainInclude # ans, err, and sometimes Out

@@ -1092,6 +1092,8 @@ STATIC_INLINE size_t module_usings_max(jl_module_t *m) JL_NOTSAFEPOINT {
 JL_DLLEXPORT jl_sym_t *jl_module_name(jl_module_t *m) JL_NOTSAFEPOINT;
 jl_module_t *jl_module_root(jl_module_t *m) JL_NOTSAFEPOINT;
 void jl_add_scanned_method(jl_module_t *m, jl_method_t *meth) JL_CANSAFEPOINT;
+void jl_root_module_add_new_typename(jl_module_t *m, jl_typename_t *tn) JL_CANSAFEPOINT;
+void jl_init_dispatch_closed_in(jl_datatype_t *dt) JL_CANSAFEPOINT;
 jl_value_t *jl_eval_global_var(jl_module_t *m JL_PROPAGATES_ROOT, jl_sym_t *e, size_t world) JL_CANSAFEPOINT;
 JL_DLLEXPORT jl_value_t *jl_eval_globalref(jl_globalref_t *g, size_t world) JL_CANSAFEPOINT;
 jl_value_t *jl_get_globalref_value(jl_globalref_t *gr, size_t world) JL_CANSAFEPOINT;

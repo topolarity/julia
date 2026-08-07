@@ -145,6 +145,12 @@ pub unsafe fn scan_julia_object<SV: SlotVisitor<JuliaVMSlot>>(obj: Address, clos
             }
             process_slot(closure, Address::from_ptr(package_requires_slot));
 
+            let new_typenames_slot = ::std::ptr::addr_of!((*m).new_typenames);
+            if PRINT_OBJ_TYPE {
+                println!(" - scan new typenames: {:?}\n", new_typenames_slot);
+            }
+            process_slot(closure, Address::from_ptr(new_typenames_slot));
+
             // m.usings.items may be inlined in the module when the array list size <= AL_N_INLINE (cf. arraylist_new)
             // In that case it may be an mmtk object and not a malloced address.
             // If it is an mmtk object, (*m).usings.items will then be an internal pointer to the module

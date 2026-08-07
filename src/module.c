@@ -616,11 +616,13 @@ static jl_module_t *jl_new_module__(jl_sym_t *name, jl_module_t *parent) JL_CANS
     m->usings_backedges = jl_nothing;
     m->scanned_methods = jl_nothing;
     m->package_requires = jl_nothing;
+    m->new_typenames = jl_nothing;
     m->nospecialize = 0;
     m->optlevel = -1;
     m->compile = -1;
     m->infer = -1;
     m->max_methods = -1;
+    m->finalized = 0;
     jl_atomic_store_relaxed(&m->has_reexports, 0);
     jl_atomic_store_relaxed(&m->export_set_changed_since_require_world, 0);
     m->file = jl_empty_sym;
@@ -884,15 +886,31 @@ static jl_binding_t *new_binding(jl_module_t *mod, jl_sym_t *name) JL_CANSAFEPOI
 
 extern jl_mutex_t jl_modules_mutex;
 
+static int root_module_has_lifecycle(jl_module_t *m)
+{
+    return m == jl_core_module || m == jl_base_module ||
+           m->uuid.hi != 0 || m->uuid.lo != 0;
+}
+
 // Module effects are permanent at ordinary runtime. While generating an
-// incremental image, only modules owned by the current output transaction are
-// open to additional permanent effects.
+// incremental image, only modules owned by the current output transaction which
+// have not yet been finalized are open to additional permanent effects.
 JL_DLLEXPORT int jl_module_is_open(jl_module_t *m)
 {
     if (!jl_options.incremental || !jl_generating_output())
         return 1;
     m = jl_module_root(m);
     JL_GC_PUSH1(&m);
+    int has_lifecycle = root_module_has_lifecycle(m);
+    if (has_lifecycle) {
+        JL_LOCK(&m->lock);
+        int finalized = m->finalized;
+        JL_UNLOCK(&m->lock);
+        if (finalized) {
+            JL_GC_POP();
+            return 0;
+        }
+    }
     JL_LOCK(&jl_modules_mutex);
     int open = ptrhash_has(&jl_current_modules, (void*)m);
     if (!open && jl_module_init_order != NULL) {
@@ -905,6 +923,8 @@ JL_DLLEXPORT int jl_module_is_open(jl_module_t *m)
         }
     }
     JL_UNLOCK(&jl_modules_mutex);
+    if (has_lifecycle)
+        assert(open && "unfinalized root module must belong to the current output transaction");
     JL_GC_POP();
     return open;
 }
@@ -940,6 +960,57 @@ JL_DLLEXPORT void jl_module_add_package_require(jl_module_t *m, jl_module_t *tar
         }
     }
     jl_array_ptr_1d_push(requires, (jl_value_t*)target);
+    JL_UNLOCK(&m->lock);
+}
+
+void jl_root_module_add_new_typename(jl_module_t *m, jl_typename_t *tn)
+{
+    m = jl_module_root(m);
+    JL_GC_PUSH2(&m, &tn);
+    if (!root_module_has_lifecycle(m)) {
+        JL_GC_POP();
+        return;
+    }
+    JL_LOCK(&m->lock);
+    if (m->finalized) {
+        JL_UNLOCK(&m->lock);
+        JL_GC_POP();
+        return;
+    }
+    jl_value_t *state = m->new_typenames;
+    if (state == jl_nothing) {
+        state = (jl_value_t*)jl_alloc_vec_any(0);
+        jl_gc_write(m, m->new_typenames, jl_value_t, state);
+    }
+    jl_array_t *typenames = (jl_array_t*)state;
+    size_t i, n = jl_array_len(typenames);
+    for (i = 0; i < n; i++) {
+        if (jl_array_ptr_ref(typenames, i) == (jl_value_t*)tn) {
+            JL_UNLOCK(&m->lock);
+            JL_GC_POP();
+            return;
+        }
+    }
+    jl_array_ptr_1d_push(typenames, (jl_value_t*)tn);
+    JL_UNLOCK(&m->lock);
+    JL_GC_POP();
+}
+
+JL_DLLEXPORT jl_value_t *jl_root_module_new_typenames(jl_module_t *m)
+{
+    assert(m == jl_module_root(m));
+    JL_LOCK(&m->lock);
+    jl_value_t *typenames = m->new_typenames;
+    JL_UNLOCK(&m->lock);
+    return typenames;
+}
+
+JL_DLLEXPORT void jl_root_module_finalize(jl_module_t *m)
+{
+    assert(m == jl_module_root(m));
+    JL_LOCK(&m->lock);
+    m->finalized = 1;
+    jl_gc_write(m, m->new_typenames, jl_value_t, jl_nothing);
     JL_UNLOCK(&m->lock);
 }
 

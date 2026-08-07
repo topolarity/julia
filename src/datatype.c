@@ -87,6 +87,7 @@ JL_DLLEXPORT jl_typename_t *jl_new_typename_in(jl_sym_t *name, jl_module_t *modu
     tn->mutabl = mutabl;
     tn->mayinlinealloc = 0;
     tn->partial = NULL;
+    tn->dispatch_closed_in = module ? (jl_value_t*)jl_module_root(module) : jl_nothing;
     tn->atomicfields = NULL;
     tn->constfields = NULL;
     tn->max_methods = 0;
@@ -95,6 +96,23 @@ JL_DLLEXPORT jl_typename_t *jl_new_typename_in(jl_sym_t *name, jl_module_t *modu
     tn->constprop_heustic = 0;
     tn->concrete_only = 0;
     return tn;
+}
+
+void jl_init_dispatch_closed_in(jl_datatype_t *dt)
+{
+    jl_typename_t *tn = dt->name;
+    if (dt == jl_any_type) {
+        jl_gc_write(tn, tn->dispatch_closed_in, jl_value_t, jl_nothing);
+        return;
+    }
+    jl_value_t *dispatch_closed_in = NULL;
+    if (dt->super != NULL)
+        dispatch_closed_in = dt->super->name->dispatch_closed_in;
+    if (dispatch_closed_in == NULL || dispatch_closed_in == jl_nothing)
+        dispatch_closed_in = tn->module ? (jl_value_t*)jl_module_root(tn->module) : jl_nothing;
+    jl_gc_write(tn, tn->dispatch_closed_in, jl_value_t, dispatch_closed_in);
+    if (tn->module != NULL)
+        jl_root_module_add_new_typename(tn->module, tn);
 }
 
 // allocating DataTypes -----------------------------------------------------------
@@ -990,6 +1008,9 @@ JL_DLLEXPORT jl_datatype_t *jl_new_datatype(
     jl_gc_write(t, t->name, jl_typename_t, tn);
     jl_gc_write(t->name, t->name->names, jl_svec_t, fnames);
     tn->n_uninitialized = jl_svec_len(fnames) - ninitialized;
+
+    if (super != NULL)
+        jl_init_dispatch_closed_in(t);
 
     uint32_t *atomicfields = NULL;
     uint32_t *constfields = NULL;
@@ -2947,6 +2968,7 @@ JL_DLLEXPORT jl_value_t *jl_resolve_typegroup(jl_module_t *module, jl_svec_t *ty
                 jl_gc_write(datatypes[i], datatypes[i]->super, jl_datatype_t, (jl_datatype_t*)resolved_super);
                 JL_GC_POP();
             }
+            jl_init_dispatch_closed_in(datatypes[i]);
         }
 
         // Note: circular supertype chain checking is not needed here because
