@@ -1119,6 +1119,10 @@ jl_value_t *jl_gf_invoke(jl_value_t *types, jl_value_t *f, jl_value_t **args, si
 JL_DLLEXPORT jl_value_t *jl_gf_invoke_lookup_worlds(jl_value_t *types, jl_value_t *mt, size_t world, size_t *min_world, size_t *max_world) JL_CANSAFEPOINT;
 JL_DLLEXPORT jl_value_t *jl_matching_methods(jl_tupletype_t *types, jl_value_t *mt, int lim, int include_ambiguous,
                                              size_t world, size_t *min_valid, size_t *max_valid, int *ambig) JL_CANSAFEPOINT;
+JL_DLLEXPORT jl_value_t *jl_matching_methods_raw(jl_tupletype_t *types, jl_value_t *mt,
+                                                 size_t world, size_t *min_valid, size_t *max_valid) JL_CANSAFEPOINT;
+JL_DLLEXPORT jl_value_t *jl_matching_interfaces_raw(jl_tupletype_t *types,
+                                                    size_t world, size_t *min_valid, size_t *max_valid) JL_CANSAFEPOINT;
 JL_DLLEXPORT jl_value_t *jl_gf_invoke_lookup_worlds(jl_value_t *types, jl_value_t *mt, size_t world, size_t *min_world, size_t *max_world);
 
 

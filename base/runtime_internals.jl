@@ -1776,6 +1776,18 @@ function _methods_by_ftype(@nospecialize(t), mt::Union{Core.MethodTable, Nothing
     return ccall(:jl_matching_methods, Any, (Any, Any, Cint, Cint, UInt, Ptr{UInt}, Ptr{UInt}, Ptr{Int32}), t, mt, lim, ambig, world, min, max, has_ambig)::Union{Vector{Any},Nothing}
 end
 
+function _methods_by_ftype_raw(@nospecialize(t), mt::Union{Core.MethodTable, Nothing},
+                               world::UInt, min::Ref{UInt}, max::Ref{UInt})
+    return ccall(:jl_matching_methods_raw, Any, (Any, Any, UInt, Ptr{UInt}, Ptr{UInt}),
+                 t, mt, world, min, max)::Union{Vector{Any},Nothing}
+end
+
+function _interfaces_by_ftype_raw(@nospecialize(t), world::UInt,
+                                  min::Ref{UInt}, max::Ref{UInt})
+    return ccall(:jl_matching_interfaces_raw, Any, (Any, UInt, Ptr{UInt}, Ptr{UInt}),
+                 t, world, min, max)::Union{Vector{Any},Nothing}
+end
+
 hasgenerator(m::Method) = isdefined(m, :generator)
 hasgenerator(m::Core.MethodInstance) = hasgenerator(m.def::Method)
 
