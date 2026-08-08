@@ -37,8 +37,8 @@ else
 
 using Core.Intrinsics, Core.IR
 
-using Core: ABIOverride, Builtin, CodeInstance, IntrinsicFunction, AnyType, MethodInstance, MethodMatch,
-    MethodTable, MethodCache, PartialOpaque, SimpleVector, TypeofVararg,
+using Core: ABIOverride, Builtin, CodeInstance, InterfaceMatch, IntrinsicFunction, AnyType,
+    MethodInstance, MethodMatch, MethodTable, MethodCache, PartialOpaque, SimpleVector, TypeofVararg,
     TypeEq,
     _apply_iterate, apply_type, compilerbarrier, donotdelete, memoryref_isassigned,
     memoryrefget, memoryrefnew, memoryrefoffset, memoryrefset!, memoryrefunset!, print, println, show, svec,
@@ -51,7 +51,8 @@ using Base: @_foldable_meta, @_gc_preserve_begin, @_gc_preserve_end, @nospeciali
     Base, BitVector, Bottom, Callable, DataTypeFieldDesc,
     EffectsOverride, Filter, Generator, NUM_EFFECTS_OVERRIDES,
     OneTo, Ordering, RefValue, _NAMEDTUPLE_NAME,
-    _array_for, _bits_findnext, _defaultctors, _methods_by_ftype, _uniontypes, all, allocatedinline, any,
+    _array_for, _bits_findnext, _defaultctors, _interfaces_by_ftype_raw, _methods_by_ftype,
+    _methods_by_ftype_raw, _uniontypes, all, allocatedinline, any,
     argument_datatypename, binding_kind, cconvert, copy_exprargs, datatype_arrayelem,
     datatype_fieldcount, datatype_fieldtypes, datatype_layoutsize, datatype_nfields,
     datatype_pointerfree, decode_effects_override, diff_names, fieldindex, visit,
@@ -174,6 +175,7 @@ end
 
 include("cicache.jl")
 include("methodtable.jl")
+include("piracy/interface_matches.jl")
 include("effects.jl")
 include("types.jl")
 include("utilities.jl")

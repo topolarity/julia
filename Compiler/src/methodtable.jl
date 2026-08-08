@@ -7,6 +7,36 @@ struct MethodLookupResult
     valid_worlds::WorldRange
     ambig::Bool
 end
+
+struct RawMethodLookupResult
+    matches::Vector{MethodMatch}
+    valid_worlds::WorldRange
+end
+
+struct RawInterfaceLookupResult
+    matches::Vector{InterfaceMatch}
+    valid_worlds::WorldRange
+end
+
+function raw_method_matches(@nospecialize(sig::Type), world::UInt;
+                            mt::Union{Nothing,MethodTable}=nothing)
+    min_valid = RefValue{UInt}(typemin(UInt))
+    max_valid = RefValue{UInt}(typemax(UInt))
+    matches = _methods_by_ftype_raw(sig, mt, world, min_valid, max_valid)
+    matches === nothing && return nothing
+    typed_matches = MethodMatch[match::MethodMatch for match in matches]
+    return RawMethodLookupResult(typed_matches, WorldRange(min_valid[], max_valid[]))
+end
+
+function raw_interface_matches(@nospecialize(sig::Type), world::UInt)
+    min_valid = RefValue{UInt}(typemin(UInt))
+    max_valid = RefValue{UInt}(typemax(UInt))
+    matches = _interfaces_by_ftype_raw(sig, world, min_valid, max_valid)
+    matches === nothing && return nothing
+    typed_matches = InterfaceMatch[match::InterfaceMatch for match in matches]
+    return RawInterfaceLookupResult(typed_matches, WorldRange(min_valid[], max_valid[]))
+end
+
 length(result::MethodLookupResult) = length(result.matches)
 function iterate(result::MethodLookupResult, args...)
     r = iterate(result.matches, args...)

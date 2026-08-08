@@ -7285,4 +7285,122 @@ function splatted_task_invoke(@nospecialize(rest::Tuple))
 end
 @test Base.infer_return_type(splatted_task_invoke, (Tuple,)) === Tuple{}
 
+module InterfaceMatchFixtures
+interface_more_specific(x) = x
+interface interface_more_specific(::Int)::Int
+
+interface method_more_specific(::Any)
+method_more_specific(::Int) = nothing
+
+equal_specificity(::Int) = nothing
+interface equal_specificity(::Int)
+
+interface parametric_interface(::T)::Ref{T} where {T}
+
+disjoint_interface(::Int) = nothing
+interface disjoint_interface(::String)
+
+union_covered(::Int) = nothing
+union_covered(::String) = nothing
+interface union_covered(::Union{Int,String})
+
+raw_complete(::T, ::Vararg{T}) where {T<:Integer} = :diagonal
+raw_complete(::Integer, ::Vararg{Union{Int,String}}) = :union
+raw_complete(::Integer, ::Vararg{String}) = :string
+
+coinductive_cycle(::T, ::Vararg{T}) where {T<:Integer} = :diagonal
+coinductive_cycle(::Integer, ::Vararg{Union{Int,String}}) = :union
+interface coinductive_cycle(::Integer, ::Integer)
+interface coinductive_cycle(::Integer, ::Vararg{String})
+
+interface broad_seed(::Any)
+interface broad_seed(::Int)
+end
+
+@testset "interface matches" begin
+    raw_methods(@nospecialize(sig)) = begin
+        result = Compiler.raw_method_matches(sig, Base.get_world_counter())
+        Core.MethodMatch[match for match in result.matches]
+    end
+    raw_interfaces(@nospecialize(sig)) = begin
+        result = Compiler.raw_interface_matches(sig, Base.get_world_counter())
+        Core.InterfaceMatch[match for match in result.matches]
+    end
+
+    ims_sig = Tuple{typeof(InterfaceMatchFixtures.interface_more_specific),Int}
+    ims_methods = raw_methods(ims_sig)
+    ims_interfaces = raw_interfaces(ims_sig)
+    @test only(ims_interfaces).rettype === Int
+    @test Compiler._in_interface_interferences(
+        only(ims_interfaces).match.method, only(ims_methods).method)
+    @test !Compiler._in_interface_interferences(
+        only(ims_methods).method, only(ims_interfaces).match.method)
+    ims_open = Compiler.interface_matches(ims_methods, ims_interfaces)
+    @test ims_open == ims_interfaces
+    @test isempty(Compiler.filter_open_callees(ims_methods, ims_open))
+
+    mms_sig = Tuple{typeof(InterfaceMatchFixtures.method_more_specific),Int}
+    mms_methods = raw_methods(mms_sig)
+    mms_interfaces = raw_interfaces(mms_sig)
+    @test Compiler._in_interface_interferences(
+        only(mms_methods).method, only(mms_interfaces).match.method)
+    @test !Compiler._in_interface_interferences(
+        only(mms_interfaces).match.method, only(mms_methods).method)
+    @test isempty(Compiler.interface_matches(mms_methods, mms_interfaces))
+
+    equal_sig = Tuple{typeof(InterfaceMatchFixtures.equal_specificity),Int}
+    equal_methods = raw_methods(equal_sig)
+    equal_interfaces = raw_interfaces(equal_sig)
+    @test Compiler._in_interface_interferences(
+        only(equal_interfaces).match.method, only(equal_methods).method)
+    @test Compiler._in_interface_interferences(
+        only(equal_methods).method, only(equal_interfaces).match.method)
+    @test isempty(Compiler.interface_matches(equal_methods, equal_interfaces))
+
+    parametric_sig = Tuple{typeof(InterfaceMatchFixtures.parametric_interface),Int}
+    parametric_interfaces = raw_interfaces(parametric_sig)
+    @test only(parametric_interfaces).rettype === Ref{Int}
+    @test Compiler.interface_matches(Core.MethodMatch[], parametric_interfaces) ==
+        parametric_interfaces
+
+    disjoint_sig = Tuple{typeof(InterfaceMatchFixtures.disjoint_interface),Union{Int,String}}
+    disjoint_methods = raw_methods(disjoint_sig)
+    disjoint_interfaces = raw_interfaces(disjoint_sig)
+    @test Compiler._interface_pair_relation(
+        only(disjoint_interfaces), only(disjoint_methods)) == (false, false)
+    @test Compiler.interface_matches(disjoint_methods, disjoint_interfaces) ==
+        disjoint_interfaces
+
+    union_sig = Tuple{typeof(InterfaceMatchFixtures.union_covered),Union{Int,String}}
+    @test isempty(Compiler.interface_matches(
+        raw_methods(union_sig), raw_interfaces(union_sig)))
+
+    raw_complete_sig = Tuple{typeof(InterfaceMatchFixtures.raw_complete),Integer,Vararg{Any}}
+    @test length(raw_methods(raw_complete_sig)) == 3
+
+    cycle_sig = Tuple{typeof(InterfaceMatchFixtures.coinductive_cycle),Integer,Vararg{Any}}
+    cycle_methods = raw_methods(cycle_sig)
+    cycle_interfaces = raw_interfaces(cycle_sig)
+    @test all(cycle_methods) do method
+        any(interface_match ->
+            last(Compiler._interface_pair_relation(interface_match, method)),
+            cycle_interfaces)
+    end
+    @test all(cycle_interfaces) do interface_match
+        any(cycle_methods) do method
+            intersects, opens =
+                Compiler._interface_pair_relation(interface_match, method)
+            intersects && !opens
+        end
+    end
+    cycle_open = Compiler.interface_matches(cycle_methods, cycle_interfaces)
+    @test length(cycle_open) == 2
+    @test all(match -> match in cycle_open, cycle_interfaces)
+
+    seed_sig = Tuple{typeof(InterfaceMatchFixtures.broad_seed),Any}
+    sorted_seeds = raw_interfaces(seed_sig)
+    @test sorted_seeds[1].match.spec_types <: sorted_seeds[2].match.spec_types
+    @test !(sorted_seeds[2].match.spec_types <: sorted_seeds[1].match.spec_types)
+end
+
 end # module inference
