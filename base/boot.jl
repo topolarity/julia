@@ -730,6 +730,7 @@ eval(Core, quote
     UpsilonNode(@nospecialize(val)) = $(Expr(:new, :UpsilonNode, :val))
     UpsilonNode() = $(Expr(:new, :UpsilonNode))
     MethodMatch(@nospecialize(spec_types), sparams::SimpleVector, method::Method, fully_covers::Bool) = $(Expr(:new, :MethodMatch, :spec_types, :sparams, :method, :fully_covers))
+    InterfaceMatch(match::MethodMatch, @nospecialize(rettype)) = $(Expr(:new, :InterfaceMatch, :match, :rettype))
 end)
 
 const NullDebugInfo = DebugInfo(:none)

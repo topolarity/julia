@@ -91,6 +91,7 @@
     XX(returntypeerror_type, jl_datatype_t*) \
     XX(method_instance_type, jl_datatype_t*) \
     XX(method_match_type, jl_datatype_t*) \
+    XX(interface_match_type, jl_datatype_t*) \
     XX(method_type, jl_datatype_t*) \
     XX(methtable_type, jl_datatype_t*) \
     XX(methcache_type, jl_datatype_t*) \

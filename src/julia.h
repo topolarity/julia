@@ -418,6 +418,11 @@ typedef struct _jl_method_t {
     int32_t line;
     _Atomic(uint8_t) dispatch_status; // bits defined in staticdata.jl
     _Atomic(jl_genericmemory_t*) interferences; // set of intersecting methods not more specific
+    // Cross-table analogue of `interferences`: for an ordinary Method the
+    // entries are interfaces, and for an interface the entries are ordinary
+    // Methods. Membership means the holder is not more specific than the
+    // entry. At least one direction is present for every intersecting pair.
+    _Atomic(jl_genericmemory_t*) interface_interferences;
     _Atomic(size_t) primary_world;
 
     // method's type signature. redundant with TypeMapEntry->specTypes
@@ -1074,6 +1079,14 @@ typedef struct {
     // during construction.
     uint8_t fully_covers;
 } jl_method_match_t;
+
+typedef struct {
+    JL_DATA_TYPE
+    // Core.MethodMatch is immutable and therefore stored inline when it is a
+    // field of another immutable Core object.
+    jl_method_match_t match;
+    jl_value_t *rettype;
+} jl_interface_match_t;
 
 // constants and type objects -------------------------------------------------
 

@@ -38,7 +38,8 @@ end
 for (T, c) in (
         (Core.CodeInfo, []),
         (Core.CodeInstance, [:next, :min_world, :max_world, :inferred, :edges, :debuginfo, :ipo_purity_bits, :invoke, :specptr, :flags, :time_compile]),
-        (Core.Method, [:primary_world, :did_scan_source, :dispatch_status, :interferences]),
+        (Core.Method, [:primary_world, :did_scan_source, :dispatch_status,
+                       :interferences, :interface_interferences]),
         (Core.MethodInstance, [:cache, :flags, :dispatch_status, :precompile]),
         (Core.MethodTable, [:defs]),
         (Core.MethodCache, [:leafcache, :cache, :var""]),
