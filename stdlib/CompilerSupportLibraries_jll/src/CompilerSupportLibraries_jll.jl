@@ -15,67 +15,83 @@ const LIBPATH_list = String[]
 artifact_dir::String = ""
 
 libatomic_path::String = ""
-const libatomic = LazyLibrary(
-    if Sys.iswindows()
-        BundledLazyLibraryPath("libatomic-1.dll")
+const libatomic_soname = if Sys.iswindows()
+        "libatomic-1.dll"
     elseif Sys.isapple()
-        BundledLazyLibraryPath("libatomic.1.dylib")
+        "libatomic.1.dylib"
     elseif Sys.isfreebsd()
-        BundledLazyLibraryPath("libatomic.so.3")
+        "libatomic.so.3"
     elseif Sys.islinux()
-        BundledLazyLibraryPath("libatomic.so.1")
+        "libatomic.so.1"
     else
         error("CompilerSupportLibraries_jll: Library 'libatomic' is not available for $(Sys.KERNEL)")
     end
+const libatomic = LazyLibrary(
+    BundledLazyLibraryPath(libatomic_soname);
+    name = libatomic_soname,
+    # uuid5(<package uuid>, "libatomic")
+    id = Base.UUID("6f70f1a7-e2d5-53ff-bc33-5d3858c96401")
 )
 
 if Sys.iswindows() || Sys.isapple() || arch(HostPlatform()) ∈ ("x86_64", "i686")
     global libquadmath_path::String = ""
-    const libquadmath = LazyLibrary(
-        if Sys.iswindows()
-            BundledLazyLibraryPath("libquadmath-0.dll")
+    const libquadmath_soname = if Sys.iswindows()
+            "libquadmath-0.dll"
         elseif Sys.isapple()
-            BundledLazyLibraryPath("libquadmath.0.dylib")
+            "libquadmath.0.dylib"
         elseif (Sys.islinux() || Sys.isfreebsd()) && arch(HostPlatform()) ∈ ("x86_64", "i686")
-            BundledLazyLibraryPath("libquadmath.so.0")
+            "libquadmath.so.0"
         else
             error("CompilerSupportLibraries_jll: Library 'libquadmath' is not available for $(Sys.KERNEL)")
         end
+    const libquadmath = LazyLibrary(
+        BundledLazyLibraryPath(libquadmath_soname);
+        name = libquadmath_soname,
+        # uuid5(<package uuid>, "libquadmath")
+        id = Base.UUID("4869bb1d-141f-5a01-b337-3d1435fc1f98"),
     )
 end
 
 libgcc_s_path::String = ""
-const libgcc_s = LazyLibrary(
-    if Sys.iswindows()
+const libgcc_s_soname = if Sys.iswindows()
         if arch(HostPlatform()) == "x86_64"
-            BundledLazyLibraryPath("libgcc_s_seh-1.dll")
+            "libgcc_s_seh-1.dll"
         else
-            BundledLazyLibraryPath("libgcc_s_sjlj-1.dll")
+            "libgcc_s_sjlj-1.dll"
         end
     elseif Sys.isapple()
         if arch(HostPlatform()) == "aarch64" || libgfortran_version(HostPlatform()) == v"5"
-            BundledLazyLibraryPath("libgcc_s.1.1.dylib")
+            "libgcc_s.1.1.dylib"
         else
-            BundledLazyLibraryPath("libgcc_s.1.dylib")
+            "libgcc_s.1.dylib"
         end
     elseif Sys.islinux() || Sys.isfreebsd()
-        BundledLazyLibraryPath("libgcc_s.so.1")
+        "libgcc_s.so.1"
     else
         error("CompilerSupportLibraries_jll: Library 'libgcc_s' is not available for $(Sys.KERNEL)")
     end
+const libgcc_s = LazyLibrary(
+    BundledLazyLibraryPath(libgcc_s_soname);
+    name = libgcc_s_soname,
+    # uuid5(<package uuid>, "libgcc_s")
+    id = Base.UUID("1cd7433b-ee8f-572a-8a86-1137cb3f5ada")
 )
 
 libgfortran_path::String = ""
-const libgfortran = LazyLibrary(
-    if Sys.iswindows()
-        BundledLazyLibraryPath(string("libgfortran-", libgfortran_version(HostPlatform()).major, ".dll"))
+const libgfortran_soname = if Sys.iswindows()
+        string("libgfortran-", libgfortran_version(HostPlatform()).major, ".dll")
     elseif Sys.isapple()
-        BundledLazyLibraryPath(string("libgfortran.", libgfortran_version(HostPlatform()).major, ".dylib"))
+        string("libgfortran.", libgfortran_version(HostPlatform()).major, ".dylib")
     elseif Sys.islinux() || Sys.isfreebsd()
-        BundledLazyLibraryPath(string("libgfortran.so.", libgfortran_version(HostPlatform()).major))
+        string("libgfortran.so.", libgfortran_version(HostPlatform()).major)
     else
         error("CompilerSupportLibraries_jll: Library 'libgfortran' is not available for $(Sys.KERNEL)")
-    end;
+    end
+const libgfortran = LazyLibrary(
+    BundledLazyLibraryPath(libgfortran_soname);
+    name = libgfortran_soname,
+    # uuid5(<package uuid>, "libgfortran")
+    id = Base.UUID("77be8d79-76da-57e6-8c3e-8eb4c9c4a43c"),
     dependencies = @static if @isdefined(libquadmath)
         LazyLibrary[libgcc_s, libquadmath]
     else
@@ -84,30 +100,38 @@ const libgfortran = LazyLibrary(
 )
 
 libstdcxx_path::String = ""
-const libstdcxx = LazyLibrary(
-    if Sys.iswindows()
-        BundledLazyLibraryPath("libstdc++-6.dll")
+const libstdcxx_soname = if Sys.iswindows()
+        "libstdc++-6.dll"
     elseif Sys.isapple()
-        BundledLazyLibraryPath("libstdc++.6.dylib")
+        "libstdc++.6.dylib"
     elseif Sys.islinux() || Sys.isfreebsd()
-        BundledLazyLibraryPath("libstdc++.so.6")
+        "libstdc++.so.6"
     else
         error("CompilerSupportLibraries_jll: Library 'libstdcxx' is not available for $(Sys.KERNEL)")
-    end;
+    end
+const libstdcxx = LazyLibrary(
+    BundledLazyLibraryPath(libstdcxx_soname);
+    name = libstdcxx_soname,
+    # uuid5(<package uuid>, "libstdcxx")
+    id = Base.UUID("2afcce28-1804-53d7-8eaf-15b85720ac97"),
     dependencies = LazyLibrary[libgcc_s]
 )
 
 libgomp_path::String = ""
-const libgomp = LazyLibrary(
-    if Sys.iswindows()
-        BundledLazyLibraryPath("libgomp-1.dll")
+const libgomp_soname = if Sys.iswindows()
+        "libgomp-1.dll"
     elseif Sys.isapple()
-        BundledLazyLibraryPath("libgomp.1.dylib")
+        "libgomp.1.dylib"
     elseif Sys.islinux() || Sys.isfreebsd()
-        BundledLazyLibraryPath("libgomp.so.1")
+        "libgomp.so.1"
     else
         error("CompilerSupportLibraries_jll: Library 'libgomp' is not available for $(Sys.KERNEL)")
-    end;
+    end
+const libgomp = LazyLibrary(
+    BundledLazyLibraryPath(libgomp_soname);
+    name = libgomp_soname,
+    # uuid5(<package uuid>, "libgomp")
+    id = Base.UUID("d86a9a2a-2317-558f-a0a8-6a2b7a7addd4"),
     dependencies = if Sys.iswindows()
         LazyLibrary[libgcc_s]
     else
@@ -118,16 +142,19 @@ const libgomp = LazyLibrary(
 # only define if isfile
 let
     if Sys.iswindows() || Sys.isapple() || libc(HostPlatform()) != "musl"
-        _libssp_path = if Sys.iswindows()
-            BundledLazyLibraryPath("libssp-0.dll")
+        _libssp_soname = if Sys.iswindows()
+            "libssp-0.dll"
         elseif Sys.isapple()
-            BundledLazyLibraryPath("libssp.0.dylib")
+            "libssp.0.dylib"
         elseif Sys.islinux() && libc(HostPlatform()) != "musl"
-            BundledLazyLibraryPath("libssp.so.0")
+            "libssp.so.0"
         end
-        if isfile(string(_libssp_path))
+        if isfile(string(BundledLazyLibraryPath(_libssp_soname)))
             global libssp_path::String = ""
-            @eval const libssp = LazyLibrary($(_libssp_path))
+            # uuid5(<package uuid>, "libssp")
+            @eval const libssp = LazyLibrary(BundledLazyLibraryPath($(_libssp_soname));
+                                             name = $(_libssp_soname),
+                                             id = Base.UUID("558536fb-6a72-5deb-a2f9-856b91bb76ef"))
         end
     end
 end

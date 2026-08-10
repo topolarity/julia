@@ -20,16 +20,20 @@ artifact_dir::String = ""
 libzstd_path::String = ""
 zstd_path::String = ""
 zstdmt_path::String = ""
-const libzstd = LazyLibrary(
-    if Sys.iswindows()
-        BundledLazyLibraryPath("libzstd-1.dll")
+const libzstd_soname = if Sys.iswindows()
+        "libzstd-1.dll"
     elseif Sys.isapple()
-        BundledLazyLibraryPath("libzstd.1.dylib")
+        "libzstd.1.dylib"
     elseif Sys.islinux() || Sys.isfreebsd()
-        BundledLazyLibraryPath("libzstd.so.1")
+        "libzstd.so.1"
     else
         error("Zstd_jll: Library 'libzstd' is not available for $(Sys.KERNEL)")
-    end;
+    end
+const libzstd = LazyLibrary(
+    BundledLazyLibraryPath(libzstd_soname);
+    name = libzstd_soname,
+    # uuid5(<package uuid>, "libzstd")
+    id = Base.UUID("830bb508-92bf-563c-9e87-0715fe87ef92"),
     dependencies = if Sys.iswindows() && Sys.WORD_SIZE == 32
         LazyLibrary[libgcc_s]
     else

@@ -22,14 +22,18 @@ else
 end
 
 libopenblas_path::String = ""
-const libopenblas = LazyLibrary(
-    if Sys.iswindows()
-        BundledLazyLibraryPath(string("libopenblas", libsuffix, ".dll"))
+const libopenblas_soname = if Sys.iswindows()
+        string("libopenblas", libsuffix, ".dll")
     elseif Sys.isapple()
-        BundledLazyLibraryPath(string("libopenblas", libsuffix, ".dylib"))
+        string("libopenblas", libsuffix, ".dylib")
     else
-        BundledLazyLibraryPath(string("libopenblas", libsuffix, ".so"))
-    end,
+        string("libopenblas", libsuffix, ".so")
+    end
+const libopenblas = LazyLibrary(
+    BundledLazyLibraryPath(libopenblas_soname);
+    name = libopenblas_soname,
+    # uuid5(<package uuid>, "libopenblas")
+    id = Base.UUID("664a9972-5d51-55af-9726-f9a39fb00bc7"),
     dependencies = if Sys.iswindows()
         LazyLibrary[libgfortran, libgcc_s]
     elseif Sys.isapple()
