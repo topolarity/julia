@@ -1872,6 +1872,8 @@ JL_CALLABLE(jl_f_invoke)
         return jl_gf_invoke_by_method(m, args[0], &args[2], nargs - 1);
     } else if (jl_is_code_instance(argtypes)) {
         jl_code_instance_t *codeinst = (jl_code_instance_t*)args[1];
+        if (__unlikely(jl_codeinst_is_edge_only(codeinst)))
+            jl_error("invoke: edge-only CodeInstance cannot be invoked");
         jl_method_instance_t *mi = jl_get_ci_mi(codeinst);
         jl_callptr_t invoke = jl_atomic_load_acquire(&codeinst->invoke);
         // N.B.: specTypes need not be a subtype of the method signature. We need to check both.

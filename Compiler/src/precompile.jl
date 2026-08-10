@@ -314,6 +314,7 @@ function enqueue_specialization!(all::Bool, worklist, mi::MethodInstance)
     end
     codeinst = isdefined(mi, :cache) ? mi.cache : nothing
     while codeinst !== nothing
+        is_edge_only(codeinst) && break
         do_compile = false
         if codeinst.owner !== nothing
             # This code instance is from a foreign interpreter, so we skip it

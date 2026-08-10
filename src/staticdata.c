@@ -478,36 +478,43 @@ static void jl_rewrite_mi_caches(jl_code_instance_t **cis, size_t n) JL_GC_DISAB
     htable_t seen;    // CodeInstances already placed, to guard against duplicates
     htable_new(&mi_last, 0);
     htable_new(&seen, 0);
-    for (size_t i = 0; i < n; i++) {
-        jl_code_instance_t *ci = cis[i];
-        // ignore any repeated CodeInstance: chaining it twice would corrupt the list
-        if (ptrhash_get(&seen, ci) != HT_NOTFOUND)
-            continue;
-        ptrhash_put(&seen, ci, ci);
-        jl_method_instance_t *mi = jl_get_ci_mi(ci);
-        // this CodeInstance terminates its MethodInstance's chain, unless a
-        // later CodeInstance for the same MethodInstance extends it below
-        record_field_change((jl_value_t**)&ci->next, NULL);
-        if (jl_options.trim && ci->owner == (jl_value_t*)jl_trim_sym) {
-            // this is an "isolated" cache entry for `--trim` inference / AOT
-            // replace the owner with `nothing` so that these are available
-            // as ordinary cache entries at runtime
-            record_field_change((jl_value_t**)&ci->owner, jl_nothing);
+    // Preserve the caller-provided order within each partition, but always
+    // write ordinary entries before edge-only entries. Runtime lookup relies on
+    // the first edge-only entry being a terminal partition boundary.
+    for (int edge_only = 0; edge_only <= 1; edge_only++) {
+        for (size_t i = 0; i < n; i++) {
+            jl_code_instance_t *ci = cis[i];
+            if (jl_codeinst_is_edge_only(ci) != edge_only)
+                continue;
+            // ignore any repeated CodeInstance: chaining it twice would corrupt the list
+            if (ptrhash_get(&seen, ci) != HT_NOTFOUND)
+                continue;
+            ptrhash_put(&seen, ci, ci);
+            jl_method_instance_t *mi = jl_get_ci_mi(ci);
+            // this CodeInstance terminates its MethodInstance's chain, unless a
+            // later CodeInstance for the same MethodInstance extends it below
+            record_field_change((jl_value_t**)&ci->next, NULL);
+            if (jl_options.trim && ci->owner == (jl_value_t*)jl_trim_sym) {
+                // this is an "isolated" cache entry for `--trim` inference / AOT
+                // replace the owner with `nothing` so that these are available
+                // as ordinary cache entries at runtime
+                record_field_change((jl_value_t**)&ci->owner, jl_nothing);
+            }
+            void **bp = ptrhash_bp(&mi_last, mi);
+            // Register unconditionally (not via record_field_change) so this
+            // cache rebuilds correctly, even if it matches what was there (which would
+            // accidentally excise the item with the next write to field_replace).
+            if (*bp == HT_NOTFOUND) {
+                // first CodeInstance seen for this MethodInstance becomes the head.
+                ptrhash_put(&field_replace, (void*)&mi->cache, (void*)ci);
+            }
+            else {
+                // link this CodeInstance after the previous one for the same MethodInstance
+                jl_code_instance_t *prev = (jl_code_instance_t*)*bp;
+                ptrhash_put(&field_replace, (void*)&prev->next, (void*)ci);
+            }
+            *bp = ci;
         }
-        void **bp = ptrhash_bp(&mi_last, mi);
-        // Register unconditionally (not via record_field_change) so this
-        // cache rebuilds correctly, even if it matches what was there (which would
-        // accidentally excise the item with the next write to field_replace).
-        if (*bp == HT_NOTFOUND) {
-            // first CodeInstance seen for this MethodInstance becomes the head.
-            ptrhash_put(&field_replace, (void*)&mi->cache, (void*)ci);
-        }
-        else {
-            // link this CodeInstance after the previous one for the same MethodInstance
-            jl_code_instance_t *prev = (jl_code_instance_t*)*bp;
-            ptrhash_put(&field_replace, (void*)&prev->next, (void*)ci);
-        }
-        *bp = ci;
     }
     htable_free(&seen);
     htable_free(&mi_last);
@@ -1804,8 +1811,10 @@ static void jl_write_values(jl_serializer_state *s) JL_CANSAFEPOINT JL_GC_DISABL
                 }
                 jl_atomic_store_relaxed(&newci->time_compile, 0.0);
                 jl_atomic_store_relaxed(&newci->invoke, NULL);
-                // preserve only JL_CI_FLAGS_NATIVE_CACHE_VALID bits
-                jl_atomic_store_relaxed(&newci->flags, jl_atomic_load_relaxed(&newci->flags) & JL_CI_FLAGS_NATIVE_CACHE_VALID);
+                // Preserve cache membership and the immutable cache partition.
+                jl_atomic_store_relaxed(&newci->flags,
+                    jl_atomic_load_relaxed(&newci->flags) &
+                    (JL_CI_FLAGS_NATIVE_CACHE_VALID | JL_CI_FLAGS_EDGE_ONLY));
                 jl_atomic_store_relaxed(&newci->specptr.fptr, NULL);
                 uintptr_t fptr_type = JL_INVOKE_SPECSIG;
                 int8_t builtin_id = 0;

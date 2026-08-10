@@ -2473,6 +2473,53 @@ precompile_test_harness("Constprop CodeInstance invalidation") do load_path
     end
 end
 
+precompile_test_harness("Edge-only CodeInstance restoration") do load_path
+    write(joinpath(load_path, "EdgeOnlyCache.jl"),
+        """
+        module EdgeOnlyCache
+            leaf(x) = x
+            root(x) = x
+
+            const leaf_mi = Base.method_instance(leaf, (Int,))
+            const root_mi = Base.method_instance(root, (Int,))
+            world = Base.get_world_counter()
+            const edge = ccall(:jl_new_codeinst_for_edge, Any,
+                (Any, Any, UInt, UInt, Any), leaf_mi, nothing, world, world,
+                Core.svec())::Core.CodeInstance
+            const ordinary = Core.CodeInstance(leaf_mi, nothing, Any, Any,
+                nothing, nothing, Int32(0), world, world, UInt32(0), nothing,
+                Core.DebugInfo(leaf_mi), Core.svec())
+            const root_ci = Core.CodeInstance(root_mi, nothing, Any, Any,
+                nothing, nothing, Int32(0), world, world, UInt32(0), nothing,
+                Core.DebugInfo(root_mi), Core.svec(edge))
+
+            Base.Compiler.store_backedges(root_ci, root_ci.edges)
+            ccall(:jl_mi_cache_insert, Cvoid, (Any, Any), root_mi, root_ci)
+            world = Base.get_world_counter()
+            @atomic :monotonic edge.max_world = world
+            @atomic :monotonic root_ci.max_world = world
+            ccall(:jl_promote_ci_to_current, Cvoid, (Any, UInt), root_ci, world)
+            ccall(:jl_mi_cache_insert, Cvoid, (Any, Any), leaf_mi, ordinary)
+        end
+        """)
+    Base.compilecache(Base.PkgId("EdgeOnlyCache"))
+    @eval using EdgeOnlyCache
+
+    found_edge = false
+    in_edge_partition = false
+    ci = EdgeOnlyCache.leaf_mi.cache
+    while ci !== nothing
+        if Base.Compiler.is_edge_only(ci)
+            in_edge_partition = true
+            found_edge |= ci === EdgeOnlyCache.edge
+        else
+            @test !in_edge_partition
+        end
+        ci = isdefined(ci, :next) ? ci.next : nothing
+    end
+    @test found_edge
+end
+
 precompile_test_harness("llvmcall validation") do load_path
     write(joinpath(load_path, "LLVMCall.jl"),
         """
