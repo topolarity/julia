@@ -909,6 +909,7 @@ static void jl_emit_native_to_output(jl_native_code_desc_t *data, jl_array_t *co
         if (jl_is_code_instance(item)) {
             // now add it to our compilation results
             jl_code_instance_t *codeinst = (jl_code_instance_t*)item;
+            assert(!jl_codeinst_is_edge_only(codeinst));
 
             if (external_linkage &&
                 (jl_atomic_load_relaxed(&codeinst->flags) & JL_CI_FLAGS_FROM_IMAGE)) {

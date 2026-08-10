@@ -542,6 +542,7 @@ typedef struct _jl_opaque_closure_t {
 #define JL_CI_FLAGS_INVOKE_MATCHES_SPECPTR   0b0010
 #define JL_CI_FLAGS_FROM_IMAGE               0b0100
 #define JL_CI_FLAGS_NATIVE_CACHE_VALID       0b1000
+#define JL_CI_FLAGS_EDGE_ONLY                 0b100000
 
 typedef struct _jl_code_instance_t {
     JL_DATA_TYPE
@@ -593,6 +594,7 @@ typedef struct _jl_code_instance_t {
                             // & 0b010 == invokeptr matches specptr
                             // & 0b100 == From image
                             // & 0b1000 == native_cache_valid
+                            // & 0b100000 == dependency edge only (terminal cache partition)
     _Atomic(jl_callptr_t) invoke; // jlcall entry point usually, but if this codeinst belongs to an OC Method, then this is an jl_fptr_args_t fptr1 instead, unless it is not, because it is a special token object instead
     union _jl_generic_specptr_t {
         _Atomic(void*) fptr;
@@ -602,6 +604,9 @@ typedef struct _jl_code_instance_t {
         // 4 interpreter
     } specptr; // private data for `jlcall entry point
 } jl_code_instance_t;
+
+#define jl_codeinst_is_edge_only(ci) \
+    ((jl_atomic_load_relaxed(&(ci)->flags) & JL_CI_FLAGS_EDGE_ONLY) != 0)
 
 // May be used as the ->def field of a CodeInstance to override the ABI
 typedef struct _jl_abi_override_t {

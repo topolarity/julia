@@ -409,6 +409,8 @@ static jl_code_instance_t *jl_method_inferred_with_abi(jl_method_instance_t *mi 
 {
     jl_code_instance_t *codeinst = jl_atomic_load_relaxed(&mi->cache);
     for (; codeinst; codeinst = jl_atomic_load_relaxed(&codeinst->next)) {
+        if (jl_codeinst_is_edge_only(codeinst))
+            break;
         if (codeinst->owner != jl_nothing)
             continue;
         if (jl_atomic_load_relaxed(&codeinst->min_world) <= world && world <= jl_atomic_load_relaxed(&codeinst->max_world)) {
@@ -588,6 +590,8 @@ JL_DLLEXPORT jl_code_instance_t *jl_get_method_uninferred(
     jl_value_t *owner = jl_nothing; // TODO: owner should be arg
     jl_code_instance_t *codeinst = jl_atomic_load_relaxed(&mi->cache);
     for (; codeinst; codeinst = jl_atomic_load_relaxed(&codeinst->next)) {
+        if (jl_codeinst_is_edge_only(codeinst))
+            break;
         if (jl_atomic_load_relaxed(&codeinst->min_world) <= min_world &&
             jl_atomic_load_relaxed(&codeinst->max_world) >= max_world &&
             jl_egal(codeinst->owner, owner) &&
@@ -639,6 +643,8 @@ static int jl_codeinst_edges_sub(jl_code_instance_t *ci, size_t min_world2, size
 // return whether the codeinst can be substituted in place of ci for an invoke target in target_world
 JL_DLLEXPORT int jl_is_ci_equiv(jl_code_instance_t *ci JL_PROPAGATES_ROOT, jl_code_instance_t *codeinst, size_t target_world) JL_NOTSAFEPOINT
 {
+    if (jl_codeinst_is_edge_only(ci) || jl_codeinst_is_edge_only(codeinst))
+        return 0;
     jl_value_t *def = ci->def;
     jl_value_t *owner = ci->owner;
     jl_value_t *rettype = ci->rettype;
@@ -665,9 +671,13 @@ JL_DLLEXPORT int jl_is_ci_equiv(jl_code_instance_t *ci JL_PROPAGATES_ROOT, jl_co
 // look for something with an egal ABI and properties that is already in the JIT for the target_world, or could be added to the JIT instead of ci to satisfy the same invoke edge with the same src.
 JL_DLLEXPORT jl_code_instance_t *jl_get_ci_equiv(jl_code_instance_t *ci JL_PROPAGATES_ROOT, size_t target_world) JL_NOTSAFEPOINT
 {
+    if (jl_codeinst_is_edge_only(ci))
+        return ci;
     jl_method_instance_t *mi = jl_get_ci_mi(ci);
     jl_code_instance_t *codeinst = jl_atomic_load_relaxed(&mi->cache);
     while (codeinst) {
+        if (jl_codeinst_is_edge_only(codeinst))
+            break;
         if (codeinst != ci && jl_is_ci_equiv(ci, codeinst, target_world))
             return codeinst;
         codeinst = jl_atomic_load_relaxed(&codeinst->next);
@@ -730,6 +740,7 @@ JL_DLLEXPORT void jl_fill_codeinst(
         double time_infer_total, double time_infer_cache_saved, double time_infer_self,
         jl_debuginfo_t *di, jl_svec_t *edges /* , int absolute_max*/)
 {
+    assert(!jl_codeinst_is_edge_only(codeinst) && "cannot fill an edge-only CodeInstance");
     assert(min_world <= max_world && "attempting to set invalid world constraints");
     //assert((!jl_is_method(codeinst->def->def.value) || max_world != ~(size_t)0 || min_world <= 1 || jl_svec_len(edges) != 0) && "missing edges");
     jl_gc_write(codeinst, codeinst->rettype, jl_value_t, rettype);
@@ -763,6 +774,32 @@ JL_DLLEXPORT jl_code_instance_t *jl_new_codeinst_uninit(jl_method_instance_t *mi
     return codeinst;
 }
 
+JL_DLLEXPORT jl_code_instance_t *jl_new_codeinst_for_edge(
+        jl_method_instance_t *mi, jl_value_t *owner,
+        size_t min_world, size_t max_world, jl_svec_t *edges)
+{
+    jl_code_instance_t *codeinst = jl_new_codeinst(
+        mi, owner, (jl_value_t*)jl_any_type, (jl_value_t*)jl_any_type,
+        NULL, NULL, 0, min_world, max_world, 0, jl_nothing, NULL, edges);
+    jl_atomic_store_relaxed(&codeinst->flags, JL_CI_FLAGS_EDGE_ONLY);
+    return codeinst;
+}
+
+static void jl_assert_mi_cache_partition(jl_method_instance_t *mi) JL_NOTSAFEPOINT
+{
+#ifndef JL_NDEBUG
+    int seen_edge_only = 0;
+    jl_code_instance_t *ci = jl_atomic_load_relaxed(&mi->cache);
+    while (ci) {
+        if (jl_codeinst_is_edge_only(ci))
+            seen_edge_only = 1;
+        else
+            assert(!seen_edge_only && "ordinary CodeInstance follows edge-only cache partition");
+        ci = jl_atomic_load_relaxed(&ci->next);
+    }
+#endif
+}
+
 JL_DLLEXPORT void jl_mi_cache_insert(jl_method_instance_t *mi,
                                      jl_code_instance_t *ci JL_MAYBE_UNROOTED)
 {
@@ -771,31 +808,45 @@ JL_DLLEXPORT void jl_mi_cache_insert(jl_method_instance_t *mi,
         JL_LOCK(&mi->def.method->writelock);
     // Set native_cache_valid bit when inserting into cache
     jl_atomic_fetch_or_relaxed(&ci->flags, JL_CI_FLAGS_NATIVE_CACHE_VALID);
-    // find the preferred location for insertion of ci now:
+    // Find the preferred location for insertion of ci now. Edge-only entries
+    // form a terminal partition: ordinary cache lookup may stop at the first
+    // such entry, while semantic cache walks continue through it.
     //   - invoke+inferred group
     //   - inferred group
     //   - others group
+    //   - edge-only group
     //   - unmoved
     //   - after existing entries with same applicable range
     jl_value_t *parent = (jl_value_t*)mi;
     _Atomic(jl_code_instance_t*) *slot = &mi->cache;
     jl_code_instance_t *oldci = jl_atomic_load_relaxed(slot);
+    int edge_only = jl_codeinst_is_edge_only(ci);
     int hasinferred = jl_atomic_load_relaxed(&ci->inferred) != NULL;
     int hasinvoke = hasinferred && jl_atomic_load_relaxed(&ci->invoke) != NULL;
+    if (edge_only) {
+        assert(!hasinferred);
+        assert(jl_atomic_load_relaxed(&ci->invoke) == NULL);
+        assert(jl_atomic_load_relaxed(&ci->specptr.fptr) == NULL);
+    }
     size_t max_world = jl_atomic_load_relaxed(&ci->max_world);
     jl_code_instance_t *next = jl_atomic_load_relaxed(&ci->next);
     while (oldci) {
         if (oldci == ci)
             break;
-        int old_hasinferred = jl_atomic_load_relaxed(&oldci->inferred) != NULL;
-        int old_hasinvoke = old_hasinferred && jl_atomic_load_relaxed(&oldci->invoke) != NULL;
-        size_t old_max_world = jl_atomic_load_relaxed(&oldci->max_world);
-        if (hasinvoke && !old_hasinvoke)
+        int old_edge_only = jl_codeinst_is_edge_only(oldci);
+        if (!edge_only && old_edge_only)
             break;
-        if (hasinferred && !old_hasinferred)
-            break;
-        if (next == NULL && old_max_world < max_world)
-            break;
+        if (!edge_only || old_edge_only) {
+            int old_hasinferred = jl_atomic_load_relaxed(&oldci->inferred) != NULL;
+            int old_hasinvoke = old_hasinferred && jl_atomic_load_relaxed(&oldci->invoke) != NULL;
+            size_t old_max_world = jl_atomic_load_relaxed(&oldci->max_world);
+            if (!edge_only && hasinvoke && !old_hasinvoke)
+                break;
+            if (!edge_only && hasinferred && !old_hasinferred)
+                break;
+            if (next == NULL && old_max_world < max_world)
+                break;
+        }
         parent = (jl_value_t*)oldci;
         slot = &oldci->next;
         oldci = jl_atomic_load_relaxed(slot);
@@ -815,6 +866,7 @@ JL_DLLEXPORT void jl_mi_cache_insert(jl_method_instance_t *mi,
             }
         }
     }
+    jl_assert_mi_cache_partition(mi);
     if (jl_is_method(mi->def.method))
         JL_UNLOCK(&mi->def.method->writelock);
     JL_GC_POP();
@@ -825,6 +877,7 @@ JL_DLLEXPORT int jl_mi_try_insert(jl_method_instance_t *mi,
                                    jl_code_instance_t *expected_ci,
                                    jl_code_instance_t *ci JL_MAYBE_UNROOTED)
 {
+    assert(!jl_codeinst_is_edge_only(ci));
     JL_GC_PUSH1(&ci);
     if (jl_is_method(mi->def.method))
         JL_LOCK(&mi->def.method->writelock);
@@ -835,6 +888,7 @@ JL_DLLEXPORT int jl_mi_try_insert(jl_method_instance_t *mi,
         jl_gc_write_atomic(mi, mi->cache, jl_code_instance_t, ci, release);
         ret = 1;
     }
+    jl_assert_mi_cache_partition(mi);
     if (jl_is_method(mi->def.method))
         JL_UNLOCK(&mi->def.method->writelock);
     JL_GC_POP();
@@ -2186,19 +2240,39 @@ JL_DLLEXPORT void jl_promote_cis_to_current(jl_code_instance_t **cis, size_t n, 
     if (current_world == validated_world) {
         arraylist_t workqueue;
         arraylist_new(&workqueue, 0);
-        for (size_t i = 0; i < n; i++)
-            arraylist_push(&workqueue, cis[i]);
+        for (size_t i = 0; i < n; i++) {
+            // An uncached inference result is promoted too, but must not make
+            // its dependency-only callees permanent. Propagate whether the
+            // root was actually adopted by a MethodInstance cache. CodeInstance
+            // pointers are aligned, so use their low bit for this worklist flag.
+            uintptr_t adopted =
+                (jl_atomic_load_relaxed(&cis[i]->flags) & JL_CI_FLAGS_NATIVE_CACHE_VALID) != 0;
+            assert(((uintptr_t)cis[i] & 1) == 0);
+            arraylist_push(&workqueue, (void*)((uintptr_t)cis[i] | adopted));
+        }
         while (workqueue.len > 0) {
-            jl_code_instance_t *current_ci = (jl_code_instance_t *)arraylist_pop(&workqueue);
-            if (jl_atomic_load_relaxed(&current_ci->max_world) != validated_world)
+            uintptr_t item = (uintptr_t)arraylist_pop(&workqueue);
+            int current_adopted = item & 1;
+            jl_code_instance_t *current_ci = (jl_code_instance_t*)(item & ~(uintptr_t)1);
+            int publish_edge_only = current_adopted && jl_codeinst_is_edge_only(current_ci) &&
+                !(jl_atomic_load_relaxed(&current_ci->flags) & JL_CI_FLAGS_NATIVE_CACHE_VALID);
+            int promote = jl_atomic_load_relaxed(&current_ci->max_world) == validated_world;
+            if (!promote && !publish_edge_only)
                 continue;
-            jl_atomic_store_relaxed(&current_ci->max_world, ~(size_t)0);
+            if (promote)
+                jl_atomic_store_relaxed(&current_ci->max_world, ~(size_t)0);
+            // The promotion walk already traverses the finalized dependency
+            // graph under the world lock. Publish only surviving edge-only
+            // callees here, before a new world can invalidate the graph.
+            if (publish_edge_only)
+                jl_mi_cache_insert(jl_get_ci_mi(current_ci), current_ci);
             jl_svec_t *edges = jl_atomic_load_relaxed(&current_ci->edges);
             for (size_t i = 0; i < jl_svec_len(edges); i++) {
                 jl_value_t *edge = jl_svecref(edges, i);
                 if (!jl_is_code_instance(edge))
                     continue;
-                arraylist_push(&workqueue, edge);
+                assert(((uintptr_t)edge & 1) == 0);
+                arraylist_push(&workqueue, (void*)((uintptr_t)edge | current_adopted));
             }
         }
         arraylist_free(&workqueue);
@@ -3739,6 +3813,8 @@ STATIC_INLINE jl_value_t *_jl_rettype_inferred(jl_value_t *owner, jl_method_inst
 {
     jl_code_instance_t *codeinst = jl_atomic_load_relaxed(&mi->cache);
     while (codeinst) {
+        if (jl_codeinst_is_edge_only(codeinst))
+            break;
         if (jl_atomic_load_relaxed(&codeinst->min_world) <= min_world &&
             max_world <= jl_atomic_load_relaxed(&codeinst->max_world) &&
             jl_egal(codeinst->owner, owner)) {
@@ -3768,6 +3844,8 @@ STATIC_INLINE jl_callptr_t jl_method_compiled_callptr(jl_method_instance_t *mi, 
 {
     jl_code_instance_t *codeinst = jl_atomic_load_relaxed(&mi->cache);
     for (; codeinst; codeinst = jl_atomic_load_relaxed(&codeinst->next)) {
+        if (jl_codeinst_is_edge_only(codeinst))
+            break;
         if (codeinst->owner != jl_nothing)
             continue;
         if (jl_atomic_load_relaxed(&codeinst->min_world) <= world && world <= jl_atomic_load_relaxed(&codeinst->max_world)) {
@@ -3979,6 +4057,8 @@ JL_DLLEXPORT void jl_add_codeinsts_to_jit(jl_array_t *codeinsts, jl_array_t *src
     JL_LOCK(&mc->writelock);
     for (size_t i = 0; i < ncodeinsts; i++) {
         jl_code_instance_t *codeinst = (jl_code_instance_t*)jl_array_ptr_ref(codeinsts, i);
+        if (jl_codeinst_is_edge_only(codeinst))
+            jl_error("cannot compile an edge-only CodeInstance");
         jl_method_instance_t *mi = (jl_method_instance_t*)codeinst->def;
         if (!jl_is_method(mi->def.method))
             continue;
@@ -4208,6 +4288,8 @@ static jl_code_instance_t *jl_compile_method_very_internal(jl_method_instance_t 
     int is_recompile = 0;
     jl_code_instance_t *codeinst_old = jl_atomic_load_relaxed(&mi->cache);
     while (codeinst_old != NULL) {
+        if (jl_codeinst_is_edge_only(codeinst_old))
+            break;
         if (jl_atomic_load_relaxed(&codeinst_old->invoke) != NULL) {
             is_recompile = 1;
             break;

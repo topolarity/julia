@@ -42,11 +42,15 @@ JL_DLLEXPORT void jl_register_fptrs_fallback(uint64_t image_base, const struct _
 
 JL_DLLEXPORT void jl_generate_fptr_for_unspecialized_fallback(jl_code_instance_t *unspec)
 {
+    if (__unlikely(jl_codeinst_is_edge_only(unspec)))
+        jl_error("cannot compile an edge-only CodeInstance");
     jl_atomic_store_release(&unspec->invoke, &jl_fptr_interpret_call);
 }
 
 JL_DLLEXPORT int jl_compile_codeinst_fallback(jl_code_instance_t *unspec)
 {
+    if (__unlikely(jl_codeinst_is_edge_only(unspec)))
+        jl_error("cannot compile an edge-only CodeInstance");
     // Do nothing. The caller will notice that we failed to provide an ->invoke and trigger
     // appropriate fallbacks.
     return 0;
@@ -56,6 +60,8 @@ JL_DLLEXPORT void jl_emit_codeinsts_to_jit_fallback(jl_code_instance_t **codeins
 {
     for (int i = 0; i < len; ++i) {
         jl_code_instance_t *codeinst = codeinsts[i];
+        if (__unlikely(jl_codeinst_is_edge_only(codeinst)))
+            jl_error("cannot compile an edge-only CodeInstance");
         jl_code_info_t *src = srcs[i];
         jl_value_t *inferred = jl_atomic_load_relaxed(&codeinst->inferred);
         if (jl_is_code_info(inferred))

@@ -469,6 +469,8 @@ jl_emit_codeinsts_to_jit_impl(jl_code_instance_t **codeinsts, jl_code_info_t **s
 
     for (int i = 0; i < len; ++i) {
         jl_code_instance_t *codeinst = codeinsts[i];
+        if (__unlikely(jl_codeinst_is_edge_only(codeinst)))
+            jl_error("cannot compile an edge-only CodeInstance");
         jl_code_info_t *src = srcs[i];
         jl_method_instance_t *mi = jl_get_ci_mi(codeinst);
 
@@ -511,6 +513,8 @@ jl_emit_codeinsts_to_jit_impl(jl_code_instance_t **codeinsts, jl_code_info_t **s
 extern "C" JL_DLLEXPORT_CODEGEN
 int jl_compile_codeinst_impl(jl_code_instance_t *ci)
 {
+    if (__unlikely(jl_codeinst_is_edge_only(ci)))
+        jl_error("cannot compile an edge-only CodeInstance");
     int newly_compiled = 0;
     if (!jl_is_compiled_codeinst(ci)) {
         ++SpecFPtrCount;
@@ -525,6 +529,8 @@ int jl_compile_codeinst_impl(jl_code_instance_t *ci)
 extern "C" JL_DLLEXPORT_CODEGEN
 void jl_generate_fptr_for_unspecialized_impl(jl_code_instance_t *unspec)
 {
+    if (__unlikely(jl_codeinst_is_edge_only(unspec)))
+        jl_error("cannot compile an edge-only CodeInstance");
     if (jl_atomic_load_relaxed(&unspec->invoke) != NULL) {
         return;
     }
@@ -2465,6 +2471,8 @@ jl_code_instance_t *JuliaOJIT::findCompatibleCI(jl_code_instance_t *ci)
     auto mi = jl_get_ci_mi(ci);
     for (auto ci2 = jl_atomic_load_relaxed(&mi->cache); ci2;
          ci2 = jl_atomic_load_relaxed(&ci2->next)) {
+        if (__unlikely(jl_codeinst_is_edge_only(ci2)))
+            break;
         if (ci2 != ci && jl_is_ci_equiv(ci, ci2, 0) &&
             (CISymbols.contains(ci2) || jl_atomic_load_relaxed(&ci2->invoke))) {
             return ci2;

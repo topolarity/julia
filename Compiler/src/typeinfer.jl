@@ -1090,7 +1090,10 @@ function codeinst_edges_sub(existing_edge::CodeInstance, min_world::UInt, max_wo
     return false
 end
 
-# allocate a dummy `edge::CodeInstance` to be added by `add_edges!`, reusing an existing_edge if possible
+# Allocate a dependency-only `edge::CodeInstance` to be added by `add_edges!`,
+# reusing an existing ordinary edge if possible. Adopted dependency-only entries
+# live in a terminal cache partition so invalidation and image serialization can
+# discover them without exposing them to ordinary CodeInstance lookup.
 # TODO: fill this in fully correctly (currently IPO info such as effects and return types are lost)
 function codeinst_as_edge(interp::AbstractInterpreter, sv::InferenceState, @nospecialize existing_edge)
     edges = Core.svec(sv.edges...)
@@ -1102,8 +1105,8 @@ function codeinst_as_edge(interp::AbstractInterpreter, sv::InferenceState, @nosp
         return existing_edge
     end
     mi = sv.linfo
-    ci = CodeInstance(mi, cache_owner(interp), Any, Any, nothing, nothing, zero(Int32),
-        min_world, max_world, zero(UInt32), nothing, nothing, edges)
+    ci = ccall(:jl_new_codeinst_for_edge, Any, (Any, Any, UInt, UInt, Any),
+        mi, cache_owner(interp), min_world, max_world, edges)::CodeInstance
     if max_world == typemax(UInt)
         # if we can record all of the backedges in the global reverse-cache,
         # we can now widen our applicability in the global cache too
@@ -1457,6 +1460,7 @@ end
 # Get source if available for inlining, otherwise return nothing
 # populates codegen cache for code, if successful
 function ci_get_source(interp::AbstractInterpreter, code::CodeInstance, @nospecialize src)
+    is_edge_only(code) && return nothing
     codegen = codegen_cache(interp)
     if codegen !== nothing
         inf = get(codegen, code, nothing)
@@ -1488,6 +1492,7 @@ function ci_has_invoke(code::CodeInstance)
 end
 
 function ci_meets_requirement(interp::AbstractInterpreter, code::CodeInstance, source_mode::UInt8)
+    is_edge_only(code) && return false
     source_mode == SOURCE_MODE_NOT_REQUIRED && return true
     source_mode == SOURCE_MODE_ABI && return ci_has_abi(interp, code)
     source_mode == SOURCE_MODE_GET_SOURCE && return ci_has_source(interp, code)
@@ -1714,6 +1719,7 @@ end
 function add_codeinsts_to_jit!(interp::AbstractInterpreter, ci, source_mode::UInt8)
     source_mode == SOURCE_MODE_ABI || return ci
     ci isa CodeInstance && !ci_has_invoke(ci) || return ci
+    @assert !is_edge_only(ci) "cannot compile an edge-only CodeInstance"
     codegen = codegen_cache(interp)
     codegen === nothing && return ci
     workqueue = CompilationQueue(; interp)
@@ -1722,6 +1728,7 @@ function add_codeinsts_to_jit!(interp::AbstractInterpreter, ci, source_mode::UIn
     while !isempty(workqueue)
         # ci_has_real_invoke(ci) && return ci # optimization: cease looping if ci happens to get compiled (not just jl_fptr_wait_for_compiled, but fully jl_is_compiled_codeinst)
         callee = pop!(workqueue)
+        @assert !is_edge_only(callee) "cannot compile an edge-only CodeInstance"
         ci_has_invoke(callee) && continue
         isinspected(workqueue, callee) && continue
         if !has_valid_abi_sparams(get_ci_mi(callee))

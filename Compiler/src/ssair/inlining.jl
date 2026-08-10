@@ -803,13 +803,14 @@ function compileable_specialization(code::Union{MethodInstance,CodeInstance}, ef
     # A normalized compileable signature can have a less precise ABI for TypeEgal
     # arguments, forcing boxed argument passing for non-recursive invokes, so a
     # directly supplied inferred edge for the actual call signature wins there.
-    keep_direct_edge = code isa CodeInstance && mi !== mi_invoke && has_typeegal_slot(atype)
+    keep_direct_edge = code isa CodeInstance && !is_edge_only(code) &&
+        mi !== mi_invoke && has_typeegal_slot(atype)
     if !keep_direct_edge
         cached = get(code_cache(state), mi_invoke, nothing)
         cached isa InferenceResult && (cached = cached.ci)
         if cached isa CodeInstance
             code = cached
-        elseif !(code isa CodeInstance && code.def === mi_invoke)
+        elseif !(code isa CodeInstance && !is_edge_only(code) && code.def === mi_invoke)
             #println("missing code for ", mi_invoke, " for ", mi)
             code = mi_invoke
         end

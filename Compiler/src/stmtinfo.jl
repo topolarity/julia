@@ -368,9 +368,18 @@ function add_inlining_edge!(edges::Vector{Any}, edge::CodeInstance)
             return
         end
         if edgeᵢ isa CodeInstance && edgeᵢ.def === edge.def
-            # found existing edge
-            # XXX compare `CodeInstance` identify?
-            return
+            if is_edge_only(edgeᵢ) && !is_edge_only(edge)
+                # A real cached CodeInstance subsumes the dependency-only
+                # fallback for this MethodInstance.
+                edges[i] = edge
+                return
+            elseif !is_edge_only(edgeᵢ) || edgeᵢ === edge
+                # An existing real CodeInstance subsumes a new edge-only
+                # fallback. Identical edge-only records are redundant too.
+                return
+            end
+            # Distinct edge-only records for one MethodInstance can carry
+            # distinct dependencies, so keep looking before appending this one.
         end
         i += 1
     end

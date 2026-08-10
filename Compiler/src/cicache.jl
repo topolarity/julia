@@ -4,6 +4,15 @@ struct WorldRange
     min_world::UInt
     max_world::UInt
 end
+
+# Must match JL_CI_FLAGS_EDGE_ONLY in src/julia.h. Edge-only CodeInstances are
+# dependency records in the terminal MethodInstance-cache partition, not
+# inference or compilation results.
+const CI_FLAGS_EDGE_ONLY = UInt8(0b100000)
+@inline function is_edge_only(ci::CodeInstance)
+    flags = @atomic :monotonic ci.flags
+    return !iszero(flags & CI_FLAGS_EDGE_ONLY)
+end
 WorldRange() = WorldRange(typemin(UInt), typemax(UInt))
 WorldRange(w::UInt) = WorldRange(w, w)
 WorldRange(r::UnitRange) = WorldRange(first(r), last(r))
@@ -43,6 +52,7 @@ end
 
 function setindex!(cache::InternalCodeCache, ci::CodeInstance, mi::MethodInstance)
     @assert ci.owner === cache.owner
+    @assert !is_edge_only(ci)
     m = mi.def
     if isa(m, Method)
         ccall(:jl_push_newly_inferred, Cvoid, (Any,), ci)
