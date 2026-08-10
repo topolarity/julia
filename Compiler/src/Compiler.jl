@@ -133,6 +133,7 @@ end
 include("timing.jl")
 include("sort.jl")
 include("piracy/packagegraph.jl")
+include("piracy/implpiracy.jl")
 
 # We don't include some.jl, but this definition is still useful.
 something(x::Nothing, y...) = something(y...)

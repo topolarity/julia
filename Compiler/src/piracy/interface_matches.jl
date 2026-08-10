@@ -23,21 +23,8 @@ function _interface_pair_relation(interface_match::InterfaceMatch, method::Metho
     return intersects, interface_opens
 end
 
-"""
-    interface_matches(methods, interfaces) -> Vector{InterfaceMatch}
-
-Compute a conservative set of open interface regions for one implementation
-authority. `methods` must contain every raw applicable Method owned outside the
-authority, and `interfaces` must contain every raw applicable interface usable
-by that authority, in the narrow-to-broad order produced by
-`raw_interface_matches`. Neither input may have been filtered by ordinary
-dispatch.
-
-The result guarantees that every call point open to a future implementation is
-contained in the union of the returned interfaces' query-local `spec_types`.
-"""
-function interface_matches(methods::Vector{MethodMatch},
-                           interfaces::Vector{InterfaceMatch})
+function _interface_future_matches(methods::Vector{MethodMatch},
+                                   interfaces::Vector{InterfaceMatch})
     nmethods = length(methods)
     ninterfaces = length(interfaces)
     openers = [Int[] for _ = 1:nmethods]
@@ -60,6 +47,16 @@ function interface_matches(methods::Vector{MethodMatch},
     resolved_interfaces = falses(ninterfaces)
     open_interfaces = falses(ninterfaces)
     R = Union{}
+
+    function result()
+        future = AnyFutureMethodMatch[]
+        for interface_index = 1:ninterfaces
+            open_interfaces[interface_index] || continue
+            _push_future_match!(
+                future, interfaces[interface_index].match.spec_types)
+        end
+        return future
+    end
 
     function mark_resolved!(resolved::BitVector, index::Int)
         resolved[index] = true
@@ -94,7 +91,7 @@ function interface_matches(methods::Vector{MethodMatch},
                 progress = true
             end
             resolved_methods[method_index] && method.fully_covers &&
-                return interfaces[open_interfaces]
+                return result()
         end
 
         for interface_index = 1:ninterfaces
@@ -110,25 +107,103 @@ function interface_matches(methods::Vector{MethodMatch},
                 progress = true
             end
             resolved_interfaces[interface_index] && interface_match.match.fully_covers &&
-                return interfaces[open_interfaces]
+                return result()
         end
 
-        all(resolved_interfaces) && return interfaces[open_interfaces]
+        all(resolved_interfaces) && return result()
         progress && continue
 
         # The unresolved component has no inductive first step. Choose the
         # narrowest remaining interface as the coinductive open seed.
         seed = findfirst(!, resolved_interfaces)::Int
         R = mark_open!(seed, interfaces[seed].match.spec_types, R)
-        interfaces[seed].match.fully_covers && return interfaces[open_interfaces]
+        interfaces[seed].match.fully_covers && return result()
     end
 end
 
-function filter_open_callees(callees::Vector{MethodMatch},
-                             open_interfaces::Vector{InterfaceMatch})
-    open_regions = Any[match.match.spec_types for match in open_interfaces]
-    open_union = isempty(open_regions) ? Union{} : Union{open_regions...}
+function _region_union(regions)
+    region_union = Bottom
+    for region in regions
+        region_union = Union{region_union, region}
+    end
+    return region_union
+end
+
+function _productive_future_region(@nospecialize(region))
+    result = Base.packagetype(region)
+    return !isempty(Base._packagetype_lower(result).alternatives)
+end
+
+function _push_future_match!(future::Vector{AnyFutureMethodMatch},
+                             @nospecialize(region))
+    _productive_future_region(region) || return false
+    any(match -> match.spec_types == region, future) && return false
+    push!(future, AnyFutureMethodMatch(region))
+    return true
+end
+
+function filter_future_callees(callees::Vector{MethodMatch},
+                               future::Vector{AnyFutureMethodMatch})
+    open_union = _region_union(match.spec_types for match in future)
     return filter(callees) do callee
         !(callee.spec_types <: open_union)
     end
+end
+
+"""
+    resolve_call_extensibility(callees, methods, interfaces)
+        -> (callees, future)
+
+Resolve conservative future-Method bounds and remove current callees whose
+complete query-local regions are covered by them. `methods` must contain every
+raw applicable Method, while `callees` is the already dispatch-resolved and
+ordered Method list. `interfaces` must contain every raw applicable interface
+in the narrow-to-broad order produced by `raw_interface_matches`.
+
+The two-argument form uses the raw Method list as the callee list as well.
+Neither `methods` nor `interfaces` may have undergone ordinary dispatch
+filtering.
+"""
+function resolve_call_extensibility(callees::Vector{MethodMatch},
+                                    methods::Vector{MethodMatch},
+                                    interfaces::Vector{InterfaceMatch})
+    future = _interface_future_matches(methods, interfaces)
+    return filter_future_callees(callees, future), future
+end
+
+function resolve_call_extensibility(methods::Vector{MethodMatch},
+                                    interfaces::Vector{InterfaceMatch})
+    return resolve_call_extensibility(methods, methods, interfaces)
+end
+
+"""
+    interface_contract(region, interfaces)
+
+Return the cumulative successful-return bound from interfaces which each cover
+all of `region`. The Boolean reports whether such a bound exists. Interfaces
+which only overlap the region remain relevant to possible `ReturnTypeError`s,
+but cannot narrow every successful return without splitting the region.
+"""
+function interface_contract(@nospecialize(region),
+                            interfaces::Vector{InterfaceMatch})
+    bound = Any
+    constrained = false
+    for interface_match in interfaces
+        region <: interface_match.match.spec_types || continue
+        rettype = interface_match.rettype
+        # `nothing` records a contract template whose required static
+        # parameter is undefined in this match. Dynamic dispatch raises a
+        # contextual UndefVarError; until exception-aware contract inference
+        # models that path, it contributes no successful-return refinement.
+        rettype isa Type || continue
+        bound = typeintersect(bound, rettype)
+        constrained = true
+    end
+    return bound, constrained
+end
+
+function future_return_type(match::AnyFutureMethodMatch,
+                            interfaces::Vector{InterfaceMatch})
+    bound, constrained = interface_contract(match.spec_types, interfaces)
+    return constrained ? bound : Any
 end

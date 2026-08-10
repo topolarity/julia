@@ -14,8 +14,40 @@ struct RawMethodLookupResult
 end
 
 struct RawInterfaceLookupResult
+    # InterfaceMatch.rettype is a Type when its static-parameter template can
+    # be instantiated, or `nothing` when a required parameter is undefined.
     matches::Vector{InterfaceMatch}
     valid_worlds::WorldRange
+end
+
+"""
+    AnyFutureMethodMatch(spec_types)
+
+Represent a query-local region in which inference must account for a future
+selected Method without pretending that the Method already exists.
+"""
+struct AnyFutureMethodMatch
+    spec_types::Type
+end
+
+"""
+    InferenceLookupResult
+
+The complete semantic lookup consumed by inference. `matches` contains only
+real current callees. `future` contains possible future dispatch-table targets,
+while `interfaces` retains every cumulative piecewise return contract.
+`fullmatch` records current Method coverage before future-callee filtering.
+`unordered` disables transformations which rely on the ordering of `matches`.
+"""
+struct InferenceLookupResult
+    # Really Vector{Core.MethodMatch}, matching MethodLookupResult's C-friendly
+    # representation and leaving future targets in their separate collection.
+    matches::Vector{Any}
+    future::Vector{AnyFutureMethodMatch}
+    interfaces::Vector{InterfaceMatch}
+    valid_worlds::WorldRange
+    fullmatch::Bool
+    unordered::Bool
 end
 
 function raw_method_matches(@nospecialize(sig::Type), world::UInt;
@@ -36,6 +68,16 @@ function raw_interface_matches(@nospecialize(sig::Type), world::UInt)
     typed_matches = InterfaceMatch[match::InterfaceMatch for match in matches]
     return RawInterfaceLookupResult(typed_matches, WorldRange(min_valid[], max_valid[]))
 end
+
+length(result::InferenceLookupResult) = length(result.matches)
+function iterate(result::InferenceLookupResult, args...)
+    r = iterate(result.matches, args...)
+    r === nothing && return nothing
+    match, state = r
+    return (match::MethodMatch, state)
+end
+getindex(result::InferenceLookupResult, idx::Int) =
+    getindex(result.matches, idx)::MethodMatch
 
 length(result::MethodLookupResult) = length(result.matches)
 function iterate(result::MethodLookupResult, args...)
@@ -148,6 +190,78 @@ function findall(@nospecialize(sig::Type), table::CachedMethodTable; limit::Int=
     else
         return table.cache[key] = findall(sig, table.table; limit)
     end
+end
+
+_raw_method_matches(@nospecialize(sig::Type), table::InternalMethodTable) =
+    raw_method_matches(sig, table.world)
+_raw_method_matches(@nospecialize(sig::Type), table::CachedMethodTable) =
+    _raw_method_matches(sig, table.table)
+
+# A future overlay-specific query can combine its raw intersections with those
+# of the internal table; until then the semantic lookup reports unsupported.
+_raw_method_matches(@nospecialize(sig::Type), table::OverlayMethodTable) = nothing
+
+_method_table_world(table::InternalMethodTable) = table.world
+_method_table_world(table::OverlayMethodTable) = table.world
+_method_table_world(table::CachedMethodTable) = _method_table_world(table.table)
+
+function _call_signature_arg0(@nospecialize(sig::Type))
+    body = unwrap_unionall(sig)
+    @assert body isa DataType && body.name === Tuple.name
+    @assert !isempty(body.parameters)
+    arg0 = body.parameters[1]
+    while arg0 isa TypeVar
+        arg0 = arg0.ub
+    end
+    return arg0::Type
+end
+
+function _fully_open_inference_result(@nospecialize(sig::Type),
+                                      interfaces::RawInterfaceLookupResult)
+    return InferenceLookupResult(
+        Any[], AnyFutureMethodMatch[AnyFutureMethodMatch(sig)],
+        interfaces.matches, interfaces.valid_worlds, false, true)
+end
+
+"""
+    inference_matches(sig, table, world, self_rights=nothing; limit=-1)
+
+Combine ordinary Method dispatch resolution with complete raw Method/interface
+intersections and first-argument package closure. During incremental output,
+`self_rights` is the package-ownership formula granted to the current
+definition transaction. Ordinary runtime bypasses the package-owner gate and
+relies on world-age backedges and invalidation.
+"""
+function inference_matches(@nospecialize(sig::Type), table::MethodTableView,
+                           world::UInt, self_rights=nothing; limit::Int=-1)
+    world == _method_table_world(table) ||
+        throw(ArgumentError("method-table and interface query worlds must agree"))
+
+    interfaces = raw_interface_matches(sig, world)
+    interfaces === nothing && return nothing
+
+    arg0 = _call_signature_arg0(sig)
+    if !_arg0_package_owner_is_closed_or_self(arg0, self_rights)
+        return _fully_open_inference_result(sig, interfaces)
+    end
+
+    current = findall(sig, table; limit)
+    current === nothing && return nothing
+
+    methods = _raw_method_matches(sig, table)
+    methods === nothing && return nothing
+
+    matches = MethodMatch[match::MethodMatch for match in current.matches]
+    matches, future = resolve_call_extensibility(
+        matches, methods.matches, interfaces.matches)
+    fullmatch = any(match::MethodMatch -> match.fully_covers, current)
+    unordered = current.ambig | !isempty(future)
+    valid_worlds = intersect(
+        intersect(current.valid_worlds, methods.valid_worlds),
+        interfaces.valid_worlds)
+    return InferenceLookupResult(
+        Any[matches...], future, interfaces.matches,
+        valid_worlds, fullmatch, unordered)
 end
 
 """
