@@ -17,7 +17,11 @@ artifact_dir::String = ""
 # Because LBT needs to have a weak-dependence on OpenBLAS (or any other BLAS)
 # we must manually construct a list of which modules and libraries we're going
 # to be using with it, as well as the on load callbacks they may or may not need.
-const on_load_callbacks::Vector{Function} = Function[]
+#
+# The registered callbacks are stored type-erased (see `Libdl.ErasedCallable`)
+# so that dispatching them involves no dynamic call and this chain stays
+# statically compileable (e.g. under `--trim`).
+const on_load_callbacks::Vector{Libdl.ErasedCallable} = Libdl.ErasedCallable[]
 const eager_mode_modules::Vector{Module} = Module[]
 function libblastrampoline_on_load_callback()
     for callback = on_load_callbacks
@@ -25,10 +29,15 @@ function libblastrampoline_on_load_callback()
     end
 end
 
-function add_dependency!(mod::Module, lib::LazyLibrary, on_load_callback::Function = () -> nothing)
+function add_dependency!(mod::Module, lib::LazyLibrary,
+                         on_load_callback::Union{Function, Libdl.ErasedCallable, Nothing} = nothing)
     Libdl.add_dependency!(libblastrampoline, lib)
     push!(eager_mode_modules, mod)
-    push!(on_load_callbacks, on_load_callback)
+    if on_load_callback !== nothing
+        push!(on_load_callbacks, on_load_callback isa Libdl.ErasedCallable ?
+            on_load_callback : Libdl.ErasedCallable(on_load_callback))
+    end
+    return nothing
 end
 
 libblastrampoline_path::String = ""

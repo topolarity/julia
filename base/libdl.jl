@@ -327,6 +327,12 @@ mutable struct ErasedCallable
         init_callable!(ec, callable)
         return ec
     end
+
+    # Pre-erased form: the caller supplies the entry point (typically a
+    # statically-typed `@cfunction` for a top-level function), so that no
+    # runtime trampoline is created. This is the trim-compatible way to
+    # construct one at runtime.
+    ErasedCallable(@nospecialize(callable), ptr::Ptr{Cvoid}) = new(ptr, nothing, callable)
 end
 
 """
