@@ -1889,6 +1889,25 @@ function has_valid_abi_sparams(mi::MethodInstance)
 end
 
 # collect a list of all code that is needed along with CodeInstance to codegen it fully
+# A `ccall`/`cglobal` site whose library is given by a runtime value loads
+# that library on first use: the runtime calls back into `Libdl.dlopen(lib)`,
+# an edge that is invisible in the IR. Return the signature of that `dlopen`
+# call for such a site, or `nothing` if the site does not call back into Julia.
+function foreign_dlopen_atype(@nospecialize(spec), ci::CodeInfo, sptypes::Vector{VarState})
+    isexpr(spec, :tuple) || return nothing
+    length(spec.args) == 2 || return nothing
+    lib = spec.args[2]
+    !applicable(argextype, lib, ci, sptypes) && return nothing # TODO: Why is this failing during bootstrap
+    libt = argextype_widened(lib, ci, sptypes)
+    # symbols, strings, and raw pointers are resolved natively by the runtime,
+    # without calling back into Julia
+    libt <: Union{Symbol, AbstractString, Ptr} && return nothing
+    dlopen_ptr = unsafe_load(cglobal(:jl_libdl_dlopen_func, Ptr{Cvoid}))
+    dlopen_ptr == C_NULL && return nothing # Libdl was never loaded
+    dlopen_fn = unsafe_load(cglobal(:jl_libdl_dlopen_func, Any))
+    return Tuple{typeof(dlopen_fn), libt}
+end
+
 function collectinvokes!(workqueue::CompilationQueue, ci::CodeInfo, sptypes::Vector{VarState};
                          invokelatest_queue::Union{CompilationQueue,Nothing} = nothing,
                          enqueue_unprepared_invokes::Bool = false)
@@ -1952,6 +1971,13 @@ function collectinvokes!(workqueue::CompilationQueue, ci::CodeInfo, sptypes::Vec
             t, _, _, _ = instanceof_tfunc(argextype(stmt.args[1], ci, sptypes))
             t <: Function || continue
             atype = Tuple{t, Vararg}
+        elseif isexpr(stmt, :foreigncall) || isexpr(stmt, :foreignglobal)
+            # A runtime library value makes the site load the library on first
+            # use through an IR-invisible `Libdl.dlopen(lib)` upcall; enqueue
+            # that call so trimmed/AOT images retain it
+            maybe_atype = foreign_dlopen_atype(stmt.args[1], ci, sptypes)
+            maybe_atype === nothing && continue
+            atype = maybe_atype
         else
             # TODO: handle other StmtInfo like OpaqueClosure?
             continue
