@@ -1,0 +1,86 @@
+# Records the official Julia builds: USE_BLAS64 (the `64_` suffix) on 64-bit
+# architectures, plain sonames on 32-bit ones.
+jll_format = "2.0"
+name = "OpenBLAS"
+
+[products.libopenblas]
+# uuid5(package uuid, "libopenblas")
+dlid = "664a9972-5d51-55af-9726-f9a39fb00bc7"
+
+[[builds]]
+os = "windows"
+location = "bundled"
+
+    [builds.products.libopenblas.dynamic]
+    soname = "libopenblas64_.dll"
+    deps = ["CompilerSupportLibraries_jll.libgfortran", "CompilerSupportLibraries_jll.libgcc_s"]
+
+[[builds]]
+os = "windows"
+arch = "i686"
+location = "bundled"
+
+    [builds.products.libopenblas.dynamic]
+    soname = "libopenblas.dll"
+    deps = ["CompilerSupportLibraries_jll.libgfortran", "CompilerSupportLibraries_jll.libgcc_s"]
+
+[[builds]]
+os = "macos"
+arch = "x86_64"
+location = "bundled"
+
+    [builds.products.libopenblas.dynamic]
+    soname = "libopenblas64_.dylib"
+    deps = ["CompilerSupportLibraries_jll.libgfortran", "CompilerSupportLibraries_jll.libquadmath", "CompilerSupportLibraries_jll.libgcc_s"]
+
+[[builds]]
+os = "macos"
+arch = "aarch64"
+location = "bundled"
+
+    [builds.products.libopenblas.dynamic]
+    soname = "libopenblas64_.dylib"
+    deps = ["CompilerSupportLibraries_jll.libgfortran"]
+
+[[builds]]
+os = "linux"
+location = "bundled"
+
+    [builds.products.libopenblas.dynamic]
+    soname = "libopenblas64_.so"
+    deps = ["CompilerSupportLibraries_jll.libgfortran"]
+
+[[builds]]
+os = "linux"
+arch = "x86_64"
+location = "bundled"
+
+    [builds.products.libopenblas.dynamic]
+    soname = "libopenblas64_.so"
+    deps = ["CompilerSupportLibraries_jll.libgfortran"]
+
+[[builds]]
+os = "linux"
+arch = "i686"
+location = "bundled"
+
+    [builds.products.libopenblas.dynamic]
+    soname = "libopenblas.so"
+    deps = ["CompilerSupportLibraries_jll.libgfortran"]
+
+[[builds]]
+os = "linux"
+arch = "armv7l"
+location = "bundled"
+
+    [builds.products.libopenblas.dynamic]
+    soname = "libopenblas.so"
+    deps = ["CompilerSupportLibraries_jll.libgfortran"]
+
+[[builds]]
+os = "freebsd"
+location = "bundled"
+
+    [builds.products.libopenblas.dynamic]
+    soname = "libopenblas64_.so"
+    deps = ["CompilerSupportLibraries_jll.libgfortran"]

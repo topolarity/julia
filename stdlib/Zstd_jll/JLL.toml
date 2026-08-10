@@ -1,0 +1,45 @@
+jll_format = "2.0"
+name = "Zstd"
+
+# Product identity is platform-invariant and stated once; builds below carry
+# only per-platform library facts.
+[products.libzstd]
+# uuid5(package uuid, "libzstd")
+dlid = "830bb508-92bf-563c-9e87-0715fe87ef92"
+
+[[builds]]
+os = "windows"
+location = "bundled"
+
+    [builds.products.libzstd.dynamic]
+    soname = "libzstd-1.dll"
+
+[[builds]]
+os = "windows"
+arch = "i686"
+location = "bundled"
+
+    [builds.products.libzstd.dynamic]
+    soname = "libzstd-1.dll"
+    deps = ["CompilerSupportLibraries_jll.libgcc_s"]
+
+[[builds]]
+os = "macos"
+location = "bundled"
+
+    [builds.products.libzstd.dynamic]
+    soname = "libzstd.1.dylib"
+
+[[builds]]
+os = "linux"
+location = "bundled"
+
+    [builds.products.libzstd.dynamic]
+    soname = "libzstd.so.1"
+
+[[builds]]
+os = "freebsd"
+location = "bundled"
+
+    [builds.products.libzstd.dynamic]
+    soname = "libzstd.so.1"

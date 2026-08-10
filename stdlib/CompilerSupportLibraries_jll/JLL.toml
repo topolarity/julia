@@ -1,0 +1,185 @@
+# Records the official Julia builds (the libgfortran-5 / GCC-12 era compiler
+# support libraries). A Julia built against an older GCC would need matching
+# sonames here; historical libgfortran majors are deliberately not enumerated.
+jll_format = "2.0"
+name = "CompilerSupportLibraries"
+
+# Product identity is platform-invariant and stated once; builds below carry
+# only per-platform library facts. Each dlid is uuid5(package uuid, name).
+[products.libatomic]
+dlid = "6f70f1a7-e2d5-53ff-bc33-5d3858c96401"
+[products.libquadmath]
+dlid = "4869bb1d-141f-5a01-b337-3d1435fc1f98"
+[products.libgcc_s]
+dlid = "1cd7433b-ee8f-572a-8a86-1137cb3f5ada"
+[products.libgfortran]
+dlid = "77be8d79-76da-57e6-8c3e-8eb4c9c4a43c"
+[products.libstdcxx]
+dlid = "2afcce28-1804-53d7-8eaf-15b85720ac97"
+[products.libgomp]
+dlid = "d86a9a2a-2317-558f-a0a8-6a2b7a7addd4"
+[products.libssp]
+dlid = "558536fb-6a72-5deb-a2f9-856b91bb76ef"
+
+[[builds]]
+os = "windows"
+location = "bundled"
+
+    [builds.products.libatomic.dynamic]
+    soname = "libatomic-1.dll"
+    [builds.products.libquadmath.dynamic]
+    soname = "libquadmath-0.dll"
+    [builds.products.libgcc_s.dynamic]
+    soname = "libgcc_s_seh-1.dll"
+    [builds.products.libgfortran.dynamic]
+    soname = "libgfortran-5.dll"
+    deps = ["libgcc_s", "libquadmath"]
+    [builds.products.libstdcxx.dynamic]
+    soname = "libstdc++-6.dll"
+    deps = ["libgcc_s"]
+    [builds.products.libgomp.dynamic]
+    soname = "libgomp-1.dll"
+    deps = ["libgcc_s"]
+    [builds.products.libssp.dynamic]
+    soname = "libssp-0.dll"
+
+[[builds]]
+os = "windows"
+arch = "i686"
+location = "bundled"
+
+    [builds.products.libatomic.dynamic]
+    soname = "libatomic-1.dll"
+    [builds.products.libquadmath.dynamic]
+    soname = "libquadmath-0.dll"
+    [builds.products.libgcc_s.dynamic]
+    soname = "libgcc_s_sjlj-1.dll"
+    [builds.products.libgfortran.dynamic]
+    soname = "libgfortran-5.dll"
+    deps = ["libgcc_s", "libquadmath"]
+    [builds.products.libstdcxx.dynamic]
+    soname = "libstdc++-6.dll"
+    deps = ["libgcc_s"]
+    [builds.products.libgomp.dynamic]
+    soname = "libgomp-1.dll"
+    deps = ["libgcc_s"]
+    [builds.products.libssp.dynamic]
+    soname = "libssp-0.dll"
+
+[[builds]]
+os = "macos"
+location = "bundled"
+
+    [builds.products.libatomic.dynamic]
+    soname = "libatomic.1.dylib"
+    [builds.products.libquadmath.dynamic]
+    soname = "libquadmath.0.dylib"
+    [builds.products.libgcc_s.dynamic]
+    soname = "libgcc_s.1.1.dylib"
+    [builds.products.libgfortran.dynamic]
+    soname = "libgfortran.5.dylib"
+    deps = ["libgcc_s", "libquadmath"]
+    [builds.products.libstdcxx.dynamic]
+    soname = "libstdc++.6.dylib"
+    deps = ["libgcc_s"]
+    [builds.products.libgomp.dynamic]
+    soname = "libgomp.1.dylib"
+    [builds.products.libssp.dynamic]
+    soname = "libssp.0.dylib"
+
+# Generic linux: the 64-bit non-x86 and musl arches; no libquadmath (x86-only)
+# and no libssp (glibc-only).
+[[builds]]
+os = "linux"
+location = "bundled"
+
+    [builds.products.libatomic.dynamic]
+    soname = "libatomic.so.1"
+    [builds.products.libgcc_s.dynamic]
+    soname = "libgcc_s.so.1"
+    [builds.products.libgfortran.dynamic]
+    soname = "libgfortran.so.5"
+    deps = ["libgcc_s"]
+    [builds.products.libstdcxx.dynamic]
+    soname = "libstdc++.so.6"
+    deps = ["libgcc_s"]
+    [builds.products.libgomp.dynamic]
+    soname = "libgomp.so.1"
+
+[[builds]]
+platforms = ["x86_64-linux-gnu", "i686-linux-gnu"]
+location = "bundled"
+
+    [builds.products.libatomic.dynamic]
+    soname = "libatomic.so.1"
+    [builds.products.libquadmath.dynamic]
+    soname = "libquadmath.so.0"
+    [builds.products.libgcc_s.dynamic]
+    soname = "libgcc_s.so.1"
+    [builds.products.libgfortran.dynamic]
+    soname = "libgfortran.so.5"
+    deps = ["libgcc_s", "libquadmath"]
+    [builds.products.libstdcxx.dynamic]
+    soname = "libstdc++.so.6"
+    deps = ["libgcc_s"]
+    [builds.products.libgomp.dynamic]
+    soname = "libgomp.so.1"
+    [builds.products.libssp.dynamic]
+    soname = "libssp.so.0"
+
+# musl x86: libquadmath ships, libssp does not (glibc-only).
+[[builds]]
+platforms = ["x86_64-linux-musl"]
+location = "bundled"
+
+    [builds.products.libatomic.dynamic]
+    soname = "libatomic.so.1"
+    [builds.products.libquadmath.dynamic]
+    soname = "libquadmath.so.0"
+    [builds.products.libgcc_s.dynamic]
+    soname = "libgcc_s.so.1"
+    [builds.products.libgfortran.dynamic]
+    soname = "libgfortran.so.5"
+    deps = ["libgcc_s", "libquadmath"]
+    [builds.products.libstdcxx.dynamic]
+    soname = "libstdc++.so.6"
+    deps = ["libgcc_s"]
+    [builds.products.libgomp.dynamic]
+    soname = "libgomp.so.1"
+
+[[builds]]
+os = "freebsd"
+location = "bundled"
+
+    [builds.products.libatomic.dynamic]
+    soname = "libatomic.so.3"
+    [builds.products.libgcc_s.dynamic]
+    soname = "libgcc_s.so.1"
+    [builds.products.libgfortran.dynamic]
+    soname = "libgfortran.so.5"
+    deps = ["libgcc_s"]
+    [builds.products.libstdcxx.dynamic]
+    soname = "libstdc++.so.6"
+    deps = ["libgcc_s"]
+    [builds.products.libgomp.dynamic]
+    soname = "libgomp.so.1"
+
+[[builds]]
+os = "freebsd"
+arch = "x86_64"
+location = "bundled"
+
+    [builds.products.libatomic.dynamic]
+    soname = "libatomic.so.3"
+    [builds.products.libquadmath.dynamic]
+    soname = "libquadmath.so.0"
+    [builds.products.libgcc_s.dynamic]
+    soname = "libgcc_s.so.1"
+    [builds.products.libgfortran.dynamic]
+    soname = "libgfortran.so.5"
+    deps = ["libgcc_s", "libquadmath"]
+    [builds.products.libstdcxx.dynamic]
+    soname = "libstdc++.so.6"
+    deps = ["libgcc_s"]
+    [builds.products.libgomp.dynamic]
+    soname = "libgomp.so.1"
