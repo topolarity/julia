@@ -2274,13 +2274,18 @@ end
 # reference when emitting an image. The policy must never affect JIT codegen,
 # so that JIT-compiled IR stays independent of it (and therefore cacheable).
 @testset "native-link policy" begin
-    @test ccall(:jl_is_native_link_lib, Cint, (Cstring,), "libnotregistered") == 0
-    ccall(:jl_add_native_link_lib, Cvoid, (Cstring,), "libpolicytest")
-    @test ccall(:jl_is_native_link_lib, Cint, (Cstring,), "libpolicytest") == 1
-    @test ccall(:jl_is_native_link_lib, Cint, (Cstring,), "libnotregistered") == 0
-    # duplicate registration is harmless
-    ccall(:jl_add_native_link_lib, Cvoid, (Cstring,), "libpolicytest")
-    @test ccall(:jl_is_native_link_lib, Cint, (Cstring,), "libpolicytest") == 1
+    unregistered_id = "11111111-2222-3333-4444-555555555555"
+    policy_id = "aabbccdd-eeff-0011-2233-445566778899"
+    @test ccall(:jl_is_native_link_lib_id, Cint, (Cstring,), unregistered_id) == 0
+    ccall(:jl_add_native_link_lib_id, Cvoid, (Cstring,), policy_id)
+    @test ccall(:jl_is_native_link_lib_id, Cint, (Cstring,), policy_id) == 1
+    @test ccall(:jl_is_native_link_lib_id, Cint, (Cstring,), unregistered_id) == 0
+    # duplicate registration is harmless; lookup is case-insensitive
+    ccall(:jl_add_native_link_lib_id, Cvoid, (Cstring,), policy_id)
+    @test ccall(:jl_is_native_link_lib_id, Cint, (Cstring,), policy_id) == 1
+    @test ccall(:jl_is_native_link_lib_id, Cint, (Cstring,), uppercase(policy_id)) == 1
+    # malformed ids never match
+    @test ccall(:jl_is_native_link_lib_id, Cint, (Cstring,), "not-a-uuid") == 0
 
     # foreign-deps export path round-trips and can be cleared
     @test ccall(:jl_get_foreign_deps_export_path, Ptr{Cchar}, ()) == C_NULL
@@ -2291,7 +2296,7 @@ end
 
     # Registering the library behind a live ccall must not change what the JIT
     # emits: still a lazy runtime lookup, no direct external reference.
-    ccall(:jl_add_native_link_lib, Cvoid, (Cstring,), dlname(named_ccalltest))
+    ccall(:jl_add_native_link_lib_id, Cvoid, (Cstring,), string(dlid(named_ccalltest)))
     ir = sprint(io -> code_llvm(io, echo_p_named, Tuple{Ptr{Cvoid}};
                                 raw=true, dump_module=false, optimize=true, debuginfo=:none))
     @test occursin("jl_lazy_load_and_lookup", ir)

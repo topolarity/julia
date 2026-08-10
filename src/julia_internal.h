@@ -537,8 +537,8 @@ extern JL_DLLEXPORT jl_value_t *jl_abstractlibrary_type JL_GLOBALLY_ROOTED;
 // Populated before AOT codegen runs (e.g. by juliac's `--link-native=`).
 // Process-local; not part of the sysimage. Consulted only when emitting an
 // image, so JIT-compiled IR is unaffected and stays cacheable.
-JL_DLLEXPORT void jl_add_native_link_lib(const char *name) JL_NOTSAFEPOINT;
-JL_DLLEXPORT int jl_is_native_link_lib(const char *name) JL_NOTSAFEPOINT;
+JL_DLLEXPORT void jl_add_native_link_lib_id(const char *uuid_str) JL_NOTSAFEPOINT;
+JL_DLLEXPORT int jl_is_native_link_lib_id(const char *uuid_str) JL_NOTSAFEPOINT;
 
 // Foreign-deps export: when set to a non-empty path, AOT codegen writes a JSON
 // manifest of every ccall/cglobal usage site there.

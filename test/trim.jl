@@ -108,7 +108,7 @@ end
 end
 
 # Native linking is an AOT-only facility: a library registered with
-# `jl_add_native_link_lib` has its symbols bound by direct external reference
+# `jl_add_native_link_lib_id` has its symbols bound by direct external reference
 # rather than resolved at run time, and that decision is only taken when
 # emitting an image. Exercising it therefore needs a real `--output-o` compile,
 # which is why this lives here rather than in `test/ccall.jl`.
@@ -126,7 +126,8 @@ end
             const CCALLTEST = Libdl.LazyLibrary(
                 Libdl.LazyLibraryPath($(repr(dirname(libpath))), $(repr(libfile)));
                 name=$(repr(libfile)), id=Base.UUID(0x00000000000000000000000000000042))
-            ccall(:jl_add_native_link_lib, Cvoid, (Cstring,), $(repr(libfile)))
+            ccall(:jl_add_native_link_lib_id, Cvoid, (Cstring,),
+                  "00000000-0000-0000-0000-000000000042")
             ccall(:jl_set_foreign_deps_export_path, Cvoid, (Cstring,), $(repr(manifest)))
             native_echo() = ccall((:test_echo_p, CCALLTEST), Ptr{Cvoid}, (Ptr{Cvoid},), C_NULL)
             Base.Experimental.entrypoint(native_echo, ())

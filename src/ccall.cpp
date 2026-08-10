@@ -744,23 +744,49 @@ static void interpret_foreignsymbol(jl_codectx_t &ctx, native_sym_arg_t &out, jl
     }
 }
 
+// Format the frozen `dlid()` value (a 16-byte bits struct wrapping the raw
+// UUID value, e.g. `Base.UUID`) as a canonical lowercase UUID string into
+// `buf` (size >= 37). Returns false if the value has no such shape.
+static bool frozen_dlid_to_string(jl_value_t *lib_id, char *buf) JL_NOTSAFEPOINT
+{
+    if (lib_id == NULL || lib_id == jl_nothing)
+        return false;
+    jl_datatype_t *t = (jl_datatype_t *)jl_typeof(lib_id);
+    if (!jl_is_datatype(t) || t->name->mutabl || jl_datatype_size(t) != 16)
+        return false;
+    const uint8_t *bytes = (const uint8_t *)jl_data_ptr(lib_id);
+    // The UInt128 payload is stored little-endian; the canonical string is
+    // the big-endian hex expansion with dashes in the 8-4-4-4-12 pattern.
+    static const char hexdig[] = "0123456789abcdef";
+    size_t pos = 0;
+    for (int i = 15; i >= 0; i--) {
+        buf[pos++] = hexdig[bytes[i] >> 4];
+        buf[pos++] = hexdig[bytes[i] & 0xf];
+        if (pos == 8 || pos == 13 || pos == 18 || pos == 23)
+            buf[pos++] = '-';
+    }
+    buf[pos] = '\0';
+    return true;
+}
+
 // Is this call site eligible for native linking, i.e. should it reference the
 // external symbol directly instead of resolving it lazily at runtime?
 //
 // Only `AbstractLibrary` targets qualify: the policy table is keyed on the
-// dlname frozen at the call site, so a library with no stable name can never
-// be named on the command line. Gated on imaging_mode so that the policy only
-// affects code emitted into an image — JIT-compiled IR is identical with and
-// without it, which keeps it valid to cache.
+// dlid frozen at the call site, so a library with no declared identity can
+// never be selected for native linking. Gated on imaging_mode so that the
+// policy only affects code emitted into an image — JIT-compiled IR is
+// identical with and without it, which keeps it valid to cache.
 static bool is_native_link_target(jl_codectx_t &ctx, const native_sym_arg_t &symarg) JL_NOTSAFEPOINT
 {
     if (!ctx.emission_context.imaging_mode)
         return false;
-    if (symarg.f_name == nullptr || symarg.lib_name == nullptr)
+    if (symarg.f_name == nullptr || symarg.lib_id == nullptr)
         return false;
-    if (!jl_is_string(symarg.lib_name))
+    char buf[37];
+    if (!frozen_dlid_to_string(symarg.lib_id, buf))
         return false;
-    return jl_is_native_link_lib(jl_string_data(symarg.lib_name));
+    return jl_is_native_link_lib_id(buf);
 }
 
 // Record a ccall/cglobal usage site for the foreign-dependency manifest.

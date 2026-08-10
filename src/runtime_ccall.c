@@ -25,36 +25,73 @@ jl_value_t *jl_libdl_dlopen_func JL_GLOBALLY_ROOTED;
 jl_value_t *jl_abstractlibrary_type JL_GLOBALLY_ROOTED; // TODO: move to be handled like other types
                                                         //       (maybe just move to Core)
 
-// Native-link policy table — process-local set of `AbstractLibrary` dlnames
-// that AOT codegen should bind via direct external symbol references rather
-// than lazy runtime lookup. Populated by `jl_add_native_link_lib`; queried by
-// `jl_is_native_link_lib`. Not serialized into the sysimage.
+// Native-link policy table — process-local set of `AbstractLibrary` dlids
+// (canonical lowercase UUID strings) that AOT codegen should bind via direct
+// external symbol references rather than lazy runtime lookup. Populated by
+// `jl_add_native_link_lib_id`; queried by `jl_is_native_link_lib_id`. Keyed
+// on the identity rather than the name: two libraries may share a soname,
+// and a library with no declared identity can never be natively linked.
+// Not serialized into the sysimage.
 static htable_t link_native_libs;
 static jl_mutex_t link_native_libs_lock;
 static int link_native_libs_initialized = 0;
 
-JL_DLLEXPORT void jl_add_native_link_lib(const char *name) JL_NOTSAFEPOINT
+// Normalize an ASCII UUID string to lowercase in `buf` (size >= 37).
+// Returns 0 (and leaves `buf` undefined) unless `str` has the canonical
+// 8-4-4-4-12 shape.
+static int normalize_uuid_str(const char *str, char *buf) JL_NOTSAFEPOINT
 {
-    if (name == NULL)
-        return;
-    JL_LOCK_NOGC(&link_native_libs_lock);
-    if (!link_native_libs_initialized) {
-        strhash_new(&link_native_libs, 8);
-        link_native_libs_initialized = 1;
+    size_t n = strlen(str);
+    if (n != 36)
+        return 0;
+    for (size_t i = 0; i < 36; i++) {
+        char c = str[i];
+        if (i == 8 || i == 13 || i == 18 || i == 23) {
+            if (c != '-')
+                return 0;
+            buf[i] = c;
+        }
+        else if (('0' <= c && c <= '9') || ('a' <= c && c <= 'f')) {
+            buf[i] = c;
+        }
+        else if ('A' <= c && c <= 'F') {
+            buf[i] = c - 'A' + 'a';
+        }
+        else {
+            return 0;
+        }
     }
-    // strhash_put internalizes the key; duplicate inserts are harmless.
-    // Value must be != HT_NOTFOUND (which is (void*)1); use the key itself.
-    strhash_put(&link_native_libs, (void *)name, (void *)name);
-    JL_UNLOCK_NOGC(&link_native_libs_lock);
+    buf[36] = '\0';
+    return 1;
 }
 
-JL_DLLEXPORT int jl_is_native_link_lib(const char *name) JL_NOTSAFEPOINT
+JL_DLLEXPORT void jl_add_native_link_lib_id(const char *uuid_str) JL_NOTSAFEPOINT
 {
-    if (name == NULL)
+    char buf[37];
+    if (uuid_str == NULL || !normalize_uuid_str(uuid_str, buf))
+        jl_safe_printf("WARNING: ignoring malformed native-link library id \"%s\"\n",
+                       uuid_str ? uuid_str : "(null)");
+    else {
+        JL_LOCK_NOGC(&link_native_libs_lock);
+        if (!link_native_libs_initialized) {
+            strhash_new(&link_native_libs, 8);
+            link_native_libs_initialized = 1;
+        }
+        // strhash_put internalizes the key; duplicate inserts are harmless.
+        // Value must be != HT_NOTFOUND (which is (void*)1); use the key itself.
+        strhash_put(&link_native_libs, (void *)buf, (void *)buf);
+        JL_UNLOCK_NOGC(&link_native_libs_lock);
+    }
+}
+
+JL_DLLEXPORT int jl_is_native_link_lib_id(const char *uuid_str) JL_NOTSAFEPOINT
+{
+    char buf[37];
+    if (uuid_str == NULL || !normalize_uuid_str(uuid_str, buf))
         return 0;
     JL_LOCK_NOGC(&link_native_libs_lock);
     int hit = link_native_libs_initialized &&
-              strhash_has(&link_native_libs, (void *)name);
+              strhash_has(&link_native_libs, (void *)buf);
     JL_UNLOCK_NOGC(&link_native_libs_lock);
     return hit;
 }
