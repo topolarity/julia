@@ -54,6 +54,10 @@ end
 is_available() = true
 
 function __init__()
+    # The type-erased callback pointer is process-local and does not survive
+    # precompile serialization; re-arm it before any dlopen can occur.
+    Libdl.init_callable!(libblastrampoline.on_load_callback::Libdl.ErasedCallable,
+                         @cfunction(libblastrampoline_on_load_callback, Any, ()))
     global libblastrampoline_path = string(libblastrampoline.path)
     global artifact_dir = dirname(Sys.BINDIR)
     LIBPATH[] = dirname(libblastrampoline_path)

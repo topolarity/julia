@@ -293,11 +293,79 @@ end
 
 
 """
+    ErasedCallable(callable)
+
+A nullary callable that is invoked through a type-erased C function pointer,
+so that calling it involves no dynamic dispatch. This keeps its callers
+statically compileable (e.g. under `--trim`) even when `callable` itself has
+an arbitrary type.
+
+The pointer is process-local state: it is created ("armed") from `callable`
+when the `ErasedCallable` is constructed, but raw pointers do not survive
+precompile serialization, so an instance restored from a precompiled image is
+unarmed and throws on use. The owning module must re-arm it once per process
+from its `__init__`, typically with a statically-typed `@cfunction`:
+
+    function __init__()
+        Libdl.init_callable!(ec, @cfunction(my_impl, Any, ()))
+    end
+
+See also [`init_callable!`](@ref).
+"""
+mutable struct ErasedCallable
+    # Invocation goes through this pointer only. It is automatically reset to
+    # C_NULL by precompile serialization and re-armed per process via
+    # `init_callable!`.
+    @atomic ptr::Ptr{Cvoid}
+    # GC root for a trampoline created by the generic `init_callable!`
+    cf
+    # The original callable, for introspection and re-arming
+    const callable
+
+    function ErasedCallable(@nospecialize(callable))
+        ec = new(C_NULL, nothing, callable)
+        init_callable!(ec, callable)
+        return ec
+    end
+end
+
+"""
+    init_callable!(ec::ErasedCallable, ptr::Ptr{Cvoid})
+    init_callable!(ec::ErasedCallable, callable)
+
+Arm `ec` with a nullary C-callable entry point returning `Any`. The pointer
+form is fully static and is what a module's `__init__` should use to re-arm
+image-resident instances; the generic form creates a `@cfunction` trampoline
+for `callable` at runtime and is what the `ErasedCallable` constructor uses.
+"""
+function init_callable!(ec::ErasedCallable, ptr::Ptr{Cvoid})
+    @atomic :release ec.ptr = ptr
+    return ec
+end
+@noinline function init_callable!(ec::ErasedCallable, @nospecialize(callable))
+    cf = @cfunction($callable, Any, ())
+    ec.cf = cf # root the trampoline for the lifetime of `ec`
+    return init_callable!(ec, Base.unsafe_convert(Ptr{Cvoid}, cf))
+end
+
+function (ec::ErasedCallable)()
+    ptr = @atomic :acquire ec.ptr
+    if ptr == C_NULL
+        error("attempt to call an `ErasedCallable` whose pointer was never armed in this process; ",
+              "the owning module must re-arm it from its `__init__` via `Libdl.init_callable!`")
+    end
+    return ccall(ptr, Any, ())
+end
+
+"""
     LazyLibraryPath(path_pieces...)
 
 Helper type for lazily constructed library paths for use with [`LazyLibrary`](@ref).
 Path pieces are stored unevaluated and joined with `joinpath()` when the library is first
-accessed. Arguments must be able to have `string()` called on them.
+accessed. Each piece must be a string or a nullary [`ErasedCallable`](@ref) returning a
+string. Any other object is wrapped in an `ErasedCallable` that lazily calls `string()`
+on it, preserving the old piece protocol — but such implicitly-wrapped pieces must be
+re-armed per process if they are serialized into a precompiled image.
 
 !!! compat "Julia 1.11"
     `LazyLibraryPath` was added in Julia 1.11.
@@ -311,21 +379,45 @@ const mylib = LazyLibrary(LazyLibraryPath(artifact_dir, "lib", "libmylib.so.1.2.
 ```
 """
 struct LazyLibraryPath
-    pieces::Tuple{Vararg{Any}}
-    LazyLibraryPath(pieces...) = new(pieces)
+    pieces::Memory{Union{String, ErasedCallable}}
+    function LazyLibraryPath(pieces...)
+        mem = Memory{Union{String, ErasedCallable}}(undef, length(pieces))
+        for i = 1:length(pieces)
+            mem[i] = _lazy_path_piece(pieces[i])
+        end
+        return new(mem)
+    end
 end
-@inline Base.string(llp::LazyLibraryPath) = joinpath(String[string(p) for p in llp.pieces])
+_lazy_path_piece(p::AbstractString) = String(p)::String
+_lazy_path_piece(p::ErasedCallable) = p
+
+# Preserve the old "any object that supports `string()`" piece protocol by
+# wrapping unknown pieces in a lazy stringifier
+struct PieceStringifier
+    x
+end
+(ps::PieceStringifier)() = string(ps.x)::String
+_lazy_path_piece(@nospecialize(p)) = ErasedCallable(PieceStringifier(p))
+
+# Statically-dispatched piece stringification: `string(::LazyLibraryPath)` must
+# remain free of dynamic dispatch so that `dlopen(::LazyLibrary)` is compileable
+# under `--trim`.
+_piece_string(p::String) = p
+_piece_string(p::ErasedCallable) = p()::String
+Base.string(llp::LazyLibraryPath) = joinpath(String[_piece_string(p) for p in llp.pieces])
 Base.cconvert(::Type{Cstring}, llp::LazyLibraryPath) = Base.cconvert(Cstring, string(llp))
 # Define `print` so that we can wrap this in a `LazyString`
 Base.print(io::IO, llp::LazyLibraryPath) = print(io, string(llp))
 
 # Helper to get `$(private_shlibdir)` at runtime
-struct PrivateShlibdirGetter; end
 const private_shlibdir = Base.OncePerProcess{String}() do
     libname = ifelse(isdebugbuild(), "libjulia-internal-debug", "libjulia-internal")
     dirname(dlpath(libname))
 end
-Base.string(::PrivateShlibdirGetter) = private_shlibdir()
+_bundled_shlibdir() = private_shlibdir()::String
+# Shared by every `BundledLazyLibraryPath`; re-armed once per process in
+# `Libdl.__init__`, so that stdlib JLLs need no arming code of their own.
+const PrivateShlibdirGetter = ErasedCallable(_bundled_shlibdir)
 
 """
     BundledLazyLibraryPath(subpath)
@@ -343,7 +435,7 @@ const libgmp = LazyLibrary(BundledLazyLibraryPath("libgmp.so.10"))
 
 See also [`LazyLibrary`](@ref), [`LazyLibraryPath`](@ref).
 """
-BundledLazyLibraryPath(subpath) = LazyLibraryPath(PrivateShlibdirGetter(), subpath)
+BundledLazyLibraryPath(subpath) = LazyLibraryPath(PrivateShlibdirGetter, subpath)
 
 # Small helper struct to initialize a LazyLibrary with its initial set of dependencies
 struct InitialDependencies{T}
@@ -369,7 +461,10 @@ This is a thread-safe mechanism for on-demand library initialization.
   as it is not expected that `ccall()` should result in large amounts of Julia code being run.
   You may call `ccall()` from within the `on_load_callback` but only for the current library
   and its dependencies, and user should not call `wait()` on any tasks within the on load
-  callback as they may deadlock).
+  callback as they may deadlock). The callback is stored as an [`ErasedCallable`](@ref) and
+  invoked through its type-erased pointer; if the `LazyLibrary` is serialized into a
+  precompiled image, the owning module must re-arm the callback from its `__init__` via
+  [`init_callable!`](@ref).
 
 The dlopen operation is thread-safe: only one thread loads the library, acquired after the
 release store of the reference to each dependency from loading of each dependency. Other
@@ -400,7 +495,7 @@ migration from `__init__()` patterns, see the manual section on
 """
 mutable struct LazyLibrary
     # Name and flags to open with
-    const path
+    const path::Union{String, LazyLibraryPath}
     const flags::UInt32
 
     # Dependencies that must be loaded before we can load
@@ -410,8 +505,11 @@ mutable struct LazyLibrary
     # on whether they were added in the process where this LazyLibrary was created)
     dependencies::Base.OncePerProcess{Vector{LazyLibrary}, InitialDependencies{LazyLibrary}}
 
-    # Function that get called once upon initial load
-    on_load_callback
+    # Callable invoked once upon initial load, through a type-erased pointer so
+    # that `dlopen(::LazyLibrary)` stays free of dynamic dispatch. An
+    # image-resident callback must be re-armed from the owning module's
+    # `__init__` via `init_callable!` (see `ErasedCallable`).
+    const on_load_callback::Union{Nothing, ErasedCallable}
     const lock::Base.ReentrantLock
 
     # Pointer that we eventually fill out upon first `dlopen()`
@@ -419,17 +517,23 @@ mutable struct LazyLibrary
     function LazyLibrary(path; flags = default_rtld_flags, dependencies = LazyLibrary[],
                          on_load_callback = nothing)
         return new(
-            path,
+            _normalize_lazy_path(path),
             UInt32(flags),
             Base.OncePerProcess{Vector{LazyLibrary}}(
                 InitialDependencies{LazyLibrary}(dependencies)
             ),
-            on_load_callback,
+            on_load_callback === nothing ? nothing :
+                on_load_callback isa ErasedCallable ? on_load_callback :
+                ErasedCallable(on_load_callback),
             Base.ReentrantLock(),
             C_NULL,
         )
     end
 end
+_normalize_lazy_path(p::AbstractString) = String(p)::String
+_normalize_lazy_path(p::LazyLibraryPath) = p
+_normalize_lazy_path(@nospecialize(p)) =
+    throw(ArgumentError("LazyLibrary path must be an AbstractString or LazyLibraryPath"))
 
 # We support adding dependencies only because of very special situations
 # such as LBT needing to have OpenBLAS_jll added as a dependency dynamically.
@@ -475,9 +579,12 @@ function dlopen(ll::LazyLibrary, flags::Integer = ll.flags; kwargs...)
                 handle = dlopen(string(ll.path), flags; kwargs...)
                 @atomic :release ll.handle = handle
 
-                # Only the thread that loaded the library calls the `on_load_callback()`.
-                if ll.on_load_callback !== nothing
-                    ll.on_load_callback()
+                # Only the thread that loaded the library calls the `on_load_callback()`,
+                # through its type-erased pointer (a dynamic call here would make this
+                # loader impossible to compile statically, e.g. under `--trim`).
+                ol = ll.on_load_callback
+                if ol !== nothing
+                    ol()
                 end
             else
                 # Another thread loaded the library while we were waiting
@@ -503,4 +610,11 @@ end
 dlopen(x::Any) = throw(TypeError(:dlopen, "", Union{Symbol,String,LazyLibrary}, x))
 dlsym(ll::LazyLibrary, args...; kwargs...) = dlsym(dlopen(ll), args...; kwargs...)
 dlpath(ll::LazyLibrary) = dlpath(dlopen(ll))
+
+function __init__()
+    # `ErasedCallable` pointers are process-local; re-arm the shared
+    # private-shlibdir getter used by every `BundledLazyLibraryPath`.
+    init_callable!(PrivateShlibdirGetter, @cfunction(_bundled_shlibdir, Any, ()))
+    nothing
+end
 end # module Libdl

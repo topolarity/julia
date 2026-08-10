@@ -172,6 +172,15 @@ Standard library changes
 
 #### JuliaSyntaxHighlighting
 
+#### Libdl
+
+* `LazyLibrary` loading is now free of dynamic dispatch, making `ccall`s through lazily-loaded
+  libraries compatible with `--trim`. `LazyLibraryPath` pieces and `on_load_callback`s are now
+  invoked through per-process type-erased function pointers (`Libdl.ErasedCallable`); a callback
+  or custom path piece restored from a precompiled image must be re-armed once per process from
+  the owning module's `__init__` via `Libdl.init_callable!`. `LazyLibrary` paths are restricted
+  to the documented `AbstractString`/`LazyLibraryPath` forms.
+
 #### LinearAlgebra
 
 #### Markdown
