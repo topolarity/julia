@@ -167,7 +167,6 @@ static void get_tags(jl_value_t **tags[NUM_TAGS])
     INSERT_TAG(jl_typeinf_func);
     INSERT_TAG(jl_compile_and_emit_func);
     INSERT_TAG(jl_libdl_dlid_func);
-    INSERT_TAG(jl_libdl_dlname_func);
     INSERT_TAG(jl_libdl_dlopen_func);
     INSERT_TAG(jl_abstractlibrary_type);
     // n.b. must update NUM_TAGS when you add something here

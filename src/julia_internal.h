@@ -528,11 +528,10 @@ extern JL_DLLEXPORT jl_value_t *jl_compile_and_emit_func JL_GLOBALLY_ROOTED;
 extern JL_DLLEXPORT size_t jl_typeinf_world;
 extern JL_DLLEXPORT size_t jl_lowering_world;
 extern JL_DLLEXPORT jl_value_t *jl_libdl_dlid_func JL_GLOBALLY_ROOTED;
-extern JL_DLLEXPORT jl_value_t *jl_libdl_dlname_func JL_GLOBALLY_ROOTED;
 extern JL_DLLEXPORT jl_value_t *jl_libdl_dlopen_func JL_GLOBALLY_ROOTED;
 extern JL_DLLEXPORT jl_value_t *jl_abstractlibrary_type JL_GLOBALLY_ROOTED;
 
-// Native-link policy: `AbstractLibrary` dlnames that AOT codegen should bind
+// Native-link policy: `AbstractLibrary` dlids that AOT codegen should bind
 // via direct external symbol references instead of lazy runtime lookup.
 // Populated before AOT codegen runs (e.g. by juliac's `--link-native=`).
 // Process-local; not part of the sysimage. Consulted only when emitting an
@@ -1773,8 +1772,7 @@ void *jl_find_dynamic_library_by_addr(void *symbol, int throw_err, int close) JL
 JL_DLLEXPORT void *jl_load_and_lookup(const char *f_lib, const char *f_name, _Atomic(void*) *hnd) JL_CANSAFEPOINT;
 JL_DLLEXPORT void *jl_lazy_load_and_lookup(jl_value_t *lib_val, jl_value_t *f_name) JL_CANSAFEPOINT;
 JL_DLLEXPORT void *jl_lazy_load_and_lookup_verified(jl_value_t *lib_val, jl_value_t *f_name,
-                                                    jl_value_t *expected_id,
-                                                    jl_value_t *expected_name) JL_CANSAFEPOINT;
+                                                    jl_value_t *expected_id) JL_CANSAFEPOINT;
 JL_DLLEXPORT jl_value_t *jl_get_cfunction_trampoline(
     jl_value_t *fobj, jl_datatype_t *result, htable_t *cache, jl_svec_t *fill,
     void *(*init_trampoline)(void *tramp, void **nval),

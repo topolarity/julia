@@ -9,7 +9,7 @@ import Base: DL_LOAD_PATH, isdebugbuild
 
 export DL_LOAD_PATH, RTLD_DEEPBIND, RTLD_FIRST, RTLD_GLOBAL, RTLD_LAZY, RTLD_LOCAL,
     RTLD_NODELETE, RTLD_NOLOAD, RTLD_NOW, dlclose, dlopen, dlopen_e, dlsym, dlsym_e,
-    dlpath, find_library, dlext, dllist, dlid, dlname, AbstractLibrary,
+    dlpath, find_library, dlext, dllist, dlid, AbstractLibrary,
     LazyLibrary, LazyLibraryPath, BundledLazyLibraryPath
 
 """
@@ -454,10 +454,10 @@ end
     AbstractLibrary
 
 Abstract supertype for library handles that carry a stable identity the compiler can
-rely on. Subtypes must implement [`dlid`](@ref) and [`dlname`](@ref).
+rely on. Subtypes must implement [`dlid`](@ref).
 
-A subtype promises that both values are invariant for the life of the handle. `ccall`
-and `cglobal` freeze them where the library is referenced and verify them when the
+A subtype promises that the identity is invariant for the life of the handle. `ccall`
+and `cglobal` freeze it where the library is referenced and verify it when the
 symbol is first resolved, so a subtype whose identity changes will raise an error
 rather than silently bind to the wrong library.
 """
@@ -468,22 +468,14 @@ abstract type AbstractLibrary end
 
 Return a stable identifier for `lib`, used by the compiler to identify the library
 at link time, or `nothing` if `lib` has no stable identity. See also
-[`dlname`](@ref) and [`AbstractLibrary`](@ref).
+[`AbstractLibrary`](@ref).
 """
 function dlid end
 
 """
-    dlname(lib::AbstractLibrary) -> Union{String, Nothing}
-
-Return the name the compiler should use to refer to `lib` at link time, or `nothing`
-if `lib` has no stable name. See also [`dlid`](@ref) and [`AbstractLibrary`](@ref).
-"""
-function dlname end
-
-"""
     LazyLibrary(path; flags = <default dlopen flags>,
                 dependencies = LazyLibrary[], on_load_callback = nothing,
-                name = nothing, id = nothing)
+                id = nothing)
 
 Represents a lazily-loaded shared library that delays loading itself and its dependencies
 until first use in a `ccall()`, `@ccall`, `dlopen()`, `dlsym()`, `dlpath()`, or `cglobal()`.
@@ -503,8 +495,6 @@ This is a thread-safe mechanism for on-demand library initialization.
   invoked through its type-erased pointer; if the `LazyLibrary` is serialized into a
   precompiled image, the owning module must re-arm the callback from its `__init__` via
   [`init_callable!`](@ref).
-- `name`: Optional stable name reported by [`dlname`](@ref) (typically the library's
-  soname). `nothing` (the default) means the library has no stable declared name.
 - `id`: Optional stable identity reported by [`dlid`](@ref), as a `Base.UUID` (typically
   derived from the owning package's UUID). `nothing` (the default) means the library has
   no stable declared identity.
@@ -541,14 +531,12 @@ mutable struct LazyLibrary <: AbstractLibrary
     const path::Union{String, LazyLibraryPath}
     const flags::UInt32
 
-    # Stable identity, reported via `dlid`/`dlname` and frozen at `ccall`
-    # definition sites. Purely declared, via constructor kwargs: a library
-    # with no declared identity reports `nothing` for both and opts out of
-    # the frozen-identity path. The id is stored as raw UUID bits because
-    # this file is bootstrapped before `Base.UUID` is defined; `dlid`
-    # materializes the `Base.UUID` lazily.
+    # Stable identity, reported via `dlid` and frozen at `ccall` definition
+    # sites. Purely declared, via a constructor kwarg: a library with no
+    # declared identity reports `nothing` and opts out of the frozen-identity
+    # path. Stored as raw UUID bits because this file is bootstrapped before
+    # `Base.UUID` is defined; `dlid` materializes the `Base.UUID` lazily.
     const id::Union{UInt128, Nothing}
-    const name::Union{String, Nothing}
 
     # Dependencies that must be loaded before we can load
     #
@@ -568,9 +556,7 @@ mutable struct LazyLibrary <: AbstractLibrary
     @atomic handle::Ptr{Cvoid}
     function LazyLibrary(path; flags = default_rtld_flags, dependencies = LazyLibrary[],
                          on_load_callback = nothing,
-                         name::Union{AbstractString, Nothing} = nothing,
                          id = nothing)
-        name = name === nothing ? nothing : String(name)
         # `Base.UUID` does not exist yet when this file is bootstrapped, so it
         # cannot appear in a signature annotation; accept it (or raw bits) here.
         id = id === nothing ? nothing : UInt128(id)
@@ -578,7 +564,6 @@ mutable struct LazyLibrary <: AbstractLibrary
             _normalize_lazy_path(path),
             UInt32(flags),
             id,
-            name,
             Base.OncePerProcess{Vector{LazyLibrary}}(
                 InitialDependencies{LazyLibrary}(dependencies)
             ),
@@ -620,21 +605,17 @@ function add_dependency!(ll::LazyLibrary, dep::LazyLibrary)
     end
 end
 
-# The last (usually static) element of the path is used as the library name.
-# A `LazyLibrary` built from a plain string has no stable name to offer.
 # Identity is declared at construction time and stored, so that reporting it
 # involves no recomputation (see the `LazyLibrary` constructor).
-dlname(ll::LazyLibrary) = ll.name
 function dlid(ll::LazyLibrary)
     raw = ll.id
     return raw === nothing ? nothing : Base.UUID(raw)
 end
 
 # Register `jl_libdl_dlopen_func` so that `ccall()` lowering knows
-# how to call `dlopen()`, and `dlid`/`dlname` + `AbstractLibrary` so that
+# how to call `dlopen()`, and `dlid` + `AbstractLibrary` so that
 # `ccall`/`cglobal` lowering can freeze and verify a library's identity.
 Base.unsafe_store!(cglobal(:jl_libdl_dlid_func, Any), dlid)
-Base.unsafe_store!(cglobal(:jl_libdl_dlname_func, Any), dlname)
 Base.unsafe_store!(cglobal(:jl_libdl_dlopen_func, Any), dlopen)
 Base.unsafe_store!(cglobal(:jl_abstractlibrary_type, Any), AbstractLibrary)
 

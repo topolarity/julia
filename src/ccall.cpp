@@ -56,7 +56,7 @@ GlobalVariable *jl_emit_RTLD_DEFAULT_var(Module *M)
 }
 
 typedef struct {
-    jl_value_t *gcroot[4];     // GC roots [f_name, f_lib, lib_id, lib_name]
+    jl_value_t *gcroot[3];     // GC roots [f_name, f_lib, lib_id]
 
     // Static name resolution (compile-time known)
     const char *f_name;        // static function name
@@ -67,10 +67,10 @@ typedef struct {
     jl_value_t *f_lib_expr;    // expression for library name
 
     // Frozen `AbstractLibrary` identity, present only when method.c expanded
-    // the target to a 4-tuple (fname, lib_ref, lib_id, lib_name). Both are
+    // the target to a 3-tuple (fname, lib_ref, lib_id). It is
     // non-NULL together; the runtime re-checks them at first-call time.
     jl_value_t *lib_id;        // value returned by dlid() at definition time
-    jl_value_t *lib_name;      // value returned by dlname() at definition time
+
 
     // Runtime pointer
     Value *jl_ptr;             // callable pointer expression result
@@ -236,9 +236,8 @@ static Value *runtime_sym_lookup(
             // `AbstractLibrary` target: re-check the identity frozen at
             // definition time before binding. See jl_lazy_load_and_lookup_verified.
             Value *id_val = track_pjlvalue(ctx, literal_pointer_val(ctx, symarg.lib_id));
-            Value *name_val = track_pjlvalue(ctx, literal_pointer_val(ctx, symarg.lib_name));
             llvmf = irbuilder.CreateCall(prepare_call(jllazydlsym_verified_func),
-                                         {lib_val, fname_val, id_val, name_val});
+                                         {lib_val, fname_val, id_val});
         }
         else {
             llvmf = irbuilder.CreateCall(prepare_call(jllazydlsym_func), {lib_val, fname_val});
@@ -651,7 +650,7 @@ static void interpret_foreignsymbol(jl_codectx_t &ctx, native_sym_arg_t &out, jl
     out.f_name_expr = nullptr;
     out.f_lib_expr = nullptr;
     out.lib_id = nullptr;
-    out.lib_name = nullptr;
+
     out.jl_ptr = nullptr;
     out.gcroot[0] = nullptr;
     out.gcroot[1] = nullptr;
@@ -681,9 +680,9 @@ static void interpret_foreignsymbol(jl_codectx_t &ctx, native_sym_arg_t &out, jl
                 }
              }
         }
-        else if (nargs == 2 || nargs == 4) {
+        else if (nargs == 2 || nargs == 3) {
             // Two element tuple: (func_name, lib_name)
-            // Four element tuple: (func_name, lib_ref, lib_id, lib_dlname),
+            // Three element tuple: (func_name, lib_ref, lib_id),
             // produced by abstract_library_expand in method.c when lib_ref
             // resolves to an `AbstractLibrary`.
             jl_value_t *fname_arg = jl_array_ptr_ref(tuple_args, 0);
@@ -714,11 +713,9 @@ static void interpret_foreignsymbol(jl_codectx_t &ctx, native_sym_arg_t &out, jl
                 }
             }
 
-            if (nargs == 4) {
+            if (nargs == 3) {
                 out.lib_id = jl_array_ptr_ref(tuple_args, 2);
-                out.lib_name = jl_array_ptr_ref(tuple_args, 3);
                 out.gcroot[2] = out.lib_id;
-                out.gcroot[3] = out.lib_name;
             }
         }
     }
@@ -744,31 +741,6 @@ static void interpret_foreignsymbol(jl_codectx_t &ctx, native_sym_arg_t &out, jl
     }
 }
 
-// Format the frozen `dlid()` value (a 16-byte bits struct wrapping the raw
-// UUID value, e.g. `Base.UUID`) as a canonical lowercase UUID string into
-// `buf` (size >= 37). Returns false if the value has no such shape.
-static bool frozen_dlid_to_string(jl_value_t *lib_id, char *buf) JL_NOTSAFEPOINT
-{
-    if (lib_id == NULL || lib_id == jl_nothing)
-        return false;
-    jl_datatype_t *t = (jl_datatype_t *)jl_typeof(lib_id);
-    if (!jl_is_datatype(t) || t->name->mutabl || jl_datatype_size(t) != 16)
-        return false;
-    const uint8_t *bytes = (const uint8_t *)jl_data_ptr(lib_id);
-    // The UInt128 payload is stored little-endian; the canonical string is
-    // the big-endian hex expansion with dashes in the 8-4-4-4-12 pattern.
-    static const char hexdig[] = "0123456789abcdef";
-    size_t pos = 0;
-    for (int i = 15; i >= 0; i--) {
-        buf[pos++] = hexdig[bytes[i] >> 4];
-        buf[pos++] = hexdig[bytes[i] & 0xf];
-        if (pos == 8 || pos == 13 || pos == 18 || pos == 23)
-            buf[pos++] = '-';
-    }
-    buf[pos] = '\0';
-    return true;
-}
-
 // Is this call site eligible for native linking, i.e. should it reference the
 // external symbol directly instead of resolving it lazily at runtime?
 //
@@ -784,7 +756,7 @@ static bool is_native_link_target(jl_codectx_t &ctx, const native_sym_arg_t &sym
     if (symarg.f_name == nullptr || symarg.lib_id == nullptr)
         return false;
     char buf[37];
-    if (!frozen_dlid_to_string(symarg.lib_id, buf))
+    if (!jl_frozen_dlid_to_string(symarg.lib_id, buf))
         return false;
     return jl_is_native_link_lib_id(buf);
 }
@@ -796,7 +768,7 @@ static void record_foreign_dep(jl_codectx_t &ctx, const native_sym_arg_t &symarg
     if (jl_get_foreign_deps_export_path() == nullptr)
         return;
     ctx.emission_context.foreign_deps.push_back(
-        jl_foreign_dep_t{symarg.f_name, symarg.f_lib, symarg.lib_id, symarg.lib_name,
+        jl_foreign_dep_t{symarg.f_name, symarg.f_lib, symarg.lib_id,
                          is_cglobal, native_linked});
 }
 

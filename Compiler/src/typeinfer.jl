@@ -1891,10 +1891,10 @@ end
 # collect a list of all code that is needed along with CodeInstance to codegen it fully
 # A `ccall`/`cglobal` site whose library is given by a runtime value loads
 # that library on first use: the runtime calls back into `Libdl.dlopen(lib)`
-# and, for an `AbstractLibrary`, into `Libdl.dlid(lib)`/`Libdl.dlname(lib)` to
-# verify the identity frozen at definition time — edges that are invisible in
-# the IR. Return the signatures of those calls for such a site, or `nothing`
-# if the site does not call back into Julia.
+# and, for an `AbstractLibrary`, into `Libdl.dlid(lib)` to verify the identity
+# frozen at definition time — edges that are invisible in the IR. Return the
+# signatures of those calls for such a site, or `nothing` if the site does not
+# call back into Julia.
 function foreign_atypes(@nospecialize(spec), ci::CodeInfo, sptypes::Vector{VarState})
     isexpr(spec, :tuple) || return nothing
     # 2-tuple (fname, lib) for plain runtime libraries; 3-tuple
@@ -1911,14 +1911,11 @@ function foreign_atypes(@nospecialize(spec), ci::CodeInfo, sptypes::Vector{VarSt
     dlopen_fn = unsafe_load(cglobal(:jl_libdl_dlopen_func, Any))
     atypes = Any[Tuple{typeof(dlopen_fn), libt}]
     if unsafe_load(cglobal(:jl_abstractlibrary_type, Ptr{Cvoid})) != C_NULL &&
-            unsafe_load(cglobal(:jl_libdl_dlid_func, Ptr{Cvoid})) != C_NULL &&
-            unsafe_load(cglobal(:jl_libdl_dlname_func, Ptr{Cvoid})) != C_NULL
+            unsafe_load(cglobal(:jl_libdl_dlid_func, Ptr{Cvoid})) != C_NULL
         abstractlibrary_t = unsafe_load(cglobal(:jl_abstractlibrary_type, Any))
         if libt <: abstractlibrary_t
             dlid_fn = unsafe_load(cglobal(:jl_libdl_dlid_func, Any))
-            dlname_fn = unsafe_load(cglobal(:jl_libdl_dlname_func, Any))
             push!(atypes, Tuple{typeof(dlid_fn), libt})
-            push!(atypes, Tuple{typeof(dlname_fn), libt})
         end
     end
     return atypes
@@ -1989,9 +1986,9 @@ function collectinvokes!(workqueue::CompilationQueue, ci::CodeInfo, sptypes::Vec
             atype = Tuple{t, Vararg}
         elseif isexpr(stmt, :foreigncall) || isexpr(stmt, :foreignglobal)
             # A runtime library value makes the site call back into Julia on
-            # first use (`Libdl.dlopen`, and `dlid`/`dlname` identity checks
-            # for an `AbstractLibrary`) through IR-invisible upcalls; enqueue
-            # those calls so trimmed/AOT images retain them
+            # first use (`Libdl.dlopen`, and a `dlid` identity check for an
+            # `AbstractLibrary`) through IR-invisible upcalls; enqueue those
+            # calls so trimmed/AOT images retain them
             upcalls = foreign_atypes(stmt.args[1], ci, sptypes)
             upcalls === nothing && continue
             let workqueue = invokelatest_queue

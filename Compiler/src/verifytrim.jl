@@ -419,10 +419,10 @@ function verify_codeinstance!(interp::NativeInterpreter, codeinst::CodeInstance,
             end
             if isempty(error)
                 # A runtime library value makes this site call back into Julia
-                # on first use (`Libdl.dlopen`, plus `dlid`/`dlname` identity
-                # checks for an `AbstractLibrary`); verify that each
-                # corresponding CodeInstance is covered (mirroring the
-                # `Core.finalizer` and `:cfunction` checks above)
+                # on first use (`Libdl.dlopen`, plus a `dlid` identity check
+                # for an `AbstractLibrary`); verify that each corresponding
+                # CodeInstance is covered (mirroring the `Core.finalizer` and
+                # `:cfunction` checks above)
                 upcalls = foreign_atypes(spec, codeinfo, sptypes)
                 if upcalls !== nothing
                     for upcall_atype in upcalls

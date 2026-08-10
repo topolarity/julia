@@ -419,17 +419,41 @@ private:
 
 // One record per ccall/cglobal usage site, collected during codegen so the
 // AOT pipeline can emit a foreign-dependency manifest. Strings point into
-// interned/AST-owned storage that outlives codegen; `lib_id` / `lib_name` are
-// the `AbstractLibrary` identity frozen at the call site (NULL when the target
+// interned/AST-owned storage that outlives codegen; `lib_id` is the
+// `AbstractLibrary` identity frozen at the call site (NULL when the target
 // is not an AbstractLibrary).
 struct jl_foreign_dep_t {
     const char *func;          // symbol name, NULL if dynamic
     const char *lib;           // static library string or sentinel, NULL if dynamic
     jl_value_t *lib_id;        // dlid() frozen at definition time, or NULL
-    jl_value_t *lib_name;      // dlname() frozen at definition time, or NULL
     bool is_cglobal;           // cglobal site rather than ccall
     bool native_linked;        // bound via a direct external symbol reference
 };
+
+// Format a frozen `dlid()` value (a 16-byte immutable bits struct wrapping the
+// raw UUID value, e.g. `Base.UUID`) as a canonical lowercase UUID string into
+// `buf` (size >= 37). Returns false if the value has no such shape.
+static inline bool jl_frozen_dlid_to_string(jl_value_t *lib_id, char *buf) JL_NOTSAFEPOINT
+{
+    if (lib_id == NULL || lib_id == jl_nothing)
+        return false;
+    jl_datatype_t *t = (jl_datatype_t *)jl_typeof(lib_id);
+    if (!jl_is_datatype(t) || t->name->mutabl || jl_datatype_size(t) != 16)
+        return false;
+    const uint8_t *bytes = (const uint8_t *)jl_data_ptr(lib_id);
+    // The UInt128 payload is stored little-endian; the canonical string is
+    // the big-endian hex expansion with dashes in the 8-4-4-4-12 pattern.
+    static const char hexdig[] = "0123456789abcdef";
+    size_t pos = 0;
+    for (int i = 15; i >= 0; i--) {
+        buf[pos++] = hexdig[bytes[i] >> 4];
+        buf[pos++] = hexdig[bytes[i] & 0xf];
+        if (pos == 8 || pos == 13 || pos == 18 || pos == 23)
+            buf[pos++] = '-';
+    }
+    buf[pos] = '\0';
+    return true;
+}
 
 struct jl_linker_info_t {
     DenseMap<jl_code_instance_t *, jl_codeinst_funcs_t<orc::SymbolStringPtr>> ci_funcs;

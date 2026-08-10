@@ -2167,10 +2167,10 @@ get_zstd_version() = prefix * unsafe_string(ccall((sym, libzstd), Cstring, ()))
 end
 
 # Tests for `Libdl.AbstractLibrary`: `ccall`/`cglobal` freeze a library's
-# `dlid()`/`dlname()` where the call is written and re-check them at first-call
-# time, so a subtype that violates the stable-identity contract errors instead
-# of silently binding to a different library.
-using Libdl: AbstractLibrary, LazyLibrary, LazyLibraryPath, dlid, dlname
+# `dlid()` where the call is written and re-check it at first-call time, so a
+# subtype that violates the stable-identity contract errors instead of
+# silently binding to a different library.
+using Libdl: AbstractLibrary, LazyLibrary, LazyLibraryPath, dlid
 
 # A subtype whose reported identity changes on every query — violates the
 # stable-identity contract that `AbstractLibrary` subtypes promise.
@@ -2178,8 +2178,7 @@ mutable struct ShiftyLibrary <: AbstractLibrary
     path::String
     n::Int
 end
-Libdl.dlname(l::ShiftyLibrary) = (l.n += 1; string(basename(l.path), l.n))
-Libdl.dlid(l::ShiftyLibrary) = Base.UUID(UInt128(hash(l.path)))
+Libdl.dlid(l::ShiftyLibrary) = (l.n += 1; Base.UUID(UInt128(hash((l.path, l.n)))))
 Libdl.dlopen(l::ShiftyLibrary, flags::Integer = Libdl.RTLD_LAZY; kwargs...) =
     Libdl.dlopen(l.path, flags; kwargs...)
 
@@ -2187,7 +2186,7 @@ const ccalltest_path = Libdl.dlpath(libccalltest)
 const named_ccalltest_id = Base.UUID(0x2fa1c7f0c93c48a0b4e2a5f0d6c60001)
 const named_ccalltest = LazyLibrary(LazyLibraryPath(dirname(ccalltest_path),
                                                     basename(ccalltest_path));
-                                    name=basename(ccalltest_path), id=named_ccalltest_id)
+                                    id=named_ccalltest_id)
 const shifty_ccalltest = ShiftyLibrary(ccalltest_path, 0)
 
 echo_p_named(x) = ccall((:test_echo_p, named_ccalltest), Ptr{Cvoid}, (Ptr{Cvoid},), x)
@@ -2196,16 +2195,14 @@ echo_p_shifty(x) = ccall((:test_echo_p, shifty_ccalltest), Ptr{Cvoid}, (Ptr{Cvoi
 @testset "AbstractLibrary identity" begin
     @test LazyLibrary <: AbstractLibrary
 
-    # Identity is purely declared: a LazyLibrary with no declared name/id
-    # reports `nothing` for both and opts out of the frozen-identity path
-    # rather than inventing one.
-    @test dlname(LazyLibrary(ccalltest_path)) === nothing
+    # Identity is purely declared: a LazyLibrary with no declared id reports
+    # `nothing` and opts out of the frozen-identity path rather than
+    # inventing one.
     @test dlid(LazyLibrary(ccalltest_path)) === nothing
-    @test dlname(LazyLibrary(LazyLibraryPath(dirname(ccalltest_path),
-                                             basename(ccalltest_path)))) === nothing
+    @test dlid(LazyLibrary(LazyLibraryPath(dirname(ccalltest_path),
+                                           basename(ccalltest_path)))) === nothing
 
     # A declared identity is reported back verbatim.
-    @test dlname(named_ccalltest) == basename(ccalltest_path)
     @test dlid(named_ccalltest) === named_ccalltest_id
 
     # ccall through an AbstractLibrary global resolves normally.
@@ -2230,23 +2227,20 @@ struct MyLib <: Libdl.AbstractLibrary
     id::String
 end
 Libdl.dlid(lib::MyLib) = Base.UUID(UInt128(hash(lib.id)))
-Libdl.dlname(lib::MyLib) = lib.id
 const mylib = MyLib("libtest")
 
 uses_mylib() = ccall((:my_symbol, mylib), Cint, ())
 let fptr = only(code_lowered(uses_mylib)).code[1].args[1]
     @test fptr.head === :tuple
-    @test length(fptr.args) == 4
+    @test length(fptr.args) == 3
     @test fptr.args[1] == QuoteNode(:my_symbol)
     @test fptr.args[2] == GlobalRef(@__MODULE__, :mylib)
     @test fptr.args[3] == Base.UUID(UInt128(hash("libtest")))
-    @test fptr.args[4] == "libtest"
 end
 
 # A subtype that declines to provide an identity is left unexpanded.
 struct NoIdLib <: Libdl.AbstractLibrary end
 Libdl.dlid(::NoIdLib) = nothing
-Libdl.dlname(::NoIdLib) = nothing
 const noidlib = NoIdLib()
 
 uses_noidlib() = ccall((:my_symbol, noidlib), Cint, ())
@@ -2266,7 +2260,7 @@ end
 uses_mylib_cglobal() = cglobal((:my_global, mylib))
 let fptr = only(code_lowered(uses_mylib_cglobal)).code[1].args[1]
     @test fptr.head === :tuple
-    @test length(fptr.args) == 4
+    @test length(fptr.args) == 3
 end
 end
 

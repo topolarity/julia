@@ -125,7 +125,7 @@ end
             const Libdl = Base.Libc.Libdl
             const CCALLTEST = Libdl.LazyLibrary(
                 Libdl.LazyLibraryPath($(repr(dirname(libpath))), $(repr(libfile)));
-                name=$(repr(libfile)), id=Base.UUID(0x00000000000000000000000000000042))
+                id=Base.UUID(0x00000000000000000000000000000042))
             ccall(:jl_add_native_link_lib_id, Cvoid, (Cstring,),
                   "00000000-0000-0000-0000-000000000042")
             ccall(:jl_set_foreign_deps_export_path, Cvoid, (Cstring,), $(repr(manifest)))
@@ -139,8 +139,8 @@ end
 
         json = read(manifest, String)
         # The registered library's symbol is bound natively, and is filed under
-        # the library's `dlname` rather than a sentinel.
-        @test occursin(libfile, json)
+        # the library's frozen dlid rather than a sentinel.
+        @test occursin("00000000-0000-0000-0000-000000000042", json)
         @test occursin("{\"symbol\": \"test_echo_p\", \"kind\": \"ccall\", \"linkage\": \"native\"}", json)
         # Libraries that were not registered keep the lazy lookup, so the policy
         # is what flips the decision rather than the AOT path itself.

@@ -74,12 +74,12 @@ JL_DLLEXPORT void jl_scan_method_source_now(jl_method_t *m, jl_value_t *src) JL_
 }
 
 // If e's first arg is a 2-tuple `(fname, lib_ref)` whose `lib_ref` resolves
-// to an `AbstractLibrary`, expand it to a 4-tuple
-// `(fname, lib_ref, lib_id, lib_name)` so that codegen can freeze the
-// library's identity and verify it at first-call time. Quiet no-op if the
-// lib doesn't resolve to an `AbstractLibrary`, if Libdl isn't loaded yet
-// (the type/dispatch globals are NULL during bootstrap), or if dlid/dlname
-// return `nothing`.
+// to an `AbstractLibrary`, expand it to a 3-tuple
+// `(fname, lib_ref, lib_id)` so that codegen can freeze the library's
+// identity and verify it at first-call time. Quiet no-op if the lib doesn't
+// resolve to an `AbstractLibrary`, if Libdl isn't loaded yet (the
+// type/dispatch globals are NULL during bootstrap), or if dlid returns
+// `nothing`.
 static void abstract_library_expand(jl_expr_t *e, jl_module_t *module,
                                     jl_svec_t *sparam_vals,
                                     const char *kind) JL_CANSAFEPOINT
@@ -90,14 +90,13 @@ static void abstract_library_expand(jl_expr_t *e, jl_module_t *module,
     jl_expr_t *tuple_expr = (jl_expr_t*)fptr;
     size_t nargs_tuple = jl_expr_nargs(tuple_expr);
     if (nargs_tuple != 2 || jl_abstractlibrary_type == NULL ||
-            jl_libdl_dlid_func == NULL || jl_libdl_dlname_func == NULL)
+            jl_libdl_dlid_func == NULL)
         return;
     jl_task_t *ct = jl_current_task;
     jl_value_t *lib_arg = jl_exprarg(tuple_expr, 1);
     jl_value_t *lib_val = NULL;
     jl_value_t *lib_id = NULL;
-    jl_value_t *lib_name = NULL;
-    JL_GC_PUSH3(&lib_val, &lib_id, &lib_name);
+    JL_GC_PUSH2(&lib_val, &lib_id);
     if (jl_is_globalref(lib_arg)) {
         JL_TRY {
             lib_val = jl_interpret_toplevel_expr_in(module, lib_arg, NULL, sparam_vals);
@@ -109,21 +108,18 @@ static void abstract_library_expand(jl_expr_t *e, jl_module_t *module,
     if (lib_val != NULL && jl_isa(lib_val, jl_abstractlibrary_type)) {
         JL_TRY {
             lib_id = jl_apply_generic(jl_libdl_dlid_func, &lib_val, 1);
-            lib_name = jl_apply_generic(jl_libdl_dlname_func, &lib_val, 1);
         }
         JL_CATCH {
             if (jl_typetagis(jl_current_exception(ct), jl_errorexception_type))
-                jl_errorf("could not evaluate dlid() or dlname() for %s library", kind);
+                jl_errorf("could not evaluate dlid() for %s library", kind);
             else
                 jl_rethrow();
         }
-        if (lib_id != NULL && lib_id != jl_nothing &&
-                lib_name != NULL && lib_name != jl_nothing) {
-            jl_expr_t *new_tuple = jl_exprn(jl_tuple_sym, 4);
+        if (lib_id != NULL && lib_id != jl_nothing) {
+            jl_expr_t *new_tuple = jl_exprn(jl_tuple_sym, 3);
             jl_exprargset(new_tuple, 0, jl_exprarg(tuple_expr, 0));
             jl_exprargset(new_tuple, 1, lib_arg);
             jl_exprargset(new_tuple, 2, lib_id);
-            jl_exprargset(new_tuple, 3, lib_name);
             jl_exprargset(e, 0, (jl_value_t*)new_tuple);
         }
     }

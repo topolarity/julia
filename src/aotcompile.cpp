@@ -895,47 +895,16 @@ static void emit_json_string(raw_ostream &os, const char *str)
     os << '"';
 }
 
-// Render a frozen identity value for the manifest. `dlid` returns an opaque
-// user-chosen value (a `Base.UUID` for `LazyLibrary`), so fall back to the
-// standard value printer for anything that isn't a plain string/symbol.
-static std::string format_jl_value(jl_value_t *v)
-{
-    if (v == NULL || v == jl_nothing)
-        return "<unknown>";
-    if (jl_is_string(v))
-        return std::string(jl_string_data(v), jl_string_len(v));
-    if (jl_is_symbol(v))
-        return std::string(jl_symbol_name((jl_sym_t*)v));
-    // Prefer the value's own `string` rendering (a `Base.UUID` prints in its
-    // canonical form, which is what a build tool wants to read), falling back
-    // to the raw value printer if that errors for a user-defined type.
-    jl_value_t *str = NULL;
-    JL_TRY {
-        jl_value_t *strfn = jl_get_global(jl_base_module, jl_symbol("string"));
-        if (strfn != NULL)
-            str = jl_call1(strfn, v);
-    }
-    JL_CATCH {
-        str = NULL;
-    }
-    if (str != NULL && jl_is_string(str))
-        return std::string(jl_string_data(str), jl_string_len(str));
-    ios_t buf;
-    ios_mem(&buf, 64);
-    JL_STREAM *s = (JL_STREAM*)&buf;
-    jl_static_show(s, v);
-    std::string out(buf.buf, buf.size);
-    ios_close(&buf);
-    return out;
-}
-
-// Human-readable key for the library a site refers to. Sites whose library
-// isn't statically known get a sentinel rather than being dropped, so the
-// manifest is a complete account of what the image may need at runtime.
+// Key for the library a site refers to: the frozen dlid for AbstractLibrary
+// targets (names are record data, not identity), the library string for
+// plain-named targets. Sites whose library isn't statically known get a
+// sentinel rather than being dropped, so the manifest is a complete account
+// of what the image may need at runtime.
 static std::string foreign_dep_lib_key(const jl_foreign_dep_t &dep)
 {
-    if (dep.lib_name != nullptr && jl_is_string(dep.lib_name))
-        return std::string(jl_string_data(dep.lib_name));
+    char uuid_buf[37];
+    if (jl_frozen_dlid_to_string(dep.lib_id, uuid_buf))
+        return std::string(uuid_buf);
     if (dep.lib == nullptr)
         return "<rtld-default>";
     if ((intptr_t)dep.lib == (intptr_t)JL_EXE_LIBNAME)
@@ -973,16 +942,8 @@ static void aot_export_foreign_deps(jl_codegen_output_t &out, const char *path)
         os << "    ";
         emit_json_string(os, lib.c_str());
         os << ": {\n";
-        // library_id is present only for AbstractLibrary targets, where the
-        // identity was frozen at the call site.
-        const jl_foreign_dep_t *with_id = nullptr;
-        for (auto *dep : deps)
-            if (dep->lib_id != nullptr) { with_id = dep; break; }
-        if (with_id) {
-            os << "      \"library_id\": ";
-            emit_json_string(os, format_jl_value(with_id->lib_id).c_str());
-            os << ",\n";
-        }
+        // AbstractLibrary targets are keyed by their frozen dlid (a canonical
+        // UUID string); other targets by their library string or a sentinel.
         os << "      \"symbols\": [\n";
         // One entry per distinct (symbol, kind, linkage); a symbol referenced
         // from many call sites is a single dependency.

@@ -20,7 +20,6 @@
 
 // --- library symbol lookup ---
 jl_value_t *jl_libdl_dlid_func JL_GLOBALLY_ROOTED;
-jl_value_t *jl_libdl_dlname_func JL_GLOBALLY_ROOTED;
 jl_value_t *jl_libdl_dlopen_func JL_GLOBALLY_ROOTED;
 jl_value_t *jl_abstractlibrary_type JL_GLOBALLY_ROOTED; // TODO: move to be handled like other types
                                                         //       (maybe just move to Core)
@@ -156,24 +155,21 @@ JL_DLLEXPORT
 // Verify that an `AbstractLibrary` still reports the identity that was frozen
 // where the ccall/cglobal was written, then resolve the symbol as usual.
 //
-// Subtypes of `AbstractLibrary` opt into a stable-identity contract: dlid() and
-// dlname() must be invariant for the life of the handle. Enforce it here, at
+// Subtypes of `AbstractLibrary` opt into a stable-identity contract: dlid()
+// must be invariant for the life of the handle. Enforce it here, at
 // first-call time, so a violation is a clear error instead of a silent bind to
 // whatever the library resolves to now.
 JL_DLLEXPORT void *jl_lazy_load_and_lookup_verified(jl_value_t *lib_val, jl_value_t *f_name,
-                                                    jl_value_t *expected_id,
-                                                    jl_value_t *expected_name)
+                                                    jl_value_t *expected_id)
 {
-    if (jl_libdl_dlid_func == NULL || jl_libdl_dlname_func == NULL)
+    if (jl_libdl_dlid_func == NULL)
         jl_error("AbstractLibrary identity check requires Libdl to be loaded");
     jl_value_t *actual_id = NULL;
-    jl_value_t *actual_name = NULL;
-    JL_GC_PUSH2(&actual_id, &actual_name);
+    JL_GC_PUSH1(&actual_id);
     actual_id = jl_apply_generic(jl_libdl_dlid_func, &lib_val, 1);
-    actual_name = jl_apply_generic(jl_libdl_dlname_func, &lib_val, 1);
-    if (!jl_egal(actual_id, expected_id) || !jl_egal(actual_name, expected_name))
+    if (!jl_egal(actual_id, expected_id))
         jl_errorf("ccall: AbstractLibrary identity changed since definition "
-                  "(dlid()/dlname() must be stable for AbstractLibrary subtypes)");
+                  "(dlid() must be stable for AbstractLibrary subtypes)");
     JL_GC_POP();
     return jl_lazy_load_and_lookup(lib_val, f_name);
 }

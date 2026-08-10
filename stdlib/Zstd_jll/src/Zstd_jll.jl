@@ -31,7 +31,6 @@ const libzstd_soname = if Sys.iswindows()
     end
 const libzstd = LazyLibrary(
     BundledLazyLibraryPath(libzstd_soname);
-    name = libzstd_soname,
     # uuid5(<package uuid>, "libzstd")
     id = Base.UUID("830bb508-92bf-563c-9e87-0715fe87ef92"),
     dependencies = if Sys.iswindows() && Sys.WORD_SIZE == 32

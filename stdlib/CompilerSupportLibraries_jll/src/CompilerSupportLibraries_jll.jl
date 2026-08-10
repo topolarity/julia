@@ -28,7 +28,6 @@ const libatomic_soname = if Sys.iswindows()
     end
 const libatomic = LazyLibrary(
     BundledLazyLibraryPath(libatomic_soname);
-    name = libatomic_soname,
     # uuid5(<package uuid>, "libatomic")
     id = Base.UUID("6f70f1a7-e2d5-53ff-bc33-5d3858c96401")
 )
@@ -46,7 +45,6 @@ if Sys.iswindows() || Sys.isapple() || arch(HostPlatform()) ∈ ("x86_64", "i686
         end
     const libquadmath = LazyLibrary(
         BundledLazyLibraryPath(libquadmath_soname);
-        name = libquadmath_soname,
         # uuid5(<package uuid>, "libquadmath")
         id = Base.UUID("4869bb1d-141f-5a01-b337-3d1435fc1f98"),
     )
@@ -72,7 +70,6 @@ const libgcc_s_soname = if Sys.iswindows()
     end
 const libgcc_s = LazyLibrary(
     BundledLazyLibraryPath(libgcc_s_soname);
-    name = libgcc_s_soname,
     # uuid5(<package uuid>, "libgcc_s")
     id = Base.UUID("1cd7433b-ee8f-572a-8a86-1137cb3f5ada")
 )
@@ -89,7 +86,6 @@ const libgfortran_soname = if Sys.iswindows()
     end
 const libgfortran = LazyLibrary(
     BundledLazyLibraryPath(libgfortran_soname);
-    name = libgfortran_soname,
     # uuid5(<package uuid>, "libgfortran")
     id = Base.UUID("77be8d79-76da-57e6-8c3e-8eb4c9c4a43c"),
     dependencies = @static if @isdefined(libquadmath)
@@ -111,7 +107,6 @@ const libstdcxx_soname = if Sys.iswindows()
     end
 const libstdcxx = LazyLibrary(
     BundledLazyLibraryPath(libstdcxx_soname);
-    name = libstdcxx_soname,
     # uuid5(<package uuid>, "libstdcxx")
     id = Base.UUID("2afcce28-1804-53d7-8eaf-15b85720ac97"),
     dependencies = LazyLibrary[libgcc_s]
@@ -129,7 +124,6 @@ const libgomp_soname = if Sys.iswindows()
     end
 const libgomp = LazyLibrary(
     BundledLazyLibraryPath(libgomp_soname);
-    name = libgomp_soname,
     # uuid5(<package uuid>, "libgomp")
     id = Base.UUID("d86a9a2a-2317-558f-a0a8-6a2b7a7addd4"),
     dependencies = if Sys.iswindows()
@@ -153,7 +147,6 @@ let
             global libssp_path::String = ""
             # uuid5(<package uuid>, "libssp")
             @eval const libssp = LazyLibrary(BundledLazyLibraryPath($(_libssp_soname));
-                                             name = $(_libssp_soname),
                                              id = Base.UUID("558536fb-6a72-5deb-a2f9-856b91bb76ef"))
         end
     end

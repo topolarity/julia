@@ -31,7 +31,6 @@ const libopenblas_soname = if Sys.iswindows()
     end
 const libopenblas = LazyLibrary(
     BundledLazyLibraryPath(libopenblas_soname);
-    name = libopenblas_soname,
     # uuid5(<package uuid>, "libopenblas")
     id = Base.UUID("664a9972-5d51-55af-9726-f9a39fb00bc7"),
     dependencies = if Sys.iswindows()
