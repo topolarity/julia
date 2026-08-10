@@ -1,7 +1,7 @@
 # This file is a part of Julia. License is MIT: https://julialang.org/license
 
 import ..Compiler: verify_typeinf_trim, NativeInterpreter, argtypes_to_type,
-    compileable_specialization_for_call, foreign_dlopen_atype
+    compileable_specialization_for_call, foreign_atypes
 
 using ..Compiler:
      # operators
@@ -418,20 +418,24 @@ function verify_codeinstance!(interp::NativeInterpreter, codeinst::CodeInstance,
                 end
             end
             if isempty(error)
-                # A runtime library value makes this site call back into
-                # `Libdl.dlopen(lib)` on first use; verify that the
+                # A runtime library value makes this site call back into Julia
+                # on first use (`Libdl.dlopen`, plus `dlid`/`dlname` identity
+                # checks for an `AbstractLibrary`); verify that each
                 # corresponding CodeInstance is covered (mirroring the
                 # `Core.finalizer` and `:cfunction` checks above)
-                atype = foreign_dlopen_atype(spec, codeinfo, sptypes)
-                if atype !== nothing
-                    covered = false
-                    mi = compileable_specialization_for_call(interp, atype)
-                    if mi !== nothing
-                        ci = get(caches, mi, nothing)
-                        covered = ci isa CodeInstance
-                    end
-                    if !covered
-                        error = "unresolved dlopen for ccall / cglobal"
+                upcalls = foreign_atypes(spec, codeinfo, sptypes)
+                if upcalls !== nothing
+                    for upcall_atype in upcalls
+                        covered = false
+                        mi = compileable_specialization_for_call(interp, upcall_atype)
+                        if mi !== nothing
+                            ci = get(caches, mi, nothing)
+                            covered = ci isa CodeInstance
+                        end
+                        if !covered
+                            error = "unresolved dlopen for ccall / cglobal"
+                            break
+                        end
                     end
                 end
             end

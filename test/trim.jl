@@ -124,7 +124,8 @@ end
         write(script, """
             const Libdl = Base.Libc.Libdl
             const CCALLTEST = Libdl.LazyLibrary(
-                Libdl.LazyLibraryPath($(repr(dirname(libpath))), $(repr(libfile))))
+                Libdl.LazyLibraryPath($(repr(dirname(libpath))), $(repr(libfile)));
+                name=$(repr(libfile)), id=Base.UUID(0x00000000000000000000000000000042))
             ccall(:jl_add_native_link_lib, Cvoid, (Cstring,), $(repr(libfile)))
             ccall(:jl_set_foreign_deps_export_path, Cvoid, (Cstring,), $(repr(manifest)))
             native_echo() = ccall((:test_echo_p, CCALLTEST), Ptr{Cvoid}, (Ptr{Cvoid},), C_NULL)

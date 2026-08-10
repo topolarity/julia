@@ -2184,8 +2184,10 @@ Libdl.dlopen(l::ShiftyLibrary, flags::Integer = Libdl.RTLD_LAZY; kwargs...) =
     Libdl.dlopen(l.path, flags; kwargs...)
 
 const ccalltest_path = Libdl.dlpath(libccalltest)
+const named_ccalltest_id = Base.UUID(0x2fa1c7f0c93c48a0b4e2a5f0d6c60001)
 const named_ccalltest = LazyLibrary(LazyLibraryPath(dirname(ccalltest_path),
-                                                    basename(ccalltest_path)))
+                                                    basename(ccalltest_path));
+                                    name=basename(ccalltest_path), id=named_ccalltest_id)
 const shifty_ccalltest = ShiftyLibrary(ccalltest_path, 0)
 
 echo_p_named(x) = ccall((:test_echo_p, named_ccalltest), Ptr{Cvoid}, (Ptr{Cvoid},), x)
@@ -2194,16 +2196,17 @@ echo_p_shifty(x) = ccall((:test_echo_p, shifty_ccalltest), Ptr{Cvoid}, (Ptr{Cvoi
 @testset "AbstractLibrary identity" begin
     @test LazyLibrary <: AbstractLibrary
 
-    # A LazyLibrary built from a plain string has no stable name, so it opts
-    # out of the frozen-identity path rather than inventing one.
+    # Identity is purely declared: a LazyLibrary with no declared name/id
+    # reports `nothing` for both and opts out of the frozen-identity path
+    # rather than inventing one.
     @test dlname(LazyLibrary(ccalltest_path)) === nothing
+    @test dlid(LazyLibrary(ccalltest_path)) === nothing
+    @test dlname(LazyLibrary(LazyLibraryPath(dirname(ccalltest_path),
+                                             basename(ccalltest_path)))) === nothing
 
-    # One built from a LazyLibraryPath reports its last path piece, and the
-    # id is a pure function of that name (stable across distinct handles).
+    # A declared identity is reported back verbatim.
     @test dlname(named_ccalltest) == basename(ccalltest_path)
-    @test dlid(named_ccalltest) isa Base.UUID
-    @test dlid(named_ccalltest) == dlid(LazyLibrary(LazyLibraryPath(
-        dirname(ccalltest_path), basename(ccalltest_path))))
+    @test dlid(named_ccalltest) === named_ccalltest_id
 
     # ccall through an AbstractLibrary global resolves normally.
     p = Ptr{Cvoid}(UInt(0xdeadbeef))
