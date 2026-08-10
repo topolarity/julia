@@ -421,6 +421,43 @@ static jl_code_instance_t *jl_method_inferred_with_abi(jl_method_instance_t *mi 
     return NULL;
 }
 
+// A bootstrapping fallback may create an uninferred CodeInstance while the
+// runtime inference hook is unavailable. Such a CI has no opportunity to run
+// the compiler's interface query, but it nevertheless enforces the complete
+// interface set when that set is empty throughout the CI's validity interval.
+// Serialize the negative query with interface activation so a later insertion
+// either observes the positive bit and invalidates the CI or happens before
+// the query and contributes to its result.
+static void mark_interfaces_enforced_if_empty(
+        jl_code_instance_t *codeinst, size_t world) JL_CANSAFEPOINT
+{
+    if (jl_atomic_load_relaxed(&codeinst->flags) &
+            JL_CI_FLAGS_INTERFACES_ENFORCED)
+        return;
+
+    jl_value_t *matches = NULL;
+    JL_GC_PUSH1(&matches);
+    JL_LOCK(&world_counter_lock);
+    if (!(jl_atomic_load_relaxed(&codeinst->flags) &
+            JL_CI_FLAGS_INTERFACES_ENFORCED)) {
+        size_t min_valid = 0;
+        size_t max_valid = ~(size_t)0;
+        jl_method_instance_t *mi = jl_get_ci_mi(codeinst);
+        matches = jl_matching_interfaces_raw(
+            (jl_tupletype_t*)mi->specTypes, world, &min_valid, &max_valid);
+        if (matches != jl_nothing && jl_is_array(matches) &&
+                jl_array_nrows((jl_array_t*)matches) == 0) {
+            size_t min_world = jl_atomic_load_relaxed(&codeinst->min_world);
+            size_t max_world = jl_atomic_load_relaxed(&codeinst->max_world);
+            if (min_valid <= min_world && max_world <= max_valid)
+                jl_atomic_fetch_or_relaxed(
+                    &codeinst->flags, JL_CI_FLAGS_INTERFACES_ENFORCED);
+        }
+    }
+    JL_UNLOCK(&world_counter_lock);
+    JL_GC_POP();
+}
+
 // run type inference on lambda "mi" for given argument types.
 // returns the inferred source, and may cache the result in mi
 // if successful, also updates the mi argument to describe the validity of this src
@@ -651,6 +688,8 @@ JL_DLLEXPORT int jl_is_ci_equiv(jl_code_instance_t *ci JL_PROPAGATES_ROOT, jl_co
     if ((!jl_atomic_load_relaxed(&codeinst->inferred)) == (!jl_atomic_load_relaxed(&ci->inferred)) &&
         jl_egal(codeinst->def, def) &&
         jl_egal(codeinst->owner, owner) &&
+        !((jl_atomic_load_relaxed(&codeinst->flags) ^
+           jl_atomic_load_relaxed(&ci->flags)) & JL_CI_FLAGS_INTERFACES_ENFORCED) &&
         jl_egal(codeinst->rettype, rettype)) {
         if (!target_world || jl_atomic_load_relaxed(&codeinst->invoke) != NULL) {
             size_t min_world = jl_atomic_load_relaxed(&ci->min_world);
@@ -720,7 +759,8 @@ JL_DLLEXPORT jl_code_instance_t *jl_new_codeinst(
     codeinst->time_infer_total = 0;
     codeinst->time_infer_self = 0;
     jl_atomic_store_relaxed(&codeinst->time_compile, 0);
-    jl_atomic_store_relaxed(&codeinst->flags, 0);
+    jl_atomic_store_relaxed(&codeinst->flags,
+        const_flags & JL_CI_FLAGS_INTERFACES_ENFORCED);
     jl_atomic_store_relaxed(&codeinst->next, NULL);
     jl_atomic_store_relaxed(&codeinst->ipo_purity_bits, effects);
     codeinst->analysis_results = analysis_results;
@@ -755,6 +795,10 @@ JL_DLLEXPORT void jl_fill_codeinst(
     jl_atomic_store_relaxed(&codeinst->ipo_purity_bits, effects);
     jl_gc_write_atomic(codeinst, codeinst->debuginfo, jl_debuginfo_t, di, relaxed);
     jl_gc_write_atomic(codeinst, codeinst->edges, jl_svec_t, edges, relaxed);
+    if (const_flags & JL_CI_FLAGS_INTERFACES_ENFORCED)
+        jl_atomic_fetch_or_relaxed(&codeinst->flags, JL_CI_FLAGS_INTERFACES_ENFORCED);
+    else
+        jl_atomic_fetch_and_relaxed(&codeinst->flags, ~JL_CI_FLAGS_INTERFACES_ENFORCED);
     if ((const_flags & 1) != 0) {
         // TODO: may want to follow ordering restrictions here (see jitlayers.cpp)
         assert(const_flags & 2);
@@ -776,12 +820,15 @@ JL_DLLEXPORT jl_code_instance_t *jl_new_codeinst_uninit(jl_method_instance_t *mi
 
 JL_DLLEXPORT jl_code_instance_t *jl_new_codeinst_for_edge(
         jl_method_instance_t *mi, jl_value_t *owner,
-        size_t min_world, size_t max_world, jl_svec_t *edges)
+        size_t min_world, size_t max_world, jl_svec_t *edges,
+        uint8_t semantic_flags)
 {
+    assert((semantic_flags & ~JL_CI_FLAGS_INTERFACES_ENFORCED) == 0);
     jl_code_instance_t *codeinst = jl_new_codeinst(
         mi, owner, (jl_value_t*)jl_any_type, (jl_value_t*)jl_any_type,
         NULL, NULL, 0, min_world, max_world, 0, jl_nothing, NULL, edges);
-    jl_atomic_store_relaxed(&codeinst->flags, JL_CI_FLAGS_EDGE_ONLY);
+    jl_atomic_store_relaxed(&codeinst->flags,
+        semantic_flags | JL_CI_FLAGS_EDGE_ONLY);
     return codeinst;
 }
 
@@ -2542,6 +2589,8 @@ JL_DLLEXPORT jl_value_t *jl_debug_method_invalidation(int state) JL_CANSAFEPOINT
 }
 
 static void _invalidate_backedges(jl_method_instance_t *replaced_mi, jl_code_instance_t *replaced_ci, size_t max_world, int depth) JL_CANSAFEPOINT;
+static void invalidate_interface_dependents(
+    jl_value_t *interface_sig, size_t query_world, size_t max_world) JL_CANSAFEPOINT;
 
 // recursively invalidate cached methods that had an edge to a replaced method
 static void invalidate_code_instance(jl_code_instance_t *replaced, size_t max_world, int depth) JL_CANSAFEPOINT
@@ -3122,6 +3171,8 @@ JL_DLLEXPORT void jl_method_table_disable(jl_method_t *method) JL_CANSAFEPOINT
         jl_atomic_store_relaxed(&method->dispatch_status, 0);
         assert(jl_atomic_load_relaxed(&methodentry->max_world) == ~(size_t)0);
         jl_atomic_store_relaxed(&methodentry->max_world, world);
+        if (mt == jl_interface_table)
+            invalidate_interface_dependents(method->sig, world, world);
         jl_method_table_invalidate(method, world);
         jl_atomic_store_release(&jl_world_counter, world + 1);
     }
@@ -3219,6 +3270,70 @@ static void record_interface_interferences(jl_method_t *method, size_t world)
     JL_GC_POP();
 }
 
+static void invalidate_interface_method_instance(
+    jl_method_instance_t *mi, jl_value_t *interface_sig, size_t max_world) JL_CANSAFEPOINT
+{
+    jl_value_t *isect = NULL;
+    jl_value_t *isect2 = NULL;
+    JL_GC_PUSH2(&isect, &isect2);
+    int intersects = jl_type_intersection2(
+        mi->specTypes, interface_sig, &isect, &isect2);
+    JL_GC_POP();
+    if (!intersects)
+        return;
+
+    // Only a CodeInstance with the positive enforcement guarantee embeds the
+    // current complete interface set. This deliberately continues through the
+    // terminal edge-only partition: adopted const-prop dependencies use those
+    // entries to propagate invalidation to their callers. Open CodeInstances
+    // query dynamically and remain valid as additional interfaces are introduced.
+    jl_code_instance_t *ci = jl_atomic_load_relaxed(&mi->cache);
+    while (ci) {
+        jl_code_instance_t *next = jl_atomic_load_relaxed(&ci->next);
+        if ((jl_atomic_load_relaxed(&ci->flags) & JL_CI_FLAGS_INTERFACES_ENFORCED) &&
+            jl_atomic_load_relaxed(&ci->max_world) == ~(size_t)0)
+            invalidate_code_instance(ci, max_world, 1);
+        ci = next;
+    }
+}
+
+static void invalidate_interface_dependents(
+    jl_value_t *interface_sig, size_t query_world, size_t max_world) JL_CANSAFEPOINT
+{
+    jl_value_t *matches = get_all_intersect_matches(
+        jl_atomic_load_relaxed(&jl_method_table->defs), interface_sig, query_world);
+    if (matches == NULL)
+        return;
+
+    jl_value_t *specializations = NULL;
+    JL_GC_PUSH2(&matches, &specializations);
+    size_t n = jl_array_nrows((jl_array_t*)matches);
+    for (size_t i = 0; i < n; i++) {
+        jl_method_t *method = (jl_method_t*)jl_array_ptr_ref((jl_array_t*)matches, i);
+        specializations = jl_atomic_load_relaxed(&method->specializations);
+        if (jl_is_svec(specializations)) {
+            size_t nspecializations = jl_svec_len(specializations);
+            for (size_t j = 0; j < nspecializations; j++) {
+                jl_method_instance_t *mi =
+                    (jl_method_instance_t*)jl_svecref(specializations, j);
+                if ((jl_value_t*)mi != jl_nothing)
+                    invalidate_interface_method_instance(mi, interface_sig, max_world);
+            }
+        }
+        else if (specializations != jl_nothing) {
+            invalidate_interface_method_instance(
+                (jl_method_instance_t*)specializations, interface_sig, max_world);
+        }
+        jl_method_instance_t *unspecialized =
+            jl_atomic_load_relaxed(&method->unspecialized);
+        if (unspecialized)
+            invalidate_interface_method_instance(
+                unspecialized, interface_sig, max_world);
+        specializations = NULL;
+    }
+    JL_GC_POP();
+}
+
 static void jl_interface_table_activate(jl_typemap_entry_t *newentry)
 {
     jl_method_t *method = newentry->func.method;
@@ -3231,6 +3346,7 @@ static void jl_interface_table_activate(jl_typemap_entry_t *newentry)
     // that activation world so the later member of a same-image cross-table
     // pair sees the earlier member and records both directional entries.
     record_interface_interferences(method, world);
+    invalidate_interface_dependents(method->sig, world, world - 1);
     jl_atomic_store_relaxed(&newentry->max_world, ~(size_t)0);
 }
 // Check if m2 is in m1's interferences set, which means !morespecific(m1, m2)
@@ -4387,6 +4503,7 @@ static jl_code_instance_t *jl_compile_method_very_internal(jl_method_instance_t 
             }
         }
     }
+    mark_interfaces_enforced_if_empty(codeinst, world);
     promote_cache_method(F, args, nargs, world, mi2, mi == mi2 ? mi->specTypes : normalize_to_cacheable_sig(mi), cause);
     jl_typeinf_timing_end(inference_start, is_recompile);
     return codeinst;
@@ -4818,30 +4935,95 @@ static void JL_NORETURN jl_throw_return_type_error(
     // not reached
 }
 
-// After a dynamic dispatch returns, check the value against every interface
-// method whose signature overlaps the call. Each match contributes its own
-// `rt` (after sparam substitution) as an independent `isa` assertion --
-// interfaces apply cumulatively, with no specificity/interference sorting.
-// On the first failure we throw a ReturnTypeError naming the offending
-// interface method.
-//
-// `tt` may be passed in from the dispatch lookup to avoid rebuilding the
-// call's argtuple; if NULL we build it lazily here. The whole pass is gated
-// on `jl_interface_table->defs` so programs without any interface methods
-// declared so far pay only an atomic load.
-STATIC_INLINE jl_value_t *apply_interface_assertions(
-    jl_value_t *F, jl_value_t **args, uint32_t nargs,
-    jl_tupletype_t *tt, jl_value_t *res, size_t world) JL_CANSAFEPOINT
+// Interface return expressions are evaluated at declaration time and stored
+// as type templates. A template may still read a signature TypeVar whose
+// match-time static-parameter slot is undefined. This is the same condition
+// under which reading `Expr(:static_parameter, i)` in an ordinary method
+// raises UndefVarError.
+static jl_tvar_t *interface_undefined_static_parameter(
+    jl_method_t *method, jl_svec_t *sparams) JL_NOTSAFEPOINT
 {
-    if (jl_atomic_load_relaxed(&jl_interface_table->defs) == jl_nothing)
+    jl_value_t *sig = method->sig;
+    size_t n = jl_svec_len(sparams);
+    for (size_t i = 0; i < n; i++) {
+        assert(jl_is_unionall(sig));
+        jl_tvar_t *var = ((jl_unionall_t*)sig)->var;
+        if (jl_has_typevar(method->rt, var) &&
+            jl_sparam_defined_value(jl_svecref(sparams, i)) == NULL)
+            return var;
+        sig = ((jl_unionall_t*)sig)->body;
+    }
+    return NULL;
+}
+
+static jl_value_t *interface_rettype_for_match(
+    jl_method_t *method, jl_svec_t *sparams) JL_CANSAFEPOINT
+{
+    jl_value_t *rettype = method->rt;
+    if (!jl_has_free_typevars(rettype))
+        return rettype;
+    if (interface_undefined_static_parameter(method, sparams))
+        return jl_nothing;
+
+    size_t n = jl_svec_len(sparams);
+    jl_value_t **env = (jl_value_t**)alloca(n * sizeof(jl_value_t*));
+    for (size_t i = 0; i < n; i++) {
+        jl_value_t *sp = jl_svecref(sparams, i);
+        jl_value_t *defined = jl_sparam_defined_value(sp);
+        env[i] = defined ? defined : sp;
+    }
+    return jl_instantiate_type_in_env(
+        rettype, (jl_unionall_t*)method->sig, env);
+}
+
+// Compiler-inserted assertion for a CodeInstance that enforces its complete
+// interface contract set. `atype` is the exact dispatch tuple of the
+// CodeInstance, including the function type as its first parameter.
+JL_CALLABLE(jl_f_interfaceassert)
+{
+    JL_NARGS(_interface_assert, 4, 4);
+    jl_value_t *res = args[0];
+    jl_value_t *expected = args[1];
+    JL_TYPECHK(_interface_assert, type, expected);
+    JL_TYPECHK(_interface_assert, method, args[2]);
+    JL_TYPECHK(_interface_assert, datatype, args[3]);
+    if (jl_isa(res, expected))
         return res;
 
+    jl_method_t *interface_method = (jl_method_t*)args[2];
+    jl_datatype_t *atype = (jl_datatype_t*)args[3];
+    if (!jl_is_tuple_type(atype) || jl_nparams(atype) == 0)
+        jl_error("_interface_assert: argument type must be a nonempty tuple type");
+
+    jl_value_t *argtypes = NULL;
+    JL_GC_PUSH2(&res, &argtypes);
+    jl_svec_t *parameters = atype->parameters;
+    size_t nparams = jl_svec_len(parameters);
+    jl_value_t *callee_type = jl_svecref(parameters, 0);
+    argtypes = jl_apply_tuple_type_v(jl_svec_data(parameters) + 1, nparams - 1);
+    jl_throw_return_type_error(callee_type, argtypes, expected, res,
+        interface_method, jl_current_task->world_age);
+    JL_GC_POP(); // not reached
+}
+
+// Resolve every applicable interface type template before entering the
+// callee, matching the evaluation order of an ordinary return annotation.
+// The whole pass is gated on `jl_interface_table->defs` so programs without
+// any interface methods declared so far pay only an atomic load.
+static jl_value_t *prepare_interface_assertions(
+    jl_code_instance_t *codeinst, jl_value_t *F, jl_value_t **args,
+    uint32_t nargs, jl_tupletype_t *tt, size_t world) JL_CANSAFEPOINT
+{
+    if (codeinst && (jl_atomic_load_acquire(&codeinst->flags) &
+                     JL_CI_FLAGS_INTERFACES_ENFORCED))
+        return jl_nothing;
+    if (jl_atomic_load_relaxed(&jl_interface_table->defs) == jl_nothing)
+        return jl_nothing;
+
     jl_value_t *matches = NULL;
-    jl_value_t *rt = NULL;
-    jl_value_t *args_tup = NULL;
-    JL_GC_PUSH5(&res, &tt, &matches, &rt, &args_tup);
+    JL_GC_PUSH2(&tt, &matches);
     if (tt == NULL)
-        tt = arg_type_tuple(F, args, nargs);
+        tt = arg_type_tuple(F, args, nargs + 1);
 
     size_t min_valid = 0, max_valid = ~(size_t)0;
     matches = jl_matching_interfaces_raw(tt, world, &min_valid, &max_valid);
@@ -4852,13 +5034,60 @@ STATIC_INLINE jl_value_t *apply_interface_assertions(
             jl_interface_match_t *interface_match =
                 (jl_interface_match_t*)jl_array_ptr_ref((jl_array_t*)matches, i);
             jl_method_t *m = interface_match->match.method;
-            rt = interface_match->rettype;
-            if (!jl_isa(res, rt)) {
-                args_tup = jl_f_tuple(NULL, args, nargs);
-                jl_throw_return_type_error(F, args_tup, rt, res, m, world);
+            if (interface_match->rettype == jl_nothing) {
+                jl_tvar_t *var = interface_undefined_static_parameter(
+                    m, interface_match->match.sparams);
+                assert(var != NULL);
+                jl_undefined_var_error(var->name, (jl_value_t*)m);
             }
         }
     }
+    JL_GC_POP();
+    return matches;
+}
+
+// After a dynamic dispatch returns, check the value against every prepared
+// interface contract. Interfaces apply cumulatively; on the first failure we
+// throw a ReturnTypeError naming the offending interface Method.
+static jl_value_t *apply_prepared_interface_assertions(
+    jl_value_t *matches, jl_value_t *F, jl_value_t **args, uint32_t nargs,
+    jl_value_t *res, size_t world) JL_CANSAFEPOINT
+{
+    if (matches == jl_nothing || !jl_is_array(matches))
+        return res;
+
+    jl_value_t *args_tup = NULL;
+    JL_GC_PUSH2(&res, &args_tup);
+    size_t n = jl_array_nrows((jl_array_t*)matches);
+    for (size_t i = 0; i < n; i++) {
+        jl_interface_match_t *interface_match =
+            (jl_interface_match_t*)jl_array_ptr_ref((jl_array_t*)matches, i);
+        jl_value_t *rt = interface_match->rettype;
+        assert(jl_is_type(rt));
+        if (!jl_isa(res, rt)) {
+            args_tup = jl_f_tuple(NULL, args, nargs);
+            jl_throw_return_type_error(F, args_tup, rt, res,
+                interface_match->match.method, world);
+        }
+    }
+    JL_GC_POP();
+    return res;
+}
+
+JL_DLLEXPORT jl_value_t *jl_invoke_codeinst_with_interface_assertions(
+    jl_code_instance_t *codeinst, jl_value_t *F, jl_value_t **args,
+    uint32_t nargs, jl_tupletype_t *tt, size_t world) JL_CANSAFEPOINT
+{
+    jl_value_t *contracts = NULL;
+    jl_value_t *res = NULL;
+    JL_GC_PUSH2(&contracts, &res);
+    contracts = prepare_interface_assertions(
+        codeinst, F, args, nargs, tt, world);
+    jl_callptr_t invoke = jl_atomic_load_acquire(&codeinst->invoke);
+    assert(invoke != NULL);
+    res = verify_type(invoke(F, args, nargs, codeinst));
+    res = apply_prepared_interface_assertions(
+        contracts, F, args, nargs, res, world);
     JL_GC_POP();
     return res;
 }
@@ -4869,31 +5098,22 @@ STATIC_INLINE jl_value_t *_jl_invoke(jl_value_t *F, jl_value_t **args, uint32_t 
 {
     jl_code_instance_t *codeinst = NULL;
     jl_callptr_t invoke = jl_method_compiled_callptr(mfunc, world, &codeinst);
-    if (invoke) {
-        jl_value_t *res = invoke(F, args, nargs, codeinst);
-        JL_GC_PUSH1(&res);
-        res = apply_interface_assertions(F, args, nargs, tt, verify_type(res), world);
-        JL_GC_POP();
-        return res;
+    if (!invoke) {
+        int64_t last_alloc = jl_options.malloc_log ? jl_gc_diff_total_bytes() : 0;
+        int last_errno = errno;
+#ifdef _OS_WINDOWS_
+        DWORD last_error = GetLastError();
+#endif
+        codeinst = jl_compile_method_very_internal(mfunc, world, F, args, nargs, cause);
+#ifdef _OS_WINDOWS_
+        SetLastError(last_error);
+#endif
+        errno = last_errno;
+        if (jl_options.malloc_log)
+            jl_gc_sync_total_bytes(last_alloc); // discard allocation count from compilation
     }
-    int64_t last_alloc = jl_options.malloc_log ? jl_gc_diff_total_bytes() : 0;
-    int last_errno = errno;
-#ifdef _OS_WINDOWS_
-    DWORD last_error = GetLastError();
-#endif
-    codeinst = jl_compile_method_very_internal(mfunc, world, F, args, nargs, cause);
-#ifdef _OS_WINDOWS_
-    SetLastError(last_error);
-#endif
-    errno = last_errno;
-    if (jl_options.malloc_log)
-        jl_gc_sync_total_bytes(last_alloc); // discard allocation count from compilation
-    invoke = jl_atomic_load_acquire(&codeinst->invoke);
-    jl_value_t *res = invoke(F, args, nargs, codeinst);
-    JL_GC_PUSH1(&res);
-    res = apply_interface_assertions(F, args, nargs, tt, verify_type(res), world);
-    JL_GC_POP();
-    return res;
+    return jl_invoke_codeinst_with_interface_assertions(
+        codeinst, F, args, nargs, tt, world);
 }
 
 JL_DLLEXPORT jl_value_t *jl_invoke(jl_value_t *F, jl_value_t **args, uint32_t nargs, jl_method_instance_t *mfunc)
@@ -6219,10 +6439,7 @@ JL_DLLEXPORT jl_value_t *jl_matching_interfaces_raw(jl_tupletype_t *types,
         jl_method_match_t *match = (jl_method_match_t*)jl_array_ptr_ref((jl_array_t*)result, i);
         jl_method_t *method = match->method;
         assert(method->rt != NULL);
-        rettype = method->rt;
-        if (jl_has_free_typevars(rettype))
-            rettype = jl_instantiate_type_in_env(
-                rettype, (jl_unionall_t*)method->sig, jl_svec_data(match->sparams));
+        rettype = interface_rettype_for_match(method, match->sparams);
         jl_interface_match_t *interface_match = make_interface_match(match, rettype);
         jl_array_ptr_set(result, i, (jl_value_t*)interface_match);
     }

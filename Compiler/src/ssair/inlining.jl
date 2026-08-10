@@ -80,6 +80,42 @@ function ssa_inlining_pass!(ir::IRCode, state::InliningState, propagate_inbounds
     return ir
 end
 
+function insert_interface_assertions!(ir::IRCode, opt::OptimizationState)
+    contracts = opt.interface_contracts::Vector{InterfaceMatch}
+    isempty(contracts) && return ir
+    atype = opt.linfo.specTypes
+    𝕃 = optimizer_lattice(opt.inlining.interp)
+    for idx = 1:length(ir.stmts)
+        inst = ir[SSAValue(idx)]
+        ret = inst[:stmt]
+        isa(ret, ReturnNode) && isdefined(ret, :val) || continue
+        val = ret.val
+        valtype = argextype(val, ir)
+        for contract in contracts
+            expected = contract.rettype
+            widenconst(ignorelimited(valtype)) <: expected && continue
+            asserted_type = typeassert_tfunc(𝕃, valtype, Const(expected))
+            assertion = Expr(:call, Core._interface_assert,
+                val, quoted(expected), quoted(contract.match.method),
+                quoted(atype))
+            val = insert_node!(ir, SSAValue(idx),
+                NewInstruction(assertion, asserted_type, inst[:line]))
+            valtype = asserted_type
+        end
+        inst[:stmt] = ReturnNode(val)
+    end
+    return ir
+end
+
+function ssa_inlining_pass!(ir::IRCode, opt::OptimizationState,
+                            propagate_inbounds::Bool)
+    ir = ssa_inlining_pass!(ir, opt.inlining, propagate_inbounds)
+    opt.interface_contracts === nothing && return ir
+    ir = insert_interface_assertions!(ir, opt)
+    opt.interfaces_callee_enforced = true
+    return ir
+end
+
 mutable struct CFGInliningState
     new_cfg_blocks::Vector{BasicBlock}
     todo_bbs::Vector{Tuple{Int, Int}}
@@ -774,6 +810,28 @@ function has_typeegal_slot(@nospecialize(atype))
     return false
 end
 
+interfaces_callee_enforced(::MethodInstance, ::InliningState) = false
+
+interfaces_callee_enforced(ci::CodeInstance, ::InliningState) =
+    !is_edge_only(ci) && interfaces_enforced(ci)
+
+function interface_enforcing_edge(result::InferenceResult)
+    if isdefined(result, :ci_as_edge) && interfaces_enforced(result.ci_as_edge)
+        return result.ci_as_edge
+    end
+    if isdefined(result, :ci) && interfaces_enforced(result.ci)
+        return result.ci
+    end
+    return nothing
+end
+interfaces_callee_enforced(result::InferenceResult, ::InliningState) =
+    interface_enforcing_edge(result) !== nothing
+
+function may_direct_invoke(@nospecialize(callee), state::InliningState,
+                           ::Symbol)
+    return interfaces_callee_enforced(callee, state)
+end
+
 function compileable_specialization(code::Union{MethodInstance,CodeInstance}, effects::Effects,
     et::InliningEdgeTracker, @nospecialize(info::CallInfo), state::InliningState)
     mi = code isa CodeInstance ? code.def : code
@@ -808,13 +866,18 @@ function compileable_specialization(code::Union{MethodInstance,CodeInstance}, ef
     if !keep_direct_edge
         cached = get(code_cache(state), mi_invoke, nothing)
         cached isa InferenceResult && (cached = cached.ci)
-        if cached isa CodeInstance
+        code_enforces_interfaces = code isa CodeInstance && interfaces_enforced(code)
+        if cached isa CodeInstance && !is_edge_only(cached) &&
+                interfaces_enforced(cached) &&
+                (!(code isa CodeInstance) || code_enforces_interfaces)
             code = cached
-        elseif !(code isa CodeInstance && !is_edge_only(code) && code.def === mi_invoke)
+        elseif !(code isa CodeInstance && !is_edge_only(code) &&
+                 code.def === mi_invoke && code_enforces_interfaces)
             #println("missing code for ", mi_invoke, " for ", mi)
             code = mi_invoke
         end
     end
+    may_direct_invoke(code, state, :compileable_specialization) || return nothing
     add_inlining_edge!(et, code) # to the code and edges
     return InvokeCase(code, effects, info)
 end
@@ -826,16 +889,17 @@ struct InferredCode
     InferredCode(@nospecialize(src), effects::Effects, edge::CodeInstance) = new(src, effects, edge)
 end
 @inline function get_local_code(inf_result::InferenceResult)
-    @assert isdefined(inf_result, :ci_as_edge) "InferenceResult without ci_as_edge"
+    edge = interface_enforcing_edge(inf_result)
+    @assert edge !== nothing "InferenceResult without an interface-enforcing edge"
     effects = inf_result.ipo_effects
     if is_foldable_nothrow(effects)
         res = inf_result.result
         if isa(res, Const) && is_inlineable_constant(res.val)
             # use constant calling convention
-            return ConstantCase(quoted(res.val), inf_result.ci_as_edge)
+            return ConstantCase(quoted(res.val), edge)
         end
     end
-    return InferredCode(inf_result.src, effects, inf_result.ci_as_edge)
+    return InferredCode(inf_result.src, effects, edge)
 end
 
 # the general resolver for usual and const-prop'ed calls
@@ -847,6 +911,8 @@ function resolve_todo(mi::MethodInstance, call_result::Union{Nothing,InferenceRe
         # there is no cached source available for this, but there might be code for the compilation sig
         return compileable_specialization(mi, Effects(), et, info, state)
     end
+
+    may_direct_invoke(call_result, state, :resolve_todo) || return nothing
 
     inferred_result = get_local_code(call_result)
     if inferred_result isa ConstantCase
@@ -1136,6 +1202,7 @@ function handle_invoke_call!(todo::Vector{Pair{Int,Any}},
     # pointer is set. Therefore, we can simply transform this into an
     # `Expr(:invoke, ...)`
     if info isa InvokeCICallInfo
+        may_direct_invoke(info.edge, state, :invoke_ci_call) || return nothing
         stmt.head = :invoke
         stmt.args = [info.edge, stmt.args[2], stmt.args[4:end]...]
         # Transformed to :invoke, now handle it as such
@@ -1438,6 +1505,7 @@ end
 function semiconcrete_result_item(result::SemiConcreteResult,
         @nospecialize(info::CallInfo), flag::UInt32, state::InliningState)
     code = result.edge
+    may_direct_invoke(code, state, :semiconcrete_result) || return nothing
     mi = get_ci_mi(code)
     et = InliningEdgeTracker(state)
 
@@ -1477,9 +1545,12 @@ end
 
 may_inline_concrete_result(result::ConcreteResult) =
     isdefined(result, :result) && is_inlineable_constant(result.result)
+may_inline_concrete_result(result::ConcreteResult, state::InliningState) =
+    may_direct_invoke(result.edge, state, :concrete_result) &&
+    may_inline_concrete_result(result)
 
 function concrete_result_item(result::ConcreteResult, @nospecialize(info::CallInfo), state::InliningState)
-    if !may_inline_concrete_result(result)
+    if !may_inline_concrete_result(result, state)
         et = InliningEdgeTracker(state)
         return compileable_specialization(result.edge, result.effects, et, info, state)
     end
@@ -1629,6 +1700,14 @@ function assemble_inline_todo!(ir::IRCode, state::InliningState)
         # `NativeInterpreter` won't need this, but provide a support for `:invoke` exprs here
         # for external `AbstractInterpreter`s that may run the inlining pass multiple times
         if isexpr(stmt, :invoke)
+            edge = stmt.args[1]
+            if edge isa CodeInstance &&
+                    !may_direct_invoke(edge, state, :existing_invoke)
+                stmt.head = :call
+                stmt.args = Any[Core.invoke, stmt.args[2], edge, stmt.args[3:end]...]
+                ir[SSAValue(idx)][:stmt] = stmt
+                continue
+            end
             handle_invoke_expr!(todo, ir, idx, stmt, info, flag, sig, state)
             continue
         end

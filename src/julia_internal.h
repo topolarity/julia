@@ -842,7 +842,8 @@ jl_value_t *jl_invoke_fromdispatch(jl_value_t *F, jl_value_t **args, uint32_t na
 JL_DLLEXPORT jl_code_instance_t *jl_new_codeinst_uninit(jl_method_instance_t *mi, jl_value_t *owner) JL_CANSAFEPOINT;
 JL_DLLEXPORT jl_code_instance_t *jl_new_codeinst_for_edge(
         jl_method_instance_t *mi, jl_value_t *owner,
-        size_t min_world, size_t max_world, jl_svec_t *edges) JL_CANSAFEPOINT;
+        size_t min_world, size_t max_world, jl_svec_t *edges,
+        uint8_t semantic_flags) JL_CANSAFEPOINT;
 JL_DLLEXPORT jl_code_instance_t *jl_new_codeinst(
         jl_method_instance_t *mi, jl_value_t *owner,
         jl_value_t *rettype, jl_value_t *exctype,
@@ -852,6 +853,9 @@ JL_DLLEXPORT jl_code_instance_t *jl_new_codeinst(
         jl_debuginfo_t *di, jl_svec_t *edges /* , int absolute_max*/) JL_CANSAFEPOINT;
 JL_DLLEXPORT jl_code_instance_t *jl_get_ci_equiv(jl_code_instance_t *ci JL_PROPAGATES_ROOT, size_t target_world) JL_NOTSAFEPOINT;
 JL_DLLEXPORT int jl_is_ci_equiv(jl_code_instance_t *ci JL_PROPAGATES_ROOT, jl_code_instance_t *codeinst, size_t target_world) JL_NOTSAFEPOINT;
+JL_DLLEXPORT jl_value_t *jl_invoke_codeinst_with_interface_assertions(
+        jl_code_instance_t *codeinst, jl_value_t *F, jl_value_t **args,
+        uint32_t nargs, jl_tupletype_t *tt, size_t world) JL_CANSAFEPOINT;
 STATIC_INLINE jl_method_instance_t *jl_get_ci_mi(jl_code_instance_t *ci JL_PROPAGATES_ROOT) JL_NOTSAFEPOINT
 {
     jl_value_t *def = ci->def;

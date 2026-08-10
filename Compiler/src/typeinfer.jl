@@ -110,6 +110,12 @@ function finish!(interp::AbstractInterpreter, caller::InferenceState, validation
     #@assert max_world <= get_world_counter() || isempty(edges)
     if isdefined(result, :ci)
         ci = result.ci
+        interface_contracts = result.interface_contracts
+        callee_enforces_interfaces = interface_contracts !== nothing &&
+            (isempty(interface_contracts) ||
+             result.src isa OptimizationState &&
+             result.src.interfaces_callee_enforced)
+        @assert !interfaces_enforced(ci) || callee_enforces_interfaces
         mi = result.linfo
         result_type = result.result
         result_type isa LimitedAccuracy && (result_type = result_type.typ)
@@ -139,6 +145,9 @@ function finish!(interp::AbstractInterpreter, caller::InferenceState, validation
         else
             rettype_const = nothing
             const_flags = 0x0
+        end
+        if callee_enforces_interfaces
+            const_flags |= Int32(CI_FLAGS_INTERFACES_ENFORCED)
         end
         inferred_result = nothing
         debuginfo = nothing
@@ -633,6 +642,89 @@ end
 
 const empty_edges = Core.svec()
 
+function minimize_interface_contracts(matches::Vector{InterfaceMatch})
+    contracts = InterfaceMatch[]
+    for match in matches
+        rettype = match.rettype
+        any(contract -> contract.rettype <: rettype, contracts) && continue
+        filter!(contract -> !(rettype <: contract.rettype), contracts)
+        push!(contracts, match)
+    end
+    return contracts
+end
+
+function apply_callee_interface_contracts!(me::InferenceState,
+                                           interp::AbstractInterpreter,
+                                           @nospecialize(bestguess),
+                                           @nospecialize(exc_bestguess),
+                                           ipo_effects::Effects,
+                                           allow_assertions::Bool)
+    # Callee enforcement is deliberately all-or-nothing. Interface-table
+    # invalidation currently knows only whether a CodeInstance embeds the
+    # complete applicable interface set; it cannot invalidate a CI according
+    # to a per-interface or per-return-region subset recorded here.
+    result = me.result
+    def = me.linfo.def
+    def isa Method || return bestguess, exc_bestguess, ipo_effects
+
+    world = get_inference_world(interp)
+    lookup = raw_interface_matches(me.linfo.specTypes, world)
+    lookup === nothing && return bestguess, exc_bestguess, ipo_effects
+    matches = lookup.matches
+    if isempty(matches)
+        # A complete negative query needs no IR transformation, so this CI
+        # enforces the empty contract set even when the optimizer does not run.
+        # Inserting an intersecting interface invalidates the positive CI.
+        update_valid_age!(me, world, lookup.valid_worlds)
+        result.interface_contracts = InterfaceMatch[]
+        if isdefined(result, :ci)
+            @atomic :monotonic result.ci.flags |= CI_FLAGS_INTERFACES_ENFORCED
+        end
+        return bestguess, exc_bestguess, ipo_effects
+    end
+
+    # Nonempty contract sets require the optimizer to insert all assertions.
+    # If it will not run, leave the result wholly independent of interfaces.
+    allow_assertions || return bestguess, exc_bestguess, ipo_effects
+
+    # Initially only dispatch tuples receive callee-side assertions. An
+    # abstract CodeInstance keeps the flag clear and is checked by dispatch.
+    isdispatchtuple(me.linfo.specTypes) ||
+        return bestguess, exc_bestguess, ipo_effects
+    all(match -> match.match.fully_covers, matches) ||
+        return bestguess, exc_bestguess, ipo_effects
+    # An undefined static parameter is represented by `nothing` in the raw
+    # match. Keep this CI wholly interface-unaware so dynamic dispatch raises
+    # the contextual UndefVarError before entering the callee.
+    all(match -> match.rettype isa Type &&
+                 !has_free_typevars(match.rettype), matches) ||
+        return bestguess, exc_bestguess, ipo_effects
+
+    update_valid_age!(me, world, lookup.valid_worlds)
+    contracts = minimize_interface_contracts(matches)
+    𝕃 = typeinf_lattice(interp)
+    narrowed = bestguess
+    needs_assertion = false
+    for contract in contracts
+        expected = contract.rettype
+        needs_assertion |= !(widenconst(ignorelimited(bestguess)) <: expected)
+        narrowed = tmeet(𝕃, narrowed, expected)
+    end
+
+    if needs_assertion
+        exc_bestguess = tmerge(𝕃, exc_bestguess, Core.ReturnTypeError)
+        ipo_effects = Effects(ipo_effects; nothrow=false)
+    end
+    result.interface_contracts = contracts
+    if isdefined(result, :ci)
+        # This is a commitment about the reserved CI. The CI cannot become
+        # executable until optimization has inserted the assertions and the
+        # inference engine has fulfilled it.
+        @atomic :monotonic result.ci.flags |= CI_FLAGS_INTERFACES_ENFORCED
+    end
+    return narrowed, exc_bestguess, ipo_effects
+end
+
 # inference completed on `me`
 # update the MethodInstance
 function finishinfer!(me::InferenceState, interp::AbstractInterpreter, cycleid::Int,
@@ -659,9 +751,24 @@ function finishinfer!(me::InferenceState, interp::AbstractInterpreter, cycleid::
         end
     end
     result = me.result
-    result.result = bestguess
-    ipo_effects = result.ipo_effects = me.ipo_effects = adjust_effects(me)
-    result.exc_result = me.exc_bestguess = refine_exception_type(me.exc_bestguess, ipo_effects)
+    ipo_effects = adjust_effects(me)
+    result.result = me.bestguess = bestguess
+    result.ipo_effects = me.ipo_effects = ipo_effects
+    result.exc_result = me.exc_bestguess = refine_exception_type(exc_bestguess, ipo_effects)
+
+    # A complete empty interface set needs no optimizer work. A nonempty set is
+    # selected only when all of its assertions will be inserted by optimization.
+    doopt = !limited_ret && !limited_src && may_optimize(interp) &&
+        me.cache_mode != CACHE_MODE_NULL && !result_is_constabi(interp, result)
+    if me.cache_mode != CACHE_MODE_NULL
+        bestguess, exc_bestguess, ipo_effects = apply_callee_interface_contracts!(
+            me, interp, bestguess, exc_bestguess, ipo_effects, doopt)
+        result.result = me.bestguess = bestguess
+        result.ipo_effects = me.ipo_effects = ipo_effects
+        result.exc_result = me.exc_bestguess =
+            refine_exception_type(exc_bestguess, ipo_effects)
+    end
+
     src = me.src
     src.rettype = widenconst(ignorelimited(bestguess))
     src.ssaflags = me.ssaflags
@@ -689,12 +796,6 @@ function finishinfer!(me::InferenceState, interp::AbstractInterpreter, cycleid::
         # annotate fulltree with type information,
         # either because we are the outermost code, or we might use this later
         type_annotate!(interp, me)
-        mayopt = may_optimize(interp)
-        doopt = mayopt &&
-                # disable optimization if we don't use this later (because it is not cached)
-                me.cache_mode != CACHE_MODE_NULL &&
-                # disable optimization if we've already obtained very accurate result
-                !result_is_constabi(interp, result)
         if doopt
             result.src = OptimizationState(me, interp, opt_cache)
         else
@@ -735,7 +836,7 @@ function is_already_cached(interp::AbstractInterpreter, result::InferenceResult)
         cached = cache[mi]
         ci = cached isa InferenceResult ? cached.ci : cached
         @assert isdefined(ci, :inferred)
-        return true
+        return interfaces_enforced(ci) == interfaces_enforced(result.ci)
     end
     return false
 end
@@ -1080,15 +1181,21 @@ function MethodCallResult(::AbstractInterpreter, sv::AbsIntState, method::Method
     return MethodCallResult(rt, exct, effects, edge, edgecycle, edgelimited, call_result)
 end
 
-function codeinst_edges_sub(existing_edge::CodeInstance, min_world::UInt, max_world::UInt, edges::SimpleVector)
+function codeinst_edges_sub(existing_edge::CodeInstance, min_world::UInt,
+                            max_world::UInt, edges::SimpleVector,
+                            callee_enforces_interfaces::Bool)
     # return if the existing edge has more restrictions than the other arguments (more edges and narrower worlds)
-    if existing_edge.min_world >= min_world &&
+    if interfaces_enforced(existing_edge) == callee_enforces_interfaces &&
+       existing_edge.min_world >= min_world &&
        existing_edge.max_world <= max_world &&
        existing_edge.edges == edges
         return true
     end
     return false
 end
+codeinst_edges_sub(existing_edge::CodeInstance, edge::CodeInstance) =
+    codeinst_edges_sub(existing_edge, edge.min_world, edge.max_world,
+        edge.edges, interfaces_enforced(edge))
 
 # Allocate a dependency-only `edge::CodeInstance` to be added by `add_edges!`,
 # reusing an existing ordinary edge if possible. Adopted dependency-only entries
@@ -1101,12 +1208,19 @@ function codeinst_as_edge(interp::AbstractInterpreter, sv::InferenceState, @nosp
     if max_world >= get_world_counter()
         max_world = typemax(UInt)
     end
-    if existing_edge isa CodeInstance && codeinst_edges_sub(existing_edge, min_world, max_world, edges)
+    callee_enforces_interfaces = existing_edge isa CodeInstance &&
+        interfaces_enforced(existing_edge)
+    if existing_edge isa CodeInstance && codeinst_edges_sub(
+            existing_edge, min_world, max_world, edges,
+            callee_enforces_interfaces)
         return existing_edge
     end
     mi = sv.linfo
-    ci = ccall(:jl_new_codeinst_for_edge, Any, (Any, Any, UInt, UInt, Any),
-        mi, cache_owner(interp), min_world, max_world, edges)::CodeInstance
+    semantic_flags = callee_enforces_interfaces ?
+        CI_FLAGS_INTERFACES_ENFORCED : zero(UInt8)
+    ci = ccall(:jl_new_codeinst_for_edge, Any,
+        (Any, Any, UInt, UInt, Any, UInt8), mi, cache_owner(interp),
+        min_world, max_world, edges, semantic_flags)::CodeInstance
     if max_world == typemax(UInt)
         # if we can record all of the backedges in the global reverse-cache,
         # we can now widen our applicability in the global cache too
@@ -1128,7 +1242,7 @@ function _schedule_edge_infer_task!(caller::AbsIntState, frame::InferenceState, 
         call_result = nothing
         edge = result.ci
         if isinferred
-            if edge_ci isa CodeInstance && codeinst_edges_sub(edge_ci, edge.min_world, edge.max_world, edge.edges)
+            if edge_ci isa CodeInstance && codeinst_edges_sub(edge_ci, edge)
                 edge = edge_ci # override the edge for tracking invalidation
             end
             result.ci_as_edge = edge # override the edge for tracking purposes

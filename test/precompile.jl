@@ -2484,8 +2484,8 @@ precompile_test_harness("Edge-only CodeInstance restoration") do load_path
             const root_mi = Base.method_instance(root, (Int,))
             world = Base.get_world_counter()
             const edge = ccall(:jl_new_codeinst_for_edge, Any,
-                (Any, Any, UInt, UInt, Any), leaf_mi, nothing, world, world,
-                Core.svec())::Core.CodeInstance
+                (Any, Any, UInt, UInt, Any, UInt8), leaf_mi, nothing,
+                world, world, Core.svec(), 0x10)::Core.CodeInstance
             const ordinary = Core.CodeInstance(leaf_mi, nothing, Any, Any,
                 nothing, nothing, Int32(0), world, world, UInt32(0), nothing,
                 Core.DebugInfo(leaf_mi), Core.svec())
@@ -2503,7 +2503,7 @@ precompile_test_harness("Edge-only CodeInstance restoration") do load_path
         end
         """)
     Base.compilecache(Base.PkgId("EdgeOnlyCache"))
-    @eval using EdgeOnlyCache
+    EdgeOnlyCache = Base.require(@__MODULE__, :EdgeOnlyCache)
 
     found_edge = false
     in_edge_partition = false
@@ -2512,6 +2512,9 @@ precompile_test_harness("Edge-only CodeInstance restoration") do load_path
         if Base.Compiler.is_edge_only(ci)
             in_edge_partition = true
             found_edge |= ci === EdgeOnlyCache.edge
+            if ci === EdgeOnlyCache.edge
+                @test Base.Compiler.interfaces_enforced(ci)
+            end
         else
             @test !in_edge_partition
         end

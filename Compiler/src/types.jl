@@ -127,6 +127,7 @@ mutable struct InferenceResult <: InferredCallResult
     ipo_effects::Effects              # if inference is finished
     effects::Effects                  # if optimization is finished
     analysis_results::AnalysisResults # AnalysisResults with e.g. result::ArgEscapeCache if optimized, otherwise NULL_ANALYSIS_RESULTS
+    interface_contracts::Union{Nothing,Vector{InterfaceMatch}} # complete minimized policy; `nothing` means no interface facts
     tombstone::Bool
 
     #=== uninitialized fields ===#
@@ -137,8 +138,9 @@ mutable struct InferenceResult <: InferredCallResult
         valid_worlds = WorldRange()
         ipo_effects = effects = Effects()
         analysis_results = NULL_ANALYSIS_RESULTS
+        interface_contracts = nothing
         return new(mi, argtypes, overridden_by_const, result, exc_result, src,
-            valid_worlds, ipo_effects, effects, analysis_results, false)
+            valid_worlds, ipo_effects, effects, analysis_results, interface_contracts, false)
     end
 end
 function InferenceResult(mi::MethodInstance, 𝕃::AbstractLattice=fallback_lattice)

@@ -9031,6 +9031,134 @@ let this_world = Base.get_world_counter()
     @test_throws ErrorException f(1.0)
 end
 
+# Callee and dynamic interface return-contract enforcement.
+module InterfaceEnforcementRuntime
+exact_contract(x::Int) = x == 0 ? "bad" : x
+interface exact_contract(::Any)::Any
+interface exact_contract(::Signed)::Number
+interface exact_contract(::Int)::Int
+
+abstract_contract(::Any) = "bad"
+interface abstract_contract(::Int)::Int
+@noinline abstract_caller(@nospecialize(x)) = abstract_contract(x)
+
+const_contract(::Int) = 1
+
+parametric_contract(::T) where {T} = T[]
+interface parametric_contract(::T)::Vector{T} where {T}
+
+parametric_bad_contract(::T) where {T} = Any[]
+interface parametric_bad_contract(::T)::Vector{T} where {T}
+
+const undefined_param_body_entered = Ref(false)
+function undefined_param_contract(
+        ::Union{T,Nothing}, ::Union{T,Nothing}) where {T}
+    undefined_param_body_entered[] = true
+    return Any[]
+end
+interface undefined_param_contract(
+    ::Union{T,Nothing}, ::Union{T,Nothing})::Vector{T} where {T}
+
+not_a_type(::TypeVar) = 13
+end
+
+let f = InterfaceEnforcementRuntime.exact_contract
+    @test f(1) == 1
+    ci = Base.specialize_method(Base._which(Tuple{typeof(f),Int})).cache
+    @test !iszero((@atomic :monotonic ci.flags) & 0x10)
+    @test ci.rettype === Int
+    @test Core.ReturnTypeError <: ci.exctype
+
+    err = try
+        f(0)
+    catch exc
+        exc
+    end
+    @test err isa Core.ReturnTypeError
+    if err isa Core.ReturnTypeError
+        @test err.f === typeof(f)
+        @test err.args === Tuple{Int}
+        @test err.expected === Int
+        @test err.got == "bad"
+        @test err.method isa Method
+    end
+
+    old_max_world = ci.max_world
+    Core.eval(InterfaceEnforcementRuntime,
+        :(interface exact_contract(::Integer)::Real))
+    @test ci.max_world < old_max_world
+end
+
+let f = InterfaceEnforcementRuntime.abstract_contract
+    @test_throws Core.ReturnTypeError InterfaceEnforcementRuntime.abstract_caller(1)
+    precompile(f, (Any,))
+    ci = Base.specialize_method(Base._which(Tuple{typeof(f),Any})).cache
+    @test iszero((@atomic :monotonic ci.flags) & 0x10)
+    @test ci.rettype === String
+    old_max_world = ci.max_world
+    Core.eval(InterfaceEnforcementRuntime,
+        :(interface abstract_contract(::Integer)::Number))
+    @test ci.max_world == old_max_world
+    @test_throws Core.ReturnTypeError invoke(f, ci, 1)
+end
+
+let f = InterfaceEnforcementRuntime.const_contract
+    @test f(1) == 1
+    ci = Base.specialize_method(Base._which(Tuple{typeof(f),Int})).cache
+    @test !iszero((@atomic :monotonic ci.flags) & 0x10)
+    old_max_world = ci.max_world
+    Core.eval(InterfaceEnforcementRuntime,
+        :(interface const_contract(::Int)::String))
+    @test ci.max_world < old_max_world
+    @test_throws Core.ReturnTypeError Base.invokelatest(f, 1)
+    ci = Base.specialize_method(Base._which(Tuple{typeof(f),Int})).cache
+    @test iszero((@atomic :monotonic ci.flags) & 0x10)
+end
+
+let f = InterfaceEnforcementRuntime.parametric_contract
+    @test f(1) == Int[]
+    ci = Base.specialize_method(Base._which(Tuple{typeof(f),Int})).cache
+    @test !iszero((@atomic :monotonic ci.flags) & 0x10)
+    @test ci.rettype <: Vector{Int}
+end
+
+let f = InterfaceEnforcementRuntime.parametric_bad_contract
+    err = try
+        f(1)
+    catch exc
+        exc
+    end
+    @test err isa Core.ReturnTypeError
+    if err isa Core.ReturnTypeError
+        @test err.expected === Vector{Int}
+        @test err.got == Any[]
+    end
+end
+
+let f = InterfaceEnforcementRuntime.undefined_param_contract
+    InterfaceEnforcementRuntime.undefined_param_body_entered[] = false
+    err = try
+        f(nothing, nothing)
+    catch exc
+        exc
+    end
+    @test err isa UndefVarError
+    if err isa UndefVarError
+        @test err.var === :T
+        @test err.scope isa Method
+        @test isdefined(err.scope, :rt)
+        @test occursin("interface undefined_param_contract",
+            sprint(showerror, err))
+    end
+    @test !InterfaceEnforcementRuntime.undefined_param_body_entered[]
+    ci = Base.specialize_method(
+        Base._which(Tuple{typeof(f),Nothing,Nothing})).cache
+    @test iszero((@atomic :monotonic ci.flags) & 0x10)
+end
+
+@test_throws TypeError Core.eval(InterfaceEnforcementRuntime,
+    :(interface invalid_contract(::T)::not_a_type(T) where {T}))
+
 
 myfun57023a(::Type{T}) where {T} = (x = @ccall mycfun()::Ptr{T}; x)
 @test only(code_lowered(myfun57023a)).has_fcall

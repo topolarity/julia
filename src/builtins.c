@@ -1693,7 +1693,8 @@ JL_CALLABLE(jl_f_define_method)
     jl_value_t *fname = args[1];
     JL_TYPECHK(define_method, simplevector, args[2]);
     jl_svec_t *argdata = (jl_svec_t*)args[2];
-    if (jl_svec_len(argdata) != 3 ||
+    size_t argdata_len = jl_svec_len(argdata);
+    if ((argdata_len != 3 && argdata_len != 4) ||
             !jl_is_svec(jl_svecref(argdata, 0)) ||
             jl_svec_len((jl_svec_t*)jl_svecref(argdata, 0)) == 0 ||
             !jl_is_svec(jl_svecref(argdata, 1)) ||
@@ -1916,7 +1917,9 @@ JL_CALLABLE(jl_f_invoke)
             invoke = jl_atomic_load_acquire(&codeinst->invoke);
         }
         if (invoke) {
-            return invoke(args[0], &args[2], nargs - 2, codeinst);
+            return jl_invoke_codeinst_with_interface_assertions(
+                codeinst, args[0], &args[2], nargs - 2, NULL,
+                jl_current_task->world_age);
         } else {
             if (codeinst->owner != jl_nothing) {
                 jl_error("Failed to invoke or compile external codeinst");

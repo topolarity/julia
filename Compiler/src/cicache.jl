@@ -13,6 +13,14 @@ const CI_FLAGS_EDGE_ONLY = UInt8(0b100000)
     flags = @atomic :monotonic ci.flags
     return !iszero(flags & CI_FLAGS_EDGE_ONLY)
 end
+
+# Must agree with JL_CI_FLAGS_INTERFACES_ENFORCED in src/julia.h.
+const CI_FLAGS_INTERFACES_ENFORCED = UInt8(0x10)
+@inline function interfaces_enforced(ci::CodeInstance)
+    flags = @atomic :monotonic ci.flags
+    return !iszero(flags & CI_FLAGS_INTERFACES_ENFORCED)
+end
+
 WorldRange() = WorldRange(typemin(UInt), typemax(UInt))
 WorldRange(w::UInt) = WorldRange(w, w)
 WorldRange(r::UnitRange) = WorldRange(first(r), last(r))

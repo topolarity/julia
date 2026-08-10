@@ -211,13 +211,16 @@ mutable struct OptimizationState{Interp<:AbstractInterpreter}
     unreachable::BitSet
     bb_states::Vector{Union{Nothing,BBEntryState}}
     insert_coverage::Bool
+    interface_contracts::Union{Nothing,Vector{InterfaceMatch}}
+    interfaces_callee_enforced::Bool
 end
 function OptimizationState(sv::InferenceState, interp::AbstractInterpreter,
                            opt_cache::IdDict{MethodInstance,CodeInstance}=IdDict{MethodInstance,CodeInstance}())
     inlining = InliningState(sv, interp, opt_cache)
     return OptimizationState(sv.linfo, sv.src, nothing, sv.stmt_info, sv.mod,
                              sv.sptypes, sv.slottypes, inlining, sv.cfg,
-                             sv.unreachable, sv.bb_states, sv.insert_coverage)
+                             sv.unreachable, sv.bb_states, sv.insert_coverage,
+                             sv.result.interface_contracts, false)
 end
 function OptimizationState(mi::MethodInstance, src::CodeInfo, interp::AbstractInterpreter,
                            opt_cache::IdDict{MethodInstance,CodeInstance}=IdDict{MethodInstance,CodeInstance}())
@@ -250,7 +253,8 @@ function OptimizationState(mi::MethodInstance, src::CodeInfo, interp::AbstractIn
             for slot = 1:nslots
         ], nbbstate)
         for _ = 1:length(cfg.blocks)]
-    return OptimizationState(mi, src, nothing, stmt_info, mod, sptypes, slottypes, inlining, cfg, unreachable, bb_states, false)
+    return OptimizationState(mi, src, nothing, stmt_info, mod, sptypes, slottypes,
+        inlining, cfg, unreachable, bb_states, false, nothing, false)
 end
 function OptimizationState(mi::MethodInstance, interp::AbstractInterpreter)
     world = get_inference_world(interp)
@@ -1036,6 +1040,9 @@ function optimize(interp::AbstractInterpreter, opt::OptimizationState{I}, caller
     @zone "CC: OPTIMIZER" ir = run_passes_ipo_safe(opt.src, opt)
     ipo_dataflow_analysis!(interp, opt, ir, caller)
     finishopt!(interp, opt, ir)
+    if opt.interfaces_callee_enforced && isdefined(caller, :ci)
+        @atomic :monotonic caller.ci.flags |= CI_FLAGS_INTERFACES_ENFORCED
+    end
     return nothing
 end
 
@@ -1072,7 +1079,7 @@ function run_passes_ipo_safe(
     @pass "CC: SLOT2REG"  ir = slot2reg(ir, ci, sv)
     # TODO: Domsorting can produce an updated domtree - no need to recompute here
     @pass "CC: COMPACT_1" ir = compact!(ir)
-    @pass "CC: INLINING"  ir = ssa_inlining_pass!(ir, sv.inlining, ci.propagate_inbounds)
+    @pass "CC: INLINING"  ir = ssa_inlining_pass!(ir, sv, ci.propagate_inbounds)
     # @zone "CC: VERIFY 2" verify_ir(ir)
     @pass "CC: COMPACT_2" ir = compact!(ir)
     @pass "CC: SROA"      ir = sroa_pass!(ir, sv.inlining)

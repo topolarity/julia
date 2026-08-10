@@ -563,10 +563,11 @@ struct MethodError <: Exception
 end
 MethodError(@nospecialize(f), @nospecialize(args)) = MethodError(f, args, typemax_UInt)
 
-# Thrown by the dynamic dispatcher when a method's actual return value
-# violates a declared `interface` return-type contract. `method` is the
-# interface Method whose `rt` (after sparam substitution into `expected`)
-# the runtime value `got` failed to satisfy.
+# Thrown when a method's actual return value violates a declared `interface`
+# return-type contract. `method` is the interface Method whose `rt` (after
+# sparam substitution into `expected`) the runtime value `got` failed to
+# satisfy. Callee-side assertions store types in `f` and `args`; dynamic
+# dispatch stores the corresponding values.
 struct ReturnTypeError <: Exception
     f
     args

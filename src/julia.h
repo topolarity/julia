@@ -538,11 +538,12 @@ typedef struct _jl_opaque_closure_t {
 //   time_infer_total, time_infer_self
 
 // flags bits for CodeInstance
-#define JL_CI_FLAGS_SPECPTR_SPECIALIZED      0b0001
-#define JL_CI_FLAGS_INVOKE_MATCHES_SPECPTR   0b0010
-#define JL_CI_FLAGS_FROM_IMAGE               0b0100
-#define JL_CI_FLAGS_NATIVE_CACHE_VALID       0b1000
-#define JL_CI_FLAGS_EDGE_ONLY                 0b100000
+#define JL_CI_FLAGS_SPECPTR_SPECIALIZED     0b00001
+#define JL_CI_FLAGS_INVOKE_MATCHES_SPECPTR  0b00010
+#define JL_CI_FLAGS_FROM_IMAGE              0b00100
+#define JL_CI_FLAGS_NATIVE_CACHE_VALID      0b01000
+#define JL_CI_FLAGS_INTERFACES_ENFORCED     0b10000
+#define JL_CI_FLAGS_EDGE_ONLY                0b100000
 
 typedef struct _jl_code_instance_t {
     JL_DATA_TYPE
@@ -594,6 +595,7 @@ typedef struct _jl_code_instance_t {
                             // & 0b010 == invokeptr matches specptr
                             // & 0b100 == From image
                             // & 0b1000 == native_cache_valid
+                            // & 0b10000 == all applicable interface return contracts are enforced
                             // & 0b100000 == dependency edge only (terminal cache partition)
     _Atomic(jl_callptr_t) invoke; // jlcall entry point usually, but if this codeinst belongs to an OC Method, then this is an jl_fptr_args_t fptr1 instead, unless it is not, because it is a special token object instead
     union _jl_generic_specptr_t {
@@ -1090,6 +1092,8 @@ typedef struct {
     // Core.MethodMatch is immutable and therefore stored inline when it is a
     // field of another immutable Core object.
     jl_method_match_t match;
+    // Instantiated return contract, or `nothing` if a required static
+    // parameter is undefined for this match.
     jl_value_t *rettype;
 } jl_interface_match_t;
 

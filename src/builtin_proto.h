@@ -39,6 +39,7 @@ extern "C" {
     XX(declare_global,"declare_global") \
     XX(define_method,"define_method") \
     XX(ifelse,"ifelse") \
+    XX(interfaceassert,"_interface_assert") \
     XX(intrinsic_call,"intrinsic_call") \
     XX(invoke,"invoke") \
     XX(invoke_in_world,"invoke_in_world") \

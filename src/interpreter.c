@@ -148,8 +148,9 @@ static jl_value_t *do_invoke(jl_value_t **args, size_t nargs, interpreter_state 
             invoke = jl_atomic_load_acquire(&codeinst->invoke);
         }
         if (invoke) {
-            result = invoke(argv[0], nargs == 2 ? NULL : &argv[1], nargs - 2, codeinst);
-
+            result = jl_invoke_codeinst_with_interface_assertions(
+                codeinst, argv[0], nargs == 2 ? NULL : &argv[1], nargs - 2,
+                NULL, jl_current_task->world_age);
         } else {
             if (codeinst->owner != jl_nothing) {
                 jl_error("Failed to invoke or compile external codeinst");

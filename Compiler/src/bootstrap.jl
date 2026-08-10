@@ -23,7 +23,9 @@ function bootstrap!()
     let time() = ccall(:jl_clock_now, Float64, ())
         println("Compiling the compiler. This may take several minutes ...")
 
+        world = get_world_counter()
         ssa_inlining_pass!_tt = Tuple{typeof(ssa_inlining_pass!), IRCode, InliningState{NativeInterpreter}, Bool}
+        ssa_inlining_pass!_opt_tt = Tuple{typeof(ssa_inlining_pass!), IRCode, OptimizationState{NativeInterpreter}, Bool}
         optimize_tt = Tuple{typeof(optimize), NativeInterpreter, OptimizationState{NativeInterpreter}, InferenceResult}
         typeinf_ext_tt = Tuple{typeof(typeinf_ext), NativeInterpreter, MethodInstance, UInt8}
         typeinf_tt = Tuple{typeof(typeinf), NativeInterpreter, InferenceState{NativeInterpreter}}
@@ -31,7 +33,7 @@ function bootstrap!()
         fs = Any[
             # we first create caches for the optimizer, because they contain many loop constructions
             # and they're better to not run in interpreter even during bootstrapping
-            compact!, ssa_inlining_pass!_tt, optimize_tt,
+            compact!, ssa_inlining_pass!_tt, ssa_inlining_pass!_opt_tt, optimize_tt,
             # then we create caches for inference entries
             typeinf_ext_tt, typeinf_tt, typeinf_edge_tt,
         ]
@@ -48,7 +50,6 @@ function bootstrap!()
             end
         end
         starttime = time()
-        world = get_world_counter()
         for f in fs
             if isa(f, DataType) && f.name === typename(Tuple)
                 tt = f

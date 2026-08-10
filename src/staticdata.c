@@ -1826,10 +1826,13 @@ static void jl_write_values(jl_serializer_state *s) JL_CANSAFEPOINT JL_GC_DISABL
                 }
                 jl_atomic_store_relaxed(&newci->time_compile, 0.0);
                 jl_atomic_store_relaxed(&newci->invoke, NULL);
-                // Preserve cache membership and the immutable cache partition.
+                // Preserve semantic properties and immutable cache placement,
+                // but clear compilation-state flags whose pointers are reset above.
                 jl_atomic_store_relaxed(&newci->flags,
                     jl_atomic_load_relaxed(&newci->flags) &
-                    (JL_CI_FLAGS_NATIVE_CACHE_VALID | JL_CI_FLAGS_EDGE_ONLY));
+                    (JL_CI_FLAGS_NATIVE_CACHE_VALID |
+                     JL_CI_FLAGS_INTERFACES_ENFORCED |
+                     JL_CI_FLAGS_EDGE_ONLY));
                 jl_atomic_store_relaxed(&newci->specptr.fptr, NULL);
                 uintptr_t fptr_type = JL_INVOKE_SPECSIG;
                 int8_t builtin_id = 0;

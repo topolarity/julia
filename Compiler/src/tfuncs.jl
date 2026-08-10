@@ -909,6 +909,11 @@ add_tfunc(has_free_typevars, 1, 1, has_free_typevars_tfunc, 1)
 end
 add_tfunc(typeassert, 2, 2, typeassert_tfunc, 4)
 
+@nospecs function interfaceassert_tfunc(𝕃::AbstractLattice, v, t, args...)
+    return typeassert_tfunc(𝕃, v, t)
+end
+add_tfunc(Core._interface_assert, 4, 4, interfaceassert_tfunc, 4)
+
 @nospecs function typeassert_nothrow(𝕃::AbstractLattice, v, t)
     ⊑ = partialorder(𝕃)
     # ty, exact = instanceof_tfunc(t, true)
@@ -2603,6 +2608,11 @@ function _builtin_nothrow(𝕃::AbstractLattice, @nospecialize(f::Builtin), argt
     elseif f === typeassert
         na == 2 || return false
         return typeassert_nothrow(𝕃, argtypes[1], argtypes[2])
+    elseif f === Core._interface_assert
+        na == 4 || return false
+        widenconst(argtypes[3]) <: Method || return false
+        widenconst(argtypes[4]) <: DataType || return false
+        return typeassert_nothrow(𝕃, argtypes[1], argtypes[2])
     elseif f === Core.get_binding_type
         na == 2 || return false
         return get_binding_type_nothrow(𝕃, argtypes[1], argtypes[2])
@@ -2654,6 +2664,7 @@ const _CONSISTENT_BUILTINS = Any[
     Core.ifelse,
     (<:),
     typeassert,
+    Core._interface_assert,
     throw,
     Core.throw_methoderror,
     setfield!,
@@ -2683,6 +2694,7 @@ const _EFFECT_FREE_BUILTINS = [
     Core._typevar,
     (<:),
     typeassert,
+    Core._interface_assert,
     throw,
     Core.throw_methoderror,
     getglobal,
@@ -2708,6 +2720,7 @@ const _INACCESSIBLEMEM_BUILTINS = Any[
     Core.throw_methoderror,
     tuple,
     typeassert,
+    Core._interface_assert,
     typeof,
     has_free_typevars,
     compilerbarrier,

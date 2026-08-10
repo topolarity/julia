@@ -4296,7 +4296,7 @@ void jl_init_types(void) JL_GC_DISABLED
 
     jl_interface_match_type = jl_new_datatype(jl_symbol("InterfaceMatch"), core, jl_any_type, jl_emptysvec,
                                        jl_perm_symsvec(2, "match", "rettype"),
-                                       jl_svec(2, jl_method_match_type, jl_type_type),
+                                       jl_svec(2, jl_method_match_type, jl_any_type),
                                        jl_emptysvec, 0, 0, 2);
 
     jl_intrinsic_type = jl_new_primitivetype((jl_value_t*)jl_symbol("IntrinsicFunction"), core,

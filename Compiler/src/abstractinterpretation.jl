@@ -948,6 +948,14 @@ function abstract_call_method_with_const_args(interp::AbstractInterpreter,
     if bail_out_const_call(interp, result, si, match, sv)
         return nothing
     end
+    if !(result.edge isa CodeInstance && interfaces_enforced(result.edge))
+        # Constant and semi-concrete propagation can eliminate the dynamic
+        # call entirely. It therefore requires a callee CI which both enforces
+        # the complete interface policy and serves as its invalidation edge.
+        add_remark!(interp, sv,
+            "[constprop] Callee does not enforce interface contracts")
+        return nothing
+    end
     eligibility = concrete_eval_eligible(interp, f, result, arginfo, sv)
     concrete_eval_result = nothing
     always_nothrow = false
@@ -1503,7 +1511,10 @@ function const_prop_call(interp::AbstractInterpreter,
         return nothing
     end
     existing_edge = result.edge
+    @assert existing_edge isa CodeInstance && interfaces_enforced(existing_edge)
+    @assert inf_result.interface_contracts !== nothing
     inf_result.ci_as_edge = codeinst_as_edge(interp, frame, existing_edge)
+    @assert interfaces_enforced(inf_result.ci_as_edge)
     @assert frame.frameid != 0 && frame.cycleid == frame.frameid
     @assert frame.parentid == sv.frameid
     @assert inf_result.result !== nothing
@@ -2508,7 +2519,16 @@ function abstract_invoke(interp::AbstractInterpreter, arginfo::ArgInfo, si::Stmt
                 exct_ci = Union{exct_ci, ErrorException}
             end
             update_valid_age!(sv, our_world, callee_valid_range)
-            return Future(CallMeta(method_or_ci.rettype, exct_ci, Effects(decode_effects(method_or_ci.ipo_purity_bits), nothrow=(exct_ci===Bottom)),
+            rt_ci = method_or_ci.rettype
+            if !interfaces_enforced(method_or_ci)
+                # The CI contains no interface-derived facts. Preserve its
+                # successful return type, but account conservatively for the
+                # dynamic contract check performed by Core.invoke.
+                exct_ci = Any
+            end
+            effects_ci = Effects(decode_effects(method_or_ci.ipo_purity_bits),
+                nothrow=(exct_ci === Bottom))
+            return Future(CallMeta(rt_ci, exct_ci, effects_ci,
                 InvokeCICallInfo(method_or_ci)))
         else
             method = method_or_ci::Method

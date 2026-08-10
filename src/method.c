@@ -1290,6 +1290,8 @@ JL_DLLEXPORT jl_method_t* jl_method_def(jl_svec_t *argdata,
     jl_value_t *rett = jl_svec_len(argdata) >= 4 ? jl_svecref(argdata, 3) : (jl_value_t*)jl_any_type;
     assert(jl_is_svec(atypes));
     assert(jl_is_svec(tvars));
+    if (is_interface && !jl_is_type(rett))
+        jl_type_error("interface return type", (jl_value_t*)jl_type_type, rett);
     size_t nargs = jl_svec_len(atypes);
     assert(nargs > 0);
     int isva = jl_is_vararg(jl_svecref(atypes, nargs - 1));

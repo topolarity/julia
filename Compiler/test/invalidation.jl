@@ -406,6 +406,9 @@ let mi = Base.method_instance(co_caller, (COBox,))
     @test ci.max_world == typemax(UInt)
 end
 
+edge_interface_target(x) = x
+edge_interface_root(x) = x
+
 @testset "edge-only CodeInstance cache partition" begin
     edge_leaf_target(x) = x
     edge_parent_target(x) = x
@@ -418,10 +421,12 @@ end
     orphan_mi = Base.method_instance(edge_orphan_target, (Int,))
 
     world = Base.get_world_counter()
-    leaf = ccall(:jl_new_codeinst_for_edge, Any, (Any, Any, UInt, UInt, Any),
-        leaf_mi, nothing, world, world, Core.svec())::Core.CodeInstance
-    parent = ccall(:jl_new_codeinst_for_edge, Any, (Any, Any, UInt, UInt, Any),
-        parent_mi, nothing, world, world, Core.svec(leaf))::Core.CodeInstance
+    leaf = ccall(:jl_new_codeinst_for_edge, Any,
+        (Any, Any, UInt, UInt, Any, UInt8), leaf_mi, nothing,
+        world, world, Core.svec(), 0x00)::Core.CodeInstance
+    parent = ccall(:jl_new_codeinst_for_edge, Any,
+        (Any, Any, UInt, UInt, Any, UInt8), parent_mi, nothing,
+        world, world, Core.svec(leaf), 0x00)::Core.CodeInstance
     Compiler.store_backedges(parent, parent.edges)
 
     root = Core.CodeInstance(root_mi, nothing, Any, Any, nothing, nothing, Int32(0),
@@ -454,8 +459,9 @@ end
         InvalidationTester(), leaf, Compiler.SOURCE_MODE_NOT_REQUIRED)
 
     # Promotion alone does not retain an uncached dependency record.
-    orphan = ccall(:jl_new_codeinst_for_edge, Any, (Any, Any, UInt, UInt, Any),
-        orphan_mi, nothing, world, world, Core.svec())::Core.CodeInstance
+    orphan = ccall(:jl_new_codeinst_for_edge, Any,
+        (Any, Any, UInt, UInt, Any, UInt8), orphan_mi, nothing,
+        world, world, Core.svec(), 0x00)::Core.CodeInstance
     orphan_world = Base.get_world_counter()
     @atomic :monotonic orphan.max_world = orphan_world
     ccall(:jl_promote_ci_to_current, Cvoid, (Any, UInt), orphan, orphan_world)
@@ -468,6 +474,35 @@ end
     @test leaf.max_world == invalidation_world
     @test parent.max_world == invalidation_world
     @test root.max_world == invalidation_world
+
+    # An adopted edge-only CI with the empty-interface guarantee is itself an
+    # interface-invalidation target. Its caller is reached through the usual
+    # exact-CI backedge, without a separate interface-query edge.
+    interface_mi = Base.method_instance(edge_interface_target, (Int,))
+    interface_root_mi = Base.method_instance(edge_interface_root, (Int,))
+    interface_world = Base.get_world_counter()
+    interface_edge = ccall(:jl_new_codeinst_for_edge, Any,
+        (Any, Any, UInt, UInt, Any, UInt8), interface_mi, nothing,
+        interface_world, interface_world, Core.svec(),
+        Compiler.CI_FLAGS_INTERFACES_ENFORCED)::Core.CodeInstance
+    interface_root = Core.CodeInstance(interface_root_mi, nothing, Any, Any,
+        nothing, nothing, Int32(0), interface_world, interface_world,
+        UInt32(0), nothing, Core.DebugInfo(interface_root_mi),
+        Core.svec(interface_edge))
+    Compiler.store_backedges(interface_root, interface_root.edges)
+    ccall(:jl_mi_cache_insert, Cvoid, (Any, Any),
+        interface_root_mi, interface_root)
+    interface_world = Base.get_world_counter()
+    @atomic :monotonic interface_edge.max_world = interface_world
+    @atomic :monotonic interface_root.max_world = interface_world
+    ccall(:jl_promote_ci_to_current, Cvoid,
+        (Any, UInt), interface_root, interface_world)
+    @test interface_mi.cache === interface_edge
+    @test Compiler.interfaces_enforced(interface_edge)
+
+    Core.eval(@__MODULE__, :(interface edge_interface_target(::Int)::Int))
+    @test interface_edge.max_world < typemax(UInt)
+    @test interface_root.max_world == interface_edge.max_world
 
     # Inserting an ordinary CI after an edge-only entry restores it ahead of
     # the terminal partition, and the optimizer prefers that real dependency.
@@ -483,9 +518,19 @@ end
     Compiler.add_inlining_edge!(edges, leaf)
     @test edges == Any[ordinary]
 
-    other = ccall(:jl_new_codeinst_for_edge, Any, (Any, Any, UInt, UInt, Any),
-        leaf_mi, nothing, world, world, Core.svec(:different_dependency))::Core.CodeInstance
+    other = ccall(:jl_new_codeinst_for_edge, Any,
+        (Any, Any, UInt, UInt, Any, UInt8), leaf_mi, nothing,
+        world, world, Core.svec(:different_dependency), 0x00)::Core.CodeInstance
     fallback_edges = Any[leaf]
     Compiler.add_inlining_edge!(fallback_edges, other)
     @test fallback_edges == Any[leaf, (leaf_mi.def::Method).sig, other]
+
+    enforced = ccall(:jl_new_codeinst_for_edge, Any,
+        (Any, Any, UInt, UInt, Any, UInt8), leaf_mi, nothing,
+        world, world, Core.svec(),
+        Compiler.CI_FLAGS_INTERFACES_ENFORCED)::Core.CodeInstance
+    policy_edges = Any[enforced]
+    Compiler.add_inlining_edge!(policy_edges, ordinary)
+    @test enforced in policy_edges
+    @test ordinary in policy_edges
 end

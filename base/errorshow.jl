@@ -182,6 +182,10 @@ function showerror(io::IO, ex::UndefVarError)
             print(io, " in `$scope`")
         elseif scope === :static_parameter
             print(io, " in static parameter matching")
+        elseif scope isa Method && isdefined(scope, :rt)
+            print(io, " while resolving static parameter in `")
+            show_interface_signature(io, scope)
+            print(io, "`")
         else
             print(io, " in $scope scope")
         end
@@ -299,12 +303,13 @@ function showerror(io::IO, ex::ReturnTypeError)
     @nospecialize io
     m = ex.method::Method
     f = ex.f
-    arg_types = isa(ex.args, Tuple) ? typesof(ex.args...) : ex.args
+    by_type = !(ex.args isa Tuple)
+    arg_types = by_type ? ex.args : typesof(ex.args...)
     # Header line, in MethodError style: "f(::T1, ::T2) returned ..."
     print(io, "ReturnTypeError: ")
     buf = IOBuffer()
     iob = IOContext(buf, io)
-    show_signature_function(iob, Core.Typeof(f))
+    show_signature_function(iob, by_type ? f : Core.Typeof(f))
     show_tuple_as_call(iob, :function, arg_types; hasfirst=false)
     print(io, String(take!(buf)), " returned a value of type ", typeof(ex.got))
     print(io, ", not matching its interface contract (expected ", ex.expected, "):\n\n")
@@ -1662,6 +1667,9 @@ function UndefVarError_hint(io::IO, ex::UndefVarError)
             end
         elseif scope === :static_parameter
             print(io, "\nSuggestion: run Test.detect_unbound_args to detect method arguments that do not fully constrain a type parameter.")
+        elseif scope isa Method && isdefined(scope, :rt)
+            print(io, "\nSuggestion: make the interface arguments fully constrain this type parameter.")
+            return nothing
         elseif scope === :local
             print(io, "\nSuggestion: check for an assignment to a local variable that shadows a global of the same name.")
         end

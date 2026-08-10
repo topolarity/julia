@@ -145,7 +145,21 @@ function add_one_edge!(edges::Vector{Any}, edge::CodeInstance)
                 # found edge we can upgrade
                 edges[i] = edge
                 return
-            elseif edgeᵢ_orig === edge || (isdefined(edge, :inferred) && codeinst_edges_sub(edgeᵢ_orig, edge.min_world, edge.max_world, edge.edges))
+            end
+            old_edge_only = is_edge_only(edgeᵢ_orig)
+            new_edge_only = is_edge_only(edge)
+            same_interface_policy =
+                interfaces_enforced(edgeᵢ_orig) == interfaces_enforced(edge)
+            if same_interface_policy && old_edge_only != new_edge_only
+                if old_edge_only
+                    # A real CI with the same interface guarantee subsumes the
+                    # dependency-only fallback for this MethodInstance.
+                    edges[i] = edge
+                end
+                return
+            elseif edgeᵢ_orig === edge ||
+                   (isdefined(edge, :inferred) &&
+                    codeinst_edges_sub(edgeᵢ_orig, edge))
                 # existing CodeInstance is identical
                 return
             end
@@ -368,18 +382,24 @@ function add_inlining_edge!(edges::Vector{Any}, edge::CodeInstance)
             return
         end
         if edgeᵢ isa CodeInstance && edgeᵢ.def === edge.def
-            if is_edge_only(edgeᵢ) && !is_edge_only(edge)
+            old_edge_only = is_edge_only(edgeᵢ)
+            new_edge_only = is_edge_only(edge)
+            same_interface_policy =
+                interfaces_enforced(edgeᵢ) == interfaces_enforced(edge)
+            if same_interface_policy && old_edge_only && !new_edge_only
                 # A real cached CodeInstance subsumes the dependency-only
                 # fallback for this MethodInstance.
                 edges[i] = edge
                 return
-            elseif !is_edge_only(edgeᵢ) || edgeᵢ === edge
+            elseif same_interface_policy && (!old_edge_only || edgeᵢ === edge)
                 # An existing real CodeInstance subsumes a new edge-only
-                # fallback. Identical edge-only records are redundant too.
+                # fallback with the same interface guarantee. Identical
+                # edge-only records are redundant too.
                 return
             end
-            # Distinct edge-only records for one MethodInstance can carry
-            # distinct dependencies, so keep looking before appending this one.
+            # Distinct edge-only records can carry distinct dependencies, and
+            # differing enforcement flags encode distinct invalidation facts.
+            # Keep looking before appending either kind.
         end
         i += 1
     end
