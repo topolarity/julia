@@ -971,6 +971,8 @@ typedef struct _jl_module_t {
     jl_value_t *usings_backedges;
     jl_value_t *scanned_methods;
     jl_value_t *package_requires; // direct requirements of the package containing this module
+    // Ownership authority granted to the package containing this module.
+    jl_value_t *implementation_rights;
     // New TypeNames accumulated anywhere under this root module.
     jl_value_t *new_typenames;
     // hidden fields:
@@ -2262,6 +2264,8 @@ JL_DLLEXPORT jl_value_t *jl_get_module_scanned_methods(jl_module_t *m);
 JL_DLLEXPORT int jl_module_is_open(jl_module_t *m) JL_CANSAFEPOINT;
 JL_DLLEXPORT jl_value_t *jl_module_package_requires(jl_module_t *m);
 JL_DLLEXPORT void jl_module_add_package_require(jl_module_t *m, jl_module_t *target) JL_CANSAFEPOINT;
+JL_DLLEXPORT jl_value_t *jl_root_module_implementation_rights(jl_module_t *m) JL_NOTSAFEPOINT;
+JL_DLLEXPORT void jl_root_module_set_implementation_rights(jl_module_t *m, jl_value_t *rights) JL_CANSAFEPOINT;
 JL_DLLEXPORT jl_value_t *jl_root_module_new_typenames(jl_module_t *m) JL_CANSAFEPOINT;
 JL_DLLEXPORT void jl_root_module_finalize(jl_module_t *m) JL_CANSAFEPOINT;
 JL_DLLEXPORT jl_value_t *jl_get_module_binding_or_nothing(jl_module_t *m, jl_sym_t *s) JL_CANSAFEPOINT;
@@ -2834,6 +2838,10 @@ JL_DLLEXPORT int jl_generating_output(void) JL_NOTSAFEPOINT;
 #define JL_OPTIONS_DEPWARN_OFF 0
 #define JL_OPTIONS_DEPWARN_ON 1
 #define JL_OPTIONS_DEPWARN_ERROR 2
+
+#define JL_OPTIONS_PIRACY_OFF 0
+#define JL_OPTIONS_PIRACY_WARN 1
+#define JL_OPTIONS_PIRACY_STRICT 2
 
 #define JL_OPTIONS_WARN_OVERWRITE_OFF 0
 #define JL_OPTIONS_WARN_OVERWRITE_ON 1

@@ -174,3 +174,103 @@ function _arg0_package_owner_is_closed_or_self(@nospecialize(type::Type),
     return _package_owner_is_closed_or_self(
         owner, self_rights, _package_owner_factor_is_closed)
 end
+
+struct DefinitionPiracyViolation
+    kind::Symbol
+    conflicting_method::Union{Nothing,Method}
+end
+
+function _definition_arg0(@nospecialize(sig::Type))
+    body = unwrap_unionall(sig)
+    @assert body isa DataType && body.name === Tuple.name
+    parameters = body.parameters
+    @assert !isempty(parameters)
+    index = parameters[1] === typeof(Core.kwcall) && length(parameters) >= 3 ? 3 : 1
+    arg0 = parameters[index]
+    while arg0 isa TypeVar
+        arg0 = arg0.ub
+    end
+    return arg0::Type
+end
+
+function _has_externally_closed_arg0(@nospecialize(sig::Type), self_rights)
+    owner = arg0_package_owner(_definition_arg0(sig))
+    for portion in owner.alternatives
+        # An empty conjunction represents an open dispatch region, not an
+        # external package's closure authority.
+        isempty(portion.factors) && continue
+        _package_owner_portion_is_self_owned(portion, self_rights) || return true
+    end
+    return false
+end
+
+function _definition_covering_interfaces(candidate::Method, world::UInt)
+    covering = Method[]
+    lookup = raw_interface_matches(candidate.sig, world)
+    lookup === nothing && return nothing
+    for interface_match in lookup.matches
+        interface = interface_match.match.method
+        candidate.sig <: interface.sig || continue
+        push!(covering, interface)
+    end
+    if get_methodtable(candidate) === Core.interfacetable
+        # The candidate has not reached the interface table yet. It nevertheless
+        # grants exactly the implementation permission it is declaring.
+        push!(covering, candidate)
+    end
+    return covering
+end
+
+"""
+    definition_piracy_violations(candidate, implementation_rights, world)
+
+Check the type- and implementation-piracy policy for a Method immediately
+before it is inserted. The returned violations do not change dispatch; the
+runtime's `--piracy` policy decides whether to ignore, warn, or reject them.
+
+An externally closed callable region requires the candidate to be contained in
+an interface. If the candidate is more specific than an existing Method from a
+different package root, one of its covering interfaces must also be more
+specific than that Method. Methods in the candidate's own package root do not
+consume its interface permission.
+"""
+function definition_piracy_violations(candidate::Method,
+                                      implementation_rights, world::UInt)
+    result = Base.packagetype(candidate.sig)
+    if !Base._packagetype_leq(
+            Base._packagetype_upper(result), implementation_rights)
+        kind = Base.ispackagetypeexact(result) ?
+            :type_piracy : :unproven_type_ownership
+        return DefinitionPiracyViolation[
+            DefinitionPiracyViolation(kind, nothing)
+        ]
+    end
+
+    _has_externally_closed_arg0(candidate.sig, implementation_rights) ||
+        return DefinitionPiracyViolation[]
+
+    covering = _definition_covering_interfaces(candidate, world)
+    covering === nothing && return nothing
+    isempty(covering) && return DefinitionPiracyViolation[
+        DefinitionPiracyViolation(:missing_interface, nothing)
+    ]
+
+    methods = raw_method_matches(candidate.sig, world)
+    methods === nothing && return nothing
+    candidate_root = moduleroot(candidate.module)
+    violations = DefinitionPiracyViolation[]
+    for method_match in methods.matches
+        method = method_match.method
+        moduleroot(method.module) === candidate_root && continue
+        morespecific(candidate.sig, method.sig) || continue
+        any(interface -> morespecific(interface.sig, method.sig), covering) &&
+            continue
+        push!(violations,
+              DefinitionPiracyViolation(:uncovered_specialization, method))
+    end
+
+    # TODO: Restrict cross-package specificity using the requires graph before
+    # relying on this policy to avoid invalidation. For now this intentionally
+    # uses the ordinary `≺:` relation exactly as dispatch does.
+    return violations
+end

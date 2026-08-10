@@ -984,6 +984,7 @@ jl_tupletype_t *jl_inst_arg_tuple_type(jl_value_t *arg1, jl_value_t **args, size
 jl_tupletype_t *jl_lookup_arg_tuple_type(jl_value_t *arg1 JL_PROPAGATES_ROOT, jl_value_t **args, size_t nargs, int leaf) JL_CANSAFEPOINT;
 JL_DLLEXPORT void jl_method_table_insert(jl_methtable_t *mt, jl_method_t *method, jl_tupletype_t *simpletype) JL_CANSAFEPOINT;
 JL_DLLEXPORT void jl_interface_table_insert(jl_method_t *method) JL_CANSAFEPOINT;
+extern jl_mutex_t jl_method_def_lock;
 void jl_method_table_activate(jl_typemap_entry_t *newentry) JL_CANSAFEPOINT;
 jl_typemap_entry_t *jl_method_table_add(jl_methtable_t *mt, jl_method_t *method, jl_tupletype_t *simpletype) JL_CANSAFEPOINT;
 jl_method_t *jl_mk_builtin_func(jl_datatype_t *dt, jl_sym_t *name, jl_fptr_args_t fptr) JL_CANSAFEPOINT JL_GC_DISABLED;
@@ -1103,6 +1104,7 @@ jl_module_t *jl_module_root(jl_module_t *m) JL_NOTSAFEPOINT;
 void jl_add_scanned_method(jl_module_t *m, jl_method_t *meth) JL_CANSAFEPOINT;
 void jl_root_module_add_new_typename(jl_module_t *m, jl_typename_t *tn) JL_CANSAFEPOINT;
 void jl_init_dispatch_closed_in(jl_datatype_t *dt) JL_CANSAFEPOINT;
+void jl_init_dispatch_forwarding_types(void) JL_NOTSAFEPOINT;
 jl_value_t *jl_eval_global_var(jl_module_t *m JL_PROPAGATES_ROOT, jl_sym_t *e, size_t world) JL_CANSAFEPOINT;
 JL_DLLEXPORT jl_value_t *jl_eval_globalref(jl_globalref_t *g, size_t world) JL_CANSAFEPOINT;
 jl_value_t *jl_get_globalref_value(jl_globalref_t *gr, size_t world) JL_CANSAFEPOINT;

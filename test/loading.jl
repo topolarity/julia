@@ -1379,6 +1379,16 @@ end
             abstract type UsedChild <: UnusedParent end
             (::UsedChild)(x) = x
 
+            function LocalFunction end
+            LocalFunction(x) = x
+
+            abstract type UnusedFunction <: Function end
+            abstract type UsedFunction <: Function end
+            (::UsedFunction)(x) = x
+
+            struct ConcreteFunction <: Function end
+            (::ConcreteFunction)(x) = x
+
             module Nested
             abstract type NestedUnused end
             abstract type NestedUsed end
@@ -1404,6 +1414,13 @@ end
         check_dispatch_closed_in = """
             using DispatchClosed
             root = DispatchClosed
+            Function.name.dispatch_closed_in === nothing ||
+                error("Function did not forward dispatch ownership")
+            for kind in (Any, Core.AnyType, DataType, Core.Intersect, Core.TypeEgal,
+                    TypeEq, Core.TypeofBottom, Union, UnionAll)
+                kind.name.dispatch_closed_in === nothing ||
+                    error("type-value kind did not forward dispatch ownership: \$kind")
+            end
             DispatchClosed.UnusedAbstract.name.dispatch_closed_in === nothing ||
                 error("unused abstract row was not left open")
             DispatchClosed.Concrete.name.dispatch_closed_in === root ||
@@ -1416,6 +1433,14 @@ end
                 error("unused abstract parent row was not left open")
             DispatchClosed.UsedChild.name.dispatch_closed_in === root ||
                 error("abstract child used by a method was not closed")
+            typeof(DispatchClosed.LocalFunction).name.dispatch_closed_in === root ||
+                error("generic function did not close in its package root")
+            DispatchClosed.UnusedFunction.name.dispatch_closed_in === nothing ||
+                error("unused Function subtype was not left open")
+            DispatchClosed.UsedFunction.name.dispatch_closed_in === root ||
+                error("used Function subtype was not closed")
+            DispatchClosed.ConcreteFunction.name.dispatch_closed_in === root ||
+                error("concrete Function subtype did not close in its package root")
             DispatchClosed.Nested.NestedUnused.name.dispatch_closed_in === nothing ||
                 error("nested unused abstract row was not left open")
             DispatchClosed.Nested.NestedUsed.name.dispatch_closed_in === root ||
@@ -1426,7 +1451,7 @@ end
         load_path = join((env, "@stdlib"), Sys.iswindows() ? ';' : ':')
         for flags in (`--compiled-modules=no`, `--compiled-modules=yes`,
                 `--compiled-modules=existing`)
-            cmd = addenv(`$(Base.julia_cmd()) --startup-file=no $flags -e $check_dispatch_closed_in`,
+            cmd = addenv(`$(Base.julia_cmd()) --startup-file=no --piracy=strict $flags -e $check_dispatch_closed_in`,
                 "JULIA_DEPOT_PATH" => depot,
                 "JULIA_LOAD_PATH" => load_path,
             )
@@ -1444,6 +1469,14 @@ end
         _pkgdir == pkgdir(parent) !== nothing || error("unexpected extension \$ext pkgdir path: \$_pkgdir")
         _pkgversion = pkgversion(_ext)
         _pkgversion == pkgversion(parent) || error("unexpected extension \$ext version: \$_pkgversion")
+
+        _trigger_ids = Base.EXT_PRIMED[Base.PkgId(_ext)]
+        _trigger_modules = Module[Base.loaded_modules[id] for id in _trigger_ids]
+        _rights = Base._root_module_implementation_rights(_ext)
+        any(_rights.alternatives) do portion
+            length(portion.factors) == length(_trigger_modules) &&
+                all(trigger -> any(factor -> factor === trigger, portion.factors), _trigger_modules)
+        end || error("extension \$ext was not granted ownership of its parent/trigger intersection")
     end
     """
     depot_path = mkdepottempdir()

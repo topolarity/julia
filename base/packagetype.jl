@@ -233,9 +233,6 @@ end
 @inline _packagetype_exact_bottom() = PackagetypeExact(_packagetype_bottom())
 @inline _packagetype_exact_top() = PackagetypeExact(_packagetype_top())
 
-@inline _packagetype_is_type_parameter(@nospecialize(parameter)) =
-    parameter isa Type || parameter isa TypeVar
-
 function _packagetype_rewrap_local_typevars(@nospecialize(type),
                                             local_typevars::Vector{TypeVar})
     has_free_typevars(type) || return type
@@ -431,26 +428,21 @@ end
 function _packagetype_analyze_unionall(unionall::UnionAll, exact::Bool,
                                        local_typevars::Vector{TypeVar})
     var = unionall.var
-    if has_free_typevars(var.lb) || has_free_typevars(var.ub)
-        return _packagetype_unknown(unionall, :dependent_unionall_bound,
-            "dependent UnionAll bounds are not implemented")
-    end
     push!(local_typevars, var)
     result = _packagetype_analyze(unionall.body, exact, local_typevars)
     pop!(local_typevars)
     return result
 end
 
-function _packagetype_analyze_typevar(var::TypeVar, exact::Bool)
+function _packagetype_analyze_typevar(var::TypeVar, exact::Bool,
+                                      local_typevars::Vector{TypeVar})
     var.ub === Bottom && return _packagetype_exact_bottom()
-    if has_free_typevars(var.lb) || has_free_typevars(var.ub)
-        return _packagetype_unknown(var, :dependent_typevar_bound,
-            "dependent TypeVar bounds are not implemented")
-    end
     # An unpinned variable ranges over productive subtypes of its upper bound.
-    # A lower bound alone cannot establish a package requirement.
+    # TODO: A non-bottom lower bound can further restrict that family and
+    # contribute package support. Follow it once package-type intervals model
+    # lower-bound constraints; for now only a pinned interval is exact.
     bound_exact = exact && var.lb === var.ub
-    return _packagetype_analyze(var.ub, bound_exact, TypeVar[])
+    return _packagetype_analyze(var.ub, bound_exact, local_typevars)
 end
 
 function _packagetype_analyze_vararg(vararg::Core.TypeofVararg,
@@ -459,13 +451,15 @@ function _packagetype_analyze_vararg(vararg::Core.TypeofVararg,
     if isdefined(vararg, :N)
         count = vararg.N
         count === 0 && return _packagetype_exact_top()
-        count isa Int || return _packagetype_unknown(vararg, :variable_vararg_length,
-            "a variable Vararg length is not implemented")
-    elseif has_fixed_prefix
+    end
+    if has_fixed_prefix && (!isdefined(vararg, :N) || !(vararg.N isa Int))
         # The zero-length tail is a productive witness that does not require
         # anything from the repeated element type.
         return _packagetype_exact_top()
     end
+    # With no fixed prefix, the zero-length member is `Tuple{}` and is omitted
+    # from productive quantification. Every productive member repeats `T` at
+    # least once.
     return _packagetype_analyze(vararg.T, false, local_typevars)
 end
 
@@ -495,7 +489,9 @@ function _packagetype_analyze_datatype(datatype::DataType,
 
     result = PackagetypeExact(_packagetype_atom(datatype.name.module))
     for parameter in datatype.parameters
-        _packagetype_is_type_parameter(parameter) || continue
+        if !(parameter isa Type || parameter isa TypeVar)
+            parameter = typeof(parameter)
+        end
         parameter_result = _packagetype_analyze(
             parameter, true, local_typevars)
         result = _packagetype_meet_result(result, parameter_result)
@@ -522,9 +518,11 @@ function _packagetype_analyze(@nospecialize(type), exact::Bool,
     elseif type isa UnionAll
         return _packagetype_analyze_unionall(type, exact, local_typevars)
     elseif type isa TypeVar
-        return _packagetype_analyze_typevar(type, exact)
+        return _packagetype_analyze_typevar(type, exact, local_typevars)
     elseif isType(type)
-        base = PackagetypeExact(_packagetype_atom(typename(Core.Type).module))
+        # `Core.Type` has a built-in TypeEq body rather than a DataType whose
+        # TypeName can be inspected. Core ownership canonicalizes to Base.
+        base = PackagetypeExact(_packagetype_atom(Base))
         parameter = _packagetype_analyze(
             type_parameter(type), true, local_typevars)
         return _packagetype_meet_result(base, parameter)
@@ -548,3 +546,151 @@ that `T` has productive support.
 function packagetype(@nospecialize(type::Type))
     return _packagetype_analyze(type, false, TypeVar[])
 end
+
+function _set_root_module_implementation_rights!(root::Module,
+                                                 rights::PackageType)
+    root = moduleroot(root)
+    ccall(:jl_root_module_set_implementation_rights, Cvoid,
+        (Any, Any), root, rights)
+    return rights
+end
+
+function _stored_root_module_implementation_rights(root::Module)
+    root = moduleroot(root)
+    rights = ccall(:jl_root_module_implementation_rights, Any, (Any,), root)
+    rights === nothing && return nothing
+    return rights::PackageType
+end
+
+function _loaded_extension_implementation_rights(root::Module, key::PkgId)
+    rights = _packagetype_atom(root)
+    trigger_ids = get(EXT_PRIMED, key, nothing)
+    trigger_ids === nothing && return rights
+
+    intersection = _packagetype_top()
+    for trigger_id in trigger_ids
+        trigger = get(loaded_modules, trigger_id, nothing)
+        # An intersection grant is dormant until all of its factors identify
+        # loaded package instances. Requires-edge publication retries this
+        # construction after additional requirements have loaded, before the
+        # package continues evaluating source definitions.
+        trigger === nothing && return rights
+        intersection = _packagetype_meet(
+            intersection, _packagetype_atom(trigger::Module))
+    end
+    return _packagetype_join(rights, intersection)
+end
+
+function _initialize_root_module_implementation_rights!(root::Module,
+                                                        key::PkgId)
+    _is_managed_package_root(root) || return nothing
+    rights = _loaded_extension_implementation_rights(root, key)
+    _set_root_module_implementation_rights!(root, rights)
+    return nothing
+end
+
+"""
+    _root_module_implementation_rights(root::Module) -> PackageType
+
+Return the ownership authority endowed to the loaded package containing
+`root`. Managed packages always own their singleton package node. An extension
+also owns the formal intersection of its parent and triggers once every factor
+identifies a loaded package instance. Unmanaged roots are unrestricted.
+"""
+function _root_module_implementation_rights(root::Module)
+    root = moduleroot(root)
+    _is_managed_package_root(root) || return _packagetype_top()
+    rights = _stored_root_module_implementation_rights(root)
+    rights === nothing && return _packagetype_atom(root)
+    return rights
+end
+
+function _definition_method_signature(method::Method)
+    return sprint(show, method;
+        context=:print_method_signature_only => true)
+end
+
+function _definition_callable_name(method::Method)
+    signature = unwrap_unionall(method.sig)::DataType
+    parameters = signature.parameters
+    index = parameters[1] === typeof(Core.kwcall) && length(parameters) >= 3 ? 3 : 1
+    callable = parameters[index]
+    while callable isa TypeVar
+        callable = callable.ub
+    end
+    body = unwrap_unionall(callable)
+    if body isa DataType && callable <: Function && isempty(body.parameters) &&
+            _isself(body)
+        return string(parentmodule(body), ".",
+            sprint(show_sym, body.name.singletonname))
+    end
+    return sprint(show, callable)
+end
+
+function _definition_piracy_message(method::Method, implementation_rights,
+                                    violation)
+    signature = _definition_method_signature(method)
+    kind = violation.kind
+    if kind === :type_piracy
+        return "type piracy in definition of $signature: the method signature " *
+               "is not owned by $implementation_rights"
+    elseif kind === :unproven_type_ownership
+        return "possible type piracy in definition of $signature: ownership " *
+               "of the method signature could not be proved within " *
+               "$implementation_rights"
+    elseif kind === :missing_interface
+        callable = _definition_callable_name(method)
+        return "$callable is defined in an external package, but the " *
+               "definition $signature has no matching interface in that package"
+    end
+
+    @assert kind === :uncovered_specialization
+    conflict = violation.conflicting_method::Method
+    conflict_signature = sprint(show, conflict)
+    specializing_method = sprint(show, method)
+    return "external method $conflict_signature was specialized by " *
+           "$specializing_method, but the external package has no matching interface"
+end
+
+function _classify_definition_piracy(method::Method)
+    policy = JLOptions().piracy
+    policy == 0 && return nothing
+
+    root = moduleroot(method.module)
+    rights = _root_module_implementation_rights(root)
+    violations = Compiler.definition_piracy_violations(
+        method, rights, get_world_counter())
+    if violations === nothing
+        # A raw lookup can decline a query only under a resource limit.
+        # Definition checks do not set one, so classify that unexpected case as
+        # unproved rather than silently weakening strict policy.
+        return (rights, :lookup_failed)
+    end
+    return isempty(violations) ? nothing : (rights, violations)
+end
+
+function _report_definition_piracy(method::Method, report)
+    policy = JLOptions().piracy
+    file = String(method.file)
+    rights, violations = report
+    if violations === :lookup_failed
+        message = "possible piracy in definition of " *
+                  "$(_definition_method_signature(method)): " *
+                  "the policy lookup could not be completed"
+        policy == 2 && throw(ErrorException(message))
+        @warn message _module=method.module _file=file _line=method.line
+        return nothing
+    end
+    for violation in violations
+        message = _definition_piracy_message(method, rights, violation)
+        policy == 2 && throw(ErrorException(message))
+        @warn message _module=method.module _file=file _line=method.line
+    end
+    return nothing
+end
+
+# The runtime looks up these bindings rather than the functions directly so
+# that installing their own Methods cannot recursively call empty generic
+# functions during Base bootstrap.
+const _definition_piracy_classifier = _classify_definition_piracy
+const _definition_piracy_reporter = _report_definition_piracy

@@ -182,6 +182,72 @@ This all-or-nothing result concerns implementation openness at the single call
 type `ϵ`. It does not remove interface return contracts. Contract applicability
 is independent of whether an interface contributes an open future region.
 
+## Prospective masked interface authority
+
+A future interface-specific meaning for `@nospecialize` may let an interface
+exclude marked declared arguments from both type-ownership admission and the
+concreteness needed for a static invoke proof. This section records the
+authority algebra that such a design must preserve; the current implementation
+does not yet attach this policy meaning to `@nospecialize`.
+
+Let `K(I)` be interface `I`'s set of masked argument coordinates, excluding the
+callable itself. Let `π[K](S)` be the package-type analysis of signature `S`
+with ownership contributions from coordinates in `K` omitted, while preserving
+the signature's binders and all dependencies among unmasked coordinates. An
+implementation `M` from package `P` may use `I` as its authority witness only
+if:
+
+```text
+M <: I
+π[K(I)](M) ≤ Rights(P)
+```
+
+along with the ordinary Method/interface specificity policy. When several
+interfaces cover `M`, admission is existential: any one interface may witness
+the definition. Inference has the dual obligation. It must consider the union
+of the future implementation families licensed by every applicable interface:
+
+```text
+Allowed(M, P) ⇔ ∃ applicable I: Licenses(I, M, P)
+Future(C)      = ⋃ { Future(I, C) │ I is applicable at C }
+```
+
+Consequently a static invoke proof must survive every applicable authority
+alternative. Return contracts compose differently: all interfaces applicable
+to the call constrain its return, independently of which interface could have
+licensed an implementation.
+
+Two interfaces with identical signatures do not provide simultaneous mask
+alternatives: ordinary method-table replacement leaves only the latest one in
+a given world. Distinct, overlapping signatures can carry incomparable masks.
+For equal regions, masking more coordinates is a stricter authority option;
+an option which masks fewer coordinates permits every implementation permitted
+by the more-masked option and potentially more.
+
+Several mask alternatives cannot in general be collapsed to one effective
+mask for definition admission. In particular, suppose one interface projection
+retains ownership factor `A`, another retains `B`, and a package owns only the
+formal intersection right `A & B`. Neither interface separately witnesses the
+definition:
+
+```text
+(A ≤ A & B) ∨ (B ≤ A & B) = false
+```
+
+An unmasked or combined projection retains both factors and does witness it:
+
+```text
+A & B ≤ A & B = true
+```
+
+Thus merging the masks can invent an implementation authorized by no actual
+interface. Treating their overlap as unmasked is nevertheless a sound
+inference over-approximation: it adds hypothetical future implementations and
+may lose an optimization, but cannot omit a legal one. Exact inference must
+instead retain the disjunction of per-interface authority options. This
+non-distributivity is intentional because intersection ownership rights are
+not canonicalized or decomposed through the requires relation.
+
 ## Lift from points to type regions
 
 Let the interface-covered region be:

@@ -589,6 +589,11 @@ static NOINLINE void _finish_jl_init_(jl_image_buf_t sysimage, jl_ptls_t ptls, j
     if (sysimage.kind != JL_IMAGE_KIND_NONE) {
         // Load the .ji or .so sysimage
         jl_restore_system_image(&parsed_image, sysimage);
+        // These labels describe native type-value semantics rather than an
+        // image's package-finalization state. Reassert them after restoration
+        // so an older bootstrap image cannot overwrite the current runtime's
+        // interpretation of dispatch ownership.
+        jl_init_dispatch_forwarding_types();
     }
     else {
         // No sysimage provided, init a minimal environment
@@ -678,6 +683,7 @@ JL_DLLEXPORT jl_cgparams_t jl_default_cgparams = {
 
 static void init_global_mutexes(void) JL_NOTSAFEPOINT {
     JL_MUTEX_INIT(&jl_modules_mutex, "jl_modules_mutex");
+    JL_MUTEX_INIT(&jl_method_def_lock, "jl_method_def_lock");
     JL_MUTEX_INIT(&precomp_statement_out_lock, "precomp_statement_out_lock");
     JL_MUTEX_INIT(&newly_inferred_mutex, "newly_inferred_mutex");
     JL_MUTEX_INIT(&global_roots_lock, "global_roots_lock");

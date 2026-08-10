@@ -8,6 +8,61 @@ import UUIDs: UUID
 
 include("tempdepot.jl")
 
+@testset "package implementation rights" begin
+    parent = Core.eval(Base.__toplevel__, :(module PackageRightsParent end))
+    trigger = Core.eval(Base.__toplevel__, :(module PackageRightsTrigger end))
+    extension = Core.eval(Base.__toplevel__, :(module PackageRightsExtension
+        module Child end
+    end))
+    ids = (
+        PkgId(UUID("51515151-5151-5151-5151-515151515151"),
+              "PackageRightsParent"),
+        PkgId(UUID("52525252-5252-5252-5252-525252525252"),
+              "PackageRightsTrigger"),
+        PkgId(UUID("53535353-5353-5353-5353-535353535353"),
+              "PackageRightsExtension"),
+    )
+    for (root, id) in zip((parent, trigger, extension), ids)
+        uuid = convert(NTuple{2,UInt64}, id.uuid)
+        ccall(:jl_set_module_uuid, Cvoid, (Any, NTuple{2,UInt64}), root, uuid)
+    end
+
+    @lock Base.require_lock begin
+        try
+            Base.loaded_modules[ids[1]] = parent
+            Base.loaded_modules[ids[2]] = trigger
+            Base.loaded_modules[ids[3]] = extension
+            Base.EXT_PRIMED[ids[3]] = PkgId[ids[1], ids[2]]
+
+            delete!(Base.loaded_modules, ids[2])
+            Base._initialize_root_module_implementation_rights!(
+                extension, ids[3])
+            dormant = Base._root_module_implementation_rights(extension)
+            @test Base._packagetype_equiv(
+                dormant, Base._packagetype_atom(extension))
+
+            Base.loaded_modules[ids[2]] = trigger
+            Base._initialize_root_module_implementation_rights!(
+                extension, ids[3])
+            intersection = Base._packagetype_meet(
+                Base._packagetype_atom(parent),
+                Base._packagetype_atom(trigger))
+            expected = Base._packagetype_join(
+                Base._packagetype_atom(extension), intersection)
+            @test Base._packagetype_equiv(
+                Base._root_module_implementation_rights(extension), expected)
+            @test Base._packagetype_equiv(
+                Base._stored_root_module_implementation_rights(
+                    extension.Child), expected)
+        finally
+            delete!(Base.EXT_PRIMED, ids[3])
+            for id in ids
+                delete!(Base.loaded_modules, id)
+            end
+        end
+    end
+end
+
 @testset "package requires graph" begin
     key1 = PkgId(UUID("10101010-1010-1010-1010-101010101010"),
         String(UInt8[0x50, 0x6b, 0x67]))
@@ -113,6 +168,10 @@ include("tempdepot.jl")
             using PackageGraphC
             using PackageGraphA
             a = Base.LoadedPackageNode(PackageGraphA)
+            rights = Base._root_module_implementation_rights(PackageGraphA)
+            Base._packagetype_equiv(
+                rights, Base._packagetype_atom(PackageGraphA)) ||
+                error("bad PackageGraphA implementation rights")
             a_requires = Base.direct_package_requires(a)
             sort!(map(node -> Base.PkgId(node).name, a_requires)) ==
                 ["PackageGraphB", "PackageGraphC"] || error("bad PackageGraphA edges")

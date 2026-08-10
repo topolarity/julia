@@ -19,6 +19,37 @@ function _root_module_new_typenames(root::Module)
     return ccall(:jl_root_module_new_typenames, Any, (Any,), root)
 end
 
+function _collect_existing_root_typenames!(typenames::IdSet{Core.TypeName},
+                                           root::Module)
+    modules = Module[root]
+    visited = IdSet{Module}()
+    while !isempty(modules)
+        mod = pop!(modules)
+        mod in visited && continue
+        push!(visited, mod)
+        for name in names(mod; all=true, imported=false)
+            isdefined(mod, name) || continue
+            value = Core.getglobal(mod, name)
+            if value isa Module && moduleroot(value) === root
+                push!(modules, value)
+            end
+            value_type = typeof(value)
+            value_module = value_type.name.module
+            if value_module isa Module && moduleroot(value_module) === root
+                push!(typenames, value_type.name)
+            end
+            body = unwrap_unionall(value)
+            if body isa DataType
+                body_module = body.name.module
+                if body_module isa Module && moduleroot(body_module) === root
+                    push!(typenames, body.name)
+                end
+            end
+        end
+    end
+    return typenames
+end
+
 struct ModuleFinalizationState
     root_module::Module
     world::UInt
@@ -26,7 +57,7 @@ struct ModuleFinalizationState
     method_closed_typenames::IdSet{Core.TypeName}
     visited_typenames::IdSet{Core.TypeName}
 
-    function ModuleFinalizationState(root::Module)
+    function ModuleFinalizationState(root::Module, include_existing::Bool=false)
         root = moduleroot(root)
         inventory = _root_module_new_typenames(root)
         new_typenames = IdSet{Core.TypeName}()
@@ -35,9 +66,18 @@ struct ModuleFinalizationState
                 push!(new_typenames, tn::Core.TypeName)
             end
         end
+        if include_existing
+            _collect_existing_root_typenames!(new_typenames, root)
+        end
         return new(root, get_world_counter(), new_typenames,
             IdSet{Core.TypeName}(), IdSet{Core.TypeName}())
     end
+end
+
+function _typename_dispatch_forwarding(tn::Core.TypeName)
+    wrapper = tn.wrapper
+    return wrapper === Any || wrapper === Function ||
+        wrapper <: Core.AnyType
 end
 
 function _method_defined_using_typename(method::Method, tn::Core.TypeName)
@@ -75,6 +115,11 @@ end
 
 function _finalize_dispatch_closed_in!(state::ModuleFinalizationState, tn::Core.TypeName)
     tn in state.visited_typenames && return nothing
+    if _typename_dispatch_forwarding(tn)
+        Core.setfield!(tn, :dispatch_closed_in, nothing)
+        push!(state.visited_typenames, tn)
+        return nothing
+    end
     wrapper = tn.wrapper
     inherited = nothing
     if wrapper !== Any
@@ -105,10 +150,12 @@ This is a package lifecycle event, not an image-serialization event: an image
 may contain several independently finalized package instances. Completion also
 records the root's monotonic `finalized` state in the runtime.
 """
-function _finalize_root_module(root::Module)
-    state = ModuleFinalizationState(root)
+function _finalize_root_module(root::Module; include_existing::Bool=false)
+    state = ModuleFinalizationState(root, include_existing)
     for tn in state.new_typenames
-        if _method_defined_using_typename(state, tn)
+        wrapper = tn.wrapper
+        if isabstracttype(wrapper) && !_typename_dispatch_forwarding(tn) &&
+                _method_defined_using_typename(state, tn)
             push!(state.method_closed_typenames, tn)
         end
     end
@@ -206,6 +253,9 @@ function _record_package_require!(into::Module, target::Module)
     _is_axiomatic_package_require(root, target) && return nothing
     @lock require_lock begin
         ccall(:jl_module_add_package_require, Cvoid, (Any, Any), root, target)
+        if isdefined(@__MODULE__, :_initialize_root_module_implementation_rights!)
+            _initialize_root_module_implementation_rights!(root, PkgId(root))
+        end
     end
     return nothing
 end

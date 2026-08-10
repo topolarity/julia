@@ -310,6 +310,8 @@
     XX(jl_methtable_lookup) \
     XX(jl_mi_cache_insert) \
     XX(jl_module_add_package_require) \
+    XX(jl_root_module_implementation_rights) \
+    XX(jl_root_module_set_implementation_rights) \
     XX(jl_module_build_id) \
     XX(jl_module_exports_p) \
     XX(jl_module_globalref) \

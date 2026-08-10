@@ -145,6 +145,12 @@ pub unsafe fn scan_julia_object<SV: SlotVisitor<JuliaVMSlot>>(obj: Address, clos
             }
             process_slot(closure, Address::from_ptr(package_requires_slot));
 
+            let implementation_rights_slot = ::std::ptr::addr_of!((*m).implementation_rights);
+            if PRINT_OBJ_TYPE {
+                println!(" - scan implementation rights: {:?}\n", implementation_rights_slot);
+            }
+            process_slot(closure, Address::from_ptr(implementation_rights_slot));
+
             let new_typenames_slot = ::std::ptr::addr_of!((*m).new_typenames);
             if PRINT_OBJ_TYPE {
                 println!(" - scan new typenames: {:?}\n", new_typenames_slot);

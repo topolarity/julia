@@ -124,6 +124,7 @@ JL_DLLEXPORT void jl_init_options(void)
 #endif
                         JL_OPTIONS_CHECK_BOUNDS_DEFAULT, // check_bounds
                         JL_OPTIONS_DEPWARN_OFF,    // deprecation warning
+                        JL_OPTIONS_PIRACY_WARN,   // piracy policy
                         0,    // method overwrite warning
                         1,    // can_inline
                         JL_OPTIONS_POLLY_ON, // polly
@@ -245,6 +246,8 @@ static const char opts[]  =
     // error and warning options
     " --depwarn={yes|no*|error}                     Enable or disable syntax and method deprecation\n"
     "                                               warnings (`error` turns warnings into errors)\n"
+    " --piracy={strict|warn*|off}                    Reject, warn about, or silently admit type and impl\n"
+    "                                               piracy\n"
     " --warn-overwrite={yes|no*}                    Enable or disable method overwrite warnings\n"
     " --warn-scope={yes*|no}                        Enable or disable warning for ambiguous top-level\n"
     "                                               scope\n\n"
@@ -384,6 +387,7 @@ JL_DLLEXPORT void jl_parse_opts(int *argcp, char ***argvp)
            opt_output_unopt_bc,
            opt_output_bc,
            opt_depwarn,
+           opt_piracy,
            opt_warn_overwrite,
            opt_warn_scope,
            opt_inline,
@@ -471,6 +475,7 @@ JL_DLLEXPORT void jl_parse_opts(int *argcp, char ***argvp)
         { "output-ji",       required_argument, 0, opt_output_ji },
         { "output-incremental",required_argument, 0, opt_incremental },
         { "depwarn",         required_argument, 0, opt_depwarn },
+        { "piracy",          required_argument, 0, opt_piracy },
         { "warn-overwrite",  required_argument, 0, opt_warn_overwrite },
         { "warn-scope",      required_argument, 0, opt_warn_scope },
         { "inline",          required_argument, 0, opt_inline },
@@ -926,6 +931,16 @@ restart_switch:
                 jl_options.depwarn = JL_OPTIONS_DEPWARN_ERROR;
             else
                 jl_errorf("julia: invalid argument to --depwarn={yes|no|error} (%s)", optarg);
+            break;
+        case opt_piracy:
+            if (!strcmp(optarg,"strict"))
+                jl_options.piracy = JL_OPTIONS_PIRACY_STRICT;
+            else if (!strcmp(optarg,"warn"))
+                jl_options.piracy = JL_OPTIONS_PIRACY_WARN;
+            else if (!strcmp(optarg,"off"))
+                jl_options.piracy = JL_OPTIONS_PIRACY_OFF;
+            else
+                jl_errorf("julia: invalid argument to --piracy={strict|warn|off} (%s)", optarg);
             break;
         case opt_warn_overwrite:
             if (!strcmp(optarg,"yes"))

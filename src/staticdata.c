@@ -596,6 +596,7 @@ static void jl_queue_module_for_serialization(jl_serializer_state *s, jl_module_
         jl_queue_for_serialization(s, m->scanned_methods);
     }
     jl_queue_for_serialization(s, m->package_requires);
+    jl_queue_for_serialization(s, m->implementation_rights);
 }
 
 static int codeinst_may_be_runnable(jl_code_instance_t *ci, int incremental) {
@@ -1275,6 +1276,9 @@ static void jl_write_module(jl_serializer_state *s, uintptr_t item, jl_module_t 
     newm->package_requires = NULL;
     arraylist_push(&s->relocs_list, (void*)(reloc_offset + offsetof(jl_module_t, package_requires)));
     arraylist_push(&s->relocs_list, (void*)backref_id(s, m->package_requires, s->link_ids_relocs));
+    newm->implementation_rights = NULL;
+    arraylist_push(&s->relocs_list, (void*)(reloc_offset + offsetof(jl_module_t, implementation_rights)));
+    arraylist_push(&s->relocs_list, (void*)backref_id(s, m->implementation_rights, s->link_ids_relocs));
     // New TypeNames are processed before image construction. The list is
     // transient root-module loading state and is empty after finalization.
     newm->new_typenames = NULL;

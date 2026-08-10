@@ -296,6 +296,55 @@ The defining `LoadedPackageNode` and the ownership portion are separate facts.
 This preserves package-locality and diagnostics when multiple independently
 authored packages receive the same intersection authority.
 
+## First-pass definition enforcement
+
+Each root `Module` stores its normalized implementation-rights formula. Root
+registration initializes the field before package source evaluation: an
+ordinary package receives `P`, while an extension receives its singleton `E`
+right plus any trigger intersection whose factors identify loaded package
+instances. Submodules query the same root field. Unmanaged roots such as an
+interactive application are unrestricted. If an intersection is initially
+dormant, successful requires-edge publication refreshes the stored grant before
+package evaluation continues. Rights updates acquire `jl_method_def_lock` while
+already holding `require_lock`; definition classification never takes the
+loading lock, preserving this lock order.
+
+Parallel precompilation passes an extension's declared parent/trigger set
+explicitly into its compile worker. This set is stored separately from the
+precompilation scheduler's trigger/dependency graph: scheduling may add other
+extensions to that graph, but those derived edges are not ownership inputs.
+Conflating them would grant authority based on a scheduling approximation.
+
+Before publishing a global Method or interface Method, definition policy checks:
+
+1. the upper bound of `packagetype(signature)` implies one of the defining
+   root's implementation rights;
+2. a definition over any externally closed first-argument portion is a subtype
+   of an interface (a candidate interface is its own witness); and
+3. whenever the candidate is more specific than an existing Method from a
+   different package root, one of those covering interfaces is also more
+   specific than that Method.
+
+Existing Methods from the defining package root do not consume its interface
+permission. This permits a package to add both a broad and a narrow local
+implementation under one upstream interface. Independently loaded sibling
+implementations may still introduce ambiguity in their downstream
+intersection; definition admission does not attempt to predict or forbid that
+intersection.
+
+`jl_method_def_lock` serializes the complete policy snapshot with publication
+to the ordinary and interface tables. Classification reads the already stored
+root rights and therefore does not acquire the loading lock while holding the
+definition lock. Diagnostics are emitted after releasing the lock. The command
+line policy is `--piracy={strict|warn|off}`, defaulting to `warn`; warning and
+off modes preserve normal dispatch, while strict mode rejects the definition
+before publication.
+
+The first implementation intentionally uses the current unrestricted `≺:`
+relation. Restricting cross-package specificity with the requires graph is
+deferred until the inference/edge work; until then, admission alone cannot
+provide the intended no-invalidation guarantee.
+
 ## Ownership rights are cache inputs
 
 The complete normalized ownership context used to classify declarations is a

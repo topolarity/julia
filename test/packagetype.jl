@@ -16,6 +16,9 @@ package_p = Core.eval(Base.__toplevel__, :(module PackagetypeTestP
 
     abstract type Family{T} end
     abstract type Parent end
+
+    struct Marker end
+    struct DependentFamily{T,V<:AbstractVector{T}} end
 end))
 package_q = Core.eval(Base.__toplevel__, :(module PackagetypeTestQ
     struct Bar end
@@ -92,6 +95,31 @@ end
     @test parameterized isa Base.PackagetypeExact
     @test has_package_type_portion(
         parameterized.value, package_r, package_p, package_q)
+end
+
+@testset "package type parameter support" begin
+    dependent = Base.packagetype(package_p.DependentFamily)
+    @test dependent isa Base.PackagetypeExact
+    @test has_package_type_portion(dependent.value, Base, package_p)
+
+    exact_dependent_union = Vector{Union{T,package_p.Foo}} where T<:package_q.Bar
+    exact_dependent_result = Base.packagetype(exact_dependent_union)
+    @test exact_dependent_result isa Base.PackagetypeExact
+    @test has_package_type_portion(
+        exact_dependent_result.value, Base, package_p, package_q)
+
+    covariant_dependent_union = Vector{T} where
+        T<:Union{package_p.Foo,package_q.Bar}
+    covariant_dependent_result = Base.packagetype(covariant_dependent_union)
+    @test covariant_dependent_result isa Base.PackagetypeExact
+    @test has_package_type_portion(
+        covariant_dependent_result.value, Base, package_p)
+    @test has_package_type_portion(
+        covariant_dependent_result.value, Base, package_q)
+
+    value_parameter = Base.packagetype(Val{package_p.Marker()})
+    @test value_parameter isa Base.PackagetypeExact
+    @test has_package_type_portion(value_parameter.value, Base, package_p)
 end
 
 @testset "package type productivity" begin
@@ -220,4 +248,17 @@ end
     fixed_prefix = Base.packagetype(Tuple{Int,Vararg{package_q.Bar}})
     @test fixed_prefix isa Base.PackagetypeExact
     @test has_package_type_portion(fixed_prefix.value, Base)
+
+    variable_length = Base.packagetype(NTuple{N,package_q.Bar} where N)
+    @test variable_length isa Base.PackagetypeExact
+    @test has_package_type_portion(variable_length.value, Base, package_q)
+
+    variable_length_tail = Base.packagetype(
+        Tuple{Int,Vararg{package_q.Bar,N}} where N)
+    @test variable_length_tail isa Base.PackagetypeExact
+    @test has_package_type_portion(variable_length_tail.value, Base)
+
+    type_family = Base.packagetype(Type{T} where T)
+    @test type_family isa Base.PackagetypeExact
+    @test has_package_type_portion(type_family.value, Base)
 end

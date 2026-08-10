@@ -98,19 +98,58 @@ JL_DLLEXPORT jl_typename_t *jl_new_typename_in(jl_sym_t *name, jl_module_t *modu
     return tn;
 }
 
+static int jl_datatype_dispatch_forwards(jl_datatype_t *dt) JL_NOTSAFEPOINT
+{
+    if (dt == jl_any_type || dt == jl_function_type)
+        return 1;
+    if (jl_anytype_type == NULL)
+        return 0;
+    while (dt != NULL) {
+        if (dt == jl_anytype_type)
+            return 1;
+        if (dt->super == NULL || dt->super == dt)
+            return 0;
+        dt = dt->super;
+    }
+    return 0;
+}
+
+void jl_init_dispatch_forwarding_types(void)
+{
+    jl_datatype_t *types[] = {
+        jl_any_type,
+        jl_function_type,
+        jl_anytype_type,
+        jl_datatype_type,
+        jl_intersect_type,
+        jl_typeegal_type,
+        jl_typeeq_type,
+        jl_typeofbottom_type,
+        jl_uniontype_type,
+        jl_unionall_type,
+    };
+    size_t i, n = sizeof(types) / sizeof(types[0]);
+    for (i = 0; i < n; i++) {
+        jl_datatype_t *dt = types[i];
+        assert(dt != NULL && jl_datatype_dispatch_forwards(dt));
+        jl_gc_write(dt->name, dt->name->dispatch_closed_in, jl_value_t, jl_nothing);
+    }
+}
+
 void jl_init_dispatch_closed_in(jl_datatype_t *dt)
 {
     jl_typename_t *tn = dt->name;
-    if (dt == jl_any_type) {
+    if (jl_datatype_dispatch_forwards(dt)) {
         jl_gc_write(tn, tn->dispatch_closed_in, jl_value_t, jl_nothing);
-        return;
     }
-    jl_value_t *dispatch_closed_in = NULL;
-    if (dt->super != NULL)
-        dispatch_closed_in = dt->super->name->dispatch_closed_in;
-    if (dispatch_closed_in == NULL || dispatch_closed_in == jl_nothing)
-        dispatch_closed_in = tn->module ? (jl_value_t*)jl_module_root(tn->module) : jl_nothing;
-    jl_gc_write(tn, tn->dispatch_closed_in, jl_value_t, dispatch_closed_in);
+    else {
+        jl_value_t *dispatch_closed_in = NULL;
+        if (dt->super != NULL)
+            dispatch_closed_in = dt->super->name->dispatch_closed_in;
+        if (dispatch_closed_in == NULL || dispatch_closed_in == jl_nothing)
+            dispatch_closed_in = tn->module ? (jl_value_t*)jl_module_root(tn->module) : jl_nothing;
+        jl_gc_write(tn, tn->dispatch_closed_in, jl_value_t, dispatch_closed_in);
+    }
     if (tn->module != NULL)
         jl_root_module_add_new_typename(tn->module, tn);
 }

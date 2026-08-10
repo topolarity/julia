@@ -829,6 +829,13 @@ let exename = `$(Base.julia_cmd()) --startup-file=no --color=no`
     @test readchomp(`$exename --depwarn=no  -E "Base.JLOptions().depwarn"`) == "0"
     @test readchomp(`$exename --depwarn=yes -E "Base.JLOptions().depwarn"`) == "1"
     @test errors_not_signals(`$exename --depwarn=false`)
+
+    # --piracy
+    @test readchomp(`$exename --piracy=off -E "Base.JLOptions().piracy"`) == "0"
+    @test readchomp(`$exename --piracy=warn -E "Base.JLOptions().piracy"`) == "1"
+    @test readchomp(`$exename --piracy=strict -E "Base.JLOptions().piracy"`) == "2"
+    @test errors_not_signals(`$exename --piracy=error`)
+
     # test deprecated syntax
     @test errors_not_signals(`$exename -e "foo (x::Int) = x * x" --depwarn=error`)
     # test deprecated method

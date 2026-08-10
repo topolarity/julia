@@ -31,6 +31,7 @@ struct JLOptions
     debug_level::Int8
     check_bounds::Int8
     depwarn::Int8
+    piracy::Int8
     warn_overwrite::Int8
     can_inline::Int8
     polly::Int8

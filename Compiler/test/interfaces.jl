@@ -71,8 +71,9 @@ is_package_type_bottom(package_type) = isempty(package_type.alternatives)
     open_owner = Compiler.arg0_package_owner(Any)
     @test has_package_type_portion(open_owner)
 
+    # Function forwards dispatch ownership to its subtypes.
     function_owner = Compiler.arg0_package_owner(Function)
-    @test has_package_type_portion(function_owner, Base)
+    @test has_package_type_portion(function_owner)
 
     @test is_package_type_bottom(Compiler.arg0_package_owner(Union{}))
 
@@ -331,6 +332,147 @@ end
 
     @test_throws ArgumentError Compiler.inference_matches(
         Tuple{typeof(f),Int}, table, world - 1)
+end
+
+definition_policy_p = Core.eval(Base.__toplevel__, :(module DefinitionPolicyP
+    type_piracy_target(x) = x
+
+    function missing_interface end
+
+    function local_extension end
+    interface local_extension(::Any, ::Any)
+
+    specialization_blocked(::Any, ::Any) = nothing
+    interface specialization_blocked(::Any, ::Any)
+
+    specialization_allowed(::Any, ::Any) = nothing
+    interface specialization_allowed(::Any, ::Any)
+    interface specialization_allowed(::Int, ::Any)
+
+    function interface_candidate end
+end))
+
+definition_policy_q = Core.eval(Base.__toplevel__, :(module DefinitionPolicyQ end))
+Core.eval(definition_policy_q, :(const P = $definition_policy_p))
+Core.eval(definition_policy_q, quote
+    struct Bar end
+    P.type_piracy_target(::Int) = nothing
+    P.missing_interface(::Any, ::Bar) = nothing
+    P.local_extension(::Any, ::Bar) = nothing
+    P.local_extension(::Int, ::Bar) = nothing
+    P.specialization_blocked(::Int, ::Bar) = nothing
+    P.specialization_allowed(::Int, ::Bar) = nothing
+    interface P.interface_candidate(::Bar)
+end)
+
+function definition_method(root::Module, @nospecialize(signature::Type))
+    for method in methods(signature.parameters[1].instance)
+        method.module === root || continue
+        method.sig == signature && return method
+    end
+    error("definition Method not found for $signature")
+end
+
+function definition_interface(root::Module, @nospecialize(signature::Type))
+    lookup = Compiler.raw_interface_matches(signature, Base.get_world_counter())
+    for match in lookup.matches
+        method = match.match.method
+        method.module === root || continue
+        method.sig == signature && return method
+    end
+    error("definition interface not found for $signature")
+end
+
+@testset "definition piracy policy" begin
+    P = definition_policy_p
+    Q = definition_policy_q
+    Bar = Q.Bar
+    rights = Base._packagetype_atom(Q)
+    world = Base.get_world_counter()
+    violation_kinds(method) = map(
+        violation -> violation.kind,
+        Compiler.definition_piracy_violations(method, rights, world))
+
+    type_piracy = definition_method(
+        Q, Tuple{typeof(P.type_piracy_target),Int})
+    @test violation_kinds(type_piracy) == [:type_piracy]
+
+    missing_interface = definition_method(
+        Q, Tuple{typeof(P.missing_interface),Any,Bar})
+    @test violation_kinds(missing_interface) == [:missing_interface]
+
+    broad_local = definition_method(
+        Q, Tuple{typeof(P.local_extension),Any,Bar})
+    narrow_local = definition_method(
+        Q, Tuple{typeof(P.local_extension),Int,Bar})
+    @test isempty(violation_kinds(broad_local))
+    # A Method from the same package root does not consume the permission
+    # granted by the broad interface.
+    @test isempty(violation_kinds(narrow_local))
+
+    blocked = definition_method(
+        Q, Tuple{typeof(P.specialization_blocked),Int,Bar})
+    @test violation_kinds(blocked) == [:uncovered_specialization]
+
+    allowed = definition_method(
+        Q, Tuple{typeof(P.specialization_allowed),Int,Bar})
+    @test isempty(violation_kinds(allowed))
+
+    interface_candidate = definition_interface(
+        Q, Tuple{typeof(P.interface_candidate),Bar})
+    @test isempty(violation_kinds(interface_candidate))
+end
+
+@testset "definition piracy command-line policy" begin
+    setup = """
+        parent = Core.eval(Base.__toplevel__, :(module PiracyCLIParent
+            target(x) = x
+        end))
+        child = Core.eval(Base.__toplevel__, :(module PiracyCLIChild end))
+        Core.eval(child, :(const Parent = \$parent))
+        ccall(:jl_set_module_uuid, Cvoid, (Any, NTuple{2, UInt64}),
+            child, (UInt64(1), UInt64(2)))
+        Base._set_root_module_implementation_rights!(
+            child, Base._packagetype_atom(child))
+        """
+    definition = "Core.eval(child, :(Parent.target(::Int) = nothing))"
+
+    function run_policy(policy, script)
+        err = IOBuffer()
+        cmd = `$(Base.julia_cmd()) --startup-file=no --piracy=$policy -e $script`
+        process = run(pipeline(ignorestatus(cmd); stdout=devnull, stderr=err))
+        return success(process), String(take!(err))
+    end
+
+    succeeded, warning = run_policy("warn", "$setup\n$definition")
+    @test succeeded
+    @test occursin("type piracy", warning)
+    @test occursin("target(::Int64)", warning)
+    @test !occursin("Tuple{typeof", warning)
+
+    strict_script = """
+        $setup
+        rejected = false
+        try
+            $definition
+        catch err
+            global rejected = true
+            showerror(stderr, err)
+            println(stderr)
+        end
+        rejected || error("strict piracy policy accepted the definition")
+        any(methods(parent.target)) do method
+            method.module === child &&
+                method.sig == Tuple{typeof(parent.target),Int}
+        end && error("strict piracy policy published the rejected definition")
+        """
+    succeeded, strict_error = run_policy("strict", strict_script)
+    @test succeeded
+    @test occursin("type piracy", strict_error)
+
+    succeeded, silence = run_policy("off", "$setup\n$definition")
+    @test succeeded
+    @test !occursin("piracy", silence)
 end
 
 end # module interfaces

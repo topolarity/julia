@@ -35,6 +35,7 @@ typedef struct {
     int8_t debug_level;
     int8_t check_bounds;
     int8_t depwarn;
+    int8_t piracy;
     int8_t warn_overwrite;
     int8_t can_inline;
     int8_t polly;

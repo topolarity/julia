@@ -217,6 +217,7 @@ Base.@kwdef mutable struct PrecompileSession
     ext_to_parent::Dict{PkgId, PkgId}
     parent_to_exts::Dict{PkgId, Vector{PkgId}}
     triggers::Dict{PkgId, Vector{PkgId}}
+    ownership_triggers::Dict{PkgId, Vector{PkgId}}
     project_deps::Vector{PkgId}
     serial_deps::Vector{PkgId}
     circular_deps::Vector{PkgId}
@@ -928,6 +929,11 @@ function build_dep_graph(env::ExplicitEnv, manifest::Bool, _from_loading::Bool, 
         end
     end
 
+    # Keep the declared parent/trigger set separate from the scheduling graph below.
+    # Scheduling may add other extensions to `triggers`, but those extensions do not
+    # contribute to the package's intersection ownership grant.
+    ownership_triggers = Dict(ext => copy(ext_triggers) for (ext, ext_triggers) in triggers)
+
     project_deps = [
         PkgId(uuid, name)
         for (name, uuid) in env.project_deps if !Base.in_sysimage(PkgId(uuid, name))
@@ -993,7 +999,8 @@ function build_dep_graph(env::ExplicitEnv, manifest::Bool, _from_loading::Bool, 
         end
     end
 
-    return (; direct_deps, ext_to_parent, parent_to_exts, triggers, project_deps, serial_deps)
+    return (; direct_deps, ext_to_parent, parent_to_exts, triggers, ownership_triggers,
+            project_deps, serial_deps)
 end
 
 # Detect circular dependencies and notify their Events so waiting tasks can skip them.
@@ -2207,6 +2214,7 @@ function spawn_precompile_tasks!(s::PrecompileSession;
                             return
                         end
                         loadable_exts = haskey(s.ext_to_parent, pkg) ? filter((dep)->haskey(s.ext_to_parent, dep), s.triggers[pkg]) : nothing
+                        ownership_triggers = get(s.ownership_triggers, pkg, nothing)
 
                         flags_ = if !isempty(deps)
                             `$flags --compiled-modules=strict`
@@ -2222,7 +2230,8 @@ function spawn_precompile_tasks!(s::PrecompileSession;
                             end)
                             t = @elapsed ret = begin
                                 Base.compilecache(pkg, sourcespec, std_pipe, std_pipe, !s.ignore_loaded;
-                                                  flags=flags_, cacheflags, loadable_exts, signal_channel=make_signal_channel(),
+                                                  flags=flags_, cacheflags, loadable_exts, ownership_triggers,
+                                                  signal_channel=make_signal_channel(),
                                                   pid_channel=pid_ch, report_timing=true)
                             end
                         else
@@ -2247,7 +2256,8 @@ function spawn_precompile_tasks!(s::PrecompileSession;
                                     @debug "Precompiling $(repr("text/plain", pkg))"
                                 end
                                 Base.compilecache(pkg, sourcespec, std_pipe, std_pipe, !s.ignore_loaded;
-                                                  flags=flags_, cacheflags, loadable_exts, signal_channel=make_signal_channel(),
+                                                  flags=flags_, cacheflags, loadable_exts, ownership_triggers,
+                                                  signal_channel=make_signal_channel(),
                                                   pid_channel=pid_ch, report_timing=true)
                             end
                         end
@@ -2363,6 +2373,7 @@ function drain_work_channel!(s::PrecompileSession, work_channel::Channel{Precomp
                     merge!(s.ext_to_parent, new_graph.ext_to_parent)
                     merge!(s.parent_to_exts, new_graph.parent_to_exts)
                     merge!(s.triggers, new_graph.triggers)
+                    merge!(s.ownership_triggers, new_graph.ownership_triggers)
                     union!(s.project_deps, new_graph.project_deps)
                     union!(s.serial_deps, new_graph.serial_deps)
                     union!(s.requested_pkgids, effective_pkgids)
@@ -2778,7 +2789,8 @@ function do_precompile(pkgs::Union{Vector{String}, Vector{PkgId}},
         start_loaded_modules=Set{PkgId}(keys(Base.loaded_modules)), requested_pkgids, requested_all,
         direct_deps=graph.direct_deps,
         ext_to_parent=graph.ext_to_parent, parent_to_exts=graph.parent_to_exts,
-        triggers=graph.triggers, project_deps=graph.project_deps,
+        triggers=graph.triggers, ownership_triggers=graph.ownership_triggers,
+        project_deps=graph.project_deps,
         serial_deps=graph.serial_deps, circular_deps,
         n_total=length(graph.direct_deps) * nconfigs,
         printloop_should_exit=!fancyprint, target,

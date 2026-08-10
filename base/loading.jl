@@ -2821,6 +2821,9 @@ end
     end
     maybe_loaded_precompile(key, module_build_id(m)) === nothing && push!(loaded_modules_order, m)
     loaded_modules[key] = m
+    if isdefined(@__MODULE__, :_initialize_root_module_implementation_rights!)
+        _initialize_root_module_implementation_rights!(m, key)
+    end
     end
     nothing
 end
@@ -3429,14 +3432,16 @@ const PRECOMPILE_TRACE_COMPILE = Ref{String}()
 const PRECOMPILE_VERBOSE_TIMING_MARKER = "__JL_PRECOMP_VERBOSE_TIMING__"
 function create_expr_cache(pkg::PkgId, input::PkgLoadSpec, output::String, output_o::Union{Nothing, String},
                            concrete_deps::typeof(_concrete_dependencies), flags::Cmd=``, cacheflags::CacheFlags=CacheFlags(),
-                           internal_stderr::IO = stderr, internal_stdout::IO = stdout, loadable_exts::Union{Vector{PkgId},Nothing}=nothing;
+                           internal_stderr::IO = stderr, internal_stdout::IO = stdout,
+                           loadable_exts::Union{Vector{PkgId},Nothing}=nothing,
+                           ownership_triggers::Union{Vector{PkgId},Nothing}=get(EXT_PRIMED, pkg, nothing);
                            report_timing::Bool=false)
     @nospecialize internal_stderr internal_stdout
     depot_path = String[abspath(x) for x in DEPOT_PATH]
     dl_load_path = String[abspath(x) for x in DL_LOAD_PATH]
     load_path = String[abspath(x) for x in Base.load_path()]
     # if pkg is a stdlib, append its parent Project.toml to the load path
-    triggers = get(EXT_PRIMED, pkg, nothing)
+    triggers = ownership_triggers
     if triggers !== nothing
         parentid = triggers[1]
         for env in load_path
@@ -3488,12 +3493,15 @@ function create_expr_cache(pkg::PkgId, input::PkgLoadSpec, output::String, outpu
     report_timing && (cmd = addenv(cmd, "JULIA_PRECOMP_REPORT_TIMING" => 1))
     io = open(pipeline(cmd, stderr = internal_stderr, stdout = internal_stdout),
               "w", stdout)
+    extension_setup = triggers === nothing ? "" :
+        "Base.EXT_PRIMED[$(_pkg_str(pkg))] = $(_pkg_str(triggers))"
     # write data over stdin to avoid the (unlikely) case of exceeding max command line size
     write(io.in, """
         empty!(Base.EXT_DORMITORY) # If we have a custom sysimage with `EXT_DORMITORY` prepopulated
         Base.track_nested_precomp($(_pkg_str(vcat(Base.precompilation_stack, pkg))))
         Base.loadable_extensions = $(_pkg_str(loadable_exts))
         Base.precompiling_extension = $(loading_extension)
+        $extension_setup
         Base.include_package_for_output($(_pkg_str(pkg)), $(repr(abspath(input.path))), $(repr(input.julia_syntax_version)), $(repr(depot_path)), $(repr(dl_load_path)),
             $(repr(load_path)), $(_pkg_str(concrete_deps)), $(repr(source_path(nothing))))
         """)
@@ -3549,18 +3557,26 @@ This can be used to reduce package load times. Cache files are stored in
 `DEPOT_PATH[1]/compiled`. See [Module initialization and precompilation](@ref)
 for important notes.
 """
-function compilecache(pkg::PkgId, internal_stderr::IO = stderr, internal_stdout::IO = stdout; flags::Cmd=``, cacheflags::CacheFlags=CacheFlags(), loadable_exts::Union{Vector{PkgId},Nothing}=nothing, signal_channel::Union{Channel{Int32},Nothing}=nothing, report_timing::Bool=false)
+function compilecache(pkg::PkgId, internal_stderr::IO = stderr, internal_stdout::IO = stdout;
+                      flags::Cmd=``, cacheflags::CacheFlags=CacheFlags(),
+                      loadable_exts::Union{Vector{PkgId},Nothing}=nothing,
+                      ownership_triggers::Union{Vector{PkgId},Nothing}=get(EXT_PRIMED, pkg, nothing),
+                      signal_channel::Union{Channel{Int32},Nothing}=nothing, report_timing::Bool=false)
     @nospecialize internal_stderr internal_stdout
     spec = locate_package_load_spec(pkg)
     spec === nothing && throw(ArgumentError("$(repr("text/plain", pkg)) not found during precompilation"))
-    return compilecache(pkg, spec, internal_stderr, internal_stdout; flags, cacheflags, loadable_exts, signal_channel, report_timing)
+    return compilecache(pkg, spec, internal_stderr, internal_stdout;
+                        flags, cacheflags, loadable_exts, ownership_triggers,
+                        signal_channel, report_timing)
 end
 
 const MAX_NUM_PRECOMPILE_FILES = Ref(10)
 
 function compilecache(pkg::PkgId, spec::PkgLoadSpec, internal_stderr::IO = stderr, internal_stdout::IO = stdout,
                       keep_loaded_modules::Bool = true; flags::Cmd=``, cacheflags::CacheFlags=CacheFlags(),
-                      loadable_exts::Union{Vector{PkgId},Nothing}=nothing, signal_channel::Union{Channel{Int32},Nothing}=nothing,
+                      loadable_exts::Union{Vector{PkgId},Nothing}=nothing,
+                      ownership_triggers::Union{Vector{PkgId},Nothing}=get(EXT_PRIMED, pkg, nothing),
+                      signal_channel::Union{Channel{Int32},Nothing}=nothing,
                       pid_channel::Union{Channel{Int32},Nothing}=nothing, report_timing::Bool=false)
 
     @nospecialize internal_stderr internal_stdout
@@ -3599,7 +3615,9 @@ function compilecache(pkg::PkgId, spec::PkgLoadSpec, internal_stderr::IO = stder
             close(tmpio_o)
             close(tmpio_so)
         end
-        p = create_expr_cache(pkg, spec, tmppath, tmppath_o, concrete_deps, flags, cacheflags, internal_stderr, internal_stdout, loadable_exts; report_timing)
+        p = create_expr_cache(pkg, spec, tmppath, tmppath_o, concrete_deps, flags, cacheflags,
+                              internal_stderr, internal_stdout, loadable_exts, ownership_triggers;
+                              report_timing)
 
         # Report the PID of the compilation subprocess
         if pid_channel !== nothing

@@ -16,6 +16,8 @@
 extern "C" {
 #endif
 
+jl_mutex_t jl_method_def_lock;
+
 static void check_c_types(const char *where, jl_value_t *rt, jl_value_t *at) JL_CANSAFEPOINT
 {
     if (jl_is_svec(rt))
@@ -1274,6 +1276,44 @@ JL_DLLEXPORT jl_methcache_t *jl_method_get_cache(jl_method_t *method JL_PROPAGAT
     return jl_method_get_table(method)->cache;
 }
 
+static jl_value_t *jl_call_definition_piracy_hook(const char *name,
+                                                  jl_method_t *method,
+                                                  jl_value_t *argument) JL_CANSAFEPOINT
+{
+    jl_task_t *ct = jl_current_task;
+    size_t last_age = ct->world_age;
+    size_t world = jl_atomic_load_acquire(&jl_world_counter);
+    jl_value_t *hook = NULL;
+    jl_value_t *result = jl_nothing;
+    JL_GC_PUSH1(&hook);
+    hook = jl_get_global_value(jl_base_module, jl_symbol(name), world);
+    if (hook == NULL) {
+        JL_GC_POP();
+        return jl_nothing;
+    }
+
+    JL_TRY {
+        ct->world_age = world;
+        jl_value_t **args;
+        size_t nargs = argument == NULL ? 2 : 3;
+        JL_GC_PUSHARGS(args, nargs);
+        args[0] = hook;
+        args[1] = (jl_value_t*)method;
+        if (argument != NULL)
+            args[2] = argument;
+        result = jl_apply(args, nargs);
+        JL_GC_POP();
+        ct->world_age = last_age;
+    }
+    JL_CATCH {
+        ct->world_age = last_age;
+        JL_GC_POP();
+        jl_rethrow();
+    }
+    JL_GC_POP();
+    return result;
+}
+
 JL_DLLEXPORT jl_method_t* jl_method_def(jl_svec_t *argdata,
                                         jl_methtable_t *mt,
                                         jl_code_info_t *f,
@@ -1281,8 +1321,8 @@ JL_DLLEXPORT jl_method_t* jl_method_def(jl_svec_t *argdata,
 {
     // argdata is svec(svec(types...), svec(typevars...), functionloc, rett)
     //   f == NULL signals an interface method declaration: build a Method
-    //   with `rt` populated from `rett` and skip the source/table-insert
-    //   steps (TODO: insert into a parallel interface MethodTable).
+    //   with `rt` populated from `rett` and insert it into the parallel
+    //   interface MethodTable.
     const int is_interface = (f == NULL);
     jl_svec_t *atypes = (jl_svec_t*)jl_svecref(argdata, 0);
     jl_svec_t *tvars = (jl_svec_t*)jl_svecref(argdata, 1);
@@ -1301,7 +1341,8 @@ JL_DLLEXPORT jl_method_t* jl_method_def(jl_svec_t *argdata,
     jl_sym_t *name;
     jl_method_t *m = NULL;
     jl_value_t *argtype = NULL;
-    JL_GC_PUSH4(&ft, &f, &m, &argtype);
+    jl_value_t *piracy_violations = NULL;
+    JL_GC_PUSH5(&ft, &f, &m, &argtype, &piracy_violations);
     size_t i, na = jl_svec_len(atypes);
 
     argtype = jl_apply_tuple_type(atypes, 1);
@@ -1411,10 +1452,47 @@ JL_DLLEXPORT jl_method_t* jl_method_def(jl_svec_t *argdata,
         m->slot_syms = jl_an_empty_string;
         m->rt = rett;
         jl_gc_wb(m, rett);
-        jl_interface_table_insert(m);
     }
     else {
         jl_method_set_source(m, f);
+    }
+
+    int check_piracy = jl_options.piracy != JL_OPTIONS_PIRACY_OFF &&
+        jl_base_module != NULL && (is_interface || mt == jl_method_table);
+    if (check_piracy) {
+        volatile int definition_locked = 1;
+        JL_LOCK(&jl_method_def_lock);
+        JL_TRY {
+            piracy_violations = jl_call_definition_piracy_hook(
+                "_definition_piracy_classifier", m, NULL);
+            if (piracy_violations != jl_nothing &&
+                    jl_options.piracy == JL_OPTIONS_PIRACY_STRICT) {
+                JL_UNLOCK(&jl_method_def_lock);
+                definition_locked = 0;
+                jl_call_definition_piracy_hook(
+                    "_definition_piracy_reporter", m, piracy_violations);
+                jl_error("strict piracy reporter returned without rejecting a definition");
+            }
+            if (is_interface)
+                jl_interface_table_insert(m);
+            else
+                jl_method_table_insert(mt, m, NULL);
+            JL_UNLOCK(&jl_method_def_lock);
+            definition_locked = 0;
+        }
+        JL_CATCH {
+            if (definition_locked)
+                JL_UNLOCK(&jl_method_def_lock);
+            jl_rethrow();
+        }
+        if (piracy_violations != jl_nothing)
+            jl_call_definition_piracy_hook(
+                "_definition_piracy_reporter", m, piracy_violations);
+    }
+    else if (is_interface) {
+        jl_interface_table_insert(m);
+    }
+    else {
         jl_method_table_insert(mt, m, NULL);
     }
     if (jl_newmeth_tracer)

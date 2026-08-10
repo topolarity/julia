@@ -4,9 +4,13 @@ Base.include("Base.jl") # finish populating Base (currently just has the Compile
 
 # Core, Compiler, and Base do not pass through `Base.require` while building the
 # system image, so finalize their root-module loading state explicitly.
-Base._finalize_root_module(Core)
-Base._finalize_root_module(Base.Compiler)
-Base._finalize_root_module(Base)
+# The compiler image supplies already-created TypeNames for these roots and
+# carries no transient `new_typenames` inventory. Reconsider their existing
+# bindings as part of this system-image transaction so changes to the closure
+# rules can bootstrap without inheriting stale labels from the compiler image.
+Base._finalize_root_module(Core; include_existing=true)
+Base._finalize_root_module(Base.Compiler; include_existing=true)
+Base._finalize_root_module(Base; include_existing=true)
 
 # Set up Main module by importing from Base
 using .Base

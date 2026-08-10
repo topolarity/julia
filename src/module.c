@@ -616,6 +616,7 @@ static jl_module_t *jl_new_module__(jl_sym_t *name, jl_module_t *parent) JL_CANS
     m->usings_backedges = jl_nothing;
     m->scanned_methods = jl_nothing;
     m->package_requires = jl_nothing;
+    m->implementation_rights = jl_nothing;
     m->new_typenames = jl_nothing;
     m->nospecialize = 0;
     m->optlevel = -1;
@@ -961,6 +962,22 @@ JL_DLLEXPORT void jl_module_add_package_require(jl_module_t *m, jl_module_t *tar
     }
     jl_array_ptr_1d_push(requires, (jl_value_t*)target);
     JL_UNLOCK(&m->lock);
+}
+
+JL_DLLEXPORT jl_value_t *jl_root_module_implementation_rights(jl_module_t *m)
+{
+    m = jl_module_root(m);
+    return m->implementation_rights;
+}
+
+JL_DLLEXPORT void jl_root_module_set_implementation_rights(jl_module_t *m, jl_value_t *rights)
+{
+    m = jl_module_root(m);
+    JL_GC_PUSH1(&m);
+    JL_LOCK(&jl_method_def_lock);
+    jl_gc_write(m, m->implementation_rights, jl_value_t, rights);
+    JL_UNLOCK(&jl_method_def_lock);
+    JL_GC_POP();
 }
 
 void jl_root_module_add_new_typename(jl_module_t *m, jl_typename_t *tn)

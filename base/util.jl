@@ -149,7 +149,7 @@ See also [`print`](@ref), [`println`](@ref), [`show`](@ref).
 Return a julia command similar to the one of the running process.
 Propagates any of the `--cpu-target`, `--sysimage`, `--compile`, `--sysimage-native-code`,
 `--compiled-modules`, `--pkgimages`, `--inline`, `--check-bounds`, `--optimize`, `--min-optlevel`, `-g`,
-`--code-coverage`, `--track-allocation`, `--color`, `--startup-file`, and `--depwarn`
+`--code-coverage`, `--track-allocation`, `--color`, `--startup-file`, `--depwarn`, and `--piracy`
 command line arguments that are not at their default values.
 
 Among others, `--math-mode`, `--warn-overwrite`, and `--trace-compile` are notably not propagated currently.
@@ -194,6 +194,15 @@ function julia_cmd(julia=joinpath(Sys.BINDIR, julia_exename()); cpu_target::Unio
                       "" # default = "no"
                   end
         isempty(depwarn) || push!(addflags, "--depwarn=$depwarn")
+    end
+    let piracy = if opts.piracy == 0
+                     "off"
+                 elseif opts.piracy == 2
+                     "strict"
+                 else
+                     "" # default = "warn"
+                 end
+        isempty(piracy) || push!(addflags, "--piracy=$piracy")
     end
     let check_bounds = if opts.check_bounds == 1
                       "yes" # on
