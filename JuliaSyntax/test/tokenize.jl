@@ -1071,6 +1071,7 @@ const all_kws = Set([
     "as",
     "doc",
     "goto",
+    "interface",
     "mutable",
     "outer",
     "primitive",
