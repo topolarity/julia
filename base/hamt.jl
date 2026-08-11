@@ -75,7 +75,7 @@ end
 
 Base.@assume_effects :effect_free function HAMT{K,V}((k,v)::Pair{K,V}) where {K, V}
     trie = init_hamt(K, V, k, v)
-    bi = BitmapIndex(HashState(k))
+    bi = BitmapIndex(HashState{K}(k))
     set!(trie, bi)
     return trie
 end
@@ -91,16 +91,23 @@ struct HashState{K}
     shift::Int
 end
 HashState(key) = HashState(key, objectid(key), 0, 0)
-# Reconstruct
-Base.@assume_effects :terminates_locally function HashState(other::HashState, key)
-    h = HashState(key)
+# Container-typed construction: parameterize by the trie's key type rather
+# than `typeof(key)`, so that every `HashState` in an operation on a
+# `HAMT{K,V}` is the single concrete type `HashState{K}` even when `K` is
+# abstract. This keeps the HAMT operations statically resolvable (e.g. under
+# `--trim`) for abstractly-keyed tries such as the scoped-value storage.
+HashState{K}(key) where {K} = HashState{K}(key, objectid(key), 0, 0)
+# Reconstruct. `@inline` so that the loop below is compiled into the (K-typed)
+# caller rather than reached through dispatch on an abstractly-typed key.
+@inline Base.@assume_effects :terminates_locally function HashState(other::HashState{K}, key) where {K}
+    h = HashState{K}(key)
     while h.depth !== other.depth
         h = next(h)
     end
     return h
 end
 
-function next(h::HashState)
+function next(h::HashState{K}) where {K}
     depth = h.depth + 1
     shift = h.shift + BITS_PER_LEVEL
     # Assert disabled for effect precision
@@ -113,7 +120,7 @@ function next(h::HashState)
     else
         h_hash = h.hash
     end
-    return HashState(h.key, h_hash, depth, shift)
+    return HashState{K}(h.key, h_hash, depth, shift)
 end
 
 struct BitmapIndex
