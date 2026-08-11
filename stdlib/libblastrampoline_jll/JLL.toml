@@ -1,0 +1,38 @@
+jll_format = "2.0"
+name = "libblastrampoline"
+
+[products.libblastrampoline]
+# uuid5(package uuid, "libblastrampoline")
+dlid = "4114344b-adca-5d9d-b4ae-fbb7c6187582"
+
+# No dependency edges: libblastrampoline's BLAS backend is attached
+# dynamically at runtime (`add_dependency!`), which is exactly the kind of
+# edge a static record cannot (and does not) declare.
+
+[[builds]]
+os = "windows"
+location = "bundled"
+
+    [builds.products.libblastrampoline.dynamic]
+    soname = "libblastrampoline-5.dll"
+
+[[builds]]
+os = "macos"
+location = "bundled"
+
+    [builds.products.libblastrampoline.dynamic]
+    soname = "libblastrampoline.5.dylib"
+
+[[builds]]
+os = "linux"
+location = "bundled"
+
+    [builds.products.libblastrampoline.dynamic]
+    soname = "libblastrampoline.so.5"
+
+[[builds]]
+os = "freebsd"
+location = "bundled"
+
+    [builds.products.libblastrampoline.dynamic]
+    soname = "libblastrampoline.so.5"

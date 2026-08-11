@@ -41,15 +41,18 @@ function add_dependency!(mod::Module, lib::LazyLibrary,
 end
 
 libblastrampoline_path::String = ""
-const libblastrampoline = LazyLibrary(
-    # NOTE: keep in sync with `Base.libblas_name` and `Base.liblapack_name`.
-    if Sys.iswindows()
-        BundledLazyLibraryPath("libblastrampoline-5.dll")
+# NOTE: keep in sync with `Base.libblas_name` and `Base.liblapack_name`.
+const libblastrampoline_soname = if Sys.iswindows()
+        "libblastrampoline-5.dll"
     elseif Sys.isapple()
-        BundledLazyLibraryPath("libblastrampoline.5.dylib")
+        "libblastrampoline.5.dylib"
     else
-        BundledLazyLibraryPath("libblastrampoline.so.5")
-    end,
+        "libblastrampoline.so.5"
+    end
+const libblastrampoline = LazyLibrary(
+    BundledLazyLibraryPath(libblastrampoline_soname);
+    # uuid5(<package uuid>, "libblastrampoline")
+    id = Base.UUID("4114344b-adca-5d9d-b4ae-fbb7c6187582"),
     dependencies = LazyLibrary[],
     on_load_callback = libblastrampoline_on_load_callback
 )
