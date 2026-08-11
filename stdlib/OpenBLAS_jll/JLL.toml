@@ -59,6 +59,14 @@ location = "bundled"
     soname = "libopenblas64_.so"
     deps = ["CompilerSupportLibraries_jll.libgfortran"]
 
+    # The archive's dependency edges and system-library
+    # closure are declared here because archives carry no DT_NEEDED
+    # equivalent.
+    [builds.products.libopenblas.static]
+    path = "libopenblas64_.a"
+    deps = ["CompilerSupportLibraries_jll.libgfortran"]
+    system_deps = ["m", "pthread"]
+
 [[builds]]
 os = "linux"
 arch = "i686"
