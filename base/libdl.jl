@@ -10,7 +10,7 @@ import Base: DL_LOAD_PATH, isdebugbuild
 export DL_LOAD_PATH, RTLD_DEEPBIND, RTLD_FIRST, RTLD_GLOBAL, RTLD_LAZY, RTLD_LOCAL,
     RTLD_NODELETE, RTLD_NOLOAD, RTLD_NOW, dlclose, dlopen, dlopen_e, dlsym, dlsym_e,
     dlpath, find_library, dlext, dllist, dlid, AbstractLibrary,
-    LazyLibrary, LazyLibraryPath, BundledLazyLibraryPath
+    LazyLibrary, LazyLibraryPath, BundledLazyLibraryPath, StaticLibrary
 
 """
     DL_LOAD_PATH
@@ -610,6 +610,43 @@ end
 function dlid(ll::LazyLibrary)
     raw = ll.id
     return raw === nothing ? nothing : Base.UUID(raw)
+end
+
+"""
+    StaticLibrary(name; id)
+
+Represents a library product that ships only as a static archive: there is no
+shared library to `dlopen`. `ccall`/`@ccall` sites against
+a `StaticLibrary` can be bound only by an ahead-of-time build that links the
+archive natively (e.g. `juliac --link-native static:Pkg_jll`); calling such a
+site in a dynamic session raises an error naming the library.
+
+# Arguments
+
+- `name`: a human-readable label for the library (typically the product name),
+  used in error messages.
+- `id`: the stable identity reported by [`dlid`](@ref), as a `Base.UUID`
+  (typically derived from the owning package's UUID). Required: a static-only
+  library is usable only through its identity.
+
+See also [`AbstractLibrary`](@ref), [`LazyLibrary`](@ref).
+"""
+struct StaticLibrary <: AbstractLibrary
+    name::String
+    # Stored as raw UUID bits for the same bootstrap reason as `LazyLibrary.id`.
+    id::UInt128
+
+    function StaticLibrary(name; id)
+        return new(String(name), UInt128(id))
+    end
+end
+
+dlid(sl::StaticLibrary) = Base.UUID(sl.id)
+
+function dlopen(sl::StaticLibrary, flags::Integer = 0; kwargs...)
+    error("$(sl.name) is a static-only library: there is no shared library to open. ",
+          "Calls against it can only be bound by an ahead-of-time build that links ",
+          "the archive natively (e.g. `juliac --link-native static:...`).")
 end
 
 # Register `jl_libdl_dlopen_func` so that `ccall()` lowering knows
