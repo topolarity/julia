@@ -28,7 +28,9 @@ const libsuitesparseconfig = LazyLibrary(
         BundledLazyLibraryPath("libsuitesparseconfig.so.7")
     else
         error("SuiteSparse_jll: Library 'libsuitesparseconfig' is not available for $(Sys.KERNEL)")
-    end
+    end;
+    # uuid5(<package uuid>, "libsuitesparseconfig")
+    id = Base.UUID("86611fa3-9125-5ef1-8104-5a485b512144")
 )
 
 libldl_path::String = ""
@@ -41,7 +43,9 @@ const libldl = LazyLibrary(
         BundledLazyLibraryPath("libldl.so.3")
     else
         error("SuiteSparse_jll: Library 'libldl' is not available for $(Sys.KERNEL)")
-    end
+    end;
+    # uuid5(<package uuid>, "libldl")
+    id = Base.UUID("383f8c85-7609-5578-a388-ce1a7daa2f2d")
 )
 
 libbtf_path::String = ""
@@ -54,7 +58,9 @@ const libbtf = LazyLibrary(
         BundledLazyLibraryPath("libbtf.so.2")
     else
         error("SuiteSparse_jll: Library 'libbtf' is not available for $(Sys.KERNEL)")
-    end
+    end;
+    # uuid5(<package uuid>, "libbtf")
+    id = Base.UUID("5f6cac12-ce37-514c-b7af-c0d63522c89f")
 )
 
 libcolamd_path::String = ""
@@ -68,6 +74,8 @@ const libcolamd = LazyLibrary(
     else
         error("SuiteSparse_jll: Library 'libcolamd' is not available for $(Sys.KERNEL)")
     end;
+    # uuid5(<package uuid>, "libcolamd")
+    id = Base.UUID("84f95f3a-f557-5166-9866-6274f522430a"),
     dependencies = if Sys.iswindows() && Sys.WORD_SIZE == 32
         LazyLibrary[libsuitesparseconfig, libgcc_s]
     else
@@ -86,6 +94,8 @@ const libamd = LazyLibrary(
     else
         error("SuiteSparse_jll: Library 'libamd' is not available for $(Sys.KERNEL)")
     end;
+    # uuid5(<package uuid>, "libamd")
+    id = Base.UUID("b52ea570-a705-5852-94e8-597e8c4d021c"),
     dependencies = if Sys.iswindows() && Sys.WORD_SIZE == 32
         LazyLibrary[libsuitesparseconfig, libgcc_s]
     else
@@ -104,6 +114,8 @@ const libcamd = LazyLibrary(
     else
         error("SuiteSparse_jll: Library 'libcamd' is not available for $(Sys.KERNEL)")
     end;
+    # uuid5(<package uuid>, "libcamd")
+    id = Base.UUID("7794f09e-a135-532d-8bfa-870421d4eff3"),
     dependencies = if Sys.iswindows() && Sys.WORD_SIZE == 32
         LazyLibrary[libsuitesparseconfig, libgcc_s]
     else
@@ -122,6 +134,8 @@ const libccolamd = LazyLibrary(
     else
         error("SuiteSparse_jll: Library 'libccolamd' is not available for $(Sys.KERNEL)")
     end;
+    # uuid5(<package uuid>, "libccolamd")
+    id = Base.UUID("47fec7c9-b3a9-5bd9-8303-42249ca0ffb5"),
     dependencies = if Sys.iswindows() && Sys.WORD_SIZE == 32
         LazyLibrary[libsuitesparseconfig, libgcc_s]
     else
@@ -140,6 +154,8 @@ const librbio = LazyLibrary(
     else
         error("SuiteSparse_jll: Library 'librbio' is not available for $(Sys.KERNEL)")
     end;
+    # uuid5(<package uuid>, "librbio")
+    id = Base.UUID("3f9b0109-ba9c-5fc9-a6be-908263760788"),
     dependencies = if Sys.iswindows() && Sys.WORD_SIZE == 32
         LazyLibrary[libsuitesparseconfig, libgcc_s]
     else
@@ -158,6 +174,8 @@ const libcholmod = LazyLibrary(
     else
         error("SuiteSparse_jll: Library 'libcholmod' is not available for $(Sys.KERNEL)")
     end;
+    # uuid5(<package uuid>, "libcholmod")
+    id = Base.UUID("fa15f4e3-cf5d-5430-8ed4-3fb8a1002ab6"),
     dependencies = if Sys.iswindows()
         LazyLibrary[
             libsuitesparseconfig, libamd, libcamd, libccolamd, libcolamd, libblastrampoline, libgcc_s
@@ -180,6 +198,8 @@ const libklu = LazyLibrary(
     else
         error("SuiteSparse_jll: Library 'libklu' is not available for $(Sys.KERNEL)")
     end;
+    # uuid5(<package uuid>, "libklu")
+    id = Base.UUID("77606314-8c57-52ee-8dce-d7d60bc753e9"),
     dependencies = if Sys.iswindows() && Sys.WORD_SIZE == 32
         LazyLibrary[libsuitesparseconfig, libamd, libcolamd, libbtf, libgcc_s]
     else
@@ -198,6 +218,8 @@ const libspqr = LazyLibrary(
     else
         error("SuiteSparse_jll: Library 'libspqr' is not available for $(Sys.KERNEL)")
     end;
+    # uuid5(<package uuid>, "libspqr")
+    id = Base.UUID("20148d4d-cf58-52f3-a15f-79966c9048c8"),
     dependencies = if Sys.iswindows()
         LazyLibrary[libsuitesparseconfig, libcholmod, libblastrampoline, libgcc_s]
     elseif Sys.isfreebsd() || Sys.isapple()
@@ -218,6 +240,8 @@ const libumfpack = LazyLibrary(
     else
         error("SuiteSparse_jll: Library 'libumfpack' is not available for $(Sys.KERNEL)")
     end;
+    # uuid5(<package uuid>, "libumfpack")
+    id = Base.UUID("f7cc2ba2-8590-5ecd-b848-9eeff80f8b0f"),
     dependencies = if Sys.iswindows() && Sys.WORD_SIZE == 32
         LazyLibrary[libsuitesparseconfig, libamd, libcholmod, libblastrampoline, libgcc_s]
     else

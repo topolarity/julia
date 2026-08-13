@@ -1,0 +1,155 @@
+# Records the official Julia builds (SuiteSparse 7.10.1, ILP64 BLAS via the
+# `64_` suffix, routed through libblastrampoline). Dependency edges are
+# transcribed from the libraries' DT_NEEDED entries. Linux only for now;
+# other platforms follow the same pattern.
+jll_format = "2.0"
+name = "SuiteSparse"
+
+[products.libsuitesparseconfig]
+dlid = "86611fa3-9125-5ef1-8104-5a485b512144"
+[products.libldl]
+dlid = "383f8c85-7609-5578-a388-ce1a7daa2f2d"
+[products.libbtf]
+dlid = "5f6cac12-ce37-514c-b7af-c0d63522c89f"
+[products.libcolamd]
+dlid = "84f95f3a-f557-5166-9866-6274f522430a"
+[products.libamd]
+dlid = "b52ea570-a705-5852-94e8-597e8c4d021c"
+[products.libcamd]
+dlid = "7794f09e-a135-532d-8bfa-870421d4eff3"
+[products.libccolamd]
+dlid = "47fec7c9-b3a9-5bd9-8303-42249ca0ffb5"
+[products.librbio]
+dlid = "3f9b0109-ba9c-5fc9-a6be-908263760788"
+[products.libcholmod]
+dlid = "fa15f4e3-cf5d-5430-8ed4-3fb8a1002ab6"
+[products.libklu]
+dlid = "77606314-8c57-52ee-8dce-d7d60bc753e9"
+[products.libspqr]
+dlid = "20148d4d-cf58-52f3-a15f-79966c9048c8"
+[products.libumfpack]
+dlid = "f7cc2ba2-8590-5ecd-b848-9eeff80f8b0f"
+
+# Generic linux: dynamic libraries only.
+[[builds]]
+os = "linux"
+location = "bundled"
+
+    [builds.products.libsuitesparseconfig.dynamic]
+    soname = "libsuitesparseconfig.so.7"
+    [builds.products.libldl.dynamic]
+    soname = "libldl.so.3"
+    [builds.products.libbtf.dynamic]
+    soname = "libbtf.so.2"
+    [builds.products.libcolamd.dynamic]
+    soname = "libcolamd.so.3"
+    deps = ["libsuitesparseconfig"]
+    [builds.products.libamd.dynamic]
+    soname = "libamd.so.3"
+    deps = ["libsuitesparseconfig"]
+    [builds.products.libcamd.dynamic]
+    soname = "libcamd.so.3"
+    deps = ["libsuitesparseconfig"]
+    [builds.products.libccolamd.dynamic]
+    soname = "libccolamd.so.3"
+    deps = ["libsuitesparseconfig"]
+    [builds.products.librbio.dynamic]
+    soname = "librbio.so.4"
+    deps = ["libsuitesparseconfig"]
+    [builds.products.libcholmod.dynamic]
+    soname = "libcholmod.so.5"
+    deps = ["libamd", "libcolamd", "libcamd", "libccolamd", "libblastrampoline_jll.libblastrampoline", "libsuitesparseconfig"]
+    [builds.products.libklu.dynamic]
+    soname = "libklu.so.2"
+    deps = ["libamd", "libcolamd", "libbtf", "libsuitesparseconfig"]
+    [builds.products.libspqr.dynamic]
+    soname = "libspqr.so.4"
+    deps = ["libcholmod", "libblastrampoline_jll.libblastrampoline", "libsuitesparseconfig", "CompilerSupportLibraries_jll.libgcc_s"]
+    [builds.products.libumfpack.dynamic]
+    soname = "libumfpack.so.6"
+    deps = ["libcholmod", "libblastrampoline_jll.libblastrampoline", "libamd", "libsuitesparseconfig"]
+
+# linux/x86_64 additionally ships static archives (validated configuration).
+[[builds]]
+os = "linux"
+arch = "x86_64"
+location = "bundled"
+
+    [builds.products.libsuitesparseconfig.dynamic]
+    soname = "libsuitesparseconfig.so.7"
+    [builds.products.libsuitesparseconfig.static]
+    path = "libsuitesparseconfig.a"
+    system_deps = ["m"]
+    [builds.products.libldl.dynamic]
+    soname = "libldl.so.3"
+    [builds.products.libldl.static]
+    path = "libldl.a"
+    system_deps = ["m"]
+    [builds.products.libbtf.dynamic]
+    soname = "libbtf.so.2"
+    [builds.products.libbtf.static]
+    path = "libbtf.a"
+    system_deps = ["m"]
+    [builds.products.libcolamd.dynamic]
+    soname = "libcolamd.so.3"
+    deps = ["libsuitesparseconfig"]
+    [builds.products.libcolamd.static]
+    path = "libcolamd.a"
+    deps = ["libsuitesparseconfig"]
+    system_deps = ["m"]
+    [builds.products.libamd.dynamic]
+    soname = "libamd.so.3"
+    deps = ["libsuitesparseconfig"]
+    [builds.products.libamd.static]
+    path = "libamd.a"
+    deps = ["libsuitesparseconfig"]
+    system_deps = ["m"]
+    [builds.products.libcamd.dynamic]
+    soname = "libcamd.so.3"
+    deps = ["libsuitesparseconfig"]
+    [builds.products.libcamd.static]
+    path = "libcamd.a"
+    deps = ["libsuitesparseconfig"]
+    system_deps = ["m"]
+    [builds.products.libccolamd.dynamic]
+    soname = "libccolamd.so.3"
+    deps = ["libsuitesparseconfig"]
+    [builds.products.libccolamd.static]
+    path = "libccolamd.a"
+    deps = ["libsuitesparseconfig"]
+    system_deps = ["m"]
+    [builds.products.librbio.dynamic]
+    soname = "librbio.so.4"
+    deps = ["libsuitesparseconfig"]
+    [builds.products.librbio.static]
+    path = "librbio.a"
+    deps = ["libsuitesparseconfig"]
+    system_deps = ["m"]
+    [builds.products.libcholmod.dynamic]
+    soname = "libcholmod.so.5"
+    deps = ["libamd", "libcolamd", "libcamd", "libccolamd", "libblastrampoline_jll.libblastrampoline", "libsuitesparseconfig"]
+    [builds.products.libcholmod.static]
+    path = "libcholmod.a"
+    deps = ["libamd", "libcolamd", "libcamd", "libccolamd", "libblastrampoline_jll.libblastrampoline", "libsuitesparseconfig"]
+    system_deps = ["m"]
+    [builds.products.libklu.dynamic]
+    soname = "libklu.so.2"
+    deps = ["libamd", "libcolamd", "libbtf", "libsuitesparseconfig"]
+    [builds.products.libklu.static]
+    path = "libklu.a"
+    deps = ["libamd", "libcolamd", "libbtf", "libsuitesparseconfig"]
+    system_deps = ["m"]
+    [builds.products.libspqr.dynamic]
+    soname = "libspqr.so.4"
+    deps = ["libcholmod", "libblastrampoline_jll.libblastrampoline", "libsuitesparseconfig", "CompilerSupportLibraries_jll.libgcc_s"]
+    [builds.products.libspqr.static]
+    path = "libspqr.a"
+    deps = ["libcholmod", "libblastrampoline_jll.libblastrampoline", "libsuitesparseconfig", "CompilerSupportLibraries_jll.libgcc_s"]
+    system_deps = ["m"]
+    [builds.products.libumfpack.dynamic]
+    soname = "libumfpack.so.6"
+    deps = ["libcholmod", "libblastrampoline_jll.libblastrampoline", "libamd", "libsuitesparseconfig"]
+    [builds.products.libumfpack.static]
+    path = "libumfpack.a"
+    deps = ["libcholmod", "libblastrampoline_jll.libblastrampoline", "libamd", "libsuitesparseconfig"]
+    system_deps = ["m"]
