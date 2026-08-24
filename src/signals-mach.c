@@ -51,8 +51,27 @@ static void attach_exception_port(thread_port_t thread, int segv_only);
 
 static mach_port_t segv_port = 0;
 
-// Dedicated PROT_NONE page for the kernel-assisted restore trigger.
+// Dedicated PROT_NONE page for the kernel-assisted restore trigger (used by
+// the cancellation-delivery path, which resumes at arbitrary PCs).
 void *jl_mach_restore_page = NULL;
+
+#if defined(_CPU_X86_64_)
+// Size of the xsave area for this CPU, queried via CPUID at init time.
+// Used by jl_call_protect_fp_state to save/restore full AVX/AVX-512 state.
+// 0 means xsave is not available (fall back to fxsave).
+uint32_t jl_xsave_size = 0;
+static void jl_init_xsave_size(void)
+{
+    uint32_t eax, ebx, ecx, edx;
+    // CPUID.01H:ECX.XSAVE[bit 26] and OSXSAVE[bit 27]
+    __asm__("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(1), "c"(0));
+    if (!(ecx & (1 << 26)) || !(ecx & (1 << 27)))
+        return;
+    // CPUID leaf 0DH, subleaf 0: EBX = size required for the enabled (XCR0) features
+    __asm__("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(0xD), "c"(0));
+    jl_xsave_size = ebx;
+}
+#endif
 
 // Maximum float state count (in natural_t units) across all supported flavors.
 #if defined(_CPU_X86_64_)
@@ -92,6 +111,7 @@ static void init_mach_restore_trigger(void)
 
     // Initialize jl_mach_float_state_info
 #if defined(_CPU_X86_64_)
+    jl_init_xsave_size();
     mach_port_t self = pthread_mach_thread_np(pthread_self());
     mach_msg_type_number_t count;
     kern_return_t ret;
@@ -326,6 +346,272 @@ static void mach_safepoint_trampoline(jl_ptls_t ptls)
     // and nothing arms the sigint page anymore.)
 }
 
+// ---- Userspace restore path (GC safepoint faults) ----
+//
+// A thread that faults at a GC safepoint is redirected to
+// mach_safepoint_trampoline on its own stack (jl_set_gc_and_wait, the same
+// codepath as the Unix signal handler). The exception handler saves the
+// thread's general-purpose state on the thread's stack, and the thread
+// restores everything *itself* when the trampoline returns:
+// jl_call_protect_fp_state saves/restores the FP/SIMD state around the call,
+// and jl_mach_restore_state restores the general-purpose state and branches
+// back to the faulting poll. No second exception and no other thread is
+// involved, so resuming from a safepoint is cheap and fully concurrent
+// across threads. (Routing every resume through the single exception
+// handler thread - a serialized kernel round-trip per thread - was enough to
+// starve threads under back-to-back collections; see #62819.)
+//
+// On AArch64 the final branch needs a scratch register and leaves x16
+// clobbered. This is sound only because the resume address is always a
+// safepoint poll that we emitted ourselves, and every poll we emit clobbers
+// x16 (see emit_safepoint_poll_load in llvm-codegen-shared.h and
+// jl_gc_safepoint_ in julia_threads.h). The cancellation-delivery path
+// resumes at arbitrary PCs and therefore keeps using the kernel restore
+// (jl_call_in_state + jl_mach_restore_trigger) below.
+
+// Assembly wrapper that saves and restores FP/SIMD registers around a
+// function call. This runs on the faulting thread itself, so it can
+// save/restore FP state with direct register access - no syscall needed.
+//
+// On entry: arg0 in x0/rdi, fptr in x1/rsi, return address (x30 / top of
+// stack) = jl_mach_restore_state, all set by jl_call_in_state_user_restore.
+// Calls fptr(arg0) with FP/SIMD state preserved across the call, then
+// returns into jl_mach_restore_state with sp pointing at the saved
+// host_thread_state_t.
+#if defined(_CPU_AARCH64_)
+// Saves all 32 NEON q-registers (512 bytes) + fpsr + fpcr.
+__attribute__((naked, used)) static void jl_call_protect_fp_state(void)
+{
+    __asm__(
+        // Save frame pointer and link register
+        "  stp x29, x30, [sp, #-16]!\n"
+        "  mov x29, sp\n"
+        // Allocate 528 bytes for NEON state (32*16 + fpsr/fpcr + padding)
+        "  sub sp, sp, #528\n"
+        // Save fpsr and fpcr (x0 = arg0, x1 = fptr, so use x2/x3 as scratch)
+        "  mrs x2, fpsr\n"
+        "  mrs x3, fpcr\n"
+        "  str w2, [sp, #512]\n"
+        "  str w3, [sp, #516]\n"
+        // Save q0-q31 (4 registers per instruction)
+        "  mov x2, sp\n"
+        "  st1 {v0.2d,  v1.2d,  v2.2d,  v3.2d},  [x2], #64\n"
+        "  st1 {v4.2d,  v5.2d,  v6.2d,  v7.2d},  [x2], #64\n"
+        "  st1 {v8.2d,  v9.2d,  v10.2d, v11.2d}, [x2], #64\n"
+        "  st1 {v12.2d, v13.2d, v14.2d, v15.2d}, [x2], #64\n"
+        "  st1 {v16.2d, v17.2d, v18.2d, v19.2d}, [x2], #64\n"
+        "  st1 {v20.2d, v21.2d, v22.2d, v23.2d}, [x2], #64\n"
+        "  st1 {v24.2d, v25.2d, v26.2d, v27.2d}, [x2], #64\n"
+        "  st1 {v28.2d, v29.2d, v30.2d, v31.2d}, [x2], #64\n"
+        // Call fptr(arg0): x0 = arg0 (untouched), x1 = fptr
+        "  blr x1\n"
+        // Restore fpsr and fpcr
+        "  ldr w0, [sp, #512]\n"
+        "  ldr w1, [sp, #516]\n"
+        "  msr fpsr, x0\n"
+        "  msr fpcr, x1\n"
+        // Restore q0-q31 (4 registers per instruction)
+        "  mov x0, sp\n"
+        "  ld1 {v0.2d,  v1.2d,  v2.2d,  v3.2d},  [x0], #64\n"
+        "  ld1 {v4.2d,  v5.2d,  v6.2d,  v7.2d},  [x0], #64\n"
+        "  ld1 {v8.2d,  v9.2d,  v10.2d, v11.2d}, [x0], #64\n"
+        "  ld1 {v12.2d, v13.2d, v14.2d, v15.2d}, [x0], #64\n"
+        "  ld1 {v16.2d, v17.2d, v18.2d, v19.2d}, [x0], #64\n"
+        "  ld1 {v20.2d, v21.2d, v22.2d, v23.2d}, [x0], #64\n"
+        "  ld1 {v24.2d, v25.2d, v26.2d, v27.2d}, [x0], #64\n"
+        "  ld1 {v28.2d, v29.2d, v30.2d, v31.2d}, [x0], #64\n"
+        // Deallocate and return to jl_mach_restore_state
+        "  add sp, sp, #528\n"
+        "  ldp x29, x30, [sp], #16\n"
+        "  ret\n"
+    );
+}
+#elif defined(_CPU_X86_64_)
+// Saves all FP/SIMD state: uses xsave64/xrstor64 if available (preserves
+// AVX/AVX-512), otherwise falls back to fxsave64/fxrstor64 (SSE only).
+__attribute__((naked, used)) static void jl_call_protect_fp_state(void)
+{
+    __asm__(
+        // On entry: rdi = arg0, rsi = fptr.
+        // rsp is 8 mod 16 (return address pushed by jl_call_in_state_user_restore).
+        // Use rbp as frame pointer so we can do dynamic stack allocation.
+        "  pushq %rbp\n"             // rsp now 0 mod 16
+        "  movq %rsp, %rbp\n"
+        // Check if xsave is available (jl_xsave_size > 0)
+        "  movl _jl_xsave_size(%rip), %eax\n"
+        "  testl %eax, %eax\n"
+        "  jz 1f\n"
+        // --- xsave path ---
+        // Allocate xsave buffer on the stack, 64-byte aligned
+        "  subq %rax, %rsp\n"
+        "  andq $-64, %rsp\n"        // xsave requires 64-byte alignment
+        // Zero the XSAVE header's XCOMP_BV (bytes 520-527) and reserved
+        // fields (bytes 528-575) before xsave64. xsave does NOT write these
+        // bytes, but xrstor requires them to be zero in standard format -
+        // otherwise it raises #GP.
+        "  movq $0, 520(%rsp)\n"
+        "  movq $0, 528(%rsp)\n"
+        "  movq $0, 536(%rsp)\n"
+        "  movq $0, 544(%rsp)\n"
+        "  movq $0, 552(%rsp)\n"
+        "  movq $0, 560(%rsp)\n"
+        "  movq $0, 568(%rsp)\n"
+        "  movl $-1, %eax\n"         // save all state components
+        "  movl $-1, %edx\n"
+        "  xsave64 (%rsp)\n"
+        "  callq *%rsi\n"            // fptr(arg0): rdi untouched, rsi = fptr
+        "  movl $-1, %eax\n"
+        "  movl $-1, %edx\n"
+        "  xrstor64 (%rsp)\n"
+        "  jmp 2f\n"
+        // --- fxsave fallback path ---
+        "1:\n"
+        "  subq $512, %rsp\n"        // 512 bytes for fxsave, rsp now 0 mod 16
+        "  andq $-16, %rsp\n"        // fxsave requires 16-byte alignment
+        "  fxsave64 (%rsp)\n"
+        "  callq *%rsi\n"
+        "  fxrstor64 (%rsp)\n"
+        // --- common epilogue ---
+        "2:\n"
+        "  movq %rbp, %rsp\n"
+        "  popq %rbp\n"
+        "  retq\n"
+    );
+}
+#endif
+
+// Assembly stub that restores the GP registers from the host_thread_state_t
+// saved on the stack by jl_call_in_state_user_restore, then jumps back to
+// the saved PC. It is the return address of jl_call_protect_fp_state, so on
+// entry sp points at the saved host_thread_state_t and the FP/SIMD state
+// has already been restored. Callee-saved registers were preserved by the
+// ABI-compliant wrapper and trampoline and are not restored here.
+#if defined(_CPU_AARCH64_)
+// arm_thread_state64_t layout (272 bytes):
+//   __x[29] at offset 0   (29 * 8 = 232 bytes, x0-x28)
+//   __fp    at offset 232  (x29)
+//   __lr    at offset 240  (x30)
+//   __sp    at offset 248  (x31)
+//   __pc    at offset 256
+//   __cpsr  at offset 264
+// x16 is not restored - it ends up holding the saved pc (see the comment on
+// the userspace restore path above for why that is sound).
+__attribute__((naked, used)) static void jl_mach_restore_state(void)
+{
+    __asm__(
+        "  .cfi_signal_frame\n"
+        "  .cfi_def_cfa sp, 0\n"
+        "  .cfi_offset lr, 256\n"   // saved __pc
+        "  .cfi_offset sp, 248\n"   // saved __sp
+        "  .cfi_offset x29, 232\n"  // saved __fp
+        // sp points to the saved host_thread_state_t; use x16 as the base
+        "  mov x16, sp\n"
+        // Restore cpsr (condition flags)
+        "  ldr w17, [x16, #264]\n"
+        "  msr nzcv, x17\n"
+        // Restore x0-x15 (caller-saved)
+        "  ldp x0,  x1,  [x16, #0]\n"
+        "  ldp x2,  x3,  [x16, #16]\n"
+        "  ldp x4,  x5,  [x16, #32]\n"
+        "  ldp x6,  x7,  [x16, #48]\n"
+        "  ldp x8,  x9,  [x16, #64]\n"
+        "  ldp x10, x11, [x16, #80]\n"
+        "  ldp x12, x13, [x16, #96]\n"
+        "  ldp x14, x15, [x16, #112]\n"
+        // Skip x18: platform register (reserved on macOS)
+        // Skip x19-x28 and x29 (fp): callee-saved, preserved by the wrapper
+        // and trampoline.
+        // Restore lr (x30) - was overwritten by jl_call_in_state_user_restore
+        "  ldr x30, [x16, #240]\n"
+        // Restore sp, x17, and jump to the saved pc.
+        "  ldr x17, [x16, #248]\n"      // x17 = saved sp
+        "  mov sp, x17\n"               // restore sp
+        "  ldr x17, [x16, #136]\n"      // restore x17 (17*8)
+        "  ldr x16, [x16, #256]\n"      // x16 = saved pc (base lost)
+        "  br x16\n"                    // jump to saved pc
+    );
+}
+#elif defined(_CPU_X86_64_)
+// x86_thread_state64_t layout (168 bytes):
+//   __rax at offset 0, __rbx at 8, __rcx at 16, __rdx at 24
+//   __rdi at 32, __rsi at 40, __rbp at 48, __rsp at 56
+//   __r8 at 64, __r9 at 72, __r10 at 80, __r11 at 88
+//   __r12 at 96, __r13 at 104, __r14 at 112, __r15 at 120
+//   __rip at 128, __rflags at 136
+__attribute__((naked, used)) static void jl_mach_restore_state(void)
+{
+    __asm__(
+        "  .cfi_signal_frame\n"
+        "  .cfi_def_cfa %rsp, 0\n"
+        "  .cfi_offset %rip, 128\n" // saved __rip
+        "  .cfi_offset %rsp, 56\n"  // saved __rsp
+        // rsp points to the saved host_thread_state_t
+        "  movq %rsp, %r11\n"         // use r11 as base pointer
+        // Restore rflags
+        "  pushq 136(%r11)\n"
+        "  popfq\n"
+        // Restore caller-saved GP registers
+        "  movq 0(%r11), %rax\n"
+        // skip rbx (8) - callee-saved
+        "  movq 16(%r11), %rcx\n"
+        "  movq 24(%r11), %rdx\n"
+        "  movq 32(%r11), %rdi\n"
+        "  movq 40(%r11), %rsi\n"
+        // skip rbp (48), rsp (56) - callee-saved / restored separately
+        "  movq 64(%r11), %r8\n"
+        "  movq 72(%r11), %r9\n"
+        "  movq 80(%r11), %r10\n"
+        // skip r12 (96), r13 (104), r14 (112), r15 (120) - callee-saved
+        // Restore rsp and r11, then jump to the saved rip, which
+        // jl_call_in_state_user_restore stored at orig_rsp - 136 (below the
+        // 128-byte red zone) so that we never write into the red zone.
+        "  movq 56(%r11), %rsp\n"    // restore original rsp
+        "  movq 88(%r11), %r11\n"    // restore r11 (base lost)
+        "  jmpq *-136(%rsp)\n"       // jump to saved rip below red zone
+    );
+}
+#endif
+
+// Set up state to call fptr(arg0) on the target thread, with the full
+// register state restored in userspace by the thread itself when fptr
+// returns (see the userspace restore path comment above).
+static void jl_call_in_state_user_restore(host_thread_state_t *state, void (*fptr)(void), uintptr_t arg0)
+{
+#ifdef _CPU_X86_64_
+    uintptr_t sp = state->__rsp;
+    sp = (sp - 256) & ~(uintptr_t)15; // redzone and re-alignment
+    sp -= sizeof(host_thread_state_t);
+    sp &= ~(uintptr_t)15;
+    memcpy((void*)sp, state, sizeof(host_thread_state_t));
+    // Store the saved rip below the original red zone (128 bytes), inside
+    // the 256-byte gap we left, so that jl_mach_restore_state can jump back
+    // without writing into the red zone.
+    *(uintptr_t*)(state->__rsp - 136) = state->__rip;
+    // Push the return address of the wrapper: the restore stub
+    sp -= sizeof(void*);
+    *(uintptr_t*)sp = (uintptr_t)&jl_mach_restore_state;
+    state->__rsp = sp;
+    state->__rip = (uint64_t)&jl_call_protect_fp_state;
+    state->__rdi = arg0;
+    state->__rsi = (uintptr_t)fptr;
+#elif defined(_CPU_AARCH64_)
+    uintptr_t sp = state->__sp;
+    sp = (sp - 256) & ~(uintptr_t)15;
+    sp -= sizeof(host_thread_state_t);
+    sp &= ~(uintptr_t)15;
+    memcpy((void*)sp, state, sizeof(host_thread_state_t));
+    state->__sp = sp;
+    state->__pc = (uint64_t)&jl_call_protect_fp_state;
+    state->__lr = (uintptr_t)&jl_mach_restore_state;
+    state->__x[0] = arg0;
+    state->__x[1] = (uintptr_t)fptr;
+#else
+#error "julia: call-in-state not supported on this platform"
+#endif
+}
+
+// ---- Kernel restore path (cancellation delivery, arbitrary PCs) ----
+
 #if defined(_CPU_AARCH64_)
 __attribute__((naked, used)) static void jl_mach_restore_trigger(void)
 {
@@ -347,7 +633,10 @@ __attribute__((naked, used)) static void jl_mach_restore_trigger(void)
 }
 #endif
 
-// Set up state to call fptr(arg0) on the target thread.
+// Set up state to call fptr(arg0) on the target thread, restoring its state
+// through the kernel when fptr returns. This is used for cancellation-handler
+// delivery, which may interrupt arbitrary (foreign) code where no register
+// can be assumed dead, so the userspace restore above is not applicable.
 static void jl_call_in_state(host_thread_state_t *state, void (*fptr)(void),
                              uintptr_t arg0, const void *float_state)
 {
@@ -476,21 +765,17 @@ kern_return_t catch_mach_exception_raise_state_identity(
     kern_return_t ret = thread_get_state(thread, HOST_EXCEPTION_STATE, (thread_state_t)&exc_state, &exc_count);
     HANDLE_MACH_ERROR("thread_get_state", ret);
     if (jl_addr_is_safepoint(fault_addr) && !is_write_fault(exc_state)) {
-        // Save FP/SIMD state from the faulting thread
-        mach_msg_type_number_t float_count = jl_mach_float_state_info.count;
-        natural_t float_state[JL_MACH_FLOAT_STATE_MAX_COUNT];
-        kern_return_t ret = thread_get_state(thread, jl_mach_float_state_info.flavor,
-                                             (thread_state_t)float_state, &float_count);
-        HANDLE_MACH_ERROR("thread_get_state", ret);
-        assert(float_count == jl_mach_float_state_info.count);
-        // Hijack the faulting thread to handle the safepoint on its own
-        // stack, using the same jl_set_gc_and_wait() codepath as Unix signals.
-        jl_call_in_state(state, (void (*)(void))&mach_safepoint_trampoline,
-                         (uintptr_t)ptls2, float_state);
+        // Redirect the faulting thread to handle the safepoint on its own
+        // stack, using the same jl_set_gc_and_wait() codepath as Unix
+        // signals. The thread saves/restores its FP/SIMD state itself and
+        // restores its GP state in userspace when the trampoline returns, so
+        // no further exception round-trip is needed to resume it.
+        jl_call_in_state_user_restore(state, (void (*)(void))&mach_safepoint_trampoline,
+                                      (uintptr_t)ptls2);
         return KERN_SUCCESS;
     } else if (jl_addr_is_restore_trigger(fault_addr)) {
         // This is a deliberate fault from jl_mach_restore_trigger, we're
-        // returning from a `jl_call_in_state` (probably the one above).
+        // returning from a `jl_call_in_state` (cancellation-handler delivery).
 #if defined(_CPU_X86_64_)
         old_state = (thread_state_t)state->__rsp;
 #elif defined(_CPU_AARCH64_)

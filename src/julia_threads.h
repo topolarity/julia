@@ -624,12 +624,28 @@ void jl_sigint_safepoint(jl_ptls_t tls);
 // This triggers a SegFault when we are in GC
 // Assign it to a variable to make sure the compiler emit the load
 // and to avoid Clang warning for -Wunused-volatile-lvalue
+#if defined(_CPU_AARCH64_) && defined(_OS_DARWIN_)
+// On macOS the Mach exception handler resumes a thread that faulted at a
+// safepoint by restoring its register state in userspace and branching back
+// to the poll through x16 (see signals-mach.c), so x16 must be dead at every
+// poll: emit the poll as inline asm that clobbers it.
+#define jl_gc_safepoint_(ptls) do {                                            \
+        jl_signal_fence();                                                     \
+        volatile size_t *safepoint_addr = jl_atomic_load_relaxed(&ptls->safepoint); \
+        size_t safepoint_load;                                                 \
+        __asm__ volatile("ldr %0, [%1]" : "=r"(safepoint_load)                 \
+                         : "r"(safepoint_addr) : "x16");                       \
+        jl_signal_fence();                                                     \
+        (void)safepoint_load;                                                  \
+    } while (0)
+#else
 #define jl_gc_safepoint_(ptls) do {                                            \
         jl_signal_fence();                                                     \
         size_t safepoint_load = jl_atomic_load_relaxed(&ptls->safepoint)[0];   \
         jl_signal_fence();                                                     \
         (void)safepoint_load;                                                  \
     } while (0)
+#endif
 #define jl_sigint_safepoint(ptls) do {                                         \
         jl_signal_fence();                                                     \
         size_t safepoint_load = jl_atomic_load_relaxed(&ptls->safepoint)[-1];  \

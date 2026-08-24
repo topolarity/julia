@@ -117,7 +117,7 @@ void FinalLowerGC::lowerSafepoint(CallInst *target, Function &F)
     assert(target->arg_size() == 1);
     IRBuilder<> builder(target);
     Value* signal_page = target->getOperand(0);
-    builder.CreateLoad(T_size, signal_page, true);
+    emit_safepoint_poll_load(builder, T_size, signal_page);
     target->eraseFromParent();
 }
 

@@ -9,6 +9,8 @@
 #include <llvm/IR/Module.h>
 #include <llvm/IR/DebugLoc.h>
 #include <llvm/IR/IRBuilder.h>
+#include <llvm/IR/InlineAsm.h>
+#include <llvm/TargetParser/Triple.h>
 #include <llvm/IR/MDBuilder.h>
 #include <llvm/Support/ModRef.h>
 
@@ -247,6 +249,25 @@ static inline void emit_signal_fence(llvm::IRBuilder<> &builder)
     builder.CreateFence(AtomicOrdering::SequentiallyConsistent, SyncScope::SingleThread);
 }
 
+// Emit the load that polls the GC safepoint page. The loaded value is unused.
+// On Darwin/AArch64 the poll is emitted as inline asm that clobbers x16:
+// signals-mach.c resumes a thread that faulted at a safepoint by restoring
+// its register state in userspace and branching back to the poll through
+// x16, which is sound only if x16 is dead at every poll.
+static inline void emit_safepoint_poll_load(llvm::IRBuilder<> &builder, llvm::Type *T_size, llvm::Value *signal_page)
+{
+    using namespace llvm;
+    Module *M = builder.GetInsertBlock()->getModule();
+    Triple TT(M->getTargetTriple());
+    if (TT.isAArch64() && TT.isOSDarwin()) {
+        FunctionType *FT = FunctionType::get(T_size, {signal_page->getType()}, false);
+        InlineAsm *IA = InlineAsm::get(FT, "ldr $0, [$1]", "=r,r,~{x16}", /*hasSideEffects=*/true);
+        builder.CreateCall(IA, {signal_page});
+        return;
+    }
+    builder.CreateLoad(T_size, signal_page, true);
+}
+
 static inline void emit_gc_safepoint(llvm::IRBuilder<> &builder, llvm::Type *T_size, llvm::Value *ptls, llvm::MDNode *tbaa, bool final = false)
 {
     using namespace llvm;
@@ -256,7 +277,7 @@ static inline void emit_gc_safepoint(llvm::IRBuilder<> &builder, llvm::Type *T_s
     LLVMContext &C = builder.getContext();
     // inline jlsafepoint_func->realize(M)
     if (final) {
-        builder.CreateLoad(T_size, signal_page, true);
+        emit_safepoint_poll_load(builder, T_size, signal_page);
     }
     else {
         Function *F = M->getFunction("julia.safepoint");
