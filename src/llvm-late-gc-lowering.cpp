@@ -1315,7 +1315,7 @@ State LateLowerGCFrame::LocalScan(Function &F) {
                             callee == pgcstack_getter || callee->getName() == XSTR(jl_egal__unboxed) ||
                             callee->getName() == XSTR(jl_lock_value) || callee->getName() == XSTR(jl_unlock_value) ||
                             callee->getName() == XSTR(jl_lock_field) || callee->getName() == XSTR(jl_unlock_field) ||
-                            callee == write_barrier_func || callee == gc_loaded_func || callee == pop_handler_noexcept_func ||
+                            isWriteBarrierFunc(callee) || callee == gc_loaded_func || callee == pop_handler_noexcept_func ||
                             callee->getName() == "memcmp") {
                             continue;
                         }
@@ -1881,8 +1881,17 @@ void LateLowerGCFrame::CleanupWriteBarriers(Function &F, State *S, const SmallVe
         // parent or perm-rooted. Invalid for plans that must observe the parent's old
         // fields regardless of the child (GC_SNAPSHOT_BARRIER).
 #ifndef GC_SNAPSHOT_BARRIER
-        if (std::all_of(CI->op_begin() + 1, CI->op_end(),
-                    [parent, &S](Value *child) { return parent == child || IsPermRooted(child, S); })) {
+        auto callee = CI->getCalledOperand();
+        bool AllElidable = true;
+        unsigned stride = isFieldWriteBarrier(callee) ? 2 : 1;
+        for (unsigned i = writeBarrierFirstChildArg(callee); i < CI->arg_size(); i += stride) {
+            Value *child = CI->getArgOperand(i);
+            if (parent != child && !IsPermRooted(child, S)) {
+                AllElidable = false;
+                break;
+            }
+        }
+        if (AllElidable) {
             CI->eraseFromParent();
             continue;
         }
@@ -1951,7 +1960,7 @@ bool LateLowerGCFrame::CleanupIR(Function &F, State *S, bool *CFGModified) {
             }
             Value *callee = CI->getCalledOperand();
 
-            if (write_barrier_func && callee == write_barrier_func) {
+            if (isWriteBarrierFunc(callee)) {
                 assert(CI->arg_size() >= 1);
                 write_barriers.push_back(CI);
                 ChangesMade = true;
