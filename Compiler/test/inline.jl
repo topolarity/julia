@@ -2462,4 +2462,91 @@ let mi = Compiler.specialize_method(only(methods(ndims, (Matrix{Float64},))),
     @test Compiler.ci_get_source(interp, codeinst) isa Core.CodeInfo
 end
 
+# Trim may invoke simple abstract signatures without relying on inlining, while
+# retaining the usual signature restrictions for runtime-dispatched calls.
+@newinterp SimpleAbstractInvokes true
+@noinline function simple_abstract_target(x::Integer, label::String)
+    return x isa Int ? sizeof(label) : 0
+end
+simple_abstract_caller(x, label) = simple_abstract_target(x, label)
+@inline simple_abstract_inline_target(x::Integer, label::String) = x isa Int ? sizeof(label) : 0
+simple_abstract_inline_caller(x, label) = simple_abstract_inline_target(x, label)
+@noinline simple_abstract_sparam(x::T) where T = T
+simple_abstract_sparam_caller(x) = simple_abstract_sparam(x)
+
+@testset "simple abstract invokes" begin
+    for (typ, expected) in (
+        (Integer, true),
+        (Any, true),
+        (Tuple{Integer, String}, true),
+        (Tuple{Tuple{Integer}, String}, true),
+        (Vector{Union{Int, String}}, true),
+        (Ref{Vector}, true),
+        (Type{Union{Int, String}}, true),
+        (Core.TypeEgal{Vector}, true),
+        (Union{Int, String}, false),
+        (Tuple{Union{Int, String}}, false),
+        (Tuple{Tuple{Union{Int, String}}}, false),
+        (Vector, false),
+        (Tuple{Vector}, false),
+        (AbstractVector{T} where T<:Union{Int, String}, false),
+    )
+        @test Compiler.is_simple_invoke_type(typ) == expected
+    end
+    v = TypeVar(:T, Integer, Integer)
+    @test Compiler.is_simple_invoke_type(UnionAll(v, Tuple{v}))
+    u = TypeVar(:T, Union{Int, String}, Union{Int, String})
+    @test !Compiler.is_simple_invoke_type(UnionAll(u, Tuple{u}))
+
+    for enabled in (false, true)
+        interp = SimpleAbstractInvokes(;
+            opt_params=Compiler.OptimizationParams(; abstract_invoke=enabled))
+        src = code_typed1(simple_abstract_caller, (Integer, String); interp)
+        @test any(isinvoke(:simple_abstract_target), src.code) == enabled
+        @test any(iscall((src, simple_abstract_target)), src.code) == !enabled
+        src = code_typed1(simple_abstract_inline_caller, (Integer, String); interp)
+        @test !any(iscall((src, simple_abstract_inline_target)), src.code)
+        @test !any(isinvoke(:simple_abstract_inline_target), src.code)
+        src = code_typed1(simple_abstract_sparam_caller, (Integer,); interp)
+        @test !any(isinvoke(:simple_abstract_sparam), src.code)
+    end
+    method = only(methods(simple_abstract_target))
+    sig = Tuple{typeof(simple_abstract_target), Integer, String}
+    @test Compiler.get_compileable_sig(method, sig, Core.svec()) === nothing
+end
+
+# The trim method budget accepts sixteen candidates, but still rejects seventeen.
+abstract type TrimMethodBudget end
+for i in 1:17
+    name = Symbol(:TrimMethodBudget, i)
+    @eval struct $name <: TrimMethodBudget end
+    @eval @noinline trim_seventeen_methods(::$name) = $i
+    if i <= 16
+        @eval @noinline trim_sixteen_methods(::$name) = $i
+    end
+end
+trim_sixteen_caller(x) = trim_sixteen_methods(x)
+trim_seventeen_caller(x) = trim_seventeen_methods(x)
+Base.Experimental.@max_methods 1 function trim_annotated_methods end
+@noinline trim_annotated_methods(::TrimMethodBudget1) = 1
+@noinline trim_annotated_methods(::TrimMethodBudget2) = 2
+trim_annotated_caller(x) = trim_annotated_methods(x)
+
+@testset "trim inference parameters" begin
+    for mode in (Compiler.TRIM_NO, Compiler.TRIM_SAFE, Compiler.TRIM_UNSAFE, Compiler.TRIM_UNSAFE_WARN)
+        ip, op = Compiler.trimming_params(mode)
+        trimming = mode != Compiler.TRIM_NO
+        @test ip.max_methods == (trimming ? 16 : Compiler.BuildSettings.MAX_METHODS)
+        @test ip.force_enable_inference == trimming
+        @test op.abstract_invoke == trimming
+        interp = SimpleAbstractInvokes(; inf_params=ip, opt_params=op)
+        src = code_typed1(trim_sixteen_caller, (TrimMethodBudget,); interp)
+        @test any(iscall((src, trim_sixteen_methods)), src.code) == !trimming
+        src = code_typed1(trim_seventeen_caller, (TrimMethodBudget,); interp)
+        @test any(iscall((src, trim_seventeen_methods)), src.code)
+        src = code_typed1(trim_annotated_caller, (TrimMethodBudget,); interp)
+        @test any(iscall((src, trim_annotated_methods)), src.code)
+    end
+end
+
 end # module inline_tests

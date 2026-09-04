@@ -773,6 +773,42 @@ function has_typeegal_slot(@nospecialize(atype))
     return false
 end
 
+"""
+    is_simple_invoke_type(t)
+
+Whether `t` has no union or nontrivial `UnionAll` in covariant position. Tuple
+elements are covariant; parameters of other data types are invariant and are
+left unrestricted. Equal-bound variables are substituted before checking.
+"""
+function is_simple_invoke_type(@nospecialize(t))
+    if t isa UnionAll
+        t.var.lb === t.var.ub || return false
+        return is_simple_invoke_type(t{t.var.lb})
+    elseif isType(t)
+        return true
+    elseif t isa DataType
+        if t.name === Tuple.name
+            for p in t.parameters
+                is_simple_invoke_type(p) || return false
+            end
+        end
+        return true
+    elseif isvarargtype(t)
+        return is_simple_invoke_type(unwrapva(t))
+    end
+    return false
+end
+
+function is_simple_abstract_invoke(method::Method, @nospecialize(atype))
+    # Keep generated-function and vararg specialization policies unchanged.
+    hasgenerator(method) && return false
+    method.isva && return false
+    atype isa DataType && atype.name === Tuple.name && !isvatuple(atype) || return false
+    has_free_typevars(atype) && return false
+    length(atype.parameters) == method.nargs || return false
+    return is_simple_invoke_type(atype)
+end
+
 function compileable_specialization(code::Union{MethodInstance,CodeInstance}, effects::Effects,
     et::InliningEdgeTracker, @nospecialize(info::CallInfo), state::InliningState)
     mi = code isa CodeInstance ? get_ci_mi(code) : code
@@ -780,7 +816,11 @@ function compileable_specialization(code::Union{MethodInstance,CodeInstance}, ef
     method, atype, sparams = mi.def::Method, mi.specTypes, mi.sparam_vals
     if OptimizationParams(state.interp).compilesig_invokes
         new_atype = get_compileable_sig(method, atype, sparams)
-        new_atype === nothing && return nothing
+        if new_atype === nothing
+            OptimizationParams(state.interp).abstract_invoke || return nothing
+            is_simple_abstract_invoke(method, atype) || return nothing
+            new_atype = atype
+        end
         if atype !== new_atype
             (_, sparams) = typeintersect_env(new_atype, method.sig)
             mi_invoke = specialize_method(method, new_atype, sparams)

@@ -290,7 +290,8 @@ Parameters that control abstract interpretation-based type inference operation.
   Typically, considering many methods means spending _lots_ of time obtaining poor type
   information, so this option should be kept low. [`Base.Experimental.@max_methods`](@ref)
   can have a more fine-grained control on this configuration with per-module or per-method
-  annotation basis.
+  annotation basis. Trimmed compilation raises the default to 16, while retaining these
+  explicit annotations.
 ---
 - `inf_params.max_union_splitting::Int = 4`\\
   Specifies the maximum number of union-tuples to swap or expand before computing the set of
@@ -441,6 +442,12 @@ Parameters that control optimizer operation.
   generating `:invoke` expression based on the [`@nospecialize`](@ref) annotation,
   in order to avoid over-specialization.
 ---
+- `opt_params.abstract_invoke::Bool = false`\\
+  Allows direct invokes of simple abstract signatures, even when runtime dispatch would
+  specialize further. Unions and nontrivial `UnionAll`s in covariant positions are excluded.
+  The additional eligibility applies to fixed-arity, non-generated methods.
+  Enabled for trimmed compilation, where falling back to dynamic dispatch is undesirable.
+---
 - `opt_params.assume_fatal_throw::Bool = false`\\
   If `true`, gives the optimizer license to assume that any `throw` is fatal and thus the
   state after a `throw` is not externally observable. In particular, this gives the
@@ -460,6 +467,7 @@ struct OptimizationParams
     inline_tupleret_bonus::Int
     max_tuple_splat::Int
     compilesig_invokes::Bool
+    abstract_invoke::Bool
     assume_fatal_throw::Bool
     preserve_local_sources::Bool
 
@@ -470,6 +478,7 @@ struct OptimizationParams
         inline_tupleret_bonus::Int,
         max_tuple_splat::Int,
         compilesig_invokes::Bool,
+        abstract_invoke::Bool,
         assume_fatal_throw::Bool,
         preserve_local_sources::Bool)
         return new(
@@ -479,6 +488,7 @@ struct OptimizationParams
             inline_tupleret_bonus,
             max_tuple_splat,
             compilesig_invokes,
+            abstract_invoke,
             assume_fatal_throw,
             preserve_local_sources)
     end
@@ -491,6 +501,7 @@ function OptimizationParams(
         #=inline_tupleret_bonus::Int=# 250,
         #=max_tuple_splat::Int=# 32,
         #=compilesig_invokes::Bool=# true,
+        #=abstract_invoke::Bool=# false,
         #=assume_fatal_throw::Bool=# false,
         #=preserve_local_sources::Bool=# false);
     inlining::Bool = params.inlining,
@@ -499,6 +510,7 @@ function OptimizationParams(
     inline_tupleret_bonus::Int = params.inline_tupleret_bonus,
     max_tuple_splat::Int = params.max_tuple_splat,
     compilesig_invokes::Bool = params.compilesig_invokes,
+    abstract_invoke::Bool = params.abstract_invoke,
     assume_fatal_throw::Bool = params.assume_fatal_throw,
     preserve_local_sources::Bool = params.preserve_local_sources)
     return OptimizationParams(
@@ -508,6 +520,7 @@ function OptimizationParams(
         inline_tupleret_bonus,
         max_tuple_splat,
         compilesig_invokes,
+        abstract_invoke,
         assume_fatal_throw,
         preserve_local_sources)
 end

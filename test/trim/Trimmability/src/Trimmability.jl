@@ -20,6 +20,16 @@ area(c::Circle) = pi*c.radius^2
 
 sum_areas(v::Vector{Shape}) = sum(area, v)
 
+# Exercise non-inlineable abstract invokes and the sixteen-method trim budget.
+const abstract_integer = Ref{Integer}(42)
+@noinline classify_integer(x::Integer, label::String) = x isa Int && sizeof(label) == 4
+abstract type TrimChoice end
+struct Choice{N} <: TrimChoice end
+for i in 1:16
+    @eval @noinline choice_number(::Choice{$i}) = $i
+end
+const abstract_choice = Ref{TrimChoice}(Choice{16}())
+
 mutable struct Foo; x::Int; end
 
 # To check that objects embedded in emitted code are retained (kept[] == 0): we did not lose any roots
@@ -203,6 +213,8 @@ function @main(args::Vector{String})::Cint
     end
 
     println(Core.stdout, "collected: ", kept[], " kept, ", dropped[], " dropped")
+    println(Core.stdout, "trim limits: ", classify_integer(abstract_integer[], "trim"),
+            " ", choice_number(abstract_choice[]))
 
     try
         sock = connect("localhost", 4900)

@@ -2034,6 +2034,8 @@ end
 
 # This is a bridge for the C code calling `jl_typeinf_func()` on a single Method match
 function typeinf_ext_toplevel(mi::MethodInstance, world::UInt, source_mode::UInt8, trim_mode::UInt8)
+    # These requests also compile build-time code (e.g. macros and generators).
+    # Reserve the expanded trim budgets for the application's batch AOT pass.
     inf_params = InferenceParams(; force_enable_inference = trim_mode != TRIM_NO)
     interp = NativeInterpreter(world; inf_params)
     return typeinf_ext_toplevel(interp, mi, source_mode)
@@ -2127,23 +2129,33 @@ const TRIM_NO = 0x0
 const TRIM_SAFE = 0x1
 const TRIM_UNSAFE = 0x2
 const TRIM_UNSAFE_WARN = 0x3
+
+function trimming_params(trim_mode::UInt8; cache_owner=nothing)
+    trimming = trim_mode != TRIM_NO
+    inf_params = InferenceParams(;
+        max_methods = trimming ? 16 : BuildSettings.MAX_METHODS,
+        force_enable_inference = trimming, cache_owner)
+    opt_params = OptimizationParams(; abstract_invoke = trimming)
+    return inf_params, opt_params
+end
+
 function typeinf_ext_toplevel(methods::Vector{Any}, worlds::Vector{UInt}, trim_mode::UInt8)
     # During `--trim`, infer against an isolated cache namespace. The owner is re-stamped
     # back to `nothing` at serialization time (see `src/staticdata.c`).
     cache_owner = trim_mode == TRIM_NO ? nothing : :trim
-    inf_params = InferenceParams(; force_enable_inference = trim_mode != TRIM_NO, cache_owner)
+    inf_params, opt_params = trimming_params(trim_mode; cache_owner)
 
     # Create an "invokelatest" queue to enable eager compilation of speculative
     # invokelatest calls such as from `Core.finalizer` and `ccallable`
     invokelatest_queue = CompilationQueue(;
-        interp = NativeInterpreter(get_world_counter(); inf_params)
+        interp = NativeInterpreter(get_world_counter(); inf_params, opt_params)
     )
 
     codeinfos = []
     workqueue = CompilationQueue(; interp = nothing)
     for this_world in reverse!(sort!(worlds))
         workqueue = CompilationQueue(workqueue;
-            interp = NativeInterpreter(this_world; inf_params)
+            interp = NativeInterpreter(this_world; inf_params, opt_params)
         )
 
         append!(workqueue, methods)
