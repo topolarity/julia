@@ -2537,6 +2537,7 @@ trim_annotated_caller(x) = trim_annotated_methods(x)
         ip, op = Compiler.trimming_params(mode)
         trimming = mode != Compiler.TRIM_NO
         @test ip.max_methods == (trimming ? 16 : Compiler.BuildSettings.MAX_METHODS)
+        @test ip.max_methods_for_constructor == (trimming ? 5 : -1)
         @test ip.force_enable_inference == trimming
         @test op.abstract_invoke == trimming
         interp = SimpleAbstractInvokes(; inf_params=ip, opt_params=op)
@@ -2546,6 +2547,38 @@ trim_annotated_caller(x) = trim_annotated_methods(x)
         @test any(iscall((src, trim_seventeen_methods)), src.code)
         src = code_typed1(trim_annotated_caller, (TrimMethodBudget,); interp)
         @test any(iscall((src, trim_annotated_methods)), src.code)
+    end
+end
+
+# Constructor limits also cover unknown type values and calls through splatting.
+struct TrimConstructorFive{T} end
+struct TrimConstructorSix{T} end
+for i in 1:6
+    arg = Symbol(:TrimMethodBudget, i)
+    @eval @noinline (::Type{TrimConstructorSix{T}})(::$arg) where T = $i
+    if i <= 5
+        @eval @noinline (::Type{TrimConstructorFive{T}})(::$arg) where T = $i
+    end
+end
+trim_constructor_five(x) = TrimConstructorFive{Int}(x)
+trim_constructor_six(x) = TrimConstructorSix{Int}(x)
+trim_constructor_unknown(T, x) = T(x)
+trim_constructor_splat(args...) = TrimConstructorSix{Int}(args...)
+
+@testset "trim constructor budget" begin
+    for limit in (-1, 5)
+        ip = Compiler.InferenceParams(; max_methods=16, max_methods_for_constructor=limit)
+        @test Compiler.InferenceParams(ip).max_methods_for_constructor == limit
+        interp = SimpleAbstractInvokes(; inf_params=ip)
+        @test last(only(code_typed(trim_constructor_five, (TrimMethodBudget,); interp))) === Int
+        expected = limit == -1 ? Int : Any
+        for (f, args) in (
+            (trim_constructor_six, (TrimMethodBudget,)),
+            (trim_constructor_unknown, (Type{<:TrimConstructorSix}, TrimMethodBudget)),
+            (trim_constructor_splat, (TrimMethodBudget,)),
+        )
+            @test last(only(code_typed(f, args; interp))) === expected
+        end
     end
 end
 

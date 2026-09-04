@@ -2134,6 +2134,7 @@ function trimming_params(trim_mode::UInt8; cache_owner=nothing)
     trimming = trim_mode != TRIM_NO
     inf_params = InferenceParams(;
         max_methods = trimming ? 16 : BuildSettings.MAX_METHODS,
+        max_methods_for_constructor = trimming ? 5 : -1,
         force_enable_inference = trimming, cache_owner)
     opt_params = OptimizationParams(; abstract_invoke = trimming)
     return inf_params, opt_params

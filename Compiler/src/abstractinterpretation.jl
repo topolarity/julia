@@ -133,6 +133,10 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(fun
         return Future(CallMeta(Any, Any, Effects(), NoCallInfo()))
     end
     current_world = get_world_counter()
+    constructor_limit = InferenceParams(interp).max_methods_for_constructor
+    if constructor_limit >= 0 && widenconst(argtypes[1]) <: Type
+        max_methods = max_methods < 0 ? constructor_limit : min(max_methods, constructor_limit)
+    end
     matches = find_method_matches(interp, argtypes, atype; max_methods, fargs=arginfo.fargs)
     if isa(matches, FailedMethodMatch)
         add_remark!(interp, sv, matches.reason)

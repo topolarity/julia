@@ -293,6 +293,11 @@ Parameters that control abstract interpretation-based type inference operation.
   annotation basis. Trimmed compilation raises the default to 16, while retaining these
   explicit annotations.
 ---
+- `inf_params.max_methods_for_constructor::Int = -1`\\
+  Additional method-count limit for constructor calls, including calls through an unknown
+  type value. Negative values disable this limit. Trimmed compilation sets it to 5 to avoid
+  excessive inference through broad constructor signatures while raising `max_methods` to 16.
+---
 - `inf_params.max_union_splitting::Int = 4`\\
   Specifies the maximum number of union-tuples to swap or expand before computing the set of
   matching methods or conditional types.
@@ -333,6 +338,7 @@ Parameters that control abstract interpretation-based type inference operation.
 """
 struct InferenceParams
     max_methods::Int
+    max_methods_for_constructor::Int
     max_union_splitting::Int
     max_apply_union_enum::Int
     max_tuple_splat::Int
@@ -346,6 +352,7 @@ struct InferenceParams
 
     function InferenceParams(
         max_methods::Int,
+        max_methods_for_constructor::Int,
         max_union_splitting::Int,
         max_apply_union_enum::Int,
         max_tuple_splat::Int,
@@ -359,6 +366,7 @@ struct InferenceParams
     )
         return new(
             max_methods,
+            max_methods_for_constructor,
             max_union_splitting,
             max_apply_union_enum,
             max_tuple_splat,
@@ -375,6 +383,7 @@ end
 function InferenceParams(
     params::InferenceParams = InferenceParams( # default constructor
         #=max_methods::Int=# BuildSettings.MAX_METHODS,
+        #=max_methods_for_constructor::Int=# -1,
         #=max_union_splitting::Int=# 4,
         #=max_apply_union_enum::Int=# 8,
         #=max_tuple_splat::Int=# 32,
@@ -387,6 +396,7 @@ function InferenceParams(
         #=cache_owner=# nothing
     );
     max_methods::Int = params.max_methods,
+    max_methods_for_constructor::Int = params.max_methods_for_constructor,
     max_union_splitting::Int = params.max_union_splitting,
     max_apply_union_enum::Int = params.max_apply_union_enum,
     max_tuple_splat::Int = params.max_tuple_splat,
@@ -400,6 +410,7 @@ function InferenceParams(
 )
     return InferenceParams(
         max_methods,
+        max_methods_for_constructor,
         max_union_splitting,
         max_apply_union_enum,
         max_tuple_splat,
