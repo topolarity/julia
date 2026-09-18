@@ -89,6 +89,8 @@ end
         @test cancel!(root3)
         # MMTk may retain promoted children until a full collection.
         @test live_children(root3) == [kept3] skip=!Base.USING_STOCK_GC
+        GC.gc()
+        @test live_children(root3) == [kept3]
     end
 
     # linked sources: a source with several parents is cancelled by any of
@@ -207,8 +209,8 @@ end
 
 @testset "cancellation source GC with dying parents" begin
     # Parents dying in the same cycle as their children: the unlink pass
-    # writes into the dead parents' memory, which the sweep must keep
-    # valid through the cycle.
+    # writes into the dead parents' memory, which must remain intact
+    # until weak processing finishes.
     for _ in 1:5
         for _ in 1:1000
             r = CancellationTokenSource()
@@ -218,8 +220,8 @@ end
         GC.gc()
     end
     GC.gc()
-    GC.gc() # pages now hold no sources: the sweep flag must clear, not pin them
-    # big-object sources (many parents) take the deferred-free path
+    GC.gc() # no sources remain to keep their pages allocated
+    # big-object sources (many parents) must also be unlinked before reclamation
     let
         parents = [CancellationTokenSource() for _ in 1:100]
         cancel!(parents[1])
@@ -240,6 +242,73 @@ end
     GC.gc()
     cancel!(root)
     @test Base.iscancelled(keep)
+end
+
+@testset "cancellation sources across generations" begin
+    # Old linked sources must retain newly installed strong referents, while
+    # young siblings unlink safely; full collection must revisit old sources.
+    @noinline function add_young_siblings(root)
+        for _ in 1:64
+            CancellationTokenSource(CancellationToken(root))
+        end
+        return nothing
+    end
+    @noinline function age_and_mutate(root, nparents)
+        parents = [root; [CancellationTokenSource() for _ in 2:nparents]]
+        child = CancellationTokenSource(CancellationToken.(parents)...)
+        GC.@preserve child begin
+            for _ in 1:3
+                GC.gc(false)
+            end
+            add_young_siblings(root)
+            GC.gc(false)
+            @test (@atomic root.child_head) === child
+            @test Base._cancel_next_child(root, child) === nothing
+            @test cancel!(child)
+        end
+        return nothing
+    end
+    for nparents in (1, 100), _ in 1:3
+        root = CancellationTokenSource()
+        age_and_mutate(root, nparents)
+        GC.gc(false)
+        @test cancel!(root)
+        GC.gc()
+        @test (@atomic root.child_head) === nothing
+    end
+end
+
+@testset "cancellation source retained by finalization (aged=$aged)" for aged in (false, true)
+    # Finalizer retention precedes weak unlinking, including when the finalizer
+    # resurrects a source; dropping the resurrected reference must unlink it.
+    @noinline function make_finalized_child(root, saved, aged)
+        child = CancellationTokenSource(CancellationToken(root))
+        finalizer(c -> (saved[] = c), child)
+        if aged
+            GC.@preserve child begin
+                for _ in 1:3
+                    GC.gc(false)
+                end
+            end
+        end
+        return nothing
+    end
+    @noinline function check_resurrected_child(root, aged)
+        saved = Ref{Union{Nothing, CancellationTokenSource}}(nothing)
+        make_finalized_child(root, saved, aged)
+        GC.gc()
+        @test saved[] isa CancellationTokenSource
+        GC.gc()
+        @test (@atomic root.child_head) === saved[]
+        @test cancel!(root)
+        @test Base.iscancelled(saved[])
+        saved[] = nothing
+        return nothing
+    end
+    root = CancellationTokenSource()
+    check_resurrected_child(root, aged)
+    GC.gc()
+    @test (@atomic root.child_head) === nothing
 end
 
 @testset "cancellation source memory accounting" begin
