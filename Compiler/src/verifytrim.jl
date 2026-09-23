@@ -1,7 +1,7 @@
 # This file is a part of Julia. License is MIT: https://julialang.org/license
 
 import ..Compiler: verify_typeinf_trim, NativeInterpreter, argtypes_to_type,
-    compileable_specialization_for_call, foreign_library_type, _libdl_dlopen
+    compileable_specialization_for_call, foreign_library_type, foreign_site_bound_natively, _libdl_dlopen
 
 using ..Compiler:
      # operators
@@ -422,6 +422,8 @@ function verify_codeinstance!(interp::NativeInterpreter, codeinst::CodeInstance,
                 dlopen_fn = _libdl_dlopen()
                 if library_type === nothing || library_type <: Union{Symbol,String}
                     continue # no runtime `dlopen()` invocation
+                elseif foreign_site_bound_natively(spec)
+                    continue # bound at link time; no `dlopen()` either
                 elseif dlopen_fn !== nothing
                     atype = Tuple{typeof(dlopen_fn), library_type}
                     mi = compileable_specialization_for_call(interp, atype)

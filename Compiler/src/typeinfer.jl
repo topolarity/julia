@@ -1912,6 +1912,23 @@ function foreign_library_type(@nospecialize(spec), ci::CodeInfo, sptypes::Vector
     return argextype_widened(lib, ci, sptypes)
 end
 
+# Whether a foreigncall / foreignglobal spec names a library the runtime's foreign
+# link policy binds natively: such a site references its symbol directly, so no
+# `dlopen` runs for it (see `is_native_link_target` in ccall.cpp). The identity is
+# the spec's third element, recorded by lowering for an `AbstractLibrary`.
+function foreign_site_bound_natively(@nospecialize(spec))
+    if isexpr(spec, :tuple) && length(spec.args) >= 3
+        id = spec.args[3]
+    elseif spec isa Tuple && length(spec) >= 3
+        id = spec[3]
+    else
+        return false
+    end
+    id isa QuoteNode && (id = id.value)
+    id isa Core.LibraryID || return false
+    return ccall(:jl_get_foreign_link_policy, Cint, (Any,), id) == 1
+end
+
 function collectinvokes!(workqueue::CompilationQueue, ci::CodeInfo, sptypes::Vector{VarState};
                          invokelatest_queue::Union{CompilationQueue,Nothing} = nothing,
                          enqueue_unprepared_invokes::Bool = false,
@@ -1987,6 +2004,7 @@ function collectinvokes!(workqueue::CompilationQueue, ci::CodeInfo, sptypes::Vec
             library_type = foreign_library_type(stmt.args[1], ci, sptypes)
             library_type === nothing && continue
             library_type <: Union{Symbol,String} && continue # resolved natively by the runtime
+            foreign_site_bound_natively(stmt.args[1]) && continue # bound at link time
             dlopen_fn = _libdl_dlopen()
             dlopen_fn === nothing && continue
             atype = Tuple{typeof(dlopen_fn), library_type}
