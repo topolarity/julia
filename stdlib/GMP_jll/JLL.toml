@@ -67,6 +67,13 @@ location = "bundled"
     soname = "libgmp.so.10"
 
     [[builds.products]]
+    name = "libgmp"
+    type = "library"
+    linkage = "static"
+    path = "libgmp.a"
+    system_deps = ["c"]
+
+    [[builds.products]]
     name = "libgmpxx"
     type = "library"
     linkage = "dynamic"

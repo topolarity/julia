@@ -48,3 +48,11 @@ location = "bundled"
     linkage = "dynamic"
     soname = "libmpfr.so.6"
     deps = ["GMP_jll.libgmp"]
+
+    [[builds.products]]
+    name = "libmpfr"
+    type = "library"
+    linkage = "static"
+    path = "libmpfr.a"
+    deps = ["GMP_jll.libgmp"]
+    system_deps = ["c", "pthread"]

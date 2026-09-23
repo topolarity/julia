@@ -43,6 +43,13 @@ location = "bundled"
     linkage = "dynamic"
     soname = "libzstd.so.1"
 
+    [[builds.products]]
+    name = "libzstd"
+    type = "library"
+    linkage = "static"
+    path = "libzstd.a"
+    system_deps = ["c", "pthread"]
+
 [[builds]]
 os = "freebsd"
 location = "bundled"
