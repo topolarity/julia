@@ -1,0 +1,50 @@
+# Records the official Julia builds. `location = "bundled"`: the library
+# lives in the private shlibdir of the Julia installation that owns this
+# record. Static entries name an archive installed next to it, where the
+# deps build produces one.
+format_version = "1.0"
+name = "MPFR"
+
+[[builds]]
+os = "windows"
+location = "bundled"
+
+    [[builds.products]]
+    name = "libmpfr"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libmpfr-6.dll"
+    deps = ["GMP_jll.libgmp", "CompilerSupportLibraries_jll.libgcc_s"]
+
+[[builds]]
+os = "macos"
+location = "bundled"
+
+    [[builds.products]]
+    name = "libmpfr"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libmpfr.6.dylib"
+    deps = ["GMP_jll.libgmp"]
+
+[[builds]]
+os = "freebsd"
+location = "bundled"
+
+    [[builds.products]]
+    name = "libmpfr"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libmpfr.so.6"
+    deps = ["GMP_jll.libgmp"]
+
+[[builds]]
+os = "linux"
+location = "bundled"
+
+    [[builds.products]]
+    name = "libmpfr"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libmpfr.so.6"
+    deps = ["GMP_jll.libgmp"]

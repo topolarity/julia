@@ -1,0 +1,53 @@
+# Records the official Julia builds. `location = "bundled"`: the library
+# lives in the private shlibdir of the Julia installation that owns this
+# record. Static entries name an archive installed next to it, where the
+# deps build produces one.
+format_version = "1.0"
+name = "PCRE2"
+
+[[builds]]
+os = "windows"
+location = "bundled"
+
+    [[builds.products]]
+    name = "libpcre2_8"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libpcre2-8-0.dll"
+
+[[builds]]
+os = "macos"
+location = "bundled"
+
+    [[builds.products]]
+    name = "libpcre2_8"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libpcre2-8.0.dylib"
+
+[[builds]]
+os = "freebsd"
+location = "bundled"
+
+    [[builds.products]]
+    name = "libpcre2_8"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libpcre2-8.so.0"
+
+[[builds]]
+os = "linux"
+location = "bundled"
+
+    [[builds.products]]
+    name = "libpcre2_8"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libpcre2-8.so.0"
+
+    [[builds.products]]
+    name = "libpcre2_8"
+    type = "library"
+    linkage = "static"
+    path = "libpcre2-8.a"
+    system_deps = ["c", "pthread"]

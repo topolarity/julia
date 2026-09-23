@@ -1,0 +1,54 @@
+# Records the official Julia builds. `location = "bundled"`: the library
+# lives in the private shlibdir of the Julia installation that owns this
+# record. Static entries name an archive installed next to it, where the
+# deps build produces one.
+format_version = "1.0"
+name = "OpenLibm"
+
+[[builds]]
+os = "windows"
+location = "bundled"
+
+    [[builds.products]]
+    name = "libopenlibm"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libopenlibm.dll"
+    deps = ["CompilerSupportLibraries_jll.libgcc_s"]
+
+[[builds]]
+os = "macos"
+location = "bundled"
+
+    [[builds.products]]
+    name = "libopenlibm"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libopenlibm.4.dylib"
+
+[[builds]]
+os = "freebsd"
+location = "bundled"
+
+    [[builds.products]]
+    name = "libopenlibm"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libopenlibm.so.4"
+
+[[builds]]
+os = "linux"
+location = "bundled"
+
+    [[builds.products]]
+    name = "libopenlibm"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libopenlibm.so.4"
+
+    [[builds.products]]
+    name = "libopenlibm"
+    type = "library"
+    linkage = "static"
+    path = "libopenlibm.a"
+    system_deps = ["c"]

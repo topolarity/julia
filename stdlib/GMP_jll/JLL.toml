@@ -1,0 +1,74 @@
+# Records the official Julia builds. `location = "bundled"`: the library
+# lives in the private shlibdir of the Julia installation that owns this
+# record. Static entries name an archive installed next to it, where the
+# deps build produces one.
+format_version = "1.0"
+name = "GMP"
+
+[[builds]]
+os = "windows"
+location = "bundled"
+
+    [[builds.products]]
+    name = "libgmp"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libgmp-10.dll"
+
+    [[builds.products]]
+    name = "libgmpxx"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libgmpxx-4.dll"
+    deps = ["libgmp", "CompilerSupportLibraries_jll.libstdcxx", "CompilerSupportLibraries_jll.libgcc_s"]
+
+[[builds]]
+os = "macos"
+location = "bundled"
+
+    [[builds.products]]
+    name = "libgmp"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libgmp.10.dylib"
+
+    [[builds.products]]
+    name = "libgmpxx"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libgmpxx.4.dylib"
+    deps = ["libgmp"]
+
+[[builds]]
+os = "freebsd"
+location = "bundled"
+
+    [[builds.products]]
+    name = "libgmp"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libgmp.so.10"
+
+    [[builds.products]]
+    name = "libgmpxx"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libgmpxx.so.4"
+    deps = ["libgmp", "CompilerSupportLibraries_jll.libgcc_s"]
+
+[[builds]]
+os = "linux"
+location = "bundled"
+
+    [[builds.products]]
+    name = "libgmp"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libgmp.so.10"
+
+    [[builds.products]]
+    name = "libgmpxx"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libgmpxx.so.4"
+    deps = ["libgmp", "CompilerSupportLibraries_jll.libstdcxx", "CompilerSupportLibraries_jll.libgcc_s"]
