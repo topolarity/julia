@@ -597,7 +597,53 @@ $(build_shlibdir)/libjulia-internal-debug.$(JL_MAJOR_MINOR_SHLIB_EXT): $(BUILDDI
 # the external libraries (libunwind, LLVMSupport, zstd, ...); `-l` system
 # libraries are left to the consumer.
 STATIC_LIBS := $(filter %.a,$(BUILDDIR)/flisp/libflisp.a $(BUILDDIR)/support/libsupport.a $(LIBUV) $(LIBUTF8PROC) $(LIBTARGET_PARSING))
-$(build_libdir)/libjulia-internal.a: $(STATIC_OBJS) $(STATIC_LIBS)
+
+# The archive's record: what it is linked against beyond what it folds in, in
+# the form a JLL.toml record states a static product's needs (`deps` are edges
+# to the bundled JLLs' products, `system_deps` are `-l` names). A consumer
+# such as juliac provisions each edge itself, statically or dynamically.
+ifeq ($(OS), Linux)
+STATIC_RECORD_OS := linux
+STATIC_RECORD_DEPS := "LibUnwind_jll.libunwind", "Zstd_jll.libzstd", "Zlib_jll.libz"
+STATIC_RECORD_SYSDEPS := "stdc++", "atomic", "rt", "dl", "pthread", "m", "c"
+else ifeq ($(OS), FreeBSD)
+STATIC_RECORD_OS := freebsd
+STATIC_RECORD_DEPS := "LibUnwind_jll.libunwind", "Zstd_jll.libzstd", "Zlib_jll.libz"
+STATIC_RECORD_SYSDEPS := "c++", "rt", "pthread", "m", "c"
+else ifeq ($(OS), Darwin)
+STATIC_RECORD_OS := macos
+STATIC_RECORD_DEPS := "Zstd_jll.libzstd", "Zlib_jll.libz"
+STATIC_RECORD_SYSDEPS := "c++", "pthread", "m", "c"
+else
+STATIC_RECORD_OS := windows
+STATIC_RECORD_DEPS := "Zstd_jll.libzstd", "Zlib_jll.libz"
+STATIC_RECORD_SYSDEPS := "stdc++", "pthread", "m", "c"
+endif
+$(build_libdir)/libjulia-internal.toml: $(SRCDIR)/Makefile | $(build_libdir)
+	@TMPFILE=$$(mktemp $(abspath $@.XXXXXX)); \
+	{ \
+	  echo '# Written by the Julia build: the static runtime archive and its needs.'; \
+	  echo 'format_version = "1.0"'; \
+	  echo 'name = "libjulia-internal"'; \
+	  echo; \
+	  echo '[[builds]]'; \
+	  echo 'os = "$(STATIC_RECORD_OS)"'; \
+	  echo 'location = "bundled"'; \
+	  echo; \
+	  echo '    [builds.artifact]'; \
+	  echo '    bundled_path = "private_libdir"'; \
+	  echo; \
+	  echo '    [[builds.products]]'; \
+	  echo '    name = "libjulia-internal"'; \
+	  echo '    type = "library"'; \
+	  echo '    linkage = "static"'; \
+	  echo '    path = "libjulia-internal.a"'; \
+	  echo '    deps = [$(STATIC_RECORD_DEPS)]'; \
+	  echo '    system_deps = [$(STATIC_RECORD_SYSDEPS)]'; \
+	} > $$TMPFILE; \
+	mv $$TMPFILE $@
+
+$(build_libdir)/libjulia-internal.a: $(STATIC_OBJS) $(STATIC_LIBS) $(build_libdir)/libjulia-internal.toml
 	@rm -rf $@
 ifeq ($(OS),Darwin)
 	@$(call PRINT_LINK, libtool -static -o $@ $(STATIC_OBJS) $(STATIC_LIBS))

@@ -1,0 +1,33 @@
+# Records the official Julia builds. `location = "bundled"`: the library
+# lives in the private shlibdir of the Julia installation that owns this
+# record. Static entries name an archive installed next to it, where the
+# deps build produces one.
+format_version = "1.0"
+name = "LibUnwind"
+
+[[builds]]
+os = "linux"
+location = "bundled"
+
+    [[builds.products]]
+    name = "libunwind"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libunwind.so.8"
+
+    [[builds.products]]
+    name = "libunwind"
+    type = "library"
+    linkage = "static"
+    path = "libunwind.a"
+    system_deps = ["lzma", "c"]
+
+[[builds]]
+os = "freebsd"
+location = "bundled"
+
+    [[builds.products]]
+    name = "libunwind"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libunwind.so.8"

@@ -1,0 +1,53 @@
+# Records the official Julia builds. `location = "bundled"`: the library
+# lives in the private shlibdir of the Julia installation that owns this
+# record. Static entries name an archive installed next to it, where the
+# deps build produces one.
+format_version = "1.0"
+name = "Zlib"
+
+[[builds]]
+os = "windows"
+location = "bundled"
+
+    [[builds.products]]
+    name = "libz"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libz.dll"
+
+[[builds]]
+os = "macos"
+location = "bundled"
+
+    [[builds.products]]
+    name = "libz"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libz.1.dylib"
+
+[[builds]]
+os = "freebsd"
+location = "bundled"
+
+    [[builds.products]]
+    name = "libz"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libz.so.1"
+
+[[builds]]
+os = "linux"
+location = "bundled"
+
+    [[builds.products]]
+    name = "libz"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libz.so.1"
+
+    [[builds.products]]
+    name = "libz"
+    type = "library"
+    linkage = "static"
+    path = "libz.a"
+    system_deps = ["c"]
