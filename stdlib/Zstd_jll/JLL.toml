@@ -1,0 +1,54 @@
+format_version = "1.0"
+name = "Zstd"
+
+[[builds]]
+os = "windows"
+location = "bundled"
+
+    [[builds.products]]
+    name = "libzstd"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libzstd-1.dll"
+
+[[builds]]
+os = "windows"
+arch = "i686"
+location = "bundled"
+
+    [[builds.products]]
+    name = "libzstd"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libzstd-1.dll"
+    deps = ["CompilerSupportLibraries_jll.libgcc_s"]
+
+[[builds]]
+os = "macos"
+location = "bundled"
+
+    [[builds.products]]
+    name = "libzstd"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libzstd.1.dylib"
+
+[[builds]]
+os = "linux"
+location = "bundled"
+
+    [[builds.products]]
+    name = "libzstd"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libzstd.so.1"
+
+[[builds]]
+os = "freebsd"
+location = "bundled"
+
+    [[builds.products]]
+    name = "libzstd"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libzstd.so.1"

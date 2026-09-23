@@ -1,0 +1,117 @@
+# Records the official Julia builds: USE_BLAS64 (the `64_` suffix) on 64-bit
+# architectures, plain sonames on 32-bit ones.
+format_version = "1.0"
+name = "OpenBLAS"
+
+[[builds]]
+os = "windows"
+location = "bundled"
+
+    [[builds.products]]
+    name = "libopenblas"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libopenblas64_.dll"
+    deps = ["CompilerSupportLibraries_jll.libgfortran", "CompilerSupportLibraries_jll.libgcc_s"]
+
+[[builds]]
+os = "windows"
+arch = "i686"
+location = "bundled"
+
+    [[builds.products]]
+    name = "libopenblas"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libopenblas.dll"
+    deps = ["CompilerSupportLibraries_jll.libgfortran", "CompilerSupportLibraries_jll.libgcc_s"]
+
+[[builds]]
+os = "macos"
+arch = "x86_64"
+location = "bundled"
+
+    [[builds.products]]
+    name = "libopenblas"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libopenblas64_.dylib"
+    deps = ["CompilerSupportLibraries_jll.libgfortran", "CompilerSupportLibraries_jll.libquadmath", "CompilerSupportLibraries_jll.libgcc_s"]
+
+[[builds]]
+os = "macos"
+arch = "aarch64"
+location = "bundled"
+
+    [[builds.products]]
+    name = "libopenblas"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libopenblas64_.dylib"
+    deps = ["CompilerSupportLibraries_jll.libgfortran"]
+
+[[builds]]
+os = "linux"
+location = "bundled"
+
+    [[builds.products]]
+    name = "libopenblas"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libopenblas64_.so"
+    deps = ["CompilerSupportLibraries_jll.libgfortran"]
+
+[[builds]]
+os = "linux"
+arch = "x86_64"
+location = "bundled"
+
+    [[builds.products]]
+    name = "libopenblas"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libopenblas64_.so"
+    deps = ["CompilerSupportLibraries_jll.libgfortran"]
+
+    [[builds.products]]
+    name = "libopenblas"
+    type = "library"
+    linkage = "static"
+    path = "libopenblas64_.a"
+    deps = ["CompilerSupportLibraries_jll.libgfortran"]
+    system_deps = ["m", "pthread"]
+
+[[builds]]
+os = "linux"
+arch = "i686"
+location = "bundled"
+
+    [[builds.products]]
+    name = "libopenblas"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libopenblas.so"
+    deps = ["CompilerSupportLibraries_jll.libgfortran"]
+
+[[builds]]
+os = "linux"
+arch = "armv7l"
+location = "bundled"
+
+    [[builds.products]]
+    name = "libopenblas"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libopenblas.so"
+    deps = ["CompilerSupportLibraries_jll.libgfortran"]
+
+[[builds]]
+os = "freebsd"
+location = "bundled"
+
+    [[builds.products]]
+    name = "libopenblas"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libopenblas64_.so"
+    deps = ["CompilerSupportLibraries_jll.libgfortran"]

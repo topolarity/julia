@@ -1,0 +1,42 @@
+format_version = "1.0"
+name = "libblastrampoline"
+
+[[builds]]
+os = "windows"
+location = "bundled"
+
+    [[builds.products]]
+    name = "libblastrampoline"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libblastrampoline-5.dll"
+
+[[builds]]
+os = "macos"
+location = "bundled"
+
+    [[builds.products]]
+    name = "libblastrampoline"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libblastrampoline.5.dylib"
+
+[[builds]]
+os = "linux"
+location = "bundled"
+
+    [[builds.products]]
+    name = "libblastrampoline"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libblastrampoline.so.5"
+
+[[builds]]
+os = "freebsd"
+location = "bundled"
+
+    [[builds.products]]
+    name = "libblastrampoline"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libblastrampoline.so.5"

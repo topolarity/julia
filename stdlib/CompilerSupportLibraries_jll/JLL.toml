@@ -1,0 +1,357 @@
+# Records the official Julia builds (the libgfortran-5 / GCC-12 era compiler
+# support libraries). A Julia built against an older GCC would need matching
+# sonames here; historical libgfortran majors are deliberately not enumerated.
+format_version = "1.0"
+name = "CompilerSupportLibraries"
+
+[[builds]]
+os = "windows"
+location = "bundled"
+
+    [[builds.products]]
+    name = "libatomic"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libatomic-1.dll"
+
+    [[builds.products]]
+    name = "libquadmath"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libquadmath-0.dll"
+
+    [[builds.products]]
+    name = "libgcc_s"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libgcc_s_seh-1.dll"
+
+    [[builds.products]]
+    name = "libgfortran"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libgfortran-5.dll"
+    deps = ["libgcc_s", "libquadmath"]
+
+    [[builds.products]]
+    name = "libstdcxx"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libstdc++-6.dll"
+    deps = ["libgcc_s"]
+
+    [[builds.products]]
+    name = "libgomp"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libgomp-1.dll"
+    deps = ["libgcc_s"]
+
+    [[builds.products]]
+    name = "libssp"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libssp-0.dll"
+
+[[builds]]
+os = "windows"
+arch = "i686"
+location = "bundled"
+
+    [[builds.products]]
+    name = "libatomic"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libatomic-1.dll"
+
+    [[builds.products]]
+    name = "libquadmath"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libquadmath-0.dll"
+
+    [[builds.products]]
+    name = "libgcc_s"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libgcc_s_sjlj-1.dll"
+
+    [[builds.products]]
+    name = "libgfortran"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libgfortran-5.dll"
+    deps = ["libgcc_s", "libquadmath"]
+
+    [[builds.products]]
+    name = "libstdcxx"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libstdc++-6.dll"
+    deps = ["libgcc_s"]
+
+    [[builds.products]]
+    name = "libgomp"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libgomp-1.dll"
+    deps = ["libgcc_s"]
+
+    [[builds.products]]
+    name = "libssp"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libssp-0.dll"
+
+[[builds]]
+os = "macos"
+location = "bundled"
+
+    [[builds.products]]
+    name = "libatomic"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libatomic.1.dylib"
+
+    [[builds.products]]
+    name = "libquadmath"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libquadmath.0.dylib"
+
+    [[builds.products]]
+    name = "libgcc_s"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libgcc_s.1.1.dylib"
+
+    [[builds.products]]
+    name = "libgfortran"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libgfortran.5.dylib"
+    deps = ["libgcc_s", "libquadmath"]
+
+    [[builds.products]]
+    name = "libstdcxx"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libstdc++.6.dylib"
+    deps = ["libgcc_s"]
+
+    [[builds.products]]
+    name = "libgomp"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libgomp.1.dylib"
+
+    [[builds.products]]
+    name = "libssp"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libssp.0.dylib"
+
+[[builds]]
+os = "linux"
+location = "bundled"
+
+    [[builds.products]]
+    name = "libatomic"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libatomic.so.1"
+
+    [[builds.products]]
+    name = "libgcc_s"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libgcc_s.so.1"
+
+    [[builds.products]]
+    name = "libgfortran"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libgfortran.so.5"
+    deps = ["libgcc_s"]
+
+    [[builds.products]]
+    name = "libstdcxx"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libstdc++.so.6"
+    deps = ["libgcc_s"]
+
+    [[builds.products]]
+    name = "libgomp"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libgomp.so.1"
+
+[[builds]]
+platforms = ["x86_64-linux-gnu", "i686-linux-gnu"]
+location = "bundled"
+
+    [[builds.products]]
+    name = "libatomic"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libatomic.so.1"
+
+    [[builds.products]]
+    name = "libquadmath"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libquadmath.so.0"
+
+    [[builds.products]]
+    name = "libgcc_s"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libgcc_s.so.1"
+
+    [[builds.products]]
+    name = "libgfortran"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libgfortran.so.5"
+    deps = ["libgcc_s", "libquadmath"]
+
+    [[builds.products]]
+    name = "libstdcxx"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libstdc++.so.6"
+    deps = ["libgcc_s"]
+
+    [[builds.products]]
+    name = "libgomp"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libgomp.so.1"
+
+    [[builds.products]]
+    name = "libssp"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libssp.so.0"
+
+[[builds]]
+platforms = ["x86_64-linux-musl"]
+location = "bundled"
+
+    [[builds.products]]
+    name = "libatomic"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libatomic.so.1"
+
+    [[builds.products]]
+    name = "libquadmath"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libquadmath.so.0"
+
+    [[builds.products]]
+    name = "libgcc_s"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libgcc_s.so.1"
+
+    [[builds.products]]
+    name = "libgfortran"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libgfortran.so.5"
+    deps = ["libgcc_s", "libquadmath"]
+
+    [[builds.products]]
+    name = "libstdcxx"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libstdc++.so.6"
+    deps = ["libgcc_s"]
+
+    [[builds.products]]
+    name = "libgomp"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libgomp.so.1"
+
+[[builds]]
+os = "freebsd"
+location = "bundled"
+
+    [[builds.products]]
+    name = "libatomic"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libatomic.so.3"
+
+    [[builds.products]]
+    name = "libgcc_s"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libgcc_s.so.1"
+
+    [[builds.products]]
+    name = "libgfortran"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libgfortran.so.5"
+    deps = ["libgcc_s"]
+
+    [[builds.products]]
+    name = "libstdcxx"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libstdc++.so.6"
+    deps = ["libgcc_s"]
+
+    [[builds.products]]
+    name = "libgomp"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libgomp.so.1"
+
+[[builds]]
+os = "freebsd"
+arch = "x86_64"
+location = "bundled"
+
+    [[builds.products]]
+    name = "libatomic"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libatomic.so.3"
+
+    [[builds.products]]
+    name = "libquadmath"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libquadmath.so.0"
+
+    [[builds.products]]
+    name = "libgcc_s"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libgcc_s.so.1"
+
+    [[builds.products]]
+    name = "libgfortran"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libgfortran.so.5"
+    deps = ["libgcc_s", "libquadmath"]
+
+    [[builds.products]]
+    name = "libstdcxx"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libstdc++.so.6"
+    deps = ["libgcc_s"]
+
+    [[builds.products]]
+    name = "libgomp"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libgomp.so.1"

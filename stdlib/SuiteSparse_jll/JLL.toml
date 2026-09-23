@@ -1,0 +1,270 @@
+# Records the official Julia builds (SuiteSparse 7.10.1, ILP64 BLAS via the
+# `64_` suffix, routed through libblastrampoline). Dependency edges are
+# transcribed from the libraries' DT_NEEDED entries. Linux only for now;
+# other platforms follow the same pattern.
+format_version = "1.0"
+name = "SuiteSparse"
+
+[[builds]]
+os = "linux"
+location = "bundled"
+
+    [[builds.products]]
+    name = "libsuitesparseconfig"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libsuitesparseconfig.so.7"
+
+    [[builds.products]]
+    name = "libldl"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libldl.so.3"
+
+    [[builds.products]]
+    name = "libbtf"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libbtf.so.2"
+
+    [[builds.products]]
+    name = "libcolamd"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libcolamd.so.3"
+    deps = ["libsuitesparseconfig"]
+
+    [[builds.products]]
+    name = "libamd"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libamd.so.3"
+    deps = ["libsuitesparseconfig"]
+
+    [[builds.products]]
+    name = "libcamd"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libcamd.so.3"
+    deps = ["libsuitesparseconfig"]
+
+    [[builds.products]]
+    name = "libccolamd"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libccolamd.so.3"
+    deps = ["libsuitesparseconfig"]
+
+    [[builds.products]]
+    name = "librbio"
+    type = "library"
+    linkage = "dynamic"
+    soname = "librbio.so.4"
+    deps = ["libsuitesparseconfig"]
+
+    [[builds.products]]
+    name = "libcholmod"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libcholmod.so.5"
+    deps = ["libamd", "libcolamd", "libcamd", "libccolamd", "libblastrampoline_jll.libblastrampoline", "libsuitesparseconfig"]
+
+    [[builds.products]]
+    name = "libklu"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libklu.so.2"
+    deps = ["libamd", "libcolamd", "libbtf", "libsuitesparseconfig"]
+
+    [[builds.products]]
+    name = "libspqr"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libspqr.so.4"
+    deps = ["libcholmod", "libblastrampoline_jll.libblastrampoline", "libsuitesparseconfig", "CompilerSupportLibraries_jll.libgcc_s"]
+
+    [[builds.products]]
+    name = "libumfpack"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libumfpack.so.6"
+    deps = ["libcholmod", "libblastrampoline_jll.libblastrampoline", "libamd", "libsuitesparseconfig"]
+
+[[builds]]
+os = "linux"
+arch = "x86_64"
+location = "bundled"
+
+    [[builds.products]]
+    name = "libsuitesparseconfig"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libsuitesparseconfig.so.7"
+
+    [[builds.products]]
+    name = "libsuitesparseconfig"
+    type = "library"
+    linkage = "static"
+    path = "libsuitesparseconfig.a"
+    system_deps = ["m"]
+
+    [[builds.products]]
+    name = "libldl"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libldl.so.3"
+
+    [[builds.products]]
+    name = "libldl"
+    type = "library"
+    linkage = "static"
+    path = "libldl.a"
+    system_deps = ["m"]
+
+    [[builds.products]]
+    name = "libbtf"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libbtf.so.2"
+
+    [[builds.products]]
+    name = "libbtf"
+    type = "library"
+    linkage = "static"
+    path = "libbtf.a"
+    system_deps = ["m"]
+
+    [[builds.products]]
+    name = "libcolamd"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libcolamd.so.3"
+    deps = ["libsuitesparseconfig"]
+
+    [[builds.products]]
+    name = "libcolamd"
+    type = "library"
+    linkage = "static"
+    path = "libcolamd.a"
+    deps = ["libsuitesparseconfig"]
+    system_deps = ["m"]
+
+    [[builds.products]]
+    name = "libamd"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libamd.so.3"
+    deps = ["libsuitesparseconfig"]
+
+    [[builds.products]]
+    name = "libamd"
+    type = "library"
+    linkage = "static"
+    path = "libamd.a"
+    deps = ["libsuitesparseconfig"]
+    system_deps = ["m"]
+
+    [[builds.products]]
+    name = "libcamd"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libcamd.so.3"
+    deps = ["libsuitesparseconfig"]
+
+    [[builds.products]]
+    name = "libcamd"
+    type = "library"
+    linkage = "static"
+    path = "libcamd.a"
+    deps = ["libsuitesparseconfig"]
+    system_deps = ["m"]
+
+    [[builds.products]]
+    name = "libccolamd"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libccolamd.so.3"
+    deps = ["libsuitesparseconfig"]
+
+    [[builds.products]]
+    name = "libccolamd"
+    type = "library"
+    linkage = "static"
+    path = "libccolamd.a"
+    deps = ["libsuitesparseconfig"]
+    system_deps = ["m"]
+
+    [[builds.products]]
+    name = "librbio"
+    type = "library"
+    linkage = "dynamic"
+    soname = "librbio.so.4"
+    deps = ["libsuitesparseconfig"]
+
+    [[builds.products]]
+    name = "librbio"
+    type = "library"
+    linkage = "static"
+    path = "librbio.a"
+    deps = ["libsuitesparseconfig"]
+    system_deps = ["m"]
+
+    [[builds.products]]
+    name = "libcholmod"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libcholmod.so.5"
+    deps = ["libamd", "libcolamd", "libcamd", "libccolamd", "libblastrampoline_jll.libblastrampoline", "libsuitesparseconfig"]
+
+    [[builds.products]]
+    name = "libcholmod"
+    type = "library"
+    linkage = "static"
+    path = "libcholmod.a"
+    deps = ["libamd", "libcolamd", "libcamd", "libccolamd", "libblastrampoline_jll.libblastrampoline", "libsuitesparseconfig"]
+    system_deps = ["m"]
+
+    [[builds.products]]
+    name = "libklu"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libklu.so.2"
+    deps = ["libamd", "libcolamd", "libbtf", "libsuitesparseconfig"]
+
+    [[builds.products]]
+    name = "libklu"
+    type = "library"
+    linkage = "static"
+    path = "libklu.a"
+    deps = ["libamd", "libcolamd", "libbtf", "libsuitesparseconfig"]
+    system_deps = ["m"]
+
+    [[builds.products]]
+    name = "libspqr"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libspqr.so.4"
+    deps = ["libcholmod", "libblastrampoline_jll.libblastrampoline", "libsuitesparseconfig", "CompilerSupportLibraries_jll.libgcc_s"]
+
+    [[builds.products]]
+    name = "libspqr"
+    type = "library"
+    linkage = "static"
+    path = "libspqr.a"
+    deps = ["libcholmod", "libblastrampoline_jll.libblastrampoline", "libsuitesparseconfig", "CompilerSupportLibraries_jll.libgcc_s"]
+    system_deps = ["m"]
+
+    [[builds.products]]
+    name = "libumfpack"
+    type = "library"
+    linkage = "dynamic"
+    soname = "libumfpack.so.6"
+    deps = ["libcholmod", "libblastrampoline_jll.libblastrampoline", "libamd", "libsuitesparseconfig"]
+
+    [[builds.products]]
+    name = "libumfpack"
+    type = "library"
+    linkage = "static"
+    path = "libumfpack.a"
+    deps = ["libcholmod", "libblastrampoline_jll.libblastrampoline", "libamd", "libsuitesparseconfig"]
+    system_deps = ["m"]
