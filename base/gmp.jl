@@ -24,13 +24,21 @@ else
 end
 const CdoubleMax = Union{Float16, Float32, Float64}
 
-if Sys.iswindows()
-    const libgmp = "libgmp-10.dll"
-elseif Sys.isapple()
-    const libgmp = "@rpath/libgmp.10.dylib"
-else
-    const libgmp = "libgmp.so.10"
-end
+import .Base.Libc.Libdl: LazyLibrary, BundledLazyLibraryPath, LibraryID
+
+# The bundled GMP, declared with the identity GMP_jll declares for it
+# (`LibraryID(<GMP_jll's UUID>, "libgmp")`), so that `ccall` sites in Base
+# and in GMP_jll's users name the same library.
+const libgmp = LazyLibrary(
+    if Sys.iswindows()
+        BundledLazyLibraryPath("libgmp-10.dll")
+    elseif Sys.isapple()
+        BundledLazyLibraryPath("libgmp.10.dylib")
+    else
+        BundledLazyLibraryPath("libgmp.so.10")
+    end;
+    id = LibraryID(Base.UUID((UInt128(0x781609d710c451f6) << 64) | 0x84f2b8444358ff6d) #= 781609d7-10c4-51f6-84f2-b8444358ff6d =#, "libgmp")
+)
 
 _version() = unsafe_string(unsafe_load(cglobal((:__gmp_version, libgmp), Ptr{Cchar})))
 version() = VersionNumber(_version())

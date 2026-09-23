@@ -5,11 +5,22 @@
 module PCRE
 
 import ..RefValue, ..DenseUTF8String
+import ..Libc.Libdl: LazyLibrary, BundledLazyLibraryPath, LibraryID
 
 # include($BUILDROOT/base/pcre_h.jl)
 include(string(Base.BUILDROOT, "pcre_h.jl"))
 
-const PCRE_LIB = "libpcre2-8"
+# The bundled PCRE2, with the identity PCRE2_jll declares for it.
+const PCRE_LIB = LazyLibrary(
+    if Sys.iswindows()
+        BundledLazyLibraryPath("libpcre2-8-0.dll")
+    elseif Sys.isapple()
+        BundledLazyLibraryPath("libpcre2-8.0.dylib")
+    else
+        BundledLazyLibraryPath("libpcre2-8.so.0")
+    end;
+    id = LibraryID(Base.UUID((UInt128(0xefcefdf747ab520b) << 64) | 0xbdef62a2eaa19f15) #= efcefdf7-47ab-520b-bdef-62a2eaa19f15 =#, "libpcre2_8")
+)
 
 function create_match_context()
     JIT_STACK_START_SIZE = 32768

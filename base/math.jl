@@ -303,7 +303,22 @@ Stacktrace:
 """
 log(b::Number, x::Number) = log(promote(b,x)...)
 
-const libm = Base.libm_name
+# The libm Base calls into. When it is the bundled OpenLibm it carries the
+# identity OpenLibm_jll declares for it; a system libm keeps its plain name.
+const libm = if Base.libm_name == "libopenlibm"
+    Base.Libc.Libdl.LazyLibrary(
+        if Sys.iswindows()
+            Base.Libc.Libdl.BundledLazyLibraryPath("libopenlibm.dll")
+        elseif Sys.isapple()
+            Base.Libc.Libdl.BundledLazyLibraryPath("libopenlibm.4.dylib")
+        else
+            Base.Libc.Libdl.BundledLazyLibraryPath("libopenlibm.so.4")
+        end;
+        id = Base.Libc.Libdl.LibraryID(Base.UUID((UInt128(0x0582350019ac5b8b) << 64) | 0x9628191a04bc5112) #= 05823500-19ac-5b8b-9628-191a04bc5112 =#, "libopenlibm")
+    )
+else
+    Base.libm_name
+end
 # functions with no domain error
 """
     sinh(x)

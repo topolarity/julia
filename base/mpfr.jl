@@ -33,13 +33,20 @@ import ..GMP: ClongMax, CulongMax, CdoubleMax, Limb, libgmp, BigInt
 
 import ..FastMath.sincos_fast
 
-if Sys.iswindows()
-    const libmpfr = "libmpfr-6.dll"
-elseif Sys.isapple()
-    const libmpfr = "@rpath/libmpfr.6.dylib"
-else
-    const libmpfr = "libmpfr.so.6"
-end
+import .Base.Libc.Libdl: LazyLibrary, BundledLazyLibraryPath, LibraryID
+
+# The bundled MPFR, with the identity MPFR_jll declares for it.
+const libmpfr = LazyLibrary(
+    if Sys.iswindows()
+        BundledLazyLibraryPath("libmpfr-6.dll")
+    elseif Sys.isapple()
+        BundledLazyLibraryPath("libmpfr.6.dylib")
+    else
+        BundledLazyLibraryPath("libmpfr.so.6")
+    end;
+    id = LibraryID(Base.UUID((UInt128(0x3a97d32306695f0c) << 64) | 0x90663539efd106a3) #= 3a97d323-0669-5f0c-9066-3539efd106a3 =#, "libmpfr"),
+    dependencies = LazyLibrary[libgmp]
+)
 
 version() = VersionNumber(unsafe_string(ccall((:mpfr_get_version,libmpfr), Ptr{Cchar}, ())))
 patches() = split(unsafe_string(ccall((:mpfr_get_patches,libmpfr), Ptr{Cchar}, ())),' ')
