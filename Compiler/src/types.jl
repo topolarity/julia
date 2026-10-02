@@ -459,6 +459,13 @@ Parameters that control optimizer operation.
   The additional eligibility applies to fixed-arity, non-generated methods.
   Enabled for trimmed compilation, where falling back to dynamic dispatch is undesirable.
 ---
+- `opt_params.split_unmatched_sparams::Bool = false`\\
+  Allows union-splitting a call over methods whose static parameters are not determined
+  by the argument types, e.g. `g(::T, ::T) where T` called with abstract arguments next to
+  a fallback method. Such cases are guarded by a runtime type check, and their inlined
+  bodies compute the static parameters at runtime. Enabled for trimmed compilation, where
+  falling back to dynamic dispatch is undesirable.
+---
 - `opt_params.assume_fatal_throw::Bool = false`\\
   If `true`, gives the optimizer license to assume that any `throw` is fatal and thus the
   state after a `throw` is not externally observable. In particular, this gives the
@@ -479,6 +486,7 @@ struct OptimizationParams
     max_tuple_splat::Int
     compilesig_invokes::Bool
     abstract_invoke::Bool
+    split_unmatched_sparams::Bool
     assume_fatal_throw::Bool
     preserve_local_sources::Bool
 
@@ -490,6 +498,7 @@ struct OptimizationParams
         max_tuple_splat::Int,
         compilesig_invokes::Bool,
         abstract_invoke::Bool,
+        split_unmatched_sparams::Bool,
         assume_fatal_throw::Bool,
         preserve_local_sources::Bool)
         return new(
@@ -500,6 +509,7 @@ struct OptimizationParams
             max_tuple_splat,
             compilesig_invokes,
             abstract_invoke,
+            split_unmatched_sparams,
             assume_fatal_throw,
             preserve_local_sources)
     end
@@ -513,6 +523,7 @@ function OptimizationParams(
         #=max_tuple_splat::Int=# 32,
         #=compilesig_invokes::Bool=# true,
         #=abstract_invoke::Bool=# false,
+        #=split_unmatched_sparams::Bool=# false,
         #=assume_fatal_throw::Bool=# false,
         #=preserve_local_sources::Bool=# false);
     inlining::Bool = params.inlining,
@@ -522,6 +533,7 @@ function OptimizationParams(
     max_tuple_splat::Int = params.max_tuple_splat,
     compilesig_invokes::Bool = params.compilesig_invokes,
     abstract_invoke::Bool = params.abstract_invoke,
+    split_unmatched_sparams::Bool = params.split_unmatched_sparams,
     assume_fatal_throw::Bool = params.assume_fatal_throw,
     preserve_local_sources::Bool = params.preserve_local_sources)
     return OptimizationParams(
@@ -532,6 +544,7 @@ function OptimizationParams(
         max_tuple_splat,
         compilesig_invokes,
         abstract_invoke,
+        split_unmatched_sparams,
         assume_fatal_throw,
         preserve_local_sources)
 end

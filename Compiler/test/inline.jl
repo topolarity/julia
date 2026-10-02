@@ -1803,6 +1803,61 @@ let src = code_typed1((Any,)) do x
     @test count(iscall((src, f_union_unmatched)), src.code) == 0
 end
 
+# union-split methods with unmatched type parameters alongside a fallback
+abstract type UnmatchedCtx end
+abstract type UnmatchedGrid end
+struct UnmatchedInter <: UnmatchedGrid end
+struct UnmatchedIntra <: UnmatchedGrid end
+struct UnmatchedX{G<:UnmatchedGrid} <: UnmatchedCtx end
+struct UnmatchedY{G<:UnmatchedGrid} <: UnmatchedCtx end
+Base.Experimental.@max_methods 4 function f_unmatched_split end
+@noinline f_unmatched_split(::UnmatchedCtx, ::UnmatchedCtx) = 0
+f_unmatched_split(::UnmatchedX{G}, ::UnmatchedX{G}) where {G<:UnmatchedGrid} =
+    G === UnmatchedInter ? 1 : 2
+f_unmatched_split(::UnmatchedY{G1}, ::UnmatchedX{G2}) where {G1<:UnmatchedGrid,G2<:UnmatchedGrid} = 3
+f_unmatched_split_caller(a, b) = f_unmatched_split(a, b)
+@newinterp SplitUnmatchedSparams true
+let src = code_typed1(f_unmatched_split_caller, (UnmatchedCtx, UnmatchedCtx))
+    # disabled outside of trimmed compilation
+    @test count(iscall((src, f_unmatched_split)), src.code) == 1
+end
+let interp = SplitUnmatchedSparams(;
+        opt_params=Compiler.OptimizationParams(; split_unmatched_sparams=true))
+    @test Compiler.trimming_params(Compiler.TRIM_SAFE)[2].split_unmatched_sparams
+    @test !Compiler.trimming_params(Compiler.TRIM_NO)[2].split_unmatched_sparams
+    src = code_typed1(f_unmatched_split_caller, (UnmatchedCtx, UnmatchedCtx); interp)
+    @test count(iscall((src, f_unmatched_split)), src.code) == 0
+    # only the diagonal method needs a joint check of its signature
+    @test count(iscall((src, Core.tuple)), src.code) == 1
+    @test count(iscall((src, Core._compute_sparams)), src.code) == 1
+    ir = Compiler.inflate_ir(src)
+    ir.argtypes[1] = Tuple{}
+    oc = Core.OpaqueClosure(ir)
+    for a in (UnmatchedX{UnmatchedInter}(), UnmatchedX{UnmatchedIntra}(),
+              UnmatchedY{UnmatchedInter}(), UnmatchedY{UnmatchedIntra}()),
+        b in (UnmatchedX{UnmatchedInter}(), UnmatchedX{UnmatchedIntra}(),
+              UnmatchedY{UnmatchedInter}(), UnmatchedY{UnmatchedIntra}())
+        @test oc(a, b) === f_unmatched_split(a, b)
+    end
+end
+constrained_dispatch_caller(x, y) = constrained_dispatch(x, y)
+let interp = SplitUnmatchedSparams(;
+        opt_params=Compiler.OptimizationParams(; split_unmatched_sparams=true))
+    src = code_typed1(constrained_dispatch_caller, (Real,Real); interp)
+    @test count(iscall((src, constrained_dispatch)), src.code) == 0
+    @test any(iscall((src, Core.throw_methoderror)), src.code)
+end
+let ex = Tuple{typeof(f_unmatched_split), UnmatchedX{G}, UnmatchedX{G}} where {G<:UnmatchedGrid}
+    relaxed, guard = Compiler.split_typevar_sig(ex)
+    @test relaxed == Tuple{typeof(f_unmatched_split), UnmatchedX, UnmatchedX}
+    @test guard === ex
+end
+let ex = Tuple{typeof(f_unmatched_split), UnmatchedY{G1}, UnmatchedX{G2}} where {G1<:UnmatchedGrid,G2<:UnmatchedGrid}
+    relaxed, guard = Compiler.split_typevar_sig(ex)
+    @test relaxed == ex
+    @test guard === nothing
+end
+
 # modifyfield! handling
 # =====================
 

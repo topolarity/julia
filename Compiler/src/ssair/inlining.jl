@@ -43,11 +43,12 @@ struct InvokeCase
 end
 
 struct InliningCase
-    sig  # Type
-    item # Union{InliningTodo, InvokeCase, ConstantCase}
-    function InliningCase(@nospecialize(sig), @nospecialize(item))
+    sig   # Type
+    item  # Union{InliningTodo, InvokeCase, ConstantCase}
+    guard # Union{Nothing, UnionAll}: signature to check jointly, in addition to `sig`
+    function InliningCase(@nospecialize(sig), @nospecialize(item), @nospecialize(guard=nothing))
         @assert isa(item, Union{InliningTodo, InvokeCase, ConstantCase}) "invalid inlining item"
-        return new(sig, item)
+        return new(sig, item, guard)
     end
 end
 
@@ -515,9 +516,10 @@ it is _invalid_ to optimize a call site like `g(x::Any, y::Any)` into:
 
 since we also need to check that `x` and `y` are equal types.
 
-But, we've already excluded such cases at this point,
-mainly by filtering out `case.sig::UnionAll`,
-so there is no need to worry about type equality at this point.
+For such cases, `case.sig` holds the per-argument relaxation of the signature
+(here `Tuple{typeof(g), Integer, Integer}`) and `case.guard` the original
+signature, which is checked jointly against the tuple of arguments after the
+per-argument `isa` checks.
 
 In essence, we can process the dispatch candidates sequentially,
 assuming their order stays the same post-discovery in `ml_matches`.
@@ -549,6 +551,22 @@ function ir_inline_unionsplit!(compact::IncrementalCompact, idx::Int, argexprs::
                 isa_expr = Expr(:call, isa, argexprs[i], mft)
                 isa_type = isa_tfunc(optimizer_lattice(interp), argextype(argexprs[i], compact), Const(mft))
                 ssa = insert_node_here!(compact, NewInstruction(isa_expr, isa_type, line))
+                if cond === true
+                    cond = ssa
+                else
+                    and_expr = Expr(:call, and_int, cond, ssa)
+                    and_type = and_int_tfunc(optimizer_lattice(interp), argextype(cond, compact), isa_type)
+                    cond = insert_node_here!(compact, NewInstruction(and_expr, and_type, line))
+                end
+            end
+            guard = ithcase.guard
+            if guard !== nothing
+                tuple_type = argtypes_to_type(Any[argextype(argex, compact) for argex in argexprs])
+                tuple_ssa = insert_node_here!(compact,
+                    NewInstruction(Expr(:call, tuple, argexprs...), tuple_type, line))
+                isa_type = isa_tfunc(optimizer_lattice(interp), tuple_type, Const(guard))
+                ssa = insert_node_here!(compact,
+                    NewInstruction(Expr(:call, isa, tuple_ssa, guard), isa_type, line))
                 if cond === true
                     cond = ssa
                 else
@@ -971,7 +989,7 @@ function analyze_method!(
     if !match.fully_covers
         # type-intersection was not able to give us a simple list of types, so
         # ir_inline_unionsplit won't be able to deal with inlining this
-        spec_types = match.spec_types
+        spec_types = unwrap_unionall(match.spec_types)
         if !(spec_types isa DataType && length(spec_types.parameters) == npassedargs &&
              !isvarargtype(spec_types.parameters[end]))
             return nothing
@@ -1444,7 +1462,8 @@ function compute_inlining_cases(@nospecialize(info::CallInfo), flag::UInt32, sig
                         revisit_idx = nothing
                     end
                 else
-                    handled_all_cases = false
+                    handled_all_cases &= handle_typevar_match!(cases,
+                        call_result, call_edge, match, argtypes, info, flag, state)
                 end
             elseif !(match.spec_types <: match.method.sig) # the requirement for correct union-split
                 handled_all_cases = false
@@ -1479,6 +1498,49 @@ function compute_inlining_cases(@nospecialize(info::CallInfo), flag::UInt32, sig
         filter!(case::InliningCase->isdispatchtuple(case.sig), cases)
     end
     return cases, handled_all_cases, fully_covered, joint_effects
+end
+
+"""
+    split_typevar_sig(spec_types) -> Union{Nothing, Tuple{DataType, Any}}
+
+Relax a `UnionAll` method-match signature to a tuple of per-argument types,
+each closed over the type variables it uses. Returns the relaxed signature and
+the joint guard that is still required, or `nothing` if the per-argument
+relaxation is already exact.
+"""
+function split_typevar_sig(@nospecialize(spec_types))
+    body = unwrap_unionall(spec_types)
+    (body isa DataType && body.name === Tuple.name) || return nothing
+    params = Any[]
+    for p in body.parameters
+        isvarargtype(p) && return nothing
+        push!(params, rewrap_unionall(p, spec_types))
+    end
+    relaxed = Tuple{params...}
+    (relaxed isa DataType && !has_free_typevars(relaxed)) || return nothing
+    guard = relaxed <: spec_types ? nothing : spec_types
+    return relaxed, guard
+end
+
+# Handle a match that does not fully cover the call and whose static parameters
+# are not determined by the argument types. The case is guarded by per-argument
+# `isa` checks (plus a joint check if a type variable relates several arguments),
+# and the inlined body computes its static parameters at runtime.
+function handle_typevar_match!(cases::Vector{InliningCase},
+        @nospecialize(call_result::Union{Nothing,InferredCallResult}),
+        call_edge::Union{Nothing,CodeInstance}, match::MethodMatch, argtypes::Vector{Any},
+        @nospecialize(info::CallInfo), flag::UInt32, state::InliningState)
+    OptimizationParams(state.interp).split_unmatched_sparams || return false
+    match.spec_types <: match.method.sig || return false
+    split = split_typevar_sig(match.spec_types)
+    split === nothing && return false
+    relaxed, guard = split
+    ncases = length(cases)
+    handle_any_call_result!(cases, call_result, call_edge, match, argtypes, info, flag,
+        state; allow_typevars=true) || return false
+    length(cases) == ncases + 1 || return false
+    cases[end] = InliningCase(relaxed, cases[end].item, guard)
+    return true
 end
 
 function handle_call!(todo::Vector{Pair{Int,Any}},
