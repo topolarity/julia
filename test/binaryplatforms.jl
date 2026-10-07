@@ -215,7 +215,10 @@ end
     t = tags(P("x86_64", "linux"))
     @test all(haskey.(Ref(t), ("arch", "os", "libc")))
     @test haskey(tags(P("x86_64", "linux"; customtag="foo")), "customtag")
-    @test tags(HostPlatform())["julia_version"] == string(VERSION.major, ".", VERSION.minor, ".", VERSION.patch)
+    @test tags(HostPlatform())["julia_version"] == string(VERSION.major, ".", VERSION.minor, ".0")
+    # Only the major and minor version of `julia_version` are kept
+    @test P("x86_64", "linux"; julia_version=v"1.11.1")["julia_version"] == "1.11.0"
+    @test P("x86_64", "linux"; julia_version="1.11.1")["julia_version"] == "1.11.0"
 
     # Extended tags recorded by the build (e.g. for sanitizer builds) are appended after
     # any compiler ABI tags detected at runtime, so that the host triplet still parses
@@ -252,12 +255,14 @@ end
     # Test that our `hash()` is stable
     @test hash(HostPlatform()) == hash(HostPlatform())
 
-    # Test that round-tripping through `triplet` for a platform does not
-    # maintain equality, as we end up losing the `compare_strategies`:
+    # Comparison strategies and attributes describe how a platform is matched, so they do
+    # not take part in equality or hashing, and round-tripping through `triplet` keeps both
     p = Platform("x86_64", "linux"; cuda = v"11")
     Base.BinaryPlatforms.set_compare_strategy!(p, "cuda", Base.BinaryPlatforms.compare_version_cap)
+    Base.BinaryPlatforms.set_attribute!(p, Base.BinaryPlatforms.VersionAttribute("cuda"; breaking=nothing))
     q = parse(Platform, triplet(p))
-    @test q != p
+    @test q == p
+    @test hash(q) == hash(p)
 end
 
 @testset "Triplet parsing" begin
@@ -422,6 +427,12 @@ end
     @test platforms_match(HostPlatform(P("x86_64", "linux"; sanitize="memory")), msan)
     # Other extended tags are still wildcards
     @test platforms_match(P("x86_64", "linux"; cuda="10.1"), linux)
+
+    # `julia_version` compares major and minor versions also when set after construction
+    a, b = P("x86_64", "linux"), P("x86_64", "linux")
+    a["julia_version"] = "1.11.0"
+    b["julia_version"] = "1.11.3"
+    @test platforms_match(a, b)
 end
 
 @testset "DL name/version parsing" begin
@@ -606,4 +617,128 @@ end
     @test !platforms_match(ac, bc)
     @test platforms_match(ac, ac)
     @test platforms_match(bc, bc)
+end
+
+@testset "Platform attributes" begin
+    using Base.BinaryPlatforms: satisfies, set_attribute!, PlatformAttribute,
+        ExactAttribute, VersionAttribute, ISAAttribute
+    sel(ps, host) = select_platform(Dict(p => i for (i, p) in enumerate(ps)), host)
+
+    @testset "satisfies is asymmetric" begin
+        host = HostPlatform(P("x86_64", "macos"; os_version="20"))
+        @test satisfies(host, P("x86_64", "macos"; os_version="14"))
+        @test !satisfies(host, P("x86_64", "macos"; os_version="21"))
+        # The role comes from the argument position, not from `HostPlatform()`
+        @test satisfies(P("x86_64", "macos"; os_version="20"), P("x86_64", "macos"; os_version="14"))
+        @test !satisfies(P("x86_64", "macos"; os_version="14"), P("x86_64", "macos"; os_version="20"))
+        # An artifact without the tag works on any host
+        @test satisfies(host, P("x86_64", "macos"))
+    end
+
+    @testset "sanitize" begin
+        linux, msan = P("x86_64", "linux"), P("x86_64", "linux"; sanitize="memory")
+        @test !satisfies(linux, msan)
+        @test !satisfies(msan, linux)
+        @test satisfies(msan, msan)
+        @test sel([linux, msan], linux) == 1
+        @test sel([linux, msan], msan) == 2
+        # Sanitized and unsanitized platforms never stand in for one another
+        @test sel([msan], linux) === nothing
+        @test sel([linux], msan) === nothing
+        @test select_platform(Dict(msan => "sanitized"), linux) === nothing
+    end
+
+    @testset "versions compare numerically" begin
+        host = HostPlatform(P("x86_64", "macos"; os_version="15"))
+        @test sel([P("x86_64", "macos"; os_version="9"), P("x86_64", "macos"; os_version="14")], host) == 2
+        # Unknown host libgfortran: prefer the newest
+        @test sel([P("x86_64", "linux"; libgfortran_version=v"3"),
+                   P("x86_64", "linux"; libgfortran_version=v"5")], P("x86_64", "linux")) == 2
+        # An artifact's version is the lowest host version that it supports
+        jl(v) = P("x86_64", "linux"; julia_version=v)
+        @test sel([jl(v"1.10.0"), jl(v"1.11.1"), jl(v"1.12.0")], jl(v"1.11.0")) == 2
+        @test sel([jl(v"1.10.0"), jl(v"1.12.0")], jl(v"1.11.0")) === nothing
+        lgf(v) = P("x86_64", "linux"; libgfortran_version=v)
+        @test satisfies(lgf(v"5.0.0"), lgf(v"5.0.0"))
+        @test !satisfies(lgf(v"5.0.0"), lgf(v"4.0.0"))
+        @test !satisfies(lgf(v"4.0.0"), lgf(v"5.0.0"))
+        @test satisfies(host, P("x86_64", "macos"; os_version="14"))
+        @test !satisfies(host, P("x86_64", "macos"; os_version="16"))
+        @test_throws ArgumentError VersionAttribute("x"; breaking=:never)
+    end
+
+    @testset "march" begin
+        x(m) = P("x86_64", "linux"; march=m)
+        builds = [x("x86_64"), x("avx"), x("avx2")]
+        # The most specific build that the host supports, not only an exact match
+        @test sel(builds, x("avx512")) == 3
+        @test sel(builds, x("avx2")) == 3
+        @test sel(builds, x("avx")) == 2
+        @test sel([x("avx2")], x("avx")) === nothing
+        # Unknown host CPU: the least demanding build
+        @test sel(builds, P("x86_64", "linux")) == 1
+        @test sel([x("avx2"), x("avx512")], P("x86_64", "linux")) == 1
+        # A build without `march` works anywhere, but a known host prefers a specific build
+        @test sel([P("x86_64", "linux"), x("avx2")], x("avx512")) == 2
+        @test sel([P("x86_64", "linux"), x("avx2")], P("x86_64", "linux")) == 1
+        # Microarchitectures without a known instruction set compare by name
+        arm(m) = P("armv7l", "linux"; march=m)
+        @test sel([arm("armv7l"), arm("neonvfpv4")], arm("neonvfpv4")) == 2
+        @test sel([arm("armv7l")], arm("neonvfpv4")) === nothing
+    end
+
+    @testset "attached attributes" begin
+        # A CUDA-like tag: same major version, and artifact minor <= host minor.  Values that
+        # are not versions (e.g. "none" for builds without CUDA) only match an equal value.
+        cuda = VersionAttribute("cuda"; breaking=:major)
+        c(v) = P("x86_64", "linux"; cuda=v)
+        host(v) = set_attribute!(v === nothing ? P("x86_64", "linux") : c(v), cuda)
+        builds = [c("11.8"), c("12.0"), c("12.4"), c("12.10"), c("none")]
+        @test sel(builds, host("12.6")) == 3
+        @test sel(builds, host("12.10")) == 4
+        @test sel(builds, host("13.0")) === nothing
+        @test sel(builds, host("none")) == 5
+        @test sel(builds, host("local")) === nothing
+        @test satisfies(host("12.6"), c("12.0"))
+        @test !satisfies(host("12.6"), c("11.8"))
+        @test !satisfies(host("12.6"), c("none"))
+        # A requirement against an unknown host value is accepted
+        @test satisfies(host(nothing), c("12.0"))
+
+        # The same attribute, declared as data
+        decl = Dict("format" => "version", "breaking" => "major")
+        @test PlatformAttribute("cuda", decl) == cuda
+        @test PlatformAttribute("os", Dict("format" => "version", "breaking" => "none")) ==
+              VersionAttribute("os"; breaking=nothing)
+        @test PlatformAttribute("x", Dict("host_default" => "a", "artifact_default" => "b")) ==
+              ExactAttribute("x"; host_default="a", artifact_default="b")
+        h = set_attribute!(c("12.6"), PlatformAttribute("cuda", decl))
+        @test sel(builds, h) == 3
+        @test_throws ArgumentError PlatformAttribute("cuda", Dict("format" => "nonsense"))
+
+        # Attached attributes override built-in ones
+        exact_os = set_attribute!(P("x86_64", "macos"; os_version="20"), ExactAttribute("os_version"))
+        @test !satisfies(exact_os, P("x86_64", "macos"; os_version="14"))
+
+        # Exact attributes can state a preference among values
+        flavor = ExactAttribute("flavor"; priority=["fast", "slow"])
+        f(v) = P("x86_64", "linux"; flavor=v)
+        @test sel([f("slow"), f("fast")], set_attribute!(P("x86_64", "linux"), flavor)) == 2
+    end
+
+    @testset "comparison strategies still apply" begin
+        odd(a, b, ar, br) = isodd(parse(Int, a)) == isodd(parse(Int, b))
+        host = P("x86_64", "linux"; vally="3")
+        Base.BinaryPlatforms.set_compare_strategy!(host, "vally", odd)
+        @test satisfies(host, P("x86_64", "linux"; vally="5"))
+        @test !satisfies(host, P("x86_64", "linux"; vally="4"))
+        @test sel([P("x86_64", "linux"; vally="4"), P("x86_64", "linux"; vally="5")], host) == 2
+    end
+
+    @testset "ambiguous selections are deterministic" begin
+        # Neither build is better than the other; the legacy ordering decides
+        builds = [P("x86_64", "linux"; foo="a"), P("x86_64", "linux"; bar="b")]
+        host = P("x86_64", "linux"; foo="a", bar="b")
+        @test sel(builds, host) == sel(reverse(builds), host) % 2 + 1
+    end
 end

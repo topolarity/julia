@@ -8,6 +8,7 @@ export AbstractPlatform, Platform, HostPlatform, platform_dlext, tags, arch, os,
        detect_libstdcxx_version, detect_cxxstring_abi, call_abi, wordsize, triplet,
        select_platform, platforms_match, platform_name
 import .Libc.Libdl
+using Base: thisminor, nextpatch, nextminor, nextmajor
 
 ### Submodule with information about CPU features
 include("cpuid.jl")
@@ -15,6 +16,72 @@ using .CPUID
 
 # This exists to ease compatibility with old-style Platform objects
 abstract type AbstractPlatform; end
+
+"""
+    PlatformAttribute
+
+Defines what a tag key means when a host platform is matched against artifact platforms,
+for example by [`select_platform`](@ref).  Every attribute has a `format`, chosen from a
+fixed set:
+
+  - `ExactAttribute`: the artifact value must equal the host value (`libc`, `sanitize`, ...)
+  - `VersionAttribute`: values are version numbers, and an artifact's version is the lowest
+    host version that it supports, up to an optional breaking version (`os_version`,
+    `julia_version`, ...); other values (e.g. "none") only match an equal value
+  - `ISAAttribute`: values name microarchitectures, and the artifact's instruction set must
+    be a subset of the host's (`march`)
+
+An attribute also states what a missing tag means on each side: on an artifact, a missing
+tag means the artifact works with `ANY` value unless `artifact_default` names a concrete
+value; on a host, a missing tag means the value is `UNKNOWN` unless `host_default` names a
+concrete value.  A requirement against an `UNKNOWN` host value is accepted as a weaker
+("possible") match.
+
+Base defines attributes for the reserved tags.  Other tags use an `ExactAttribute` with the
+default settings, unless the host platform carries an attribute for them, attached with
+[`set_attribute!`](@ref) or declared in TOML via `PlatformAttribute(key, dict)`.
+"""
+abstract type PlatformAttribute end
+
+struct AnyValue end
+struct UnknownValue end
+const ANY = AnyValue()
+const UNKNOWN = UnknownValue()
+
+struct ExactAttribute <: PlatformAttribute
+    key::String
+    artifact_default::Union{String,AnyValue}
+    host_default::Union{String,UnknownValue}
+    # Order in which values are preferred when the host value is unknown, best first
+    priority::Vector{String}
+end
+ExactAttribute(key::String; artifact_default=ANY, host_default=UNKNOWN, priority=String[]) =
+    ExactAttribute(key, artifact_default, host_default, priority)
+
+struct VersionAttribute <: PlatformAttribute
+    key::String
+    artifact_default::Union{String,AnyValue}
+    host_default::Union{String,UnknownValue}
+    # The version component whose increase breaks compatibility: an artifact's version `v`
+    # supports the host versions from `v` up to, but excluding, `nextpatch(v)`,
+    # `nextminor(v)` or `nextmajor(v)` (`:patch`, `:minor` or `:major`), or any later host
+    # version (`nothing`)
+    breaking::Union{Symbol,Nothing}
+end
+function VersionAttribute(key::String; artifact_default=ANY, host_default=UNKNOWN,
+                          breaking::Union{Symbol,Nothing}=:patch)
+    breaking === nothing || breaking ∈ (:patch, :minor, :major) ||
+        throw(ArgumentError("Invalid breaking version component $(repr(breaking))"))
+    return VersionAttribute(key, artifact_default, host_default, breaking)
+end
+
+struct ISAAttribute <: PlatformAttribute
+    key::String
+    artifact_default::Union{String,AnyValue}
+    host_default::Union{String,UnknownValue}
+end
+ISAAttribute(key::String; artifact_default=ANY, host_default=UNKNOWN) =
+    ISAAttribute(key, artifact_default, host_default)
 
 """
     Platform
@@ -40,6 +107,8 @@ struct Platform <: AbstractPlatform
     tags::Dict{String,String}
     # The "compare strategy" allows selective overriding on how a tag is compared
     compare_strategies::Dict{String,Function}
+    # Attributes attached to a host platform, which override the built-in ones
+    attributes::Dict{String,PlatformAttribute}
 
     # Passing `tags` as a `Dict` avoids the need to infer different NamedTuple specializations
     function Platform(arch::String, os::String, _tags::Dict{String};
@@ -89,14 +158,10 @@ struct Platform <: AbstractPlatform
 
         # By default, we compare julia_version only against major and minor versions:
         if haskey(tags, "julia_version") && !haskey(compare_strategies, "julia_version")
-            compare_strategies["julia_version"] = (a::String, b::String, a_comparator, b_comparator) -> begin
-                a = VersionNumber(a)
-                b = VersionNumber(b)
-                return a.major == b.major && a.minor == b.minor
-            end
+            compare_strategies["julia_version"] = compare_julia_version
         end
 
-        return new(tags, compare_strategies)
+        return new(tags, compare_strategies, Dict{String,PlatformAttribute}())
     end
 end
 
@@ -145,6 +210,12 @@ function add_platform_tag!(tags::Dict{String,String}, tag::String, value::Union{
                 value = string(v)
             end
         end
+    elseif tag == "julia_version"
+        # Only the major and minor version are meaningful
+        v = isa(value, VersionNumber) ? value : tryparse(VersionNumber, value)
+        if isa(v, VersionNumber)
+            value = string(thisminor(v))
+        end
     end
 
     return add_tag!(tags, tag, string(value)::String)
@@ -180,18 +251,26 @@ function Base.setindex!(p::AbstractPlatform, v::String, k::String)
     add_platform_tag!(tags(p), k, v)
     return p
 end
+function Base.setindex!(p::Platform, v::String, k::String)
+    add_platform_tag!(tags(p), k, v)
+    # Match the constructor, which compares `julia_version` by major and minor version
+    if lowercase(k) == "julia_version" && !haskey(p.compare_strategies, "julia_version")
+        p.compare_strategies["julia_version"] = compare_julia_version
+    end
+    return p
+end
 
-# Hash definition to ensure that it's stable
+# Hash definition to ensure that it's stable.  Comparison strategies and attributes only
+# describe how a platform is matched, so they do not take part in hashing or equality.
 function Base.hash(p::Platform, h::UInt)
     h ⊻= 0x506c6174666f726d % UInt
     h = hash(p.tags, h)
-    h = hash(p.compare_strategies, h)
     return h
 end
 
 # Simple equality definition; for compatibility testing, use `platforms_match()`
 function Base.:(==)(a::Platform, b::Platform)
-    return a.tags == b.tags && a.compare_strategies == b.compare_strategies
+    return a.tags == b.tags
 end
 
 
@@ -307,9 +386,6 @@ function get_compare_strategy(p::Platform, key::String, default = compare_defaul
 end
 get_compare_strategy(p::AbstractPlatform, key::String, default = compare_default) = default
 
-# Tags for which absence is meaningful: a platform without the tag only matches
-# platforms that also lack it (rather than acting as a wildcard).
-const strict_presence_tags = ("sanitize",)
 
 
 """
@@ -352,6 +428,18 @@ function compare_version_cap(a::String, b::String, a_requested::Bool, b_requeste
     else
         return a <= b
     end
+end
+
+"""
+    compare_julia_version(a::String, b::String, a_requested::Bool, b_requested::Bool)
+
+Comparison strategy that every `Platform` with a `julia_version` tag uses: versions match
+when their major and minor components are equal.
+"""
+function compare_julia_version(a::String, b::String, a_requested::Bool, b_requested::Bool)
+    a = VersionNumber(a)
+    b = VersionNumber(b)
+    return a.major == b.major && a.minor == b.minor
 end
 
 
@@ -1125,6 +1213,387 @@ function HostPlatform()
     return HostPlatform(parse(Platform, host_triplet()))::Platform
 end
 
+## Platform attributes: matching a host against artifacts
+
+# Attributes of the reserved tags.  Any other tag uses `ExactAttribute(key)`, unless the
+# host carries an attribute for it.
+const builtin_attributes = Dict{String,PlatformAttribute}(
+    "arch" => ExactAttribute("arch"),
+    "os" => ExactAttribute("os"),
+    "libc" => ExactAttribute("libc"),
+    "call_abi" => ExactAttribute("call_abi"),
+    # Instrumented and uninstrumented binaries cannot be mixed; a platform without a
+    # `sanitize` tag is known to be uninstrumented.
+    "sanitize" => ExactAttribute("sanitize"; artifact_default="none", host_default="none"),
+    "cxxlib" => ExactAttribute("cxxlib"),
+    "cxxstring_abi" => ExactAttribute("cxxstring_abi"; priority=["cxx11", "cxx03"]),
+    "cxxlib_version" => VersionAttribute("cxxlib_version"; breaking=nothing),
+    "libgfortran_version" => VersionAttribute("libgfortran_version"; breaking=:major),
+    "os_version" => VersionAttribute("os_version"; breaking=nothing),
+    "julia_version" => VersionAttribute("julia_version"; breaking=:minor),
+    "march" => ISAAttribute("march"),
+)
+
+# Order in which keys break remaining ties between equally good matches.  Keys that are not
+# listed come afterwards, sorted by name.
+const attribute_priority = ("arch", "os", "libc", "call_abi", "sanitize", "cxxlib",
+                            "cxxstring_abi", "libgfortran_version", "cxxlib_version",
+                            "os_version", "julia_version", "march")
+
+"""
+    set_attribute!(p::Platform, attr::PlatformAttribute)
+
+Attach `attr` to the host platform `p`, so that matching `p` against artifact platforms
+interprets the tag `attr.key` according to `attr`.  This overrides the built-in attribute
+of a reserved tag, as well as any comparison strategy set for the same key.  Platform
+augmentation hooks call this for the tags that they add.
+"""
+function set_attribute!(p::Platform, attr::PlatformAttribute)
+    p.attributes[attribute_key(attr)] = attr
+    return p
+end
+
+attribute_key(attr::PlatformAttribute) = with_format(a -> a.key, attr)::String
+
+function Base.:(==)(a::T, b::T) where {T<:PlatformAttribute}
+    return all(f -> getfield(a, f) == getfield(b, f), fieldnames(T))
+end
+function Base.hash(a::PlatformAttribute, h::UInt)
+    h = hash(typeof(a), h)
+    for f in fieldnames(typeof(a))
+        h = hash(getfield(a, f), h)
+    end
+    return h
+end
+
+"""
+    PlatformAttribute(key::String, declaration::AbstractDict)
+
+Construct the attribute of tag `key` from a declaration, such as a TOML table:
+
+```toml
+format = "version"     # "exact" (default), "version" or "isa"
+breaking = "major"     # "version" only: "patch" (default), "minor", "major" or "none"
+priority = ["a", "b"]  # "exact" only: values to prefer, best first
+artifact_default = "x" # value of a missing artifact tag (default: any value)
+host_default = "x"     # value of a missing host tag (default: unknown)
+```
+"""
+function PlatformAttribute(key::String, d::AbstractDict)
+    strvec(v) = String[lowercase(string(x)) for x in v]
+    key = lowercase(key)
+    format = lowercase(string(get(d, "format", "exact")))
+    artifact_default = haskey(d, "artifact_default") ? lowercase(string(d["artifact_default"])) : ANY
+    host_default = haskey(d, "host_default") ? lowercase(string(d["host_default"])) : UNKNOWN
+    if format == "exact"
+        return ExactAttribute(key; artifact_default, host_default,
+                              priority=strvec(get(d, "priority", String[])))
+    elseif format == "version"
+        b = lowercase(string(get(d, "breaking", "patch")))
+        breaking = b == "none" ? nothing : Symbol(b)
+        return VersionAttribute(key; artifact_default, host_default, breaking)
+    elseif format == "isa"
+        return ISAAttribute(key; artifact_default, host_default)
+    end
+    throw(ArgumentError("Unknown platform attribute format $(repr(format)) for tag $(repr(key))"))
+end
+
+# The formats are a closed set: split on them explicitly, so that matching does not need
+# dynamic dispatch.
+@inline function with_format(f, attr::PlatformAttribute)
+    if attr isa ExactAttribute
+        return f(attr)
+    elseif attr isa VersionAttribute
+        return f(attr)
+    elseif attr isa ISAAttribute
+        return f(attr)
+    end
+    throw(ArgumentError("Unsupported platform attribute type $(typeof(attr))"))
+end
+
+"""
+    parse_value(attr::PlatformAttribute, value::String, p::AbstractPlatform)
+
+Parse the tag `value` carried by platform `p` into the representation that `attr`
+compares, or return `nothing` if it does not parse.  `p` provides context, such as the
+architecture that a microarchitecture name refers to.
+"""
+parse_value(::ExactAttribute, s::String, ::AbstractPlatform) = s
+parse_value(::VersionAttribute, s::String, ::AbstractPlatform) = tryparse(VersionNumber, s)
+function parse_value(::ISAAttribute, s::String, p::AbstractPlatform)
+    isas = get(arch_march_isa_mapping, arch(p), nothing)
+    if isas !== nothing
+        idx = findfirst(x -> x.first == s, isas)
+        idx === nothing || return isas[idx].second
+    end
+    # Microarchitectures without a known instruction set are compared by name
+    return s
+end
+
+# Whether the parsed requirement `req` is satisfied by the parsed host value `have`
+satisfies_value(::ExactAttribute, req::String, have::String) = req == have
+function satisfies_value(attr::VersionAttribute, req::VersionNumber, have::VersionNumber)
+    req <= have || return false
+    b = attr.breaking
+    return b === nothing || have < (b === :patch ? nextpatch(req) :
+                                    b === :minor ? nextminor(req) : nextmajor(req))
+end
+satisfies_value(::ISAAttribute, req::CPUID.ISA, have::CPUID.ISA) = req <= have
+satisfies_value(::ISAAttribute, req::String, have::String) = req == have
+satisfies_value(::ISAAttribute, req, have) = false
+
+# Results of comparing two candidates on one key
+const PREFER_FIRST = Int8(1)
+const PREFER_SECOND = Int8(-1)
+const PREFER_NEITHER = Int8(0)
+const INCOMPARABLE = Int8(2)
+
+# How the parsed requirements `a` and `b`, which both match, rank against each other,
+# depending on whether the host value is unknown
+function prefer_value(attr::ExactAttribute, a::String, b::String, host_unknown::Bool)
+    a == b && return PREFER_NEITHER
+    ia = something(findfirst(==(a), attr.priority), typemax(Int))
+    ib = something(findfirst(==(b), attr.priority), typemax(Int))
+    return ia < ib ? PREFER_FIRST : ia > ib ? PREFER_SECOND : INCOMPARABLE
+end
+prefer_value(::VersionAttribute, a::VersionNumber, b::VersionNumber, host_unknown::Bool) =
+    a > b ? PREFER_FIRST : a < b ? PREFER_SECOND : PREFER_NEITHER
+function prefer_value(::ISAAttribute, a::CPUID.ISA, b::CPUID.ISA, host_unknown::Bool)
+    a <= b && b <= a && return PREFER_NEITHER
+    if host_unknown
+        # The host's instruction set is unknown: prefer the least demanding build
+        a < b && return PREFER_FIRST
+        b < a && return PREFER_SECOND
+    else
+        # Prefer the most specific build that the host supports
+        b < a && return PREFER_FIRST
+        a < b && return PREFER_SECOND
+    end
+    return INCOMPARABLE
+end
+prefer_value(::ISAAttribute, a::String, b::String, host_unknown::Bool) = a == b ? PREFER_NEITHER : INCOMPARABLE
+prefer_value(::ISAAttribute, a, b, host_unknown::Bool) = INCOMPARABLE
+
+# Quality of a match, combined across keys by taking the minimum
+const NO_MATCH = Int8(0)
+const POSSIBLE_MATCH = Int8(1)  # depends on host values that are unknown
+const CERTAIN_MATCH = Int8(2)
+
+function requirement(attr::PlatformAttribute, artifact::AbstractPlatform, key::String)
+    s = get(tags(artifact), key, nothing)
+    return s === nothing ? attr.artifact_default : s
+end
+function host_value(attr::PlatformAttribute, host::AbstractPlatform, key::String)
+    s = get(tags(host), key, nothing)
+    return s === nothing ? attr.host_default : s
+end
+
+# The platforms are passed rather than their values, which are unions too large to split
+function attribute_match(attr::PlatformAttribute, host::AbstractPlatform,
+                         artifact::AbstractPlatform, key::String)
+    req, have = requirement(attr, artifact, key), host_value(attr, host, key)
+    req isa AnyValue && return CERTAIN_MATCH
+    have isa UnknownValue && return POSSIBLE_MATCH
+    r = parse_value(attr, req, artifact)
+    h = parse_value(attr, have, host)
+    # Values that do not parse only match an equal value
+    (r === nothing || h === nothing) && return req == have ? CERTAIN_MATCH : NO_MATCH
+    return satisfies_value(attr, r, h) ? CERTAIN_MATCH : NO_MATCH
+end
+
+# Rank of a requirement.  When the host value is known, a specific value beats `ANY`.  When
+# it is unknown, a specific value relies on a guess, so it ranks below `ANY`.
+const RANK_ANY = 1
+function requirement_rank(req::Union{String,AnyValue}, have::Union{String,UnknownValue})
+    req isa AnyValue && return RANK_ANY
+    return have isa UnknownValue ? 0 : 2
+end
+
+function attribute_preference(attr::PlatformAttribute, host::AbstractPlatform,
+                              pa::AbstractPlatform, pb::AbstractPlatform, key::String)
+    ra, rb = requirement(attr, pa, key), requirement(attr, pb, key)
+    have = host_value(attr, host, key)
+    ka, kb = requirement_rank(ra, have), requirement_rank(rb, have)
+    ka != kb && return ka > kb ? PREFER_FIRST : PREFER_SECOND
+    ka == RANK_ANY && return PREFER_NEITHER
+    ra, rb = ra::String, rb::String
+    a = parse_value(attr, ra, pa)
+    b = parse_value(attr, rb, pb)
+    if a === nothing || b === nothing
+        return ra == rb ? PREFER_NEITHER : INCOMPARABLE
+    end
+    return prefer_value(attr, a, b, have isa UnknownValue)
+end
+
+# A comparison strategy set on either platform (the pre-attribute extension mechanism).
+# Strategies that implement exactly the semantics of a built-in attribute are ignored.
+function legacy_strategy(host::AbstractPlatform, artifact::AbstractPlatform, key::String)
+    function custom(p)
+        p isa Platform || return nothing
+        f = get(p.compare_strategies, key, nothing)
+        f === nothing && return nothing
+        f === compare_default && return nothing
+        f === compare_julia_version && key == "julia_version" && return nothing
+        f === compare_version_cap && key ∈ ("os_version", "cxxlib_version") && return nothing
+        return f
+    end
+    hs, as = custom(host), custom(artifact)
+    if hs !== nothing && as !== nothing && hs !== as
+        throw(ArgumentError("Cannot compare Platform objects with two different non-default comparison strategies for the same key \"$(key)\""))
+    end
+    return hs === nothing ? as : hs
+end
+
+# The value of a missing tag for the built-in attribute of `key`, if it is the same
+# concrete value on the host and the artifact side
+function absent_value(key::String)
+    attr = get(builtin_attributes, key, nothing)
+    attr === nothing && return nothing
+    a, h = attr.artifact_default, attr.host_default
+    return (a isa String && h isa String && a == h) ? a : nothing
+end
+
+function attached_attribute(host::AbstractPlatform, key::String)
+    host isa Platform || return nothing
+    return get(host.attributes, key, nothing)
+end
+function key_attribute(host::AbstractPlatform, key::String)
+    attr = attached_attribute(host, key)
+    attr === nothing || return attr
+    return get(() -> ExactAttribute(key), builtin_attributes, key)
+end
+
+# Calls a comparison strategy, which can be any function.  Overridden in trimmed images,
+# which cannot call arbitrary functions.
+call_compare_strategy(f, req::String, have::String, artifact_requested::Bool, host_requested::Bool) =
+    @invokelatest(f(req, have, artifact_requested, host_requested))::Bool
+
+function key_match(host::AbstractPlatform, artifact::AbstractPlatform, key::String)
+    if attached_attribute(host, key) === nothing
+        f = legacy_strategy(host, artifact, key)
+        if f !== nothing
+            # A missing tag on either side is a wildcard, as with `platforms_match`
+            req = get(tags(artifact), key, nothing)
+            have = get(tags(host), key, nothing)
+            req === nothing && return CERTAIN_MATCH
+            have === nothing && return POSSIBLE_MATCH
+            artifact_requested = artifact isa Platform && get(artifact.compare_strategies, key, nothing) === f
+            host_requested = host isa Platform && get(host.compare_strategies, key, nothing) === f
+            ok = call_compare_strategy(f, req, have, artifact_requested, host_requested)
+            return ok ? CERTAIN_MATCH : NO_MATCH
+        end
+    end
+    return with_format(key_attribute(host, key)) do attr
+        attribute_match(attr, host, artifact, key)
+    end
+end
+
+function key_preference(host::AbstractPlatform, a::AbstractPlatform, b::AbstractPlatform, key::String)
+    if attached_attribute(host, key) === nothing &&
+            (legacy_strategy(host, a, key) !== nothing || legacy_strategy(host, b, key) !== nothing)
+        # Comparison strategies carry no preference, beyond a specific value beating none
+        ha, hb = haskey(tags(a), key), haskey(tags(b), key)
+        return ha == hb ? PREFER_NEITHER : ha ? PREFER_FIRST : PREFER_SECOND
+    end
+    return with_format(key_attribute(host, key)) do attr
+        attribute_preference(attr, host, a, b, key)
+    end
+end
+
+function matching_keys(host::AbstractPlatform, artifacts)
+    ks = Set{String}(keys(tags(host)))
+    for p in artifacts
+        union!(ks, keys(tags(p)))
+    end
+    host isa Platform && union!(ks, keys(host.attributes))
+    prio(k) = something(findfirst(==(k), attribute_priority), length(attribute_priority) + 1)
+    return sort!(collect(ks); by = k -> (prio(k), k))
+end
+
+function match_quality(host::AbstractPlatform, artifact::AbstractPlatform, ks=matching_keys(host, (artifact,)))
+    q = CERTAIN_MATCH
+    for key in ks
+        q = min(q, key_match(host, artifact, key))
+        q == NO_MATCH && break
+    end
+    return q
+end
+
+"""
+    satisfies(host::AbstractPlatform, artifact::AbstractPlatform)
+
+Return `true` if a binary built for the platform `artifact` can be used on `host`.  Unlike
+[`platforms_match`](@ref), this is not symmetric: every tag is interpreted according to
+its [`PlatformAttribute`](@ref), as a fact about the host on one side and as a requirement
+of the artifact on the other.  A match that relies on host values that are unknown counts
+as satisfied.
+"""
+satisfies(host::AbstractPlatform, artifact::AbstractPlatform) =
+    match_quality(host, artifact) != NO_MATCH
+
+# Whether `a` is at least as good as `b` on every key and strictly better on one
+function dominates(host, a, b, ks)
+    better = false
+    for key in ks
+        c = key_preference(host, a, b, key)
+        (c == PREFER_SECOND || c == INCOMPARABLE) && return false
+        c == PREFER_FIRST && (better = true)
+    end
+    return better
+end
+
+# Compare `a` and `b` key by key, in priority order
+function lexicographic_preference(host, a, b, ks)
+    for key in ks
+        c = key_preference(host, a, b, key)
+        (c == PREFER_FIRST || c == PREFER_SECOND) && return c
+    end
+    return PREFER_NEITHER
+end
+
+# The ordering that `select_platform` used before platform attributes; it now only
+# resolves ambiguous selections.
+function legacy_selection_order!(ps::Vector, platform::AbstractPlatform)
+    function match_loss(a, b)
+        a_tags = Set(keys(tags(a)))
+        b_tags = Set(keys(tags(b)))
+        return length(union(a_tags, b_tags)) - length(intersect(a_tags, b_tags))
+    end
+    sort!(ps, lt = (a, b) -> begin
+        loss_a = match_loss(a, platform)
+        loss_b = match_loss(b, platform)
+        if loss_a != loss_b
+            return loss_a < loss_b
+        end
+        return triplet(a) > triplet(b)
+    end)
+    return ps
+end
+
+# The best artifact platform among `ps` for `host`, or `nothing` if none matches
+function select_platform_key(ps::Vector, host::AbstractPlatform)
+    isempty(ps) && return nothing
+    ks = matching_keys(host, ps)
+    qualities = Int8[match_quality(host, p, ks) for p in ps]
+    q = maximum(qualities)
+    q == NO_MATCH && return nothing
+    # Prefer matches that do not rely on unknown host values
+    cands = ps[qualities .== q]
+    length(cands) == 1 && return only(cands)
+
+    # Keep the candidates that no other candidate beats on every key
+    maximal = filter(a -> !any(b -> b !== a && dominates(host, b, a, ks), cands), cands)
+    length(maximal) == 1 && return only(maximal)
+
+    # Break remaining ties by key priority
+    best = filter(a -> !any(b -> b !== a && lexicographic_preference(host, b, a, ks) == PREFER_FIRST, maximal), maximal)
+    length(best) == 1 && return only(best)
+
+    # The selection is ambiguous; fall back to the legacy ordering so that the result
+    # stays deterministic.
+    return first(legacy_selection_order!(isempty(best) ? maximal : best, host))
+end
+
 """
     platforms_match(a::AbstractPlatform, b::AbstractPlatform)
 
@@ -1145,21 +1614,25 @@ bounded version constraints, where an artifact can specify that it was built usi
 only available in macOS `v"10.11"` and later, or an artifact can state that it requires
 a libstdc++ that is at least `v"3.4.22"`, etc...
 
-Keys present in only one of `a` or `b` are normally ignored, with the exception of the
-`sanitize` tag: a sanitized platform (e.g. `x86_64-linux-gnu-sanitize+memory`) never
-matches a platform without a `sanitize` tag, since instrumented and uninstrumented
-binaries cannot be mixed.
+Keys present in only one of `a` or `b` are normally ignored.  The exception is a tag such
+as `sanitize`, where a missing tag has a definite meaning: a sanitized platform (e.g.
+`x86_64-linux-gnu-sanitize+memory`) never matches a platform without a `sanitize` tag,
+since instrumented and uninstrumented binaries cannot be mixed.
+
+To check whether an artifact can be used on a host, prefer [`satisfies`](@ref), which
+interprets each tag according to its [`PlatformAttribute`](@ref).
 """
 function platforms_match(a::AbstractPlatform, b::AbstractPlatform)
     for k in union(keys(tags(a)::Dict{String,String}), keys(tags(b)::Dict{String,String}))
         ak = get(tags(a), k, nothing)
         bk = get(tags(b), k, nothing)
 
-        # A tag missing from one side acts as a wildcard, except for strict tags
+        # A tag missing on one side is a wildcard, unless its built-in attribute gives a
+        # missing tag the same concrete meaning on both sides (e.g. `sanitize`)
         if ak === nothing || bk === nothing
-            if k in strict_presence_tags
-                return false
-            end
+            absent = absent_value(k)
+            absent === nothing && continue
+            something(ak, absent) == something(bk, absent) || return false
             continue
         end
 
@@ -1204,45 +1677,21 @@ platforms_match(a::AbstractString, b::AbstractString) = platforms_match(string(a
 """
     select_platform(download_info::Dict, platform::AbstractPlatform = HostPlatform())
 
-Given a `download_info` dictionary mapping platforms to some value, choose
-the value whose key best matches `platform`, returning `nothing` if no matches
-can be found.
+Given a `download_info` dictionary mapping artifact platforms to some value, choose the
+value whose key best matches the host `platform`, returning `nothing` if no artifact
+platform [`satisfies`](@ref) the host.
 
-Platform attributes such as architecture, libc, calling ABI, etc... must all
-match exactly, however attributes such as compiler ABI can have wildcards
-within them such as `nothing` which matches any version of GCC.
+Each tag is interpreted according to its [`PlatformAttribute`](@ref).  Among the matching
+artifacts, those that do not rely on unknown host values are preferred.  An artifact is
+then preferred over another if it is at least as good on every tag and better on one:
+a specific value beats an artifact that works with any value, a newer version beats an
+older one, a more specific microarchitecture beats a more generic one, and so on.
+Remaining ties are broken tag by tag, in a fixed priority order.
 """
 function select_platform(download_info::Dict, platform::AbstractPlatform = HostPlatform())
-    ps = collect(filter(p -> platforms_match(p, platform), keys(download_info)))
-
-    if isempty(ps)
-        return nothing
-    end
-
-    # At this point, we may have multiple possibilities.  We now engage a multi-
-    # stage selection algorithm, where we first sort the matches by how complete
-    # the match is, e.g. preferring matches where the intersection of tags is
-    # equal to the union of the tags:
-    function match_loss(a, b)
-        a_tags = Set(keys(tags(a)))
-        b_tags = Set(keys(tags(b)))
-        return length(union(a_tags, b_tags)) - length(intersect(a_tags, b_tags))
-    end
-
-    # We prefer these better matches, and secondarily reverse-sort by triplet so
-    # as to generally choose the latest release (e.g. a `libgfortran5` tarball
-    # over a `libgfortran3` tarball).
-    sort!(ps, lt = (a, b) -> begin
-        loss_a = match_loss(a, platform)
-        loss_b = match_loss(b, platform)
-        if loss_a != loss_b
-            return loss_a < loss_b
-        end
-        return triplet(a) > triplet(b)
-    end)
-
-    # @invokelatest here to not get invalidated by new defs of `==(::Function, ::Function)`
-    return @invokelatest getindex(download_info, first(ps))
+    best = select_platform_key(collect(keys(download_info)), platform)
+    best === nothing && return nothing
+    return download_info[best]
 end
 
 # precompiles to reduce latency (see https://github.com/JuliaLang/julia/pull/43990#issuecomment-1025692379)

@@ -224,6 +224,14 @@ New library features
   fit on a single line, truncated to the display width, instead of showing no data at all ([#62543]).
 * The element type of broadcast expressions now uses regular inference machinery rather than an idiosyncratic
   heuristic. This can help fused or empty broadcasts infer to more precise element types ([#62564]).
+* `Base.BinaryPlatforms` now interprets each platform tag through a `PlatformAttribute`, which states
+  how values compare and what a missing tag means on the host and on the artifact side. `select_platform`
+  uses these attributes instead of comparing triplets as strings: it compares versions numerically, picks
+  the most specific `march` build that the host supports (and the least demanding one when the host CPU is
+  unknown), and never selects a sanitized artifact for an unsanitized host or the other way round. The new
+  `Base.BinaryPlatforms.satisfies(host, artifact)` checks a single artifact, and `set_attribute!` lets
+  platform augmentation hooks define the attributes of their own tags. Comparison strategies no longer take
+  part in `==` and `hash` of `Platform` objects.
 
 Standard library changes
 ------------------------
