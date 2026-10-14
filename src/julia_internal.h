@@ -529,6 +529,13 @@ extern JL_DLLEXPORT jl_value_t *jl_compile_and_emit_func JL_GLOBALLY_ROOTED;
 extern JL_DLLEXPORT size_t jl_typeinf_world;
 extern JL_DLLEXPORT jl_value_t *jl_libdl_dlid_func JL_GLOBALLY_ROOTED;
 extern JL_DLLEXPORT jl_value_t *jl_libdl_dlopen_func JL_GLOBALLY_ROOTED;
+extern jl_array_t *jl_foreign_library_refs JL_GLOBALLY_ROOTED;
+extern jl_array_t *jl_foreign_library_refs_new JL_GLOBALLY_ROOTED;
+extern jl_genericmemory_t *jl_foreign_library_ids JL_GLOBALLY_ROOTED;
+void jl_record_foreign_library(jl_value_t *lib) JL_CANSAFEPOINT;
+void jl_add_foreign_library_refs(jl_array_t *refs) JL_CANSAFEPOINT;
+JL_DLLEXPORT void jl_foreign_libraries_query_dlids(void) JL_CANSAFEPOINT;
+JL_DLLEXPORT jl_value_t *jl_get_foreign_library_id(jl_value_t *lib) JL_CANSAFEPOINT;
 extern _Atomic(jl_typemap_entry_t*) call_cache[N_CALL_CACHE] JL_GLOBALLY_ROOTED;
 
 void free_stack(void *stkbuf, size_t bufsz) JL_NOTSAFEPOINT;

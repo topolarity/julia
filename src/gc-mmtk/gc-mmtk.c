@@ -706,6 +706,9 @@ JL_DLLEXPORT void jl_gc_scan_vm_specific_roots(RootsWorkClosure* closure)
     // builtin values
     add_node_to_roots_buffer(closure, &buf, &len, jl_an_empty_vec_any);
     add_node_to_roots_buffer(closure, &buf, &len, jl_module_init_order);
+    add_node_to_roots_buffer(closure, &buf, &len, jl_foreign_library_refs);
+    add_node_to_roots_buffer(closure, &buf, &len, jl_foreign_library_refs_new);
+    add_node_to_roots_buffer(closure, &buf, &len, jl_foreign_library_ids);
     for (size_t i = 0; i < jl_current_modules.size; i += 2) {
         if (jl_current_modules.table[i + 1] != HT_NOTFOUND) {
             add_node_to_roots_buffer(closure, &buf, &len, jl_current_modules.table[i]);

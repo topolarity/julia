@@ -3126,6 +3126,12 @@ static void gc_mark_roots(jl_gc_markqueue_t *mq) JL_NOTSAFEPOINT
     gc_heap_snapshot_record_gc_roots((jl_value_t*)jl_an_empty_vec_any, "an_empty_vec_any");
     gc_try_claim_and_push(mq, jl_module_init_order, NULL);
     gc_heap_snapshot_record_gc_roots((jl_value_t*)jl_module_init_order, "module_init_order");
+    gc_try_claim_and_push(mq, jl_foreign_library_refs, NULL);
+    gc_heap_snapshot_record_gc_roots((jl_value_t*)jl_foreign_library_refs, "foreign_library_refs");
+    gc_try_claim_and_push(mq, jl_foreign_library_refs_new, NULL);
+    gc_heap_snapshot_record_gc_roots((jl_value_t*)jl_foreign_library_refs_new, "foreign_library_refs_new");
+    gc_try_claim_and_push(mq, jl_foreign_library_ids, NULL);
+    gc_heap_snapshot_record_gc_roots((jl_value_t*)jl_foreign_library_ids, "foreign_library_ids");
     for (size_t i = 0; i < jl_current_modules.size; i += 2) {
         if (jl_current_modules.table[i + 1] != HT_NOTFOUND) {
             gc_try_claim_and_push(mq, jl_current_modules.table[i], NULL);

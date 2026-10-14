@@ -154,7 +154,7 @@ extern "C" {
 // TODO: put WeakRefs on the weak_refs list during deserialization
 // TODO: handle finalizers
 
-#define NUM_TAGS    7
+#define NUM_TAGS    8
 
 // An array of special references that need to be restored from the sysimg
 static void get_tags(jl_value_t **tags[NUM_TAGS])
@@ -168,6 +168,7 @@ static void get_tags(jl_value_t **tags[NUM_TAGS])
     INSERT_TAG(jl_compile_and_emit_func);
     INSERT_TAG(jl_libdl_dlid_func);
     INSERT_TAG(jl_libdl_dlopen_func);
+    INSERT_TAG(jl_foreign_library_refs);
     // n.b. must update NUM_TAGS when you add something here
 #undef INSERT_TAG
     assert(i == NUM_TAGS - 1);
@@ -3266,6 +3267,9 @@ static void jl_save_system_image_to_stream(ios_t *f, jl_array_t *mod_array,
         s.worklist_key = jl_worklist_key(worklist);
     }
     else {
+        // a `--trim` image is done with codegen, so has no use for these
+        if (jl_options.trim)
+            jl_foreign_library_refs = NULL;
         get_tags(_tags);
     }
 
@@ -3285,6 +3289,8 @@ static void jl_save_system_image_to_stream(ios_t *f, jl_array_t *mod_array,
     }
     jl_genericmemory_t *global_roots_list = NULL;
     jl_genericmemory_t *global_roots_keyset = NULL;
+    // `ccall`/`cglobal` libraries recorded by methods defined while precompiling
+    jl_value_t *foreign_library_refs = jl_foreign_library_refs_new ? (jl_value_t*)jl_foreign_library_refs_new : jl_an_empty_vec_any;
 
     { // step 1: record values (recursively) that need to go in the image
         size_t i;
@@ -3307,6 +3313,7 @@ static void jl_save_system_image_to_stream(ios_t *f, jl_array_t *mod_array,
             // Queue the worklist itself as the first item we serialize
             jl_queue_for_serialization(&s, worklist);
             jl_queue_for_serialization(&s, module_init_order);
+            jl_queue_for_serialization(&s, foreign_library_refs);
         }
         // step 1.1: as needed, serialize the data needed for insertion into the running system
         if (extext_methods) {
@@ -3482,6 +3489,7 @@ static void jl_save_system_image_to_stream(ios_t *f, jl_array_t *mod_array,
             jl_write_value(&s, extext_methods);
             jl_write_value(&s, new_ext);
             jl_write_value(&s, s.method_roots_list);
+            jl_write_value(&s, foreign_library_refs);
         }
         write_uint32(f, jl_array_len(s.link_ids_gctags));
         ios_write(f, (char*)jl_array_data(s.link_ids_gctags, uint32_t), jl_array_len(s.link_ids_gctags) * sizeof(uint32_t));
@@ -4154,6 +4162,7 @@ static void jl_restore_system_image_from_stream_(ios_t *f, jl_image_t *image,
     int en = jl_gc_enable(0);
     ios_t sysimg, const_data, symbols, relocs, gvar_record, fptr_record;
     jl_serializer_state s = {0};
+    jl_array_t *foreign_library_refs = NULL; // lives in the image
     s.incremental = restored != NULL; // n_linkage_blobs() > 0;
     s.image = image;
     s.s = NULL;
@@ -4219,7 +4228,7 @@ static void jl_restore_system_image_from_stream_(ios_t *f, jl_image_t *image,
     ios_seek(f, LLT_ALIGN(ios_pos(f), 8));
     assert(!ios_eof(f));
     s.s = f;
-    uintptr_t offset_restored = 0, offset_init_order = 0, offset_extext_methods = 0, offset_new_ext = 0, offset_method_roots_list = 0;
+    uintptr_t offset_restored = 0, offset_init_order = 0, offset_extext_methods = 0, offset_new_ext = 0, offset_method_roots_list = 0, offset_foreign_library_refs = 0;
     if (!s.incremental) {
         size_t i;
         for (i = 0; tags[i] != NULL; i++) {
@@ -4256,6 +4265,7 @@ static void jl_restore_system_image_from_stream_(ios_t *f, jl_image_t *image,
         offset_extext_methods = jl_read_offset(&s);
         offset_new_ext = jl_read_offset(&s);
         offset_method_roots_list = jl_read_offset(&s);
+        offset_foreign_library_refs = jl_read_offset(&s);
     }
     s.buildid_depmods_idxs = depmod_to_imageidx(depmods);
     size_t nlinks_gctags = read_uint32(f);
@@ -4286,6 +4296,7 @@ static void jl_restore_system_image_from_stream_(ios_t *f, jl_image_t *image,
         *extext_methods = (jl_array_t*)jl_delayed_reloc(&s, offset_extext_methods);
         (void)(jl_array_t*)jl_delayed_reloc(&s, offset_new_ext);
         *method_roots_list = (jl_array_t*)jl_delayed_reloc(&s, offset_method_roots_list);
+        foreign_library_refs = (jl_array_t*)jl_delayed_reloc(&s, offset_foreign_library_refs);
         *internal_methods = jl_alloc_vec_any(0);
     }
     s.s = NULL;
@@ -4702,9 +4713,10 @@ static void jl_restore_system_image_from_stream_(ios_t *f, jl_image_t *image,
     // jl_printf(JL_STDOUT, "%ld blobs to link against\n", image_tree.nranges);
     jl_gc_enable(en);
 
-    if (s.incremental)
+    if (s.incremental) {
         jl_add_methods(*extext_methods);
-
+        jl_add_foreign_library_refs(foreign_library_refs);
+    }
 }
 
 static jl_value_t *jl_validate_cache_file(ios_t *f, jl_array_t *depmods, uint32_t *checksum,

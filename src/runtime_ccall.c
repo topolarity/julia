@@ -22,6 +22,149 @@
 jl_value_t *jl_libdl_dlid_func JL_GLOBALLY_ROOTED;
 jl_value_t *jl_libdl_dlopen_func JL_GLOBALLY_ROOTED;
 
+// Library arguments of `ccall`/`cglobal`, recorded when a method is defined, so
+// that `jl_foreign_libraries_query_dlids` can find the `LibraryID` of each one later.
+//
+// Each library is keyed by its (canonical) GlobalRef, or else by the library
+// object itself, compared by `===`.
+jl_array_t *jl_foreign_library_refs JL_GLOBALLY_ROOTED = NULL; // every known key (with duplicates)
+jl_array_t *jl_foreign_library_refs_new JL_GLOBALLY_ROOTED = NULL; // keys first seen in this process
+jl_genericmemory_t *jl_foreign_library_ids JL_GLOBALLY_ROOTED = NULL; // eqtable: key => LibraryID or nothing
+static size_t foreign_library_refs_indexed = 0; // prefix of `jl_foreign_library_refs` in the table
+static jl_mutex_t foreign_library_lock;
+
+// The key for a library argument, or NULL if it needs no `dlid` (e.g. a library name)
+static jl_value_t *foreign_library_key(jl_value_t *lib, int alloc) JL_CANSAFEPOINT
+{
+    if (jl_is_globalref(lib)) {
+        jl_globalref_t *gr = (jl_globalref_t*)lib;
+        jl_binding_t *b = gr->binding;
+        if (b == NULL)
+            b = jl_get_module_binding(gr->mod, gr->name, alloc);
+        return b == NULL ? NULL : (jl_value_t*)b->globalref;
+    }
+    if (jl_is_quotenode(lib))
+        lib = jl_quotenode_value(lib);
+    if (lib == NULL || jl_is_string(lib) || jl_is_symbol(lib) || jl_isa_ast_node(lib))
+        return NULL;
+    return lib;
+}
+
+// Add any keys restored from an image to the table. Requires `foreign_library_lock`.
+static void index_foreign_library_refs(void) JL_CANSAFEPOINT
+{
+    if (jl_foreign_library_refs == NULL)
+        return;
+    size_t n = jl_array_nrows(jl_foreign_library_refs);
+    for (; foreign_library_refs_indexed < n; foreign_library_refs_indexed++) {
+        jl_value_t *key = jl_array_ptr_ref(jl_foreign_library_refs, foreign_library_refs_indexed);
+        if (jl_foreign_library_ids == NULL)
+            jl_foreign_library_ids = jl_alloc_memory_any(32);
+        if (jl_eqtable_get(jl_foreign_library_ids, key, NULL) == NULL)
+            jl_foreign_library_ids = jl_eqtable_put(jl_foreign_library_ids, key, jl_nothing, NULL);
+    }
+}
+
+// Record the library argument of a `ccall`/`cglobal` for `jl_foreign_libraries_query_dlids`
+void jl_record_foreign_library(jl_value_t *lib)
+{
+    jl_value_t *key = foreign_library_key(lib, 1);
+    if (key == NULL)
+        return;
+    JL_GC_PUSH1(&key);
+    JL_LOCK(&foreign_library_lock);
+    index_foreign_library_refs();
+    if (jl_foreign_library_ids == NULL)
+        jl_foreign_library_ids = jl_alloc_memory_any(32);
+    if (jl_eqtable_get(jl_foreign_library_ids, key, NULL) == NULL) {
+        jl_foreign_library_ids = jl_eqtable_put(jl_foreign_library_ids, key, jl_nothing, NULL);
+        if (jl_foreign_library_refs == NULL)
+            jl_foreign_library_refs = jl_alloc_vec_any(0);
+        if (jl_foreign_library_refs_new == NULL)
+            jl_foreign_library_refs_new = jl_alloc_vec_any(0);
+        jl_array_ptr_1d_push(jl_foreign_library_refs, key);
+        jl_array_ptr_1d_push(jl_foreign_library_refs_new, key);
+        foreign_library_refs_indexed++;
+    }
+    JL_UNLOCK(&foreign_library_lock);
+    JL_GC_POP();
+}
+
+// Add the keys saved in a package image
+void jl_add_foreign_library_refs(jl_array_t *refs)
+{
+    size_t n = jl_array_nrows(refs);
+    if (n == 0)
+        return;
+    JL_LOCK(&foreign_library_lock);
+    if (jl_foreign_library_refs == NULL)
+        jl_foreign_library_refs = jl_alloc_vec_any(0);
+    for (size_t i = 0; i < n; i++)
+        jl_array_ptr_1d_push(jl_foreign_library_refs, jl_array_ptr_ref(refs, i));
+    JL_UNLOCK(&foreign_library_lock);
+}
+
+// Call `dlid(lib)` for each recorded library argument that is an `AbstractLibrary`
+// (in the latest world), for codegen to read with `jl_get_foreign_library_id`.
+// A global that has no value yet is skipped.
+JL_DLLEXPORT void jl_foreign_libraries_query_dlids(void)
+{
+    jl_task_t *ct = jl_current_task;
+    jl_genericmemory_t *keys = NULL;
+    jl_value_t *lib = NULL, *id = NULL;
+    JL_GC_PUSH3(&keys, &lib, &id);
+    JL_LOCK(&foreign_library_lock);
+    index_foreign_library_refs();
+    keys = jl_foreign_library_ids;
+    JL_UNLOCK(&foreign_library_lock);
+    if (keys == NULL || jl_libdl_dlid_func == NULL) {
+        JL_GC_POP();
+        return;
+    }
+    size_t last_age = ct->world_age;
+    ct->world_age = jl_atomic_load_acquire(&jl_world_counter);
+    for (size_t i = 0; i < keys->length; i += 2) {
+        jl_value_t *key = jl_genericmemory_ptr_ref(keys, i);
+        if (key == NULL)
+            continue;
+        if (jl_is_globalref(key)) {
+            jl_globalref_t *gr = (jl_globalref_t*)key;
+            jl_binding_t *b = gr->binding ? gr->binding : jl_get_module_binding(gr->mod, gr->name, 1);
+            lib = jl_get_binding_value(b);
+        }
+        else {
+            lib = key;
+        }
+        if (lib == NULL || !jl_isa(lib, (jl_value_t*)jl_abstractlibrary_type))
+            continue;
+        id = jl_apply_generic(jl_libdl_dlid_func, &lib, 1);
+        if (id != jl_nothing && !jl_typeis(id, (jl_value_t*)jl_libraryid_type))
+            jl_errorf("dlid(::%s) must return a LibraryID or nothing", jl_symbol_name(((jl_datatype_t*)jl_typeof(lib))->name->name));
+        JL_LOCK(&foreign_library_lock);
+        jl_foreign_library_ids = jl_eqtable_put(jl_foreign_library_ids, key, id, NULL);
+        JL_UNLOCK(&foreign_library_lock);
+    }
+    ct->world_age = last_age;
+    JL_GC_POP();
+}
+
+// The `LibraryID` that `jl_foreign_libraries_query_dlids` found for a library argument, or NULL
+JL_DLLEXPORT jl_value_t *jl_get_foreign_library_id(jl_value_t *lib)
+{
+    jl_value_t *key = foreign_library_key(lib, 0);
+    if (key == NULL)
+        return NULL;
+    jl_value_t *id = NULL;
+    JL_GC_PUSH2(&key, &id);
+    // n.b. not JL_LOCK_NOGC: the lock is held while allocating in `jl_record_foreign_library`
+    JL_LOCK(&foreign_library_lock);
+    if (jl_foreign_library_ids != NULL)
+        id = jl_eqtable_get(jl_foreign_library_ids, key, NULL);
+    JL_UNLOCK(&foreign_library_lock);
+    JL_GC_POP();
+    return (id != NULL && jl_typeis(id, (jl_value_t*)jl_libraryid_type)) ? id : NULL;
+}
+
 // map from user-specified lib names to handles
 static htable_t libMap;
 static jl_mutex_t libmap_lock;
@@ -478,6 +621,7 @@ void *jl_get_abi_converter(jl_task_t *ct, void *data)
 void jl_init_runtime_ccall(void)
 {
     JL_MUTEX_INIT(&libmap_lock, "libmap_lock");
+    JL_MUTEX_INIT(&foreign_library_lock, "foreign_library_lock");
     strhash_new(&libMap, 16);
     uv_mutex_init(&trampoline_lock);
 }

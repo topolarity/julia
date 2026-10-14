@@ -412,8 +412,9 @@ LibraryID(pkg::Base.UUID, name::AbstractString) = LibraryID(pkg, String(name))
 Abstract supertype for library handles that carry a stable identity the compiler can
 rely on. Subtypes must implement [`dlid`](@ref).
 
-A subtype promises that the identity is invariant for the life of the handle. `ccall`
-and `cglobal` record it where the library is referenced.
+A subtype promises that the identity is invariant for the life of the handle. Tools that
+compile ahead of time (such as JuliaC) query it for each library that a `ccall` or
+`cglobal` refers to.
 
 !!! compat "Julia 1.14"
     `AbstractLibrary` was added in Julia 1.14.

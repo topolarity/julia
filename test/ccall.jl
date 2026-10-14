@@ -2462,9 +2462,10 @@ end
     @test InterpretedCGlobal.address() == cglobal((:test_echo_p, named_lib))
 end
 
-# the recorded identity is visible in lowered code as a third tuple element
+# `jl_foreign_libraries_query_dlids` finds the identity of each library a `ccall`/`cglobal` is written against
 struct DeclaringLib <: AbstractLibrary end
-Libdl.dlid(::DeclaringLib) = LibraryID(Base.UUID(0x2fa1c7f0c93c48a0b4e2a5f0d6c60002), "libdeclaring")
+const declaring_id = LibraryID(Base.UUID(0x2fa1c7f0c93c48a0b4e2a5f0d6c60002), "libdeclaring")
+Libdl.dlid(::DeclaringLib) = declaring_id
 const declaring_lib = DeclaringLib()
 
 struct SilentLib <: AbstractLibrary end
@@ -2473,24 +2474,40 @@ const silent_lib = SilentLib()
 
 struct MisdeclaredLib <: AbstractLibrary end
 Libdl.dlid(::MisdeclaredLib) = "not an identity"
-const misdeclared_lib = MisdeclaredLib()
 
 uses_declaring() = ccall((:my_symbol, declaring_lib), Cint, ())
 uses_silent() = ccall((:my_symbol, silent_lib), Cint, ())
 uses_string() = ccall((:my_symbol, "libbar"), Cint, ())
 cglobal_declaring() = cglobal((:my_global, declaring_lib))
+# the library is not defined yet when these methods are
+uses_late() = ccall((:my_symbol, late_lib), Cint, ())
+uses_undefined() = ccall((:my_symbol, undefined_lib), Cint, ())
+uses_misdeclared() = ccall((:my_symbol, misdeclared_lib), Cint, ())
+const late_lib = DeclaringLib()
 
-@testset "identity recorded at the call site" begin
+function queried_id(lib)
+    p = ccall(:jl_get_foreign_library_id, Ptr{Cvoid}, (Any,), lib)
+    return p == C_NULL ? nothing : unsafe_pointer_to_objref(p)
+end
+
+@testset "identity found by jl_foreign_libraries_query_dlids" begin
+    # lowered code is unchanged
     let fptr = only(code_lowered(uses_declaring)).code[1].args[1]
         @test fptr.head === :tuple
-        @test length(fptr.args) == 3
-        @test fptr.args[1] == QuoteNode(:my_symbol)
-        @test fptr.args[2] == GlobalRef(@__MODULE__, :declaring_lib)
-        @test fptr.args[3] === LibraryID(Base.UUID(0x2fa1c7f0c93c48a0b4e2a5f0d6c60002), "libdeclaring")
+        @test fptr.args == Any[QuoteNode(:my_symbol), GlobalRef(@__MODULE__, :declaring_lib)]
     end
-    @test length(only(code_lowered(uses_silent)).code[1].args[1].args) == 2
-    @test length(only(code_lowered(uses_string)).code[1].args[1].args) == 2
-    @test length(only(code_lowered(cglobal_declaring)).code[1].args[1].args) == 3
-    @test_throws ErrorException @eval uses_misdeclared() = ccall((:my_symbol, misdeclared_lib), Cint, ())
+    @test length(only(code_lowered(cglobal_declaring)).code[1].args[1].args) == 2
+
+    @test queried_id(GlobalRef(@__MODULE__, :declaring_lib)) === nothing # not queried yet
+    @test_throws ErrorException ccall(:jl_foreign_libraries_query_dlids, Cvoid, ())
+    @eval Libdl.dlid(::MisdeclaredLib) = nothing
+    ccall(:jl_foreign_libraries_query_dlids, Cvoid, ())
+
+    @test queried_id(GlobalRef(@__MODULE__, :declaring_lib)) === declaring_id
+    @test queried_id(GlobalRef(@__MODULE__, :late_lib)) === declaring_id
+    @test queried_id(GlobalRef(@__MODULE__, :silent_lib)) === nothing
+    @test queried_id(GlobalRef(@__MODULE__, :undefined_lib)) === nothing
+    @test queried_id(GlobalRef(@__MODULE__, :misdeclared_lib)) === nothing
+    @test queried_id("libbar") === nothing
 end
 end

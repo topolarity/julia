@@ -64,7 +64,7 @@ typedef struct {
     // Dynamic name resolution (simple runtime expressions)
     jl_value_t *f_name_expr;   // expression for function name
     jl_value_t *f_lib_expr;    // expression for library name
-    jl_value_t *lib_id;        // value returned by dlid() at definition time
+    jl_value_t *lib_id;        // the library's LibraryID from jl_foreign_libraries_query_dlids, or NULL
 
     // Runtime pointer
     Value *jl_ptr;             // callable pointer expression result
@@ -682,8 +682,8 @@ static void interpret_foreignsymbol(jl_codectx_t &ctx, native_sym_arg_t &out, jl
                 }
              }
         }
-        else if (nargs == 2 || nargs == 3) {
-            // Three element tuple: (func_name, lib_ref, lib_id)
+        else if (nargs == 2) {
+            // Two element tuple: (func_name, lib_name)
             jl_value_t *fname_arg = jl_array_ptr_ref(tuple_args, 0);
             jl_value_t *lib_arg = jl_array_ptr_ref(tuple_args, 1);
             out.f_name_expr = fname_arg;
@@ -712,10 +712,8 @@ static void interpret_foreignsymbol(jl_codectx_t &ctx, native_sym_arg_t &out, jl
                 }
             }
 
-            if (nargs == 3) {
-                out.lib_id = jl_array_ptr_ref(tuple_args, 2);
-                out.gcroot[2] = out.lib_id;
-            }
+            out.lib_id = jl_get_foreign_library_id(lib_arg);
+            out.gcroot[2] = out.lib_id;
         }
     }
     else {
