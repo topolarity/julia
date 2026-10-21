@@ -26,3 +26,17 @@
 `mapper` adds 2 mappings per graph, as on Linux, but did not fail at 80k
 mappings: macOS has no limit like Linux's `vm.max_map_count` at this scale.
 The arena run used a single arena throughout.
+
+Absolute RSS on macOS varies a lot between runs (memory compression and the
+load from other processes): a later run of the same workload measured 905 MiB
+at 4000 functions in both `split` and `arena`. Compare RSS only between modes
+run side by side; the JIT's own mapped memory is stable across runs.
+
+With 256 MiB arenas (64 blocks of 16 KiB pages), the same workload switches
+arenas twice by 40000 functions; run side by side with `split`:
+
+| functions | arenas | mappings split / arena | RSS MiB split / arena | JIT mapped MiB split / arena |
+|---|---|---|---|---|
+| 16000 | 1 | 231 / 231 | 1342 / 1342 | 256 / 256 |
+| 24000 | 2 | 270 / 272 | 1555 / 1557 | 380 / 381 |
+| 40000 | 3 | 345 / 347 | 1948 / 1948 | 632 / 635 |
