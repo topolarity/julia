@@ -7,7 +7,7 @@ using Printf, Statistics
 const DIR = @__DIR__
 const REPS = isempty(ARGS) ? 5 : parse(Int, ARGS[1])
 const MODES = ["split", "arena", "mapper"]
-const WORKLOADS = ["many_small.jl", "realistic.jl"]
+const WORKLOADS = ["many_small.jl", "realistic.jl", "far_placement.jl"]
 
 function run_one(mode, workload)
     cmd = addenv(`$(Base.julia_cmd()) --startup-file=no $(joinpath(DIR, workload))`,
