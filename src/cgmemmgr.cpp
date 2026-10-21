@@ -9,6 +9,8 @@
 #pragma GCC diagnostic ignored "-Warray-bounds"
 
 #include "llvm-version.h"
+#include <atomic>
+#include <cstring>
 #include "platform.h"
 
 #include <llvm/ExecutionEngine/JITLink/JITLink.h>
@@ -44,6 +46,36 @@
 #include "julia_assert.h"
 
 namespace {
+
+// TEMPORARY measurement instrumentation (not for merging).
+// JULIA_JIT_MM selects the memory manager: "arena" (default), "split" (arenas
+// disabled, i.e. master's behavior), or "mapper" (MapperJITLinkMemoryManager).
+enum class JitMMMode { Arena, Split, Mapper };
+static JitMMMode jit_mm_mode = JitMMMode::Arena;
+static const char *jit_mm_allocator = "unset";
+struct JitMemStats {
+    std::atomic<uint64_t> graphs{0};   // LinkGraphs allocated
+    std::atomic<uint64_t> content{0};  // sum of segment content + zero-fill sizes
+    std::atomic<int64_t> mapped{0};    // runtime pages currently mapped by the split allocators
+    std::atomic<int64_t> wrbuf{0};     // SelfMemAllocator write buffers currently mapped
+    std::atomic<uint64_t> pp4k{0}, pp16k{0}, pp64k{0}; // per-graph page-rounded size (as Mapper)
+    std::atomic<uint64_t> arenas{0};
+} jit_memstats;
+
+static void record_graph_layout(jitlink::LinkGraph &G) JL_NOTSAFEPOINT
+{
+    jitlink::BasicLayout BL{G};
+    jit_memstats.graphs++;
+    for (auto &[AG, Seg] : BL.segments()) {
+        if (AG.getMemLifetime() == orc::MemLifetime::NoAlloc)
+            continue;
+        uint64_t Size = Seg.ContentSize + Seg.ZeroFillSize;
+        jit_memstats.content += Size;
+        jit_memstats.pp4k += alignTo(Size, 4096);
+        jit_memstats.pp16k += alignTo(Size, 16384);
+        jit_memstats.pp64k += alignTo(Size, 65536);
+    }
+}
 
 static size_t get_block_size(size_t size) JL_NOTSAFEPOINT
 {
@@ -132,13 +164,17 @@ static void reserve_arena(size_t size) JL_NOTSAFEPOINT
     // The previous arena is not released: the blocks carved from it stay
     // mapped for the lifetime of the code that lives in them.
     current_arena = Arena{(char*)mem, size, 0};
+    jit_memstats.arenas++;
 }
 #endif
 
 // Map `size` bytes of RW memory to hold runtime addresses of JIT code or data.
 static void *map_runtime_page(size_t size) JL_NOTSAFEPOINT
 {
+    jit_memstats.mapped += size;
 #ifdef JL_JIT_USE_ARENAS
+    if (jit_mm_mode != JitMMMode::Arena)
+        return map_anon_page(size);
     void *addr = current_arena.carve(size);
     void *mem = mmap(addr, size, PROT_READ | PROT_WRITE,
                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
@@ -373,7 +409,10 @@ static void *alloc_shared_page(size_t size, size_t *id, bool exec) JL_NOTSAFEPOI
         }
         uv_mutex_unlock(&shared_map_lock.mtx);
     }
+    jit_memstats.mapped += size;
 #ifdef JL_JIT_USE_ARENAS
+    if (jit_mm_mode != JitMMMode::Arena)
+        return create_shared_map(size, off);
     // This is the runtime view of the block, so it must lie in the arena (the
     // write view from `create_shared_map` may be anywhere).
     void *addr = current_arena.carve(size);
@@ -550,6 +589,7 @@ struct Block {
             first_free = LLT_ALIGN(first_free, jl_page_size);
             assert(first_free < end);
             unmap_page((void*)first_free, end - first_free);
+            jit_memstats.mapped -= end - first_free;
         }
         ptr = (char*)addr;
         total = avail = size;
@@ -822,6 +862,7 @@ protected:
         Block &new_block = temp_buff.back();
         size_t block_size = get_block_size(size);
         new_block.reset(map_anon_page(block_size), block_size);
+        jit_memstats.wrbuf += block_size;
         return new_block.alloc(size, align);
     }
     SplitPtrBlock alloc_block(size_t size) override JL_NOTSAFEPOINT
@@ -871,6 +912,7 @@ public:
         for (auto &block : temp_buff) {
             if (cached) {
                 munmap(block.ptr, block.total);
+                jit_memstats.wrbuf -= block.total;
                 block.ptr = nullptr;
                 block.total = block.avail = 0;
             }
@@ -889,16 +931,27 @@ public:
 std::pair<std::unique_ptr<ROAllocator>, std::unique_ptr<ROAllocator>>
 get_preferred_allocators() JL_NOTSAFEPOINT
 {
-#if !(defined(_CPU_AARCH64_) || defined(_CPU_RISCV64_))
+    // Measurement override: master never uses these allocators on AArch64 or
+    // RISC-V (see #60245); allow them there when explicitly requested.
+    bool allowed = jit_mm_mode != JitMMMode::Mapper;
+#if defined(_CPU_AARCH64_) || defined(_CPU_RISCV64_)
+    allowed = allowed && getenv("JULIA_JIT_MM") != nullptr;
+#endif
+    if (allowed) {
 #ifdef _OS_LINUX_
-    if (get_self_mem_fd() != -1)
-        return {std::make_unique<SelfMemAllocator>(false),
-                std::make_unique<SelfMemAllocator>(true)};
+        if (get_self_mem_fd() != -1) {
+            jit_mm_allocator = "selfmem";
+            return {std::make_unique<SelfMemAllocator>(false),
+                    std::make_unique<SelfMemAllocator>(true)};
+        }
 #endif
-    if (init_shared_map() != -1)
-        return {std::make_unique<DualMapAllocator>(false),
-                std::make_unique<DualMapAllocator>(true)};
-#endif
+        if (init_shared_map() != -1) {
+            jit_mm_allocator = "dualmap";
+            return {std::make_unique<DualMapAllocator>(false),
+                    std::make_unique<DualMapAllocator>(true)};
+        }
+    }
+    jit_mm_allocator = "mapper";
     return {};
 }
 
@@ -919,6 +972,25 @@ get_preferred_allocators() JL_NOTSAFEPOINT
 // finalized. Deferring it to the end of the batch would deadlock against the
 // LinkGraph's own allocation, which is not finalized until the linker thread
 // gets to run again.
+// Forwards to another memory manager, recording the layout of each graph.
+class CountingMemoryManager : public jitlink::JITLinkMemoryManager {
+    std::unique_ptr<jitlink::JITLinkMemoryManager> Inner;
+public:
+    CountingMemoryManager(std::unique_ptr<jitlink::JITLinkMemoryManager> Inner) JL_NOTSAFEPOINT
+        : Inner(std::move(Inner)) {}
+    void allocate(const jitlink::JITLinkDylib *JD, jitlink::LinkGraph &G,
+                  OnAllocatedFunction OnAllocated) override
+    {
+        record_graph_layout(G);
+        Inner->allocate(JD, G, std::move(OnAllocated));
+    }
+    void deallocate(std::vector<FinalizedAlloc> Allocs,
+                    OnDeallocatedFunction OnDeallocated) override
+    {
+        Inner->deallocate(std::move(Allocs), std::move(OnDeallocated));
+    }
+};
+
 class JLJITLinkMemoryManager : public jitlink::JITLinkMemoryManager {
     using OnFinalizedFunction =
         jitlink::JITLinkMemoryManager::InFlightAlloc::OnFinalizedFunction;
@@ -941,14 +1013,22 @@ public:
 
     static std::unique_ptr<JITLinkMemoryManager> Create() JL_NOTSAFEPOINT
     {
+        if (const char *mode = getenv("JULIA_JIT_MM")) {
+            if (strcmp(mode, "split") == 0)
+                jit_mm_mode = JitMMMode::Split;
+            else if (strcmp(mode, "mapper") == 0)
+                jit_mm_mode = JitMMMode::Mapper;
+            else
+                jit_mm_mode = JitMMMode::Arena;
+        }
         auto [ROAlloc, ExeAlloc] = get_preferred_allocators();
         if (ROAlloc && ExeAlloc)
             return std::unique_ptr<JLJITLinkMemoryManager>(
                 new JLJITLinkMemoryManager(std::move(ROAlloc), std::move(ExeAlloc)));
 
-        return cantFail(
+        return std::make_unique<CountingMemoryManager>(cantFail(
             orc::MapperJITLinkMemoryManager::CreateWithMapper<orc::InProcessMemoryMapper>(
-                /*Reservation Granularity*/ 16 * 1024 * 1024));
+                /*Reservation Granularity*/ 16 * 1024 * 1024)));
     }
 
     void allocate(const jitlink::JITLinkDylib *JD, jitlink::LinkGraph &G,
@@ -1099,9 +1179,11 @@ void JLJITLinkMemoryManager::allocate(const jitlink::JITLinkDylib *JD,
     SmallVector<Allocation, 4> ROAllocs;
     SmallVector<Allocation, 4> ExeAllocs;
 
+    record_graph_layout(G);
     {
         std::unique_lock Lock{Mutex};
 #ifdef JL_JIT_USE_ARENAS
+        if (jit_mm_mode == JitMMMode::Arena) {
         // Lay the whole graph out in one arena. Each segment needs at most one
         // new block, so if the worst case does not fit in what is left of the
         // current arena, switch to a new one and stop using the old blocks.
@@ -1122,6 +1204,7 @@ void JLJITLinkMemoryManager::allocate(const jitlink::JITLinkDylib *JD,
             ROAlloc->retire();
             ExeAlloc->retire();
         }
+        }
 #endif
         for (auto &[AG, Seg] : BL.segments()) {
             if (AG.getMemLifetime() == orc::MemLifetime::NoAlloc)
@@ -1141,7 +1224,8 @@ void JLJITLinkMemoryManager::allocate(const jitlink::JITLinkDylib *JD,
             else
                 abort();
 #ifdef JL_JIT_USE_ARENAS
-            assert(current_arena.contains(Alloc.rt_addr, Size));
+            assert(jit_mm_mode != JitMMMode::Arena ||
+                   current_arena.contains(Alloc.rt_addr, Size));
 #endif
 
             Seg.Addr = orc::ExecutorAddr::fromPtr(Alloc.rt_addr);
@@ -1157,6 +1241,24 @@ void JLJITLinkMemoryManager::allocate(const jitlink::JITLinkDylib *JD,
     OnAllocated(std::make_unique<InFlightAlloc>(*this, G, std::move(ROAllocs),
                                                 std::move(ExeAllocs)));
 }
+}
+
+// TEMPORARY measurement export: fills `out[0..7]` with the counters above.
+extern "C" JL_DLLEXPORT_CODEGEN void jl_jit_memstats(uint64_t *out) JL_NOTSAFEPOINT
+{
+    out[0] = jit_memstats.graphs;
+    out[1] = jit_memstats.content;
+    out[2] = (uint64_t)jit_memstats.mapped.load();
+    out[3] = (uint64_t)jit_memstats.wrbuf.load();
+    out[4] = jit_memstats.pp4k;
+    out[5] = jit_memstats.pp16k;
+    out[6] = jit_memstats.pp64k;
+    out[7] = jit_memstats.arenas;
+}
+
+extern "C" JL_DLLEXPORT_CODEGEN const char *jl_jit_memstats_allocator(void) JL_NOTSAFEPOINT
+{
+    return jit_mm_allocator;
 }
 
 std::unique_ptr<jitlink::JITLinkMemoryManager> createJITLinkMemoryManager() JL_NOTSAFEPOINT
