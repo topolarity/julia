@@ -22,6 +22,10 @@
 #include "julia.h"
 #include "julia_internal.h"
 
+#ifdef _OS_DARWIN_
+#  include <mach/mach.h>
+#  include <mach/mach_vm.h>
+#endif
 #ifdef _OS_LINUX_
 #  include <sys/syscall.h>
 #  include <sys/utsname.h>
@@ -1300,7 +1304,39 @@ void JLJITLinkMemoryManager::allocate(const jitlink::JITLinkDylib *JD,
 }
 }
 
-// TEMPORARY measurement export: fills `out[0..7]` with the counters above.
+// Number of memory mappings (VMAs / VM regions) in the process. Exceeding the
+// kernel's limit on these (`vm.max_map_count` on Linux) makes `mmap` and
+// `mprotect` fail with ENOMEM (llvm/llvm-project#63236).
+static uint64_t count_memory_mappings() JL_NOTSAFEPOINT
+{
+    uint64_t n = 0;
+#if defined(_OS_LINUX_)
+    FILE *f = fopen("/proc/self/maps", "r");
+    if (!f)
+        return 0;
+    int c;
+    while ((c = fgetc(f)) != EOF)
+        n += c == '\n';
+    fclose(f);
+#elif defined(_OS_DARWIN_)
+    mach_vm_address_t addr = 0;
+    while (true) {
+        mach_vm_size_t size = 0;
+        vm_region_basic_info_data_64_t info;
+        mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t object_name;
+        if (mach_vm_region(mach_task_self(), &addr, &size, VM_REGION_BASIC_INFO_64,
+                           (vm_region_info_t)&info, &count, &object_name) != KERN_SUCCESS)
+            break;
+        n++;
+        addr += size;
+    }
+#endif
+    return n;
+}
+
+// TEMPORARY measurement export: fills `out[0..8]` with the counters above and
+// the number of memory mappings in the process.
 extern "C" JL_DLLEXPORT_CODEGEN void jl_jit_memstats(uint64_t *out) JL_NOTSAFEPOINT
 {
     out[0] = jit_memstats.graphs;
@@ -1311,6 +1347,7 @@ extern "C" JL_DLLEXPORT_CODEGEN void jl_jit_memstats(uint64_t *out) JL_NOTSAFEPO
     out[5] = jit_memstats.pp16k;
     out[6] = jit_memstats.pp64k;
     out[7] = jit_memstats.arenas;
+    out[8] = count_memory_mappings();
 }
 
 extern "C" JL_DLLEXPORT_CODEGEN const char *jl_jit_memstats_allocator(void) JL_NOTSAFEPOINT
