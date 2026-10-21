@@ -130,8 +130,17 @@ static void unmap_page(void *ptr, size_t size) JL_NOTSAFEPOINT
 
 #ifdef JL_JIT_USE_ARENAS
 // Any two addresses in an arena are less than 2^31 bytes apart.
-static constexpr size_t arena_size_default = size_t(1) << 30;
 static constexpr size_t arena_size_max = (size_t(1) << 31) - 1;
+
+// Arenas hold 64 blocks (64 MiB with 4 KiB pages, 1 GiB with 64 KiB pages):
+// enough that switching arenas, which costs a few syscalls and mappings, is
+// rare next to the code generation that fills them, while keeping the
+// reservation small on hosts with little address space.
+static size_t arena_size_default() JL_NOTSAFEPOINT
+{
+    return std::min<size_t>(64 * get_block_size(0),
+                            arena_size_max & -(size_t)jl_page_size);
+}
 
 struct Arena {
     char *base{nullptr};
@@ -165,8 +174,10 @@ static void reserve_arena(size_t size) JL_NOTSAFEPOINT
     void *mem = mmap(nullptr, size, PROT_NONE,
                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     assert(mem != MAP_FAILED && "Cannot reserve JIT address range");
-    // The previous arena is not released: the blocks carved from it stay
-    // mapped for the lifetime of the code that lives in them.
+    // The blocks carved from the previous arena stay mapped for the lifetime
+    // of the code that lives in them, but its unused rest can be released.
+    if (current_arena.avail() > 0)
+        munmap(current_arena.base + current_arena.used, current_arena.avail());
     current_arena = Arena{(char*)mem, size, 0};
     jit_memstats.arenas++;
 }
@@ -576,6 +587,11 @@ struct Block {
 
     Block() JL_NOTSAFEPOINT = default;
 
+    // Whether `alloc(size, align)` would succeed.
+    bool fits(size_t size, size_t align) const JL_NOTSAFEPOINT
+    {
+        return (avail & (-align)) >= size;
+    }
     void *alloc(size_t size, size_t align) JL_NOTSAFEPOINT
     {
         size_t aligned_avail = avail & (-align);
@@ -630,6 +646,15 @@ public:
         blocks[min_id].reset(map_runtime_page(block_size), block_size);
         void *ptr = blocks[min_id].alloc(size, align);
         return {ptr, ptr, size, false};
+    }
+    // Whether `alloc(size, align)` would fit in an existing block.
+    bool fits(size_t size, size_t align) const JL_NOTSAFEPOINT
+    {
+        for (int i = 0;i < nblocks && blocks[i].ptr;i++) {
+            if (blocks[i].fits(size, align))
+                return true;
+        }
+        return false;
     }
     // Stop allocating from the current blocks (they belong to an old arena).
     void retire() JL_NOTSAFEPOINT
@@ -701,6 +726,15 @@ public:
     virtual void finalize() JL_NOTSAFEPOINT
     {
         completed.clear();
+    }
+    // Whether `alloc(size, align, ...)` would fit in an existing block.
+    bool fits(size_t size, size_t align) const JL_NOTSAFEPOINT
+    {
+        for (int i = 0;i < nblocks && blocks[i].ptr;i++) {
+            if (blocks[i].fits(size, align))
+                return true;
+        }
+        return false;
     }
     // Stop allocating from the current blocks (they belong to an old arena).
     // Blocks that were used are finalized with the rest of the batch.
@@ -1245,22 +1279,30 @@ void JLJITLinkMemoryManager::allocate(const jitlink::JITLinkDylib *JD,
         std::unique_lock Lock{Mutex};
 #ifdef JL_JIT_USE_ARENAS
         if (jit_mm_mode == JitMMMode::Arena) {
-        // Lay the whole graph out in one arena. Each segment needs at most one
-        // new block, so if the worst case does not fit in what is left of the
-        // current arena, switch to a new one and stop using the old blocks.
+        // Lay the whole graph out in one arena. A segment that does not fit in
+        // an open block of its allocator needs one new block, so if those do
+        // not fit in what is left of the current arena, switch to a new one
+        // and stop using the old blocks.
         size_t Needed = 0;
         for (auto &[AG, Seg] : BL.segments()) {
             if (AG.getMemLifetime() == orc::MemLifetime::NoAlloc)
                 continue;
-            Needed += get_block_size(Seg.ContentSize + Seg.ZeroFillSize +
-                                     Seg.Alignment.value());
+            auto Prot = AG.getMemProt();
+            uint64_t Alignment = Seg.Alignment.value();
+            uint64_t Size = Seg.ContentSize + Seg.ZeroFillSize;
+            bool Fits = Prot == (MemProt::Read | MemProt::Write) ? RWAlloc.fits(Size, Alignment) :
+                        Prot == MemProt::Read ? ROAlloc->fits(Size, Alignment) :
+                        Prot == (MemProt::Read | MemProt::Exec) ? ExeAlloc->fits(Size, Alignment) :
+                        false;
+            if (!Fits)
+                Needed += get_block_size(Size + Alignment);
         }
         if (Needed > arena_size_max)
             return OnAllocated(make_error<StringError>(
                 "LinkGraph " + G.getName() + " is too large to keep in range",
                 inconvertibleErrorCode()));
         if (Needed > current_arena.avail()) {
-            reserve_arena(std::max(arena_size_default, Needed));
+            reserve_arena(std::max(arena_size_default(), Needed));
             RWAlloc.retire();
             ROAlloc->retire();
             ExeAlloc->retire();
