@@ -76,6 +76,79 @@ static void unmap_page(void *ptr, size_t size) JL_NOTSAFEPOINT
 #endif // _OS_WINDOWS_
 }
 
+// JITLink assumes that every segment of a LinkGraph can reach every other one
+// with a 32-bit PC-relative displacement: its own GOT and PLT stubs, and the
+// stubs and trampolines of ORC's lazy reexports, are all built that way.
+// `InProcessMemoryManager` satisfies that by allocating each graph as a single
+// slab. We share blocks between graphs instead, so we satisfy it by carving all
+// of the memory that holds runtime addresses out of a reserved address range
+// (an arena) that is small enough for any two addresses in it to be in range,
+// and by never laying a graph out across two arenas.
+//
+// On Windows, the dual-mapped RO / RX views cannot be placed inside a reserved
+// range (that needs the `VirtualAlloc2` placeholder API), so the arenas are
+// not used there.
+#ifndef _OS_WINDOWS_
+#define JL_JIT_USE_ARENAS
+#endif
+
+#ifdef JL_JIT_USE_ARENAS
+// Any two addresses in an arena are less than 2^31 bytes apart.
+static constexpr size_t arena_size_default = size_t(1) << 30;
+static constexpr size_t arena_size_max = (size_t(1) << 31) - 1;
+
+struct Arena {
+    char *base{nullptr};
+    size_t size{0};
+    size_t used{0};
+
+    size_t avail() const JL_NOTSAFEPOINT { return size - used; }
+    // Return the next `size` bytes of the arena. They are still reserved
+    // (`PROT_NONE`) and must be mapped with `MAP_FIXED` by the caller.
+    char *carve(size_t sz) JL_NOTSAFEPOINT
+    {
+        assert(sz % jl_page_size == 0);
+        assert(sz <= avail() && "JIT arena exhausted");
+        char *p = base + used;
+        used += sz;
+        return p;
+    }
+    bool contains(const void *p, size_t sz) const JL_NOTSAFEPOINT
+    {
+        return (const char*)p >= base && (const char*)p + sz <= base + size;
+    }
+};
+
+// The arena that new runtime blocks are carved from. Guarded by the mutex of
+// the `JLJITLinkMemoryManager`, which is the only user of these allocators.
+static Arena current_arena;
+
+static void reserve_arena(size_t size) JL_NOTSAFEPOINT
+{
+    size = LLT_ALIGN(size, jl_page_size);
+    void *mem = mmap(nullptr, size, PROT_NONE,
+                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    assert(mem != MAP_FAILED && "Cannot reserve JIT address range");
+    // The previous arena is not released: the blocks carved from it stay
+    // mapped for the lifetime of the code that lives in them.
+    current_arena = Arena{(char*)mem, size, 0};
+}
+#endif
+
+// Map `size` bytes of RW memory to hold runtime addresses of JIT code or data.
+static void *map_runtime_page(size_t size) JL_NOTSAFEPOINT
+{
+#ifdef JL_JIT_USE_ARENAS
+    void *addr = current_arena.carve(size);
+    void *mem = mmap(addr, size, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    assert(mem == addr && "Cannot allocate RW memory");
+    return mem;
+#else
+    return map_anon_page(size);
+#endif
+}
+
 #ifdef _OS_WINDOWS_
 enum class Prot : int {
     RW = PAGE_READWRITE,
@@ -300,7 +373,17 @@ static void *alloc_shared_page(size_t size, size_t *id, bool exec) JL_NOTSAFEPOI
         }
         uv_mutex_unlock(&shared_map_lock.mtx);
     }
+#ifdef JL_JIT_USE_ARENAS
+    // This is the runtime view of the block, so it must lie in the arena (the
+    // write view from `create_shared_map` may be anywhere).
+    void *addr = current_arena.carve(size);
+    void *mem = mmap(addr, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED,
+                     anon_hdl, off);
+    assert(mem == addr && "Cannot map RW view");
+    return mem;
+#else
     return create_shared_map(size, off);
+#endif
 }
 #endif // _OS_WINDOWS_
 
@@ -500,9 +583,15 @@ public:
             }
         }
         size_t block_size = get_block_size(size);
-        blocks[min_id].reset(map_anon_page(block_size), block_size);
+        blocks[min_id].reset(map_runtime_page(block_size), block_size);
         void *ptr = blocks[min_id].alloc(size, align);
         return {ptr, ptr, size, false};
+    }
+    // Stop allocating from the current blocks (they belong to an old arena).
+    void retire() JL_NOTSAFEPOINT
+    {
+        for (auto &block : blocks)
+            block.reset(nullptr, 0);
     }
 };
 
@@ -568,6 +657,19 @@ public:
     virtual void finalize() JL_NOTSAFEPOINT
     {
         completed.clear();
+    }
+    // Stop allocating from the current blocks (they belong to an old arena).
+    // Blocks that were used are finalized with the rest of the batch.
+    void retire() JL_NOTSAFEPOINT
+    {
+        for (auto &block : blocks) {
+            if (block.state) {
+                completed.push_back(std::move(block));
+            }
+            else {
+                block.reset(nullptr, 0);
+            }
+        }
     }
     Allocation alloc(size_t size, size_t align,
                      SmallVectorImpl<Allocation> &allocations) JL_NOTSAFEPOINT
@@ -725,7 +827,7 @@ protected:
     SplitPtrBlock alloc_block(size_t size) override JL_NOTSAFEPOINT
     {
         SplitPtrBlock new_block;
-        new_block.reset(map_anon_page(size), size);
+        new_block.reset(map_runtime_page(size), size);
         return new_block;
     }
     void finalize_block(SplitPtrBlock &block, bool reset) JL_NOTSAFEPOINT
@@ -999,6 +1101,28 @@ void JLJITLinkMemoryManager::allocate(const jitlink::JITLinkDylib *JD,
 
     {
         std::unique_lock Lock{Mutex};
+#ifdef JL_JIT_USE_ARENAS
+        // Lay the whole graph out in one arena. Each segment needs at most one
+        // new block, so if the worst case does not fit in what is left of the
+        // current arena, switch to a new one and stop using the old blocks.
+        size_t Needed = 0;
+        for (auto &[AG, Seg] : BL.segments()) {
+            if (AG.getMemLifetime() == orc::MemLifetime::NoAlloc)
+                continue;
+            Needed += get_block_size(Seg.ContentSize + Seg.ZeroFillSize +
+                                     Seg.Alignment.value());
+        }
+        if (Needed > arena_size_max)
+            return OnAllocated(make_error<StringError>(
+                "LinkGraph " + G.getName() + " is too large to keep in range",
+                inconvertibleErrorCode()));
+        if (Needed > current_arena.avail()) {
+            reserve_arena(std::max(arena_size_default, Needed));
+            RWAlloc.retire();
+            ROAlloc->retire();
+            ExeAlloc->retire();
+        }
+#endif
         for (auto &[AG, Seg] : BL.segments()) {
             if (AG.getMemLifetime() == orc::MemLifetime::NoAlloc)
                 continue;
@@ -1016,6 +1140,9 @@ void JLJITLinkMemoryManager::allocate(const jitlink::JITLinkDylib *JD,
                 Alloc = ExeAlloc->alloc(Size, Alignment, ExeAllocs);
             else
                 abort();
+#ifdef JL_JIT_USE_ARENAS
+            assert(current_arena.contains(Alloc.rt_addr, Size));
+#endif
 
             Seg.Addr = orc::ExecutorAddr::fromPtr(Alloc.rt_addr);
             Seg.WorkingMem = (char *)Alloc.wr_addr;
