@@ -889,58 +889,6 @@ public:
     }
 };
 
-#ifdef _OS_DARWIN_
-// Apple Silicon refuses executable mappings of files, so `DualMapAllocator`
-// is not available there, and there is no `/proc/self/mem`. Instead, write
-// in place to RW pages and seal them (RO or RX) at finalization. A sealed page
-// is never made writable again, since other threads may be running code on
-// it, so allocations after a finalization start on the next fresh page: each
-// segment wastes up to a page per finalization batch, like a per-graph memory
-// manager.
-class ProtectAllocator : public ROAllocator {
-    bool exec;
-protected:
-    void *get_wr_ptr(SplitPtrBlock &block, void *rt_ptr, size_t, size_t) override JL_NOTSAFEPOINT
-    {
-        // Everything past the sealed prefix (its size is kept in `wr_ptr`) is
-        // still RW.
-        assert((char*)rt_ptr >= block.ptr + block.wr_ptr);
-        return rt_ptr;
-    }
-    SplitPtrBlock alloc_block(size_t size) override JL_NOTSAFEPOINT
-    {
-        SplitPtrBlock new_block;
-        new_block.reset(map_runtime_page(size), size);
-        return new_block;
-    }
-    void finalize_block(SplitPtrBlock &block) JL_NOTSAFEPOINT
-    {
-        if (!(block.state & SplitPtrBlock::Alloc))
-            return;
-        size_t used = block.total - block.avail;
-        size_t sealed = std::min(LLT_ALIGN(used, jl_page_size), block.total);
-        protect_page(block.ptr + block.wr_ptr, sealed - block.wr_ptr,
-                     exec ? Prot::RX : Prot::RO);
-        block.wr_ptr = sealed;
-        block.avail = block.total - sealed;
-        block.state = 0;
-    }
-public:
-    ProtectAllocator(bool exec) JL_NOTSAFEPOINT : exec(exec) {}
-    virtual ~ProtectAllocator() JL_NOTSAFEPOINT override = default;
-    void finalize() override JL_NOTSAFEPOINT
-    {
-        for (auto &block : this->blocks)
-            finalize_block(block);
-        for (auto &block : this->completed) {
-            finalize_block(block);
-            block.reset(nullptr, 0);
-        }
-        ROAllocator::finalize();
-    }
-};
-#endif // _OS_DARWIN_
-
 #ifdef _OS_LINUX_
 class SelfMemAllocator : public ROAllocator {
     bool exec;
@@ -1047,11 +995,6 @@ get_preferred_allocators() JL_NOTSAFEPOINT
             return {std::make_unique<DualMapAllocator>(false),
                     std::make_unique<DualMapAllocator>(true)};
         }
-#ifdef _OS_DARWIN_
-        jit_mm_allocator = "protect";
-        return {std::make_unique<ProtectAllocator>(false),
-                std::make_unique<ProtectAllocator>(true)};
-#endif
     }
     jit_mm_allocator = "mapper";
     return {};
