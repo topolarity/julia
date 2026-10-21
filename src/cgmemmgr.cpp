@@ -248,9 +248,16 @@ static bool check_fd_or_close(int fd) JL_NOTSAFEPOINT
         return false;
     }
     // This can fail due to `noexec` mount option ....
-    void *ptr = mmap(nullptr, jl_page_size, PROT_READ | PROT_EXEC,
-                     MAP_SHARED, fd, 0);
+    void *ptr = mmap(nullptr, jl_page_size, PROT_NONE, MAP_SHARED, fd, 0);
     if (ptr == MAP_FAILED) {
+        close(fd);
+        return false;
+    }
+    // macOS on Apple Silicon refuses to map a file R-X directly, but allows
+    // changing the protection of a shared mapping to R-X afterwards, which is
+    // what the dual-mapped allocator does.
+    if (mprotect(ptr, jl_page_size, PROT_READ | PROT_EXEC) != 0) {
+        munmap(ptr, jl_page_size);
         close(fd);
         return false;
     }
