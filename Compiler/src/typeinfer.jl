@@ -637,9 +637,8 @@ end
 
 # A cache without native code needs the source of every compileable signature, or
 # loading it means inferring them all again. Caches with native code drop it on save.
-# FIXME: this and `precompile_keep_ir` are two rules for the same thing, keeping source
-# until the code for an output image is collected. `precompile_keep_ir` only applies
-# to a package image with native code, and keeps the source uncompressed.
+# This decides for code inferred outside `precompile_keep_ir`, which keeps all source
+# until the code for the image is collected, and leaves the same decision to the save.
 keep_source_for_output(mi::MethodInstance) =
     ccall(:jl_generating_output, Cint, ()) != 0 && isa_compileable_sig(mi)
 
