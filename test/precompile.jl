@@ -1706,7 +1706,7 @@ precompile_test_harness("serialization leaves the heap unchanged") do dir
           struct Wrap{T} end
           const kept = Wrap{Int}
           global counter::Int = 0
-          # too large to inline, and inferred while loading, so that its inferred IR is kept
+          # too large to inline, and inferred while loading, so that its source is kept
           # only to emit the image
           function noinline_sum(n)
               s = 0
@@ -1729,7 +1729,7 @@ precompile_test_harness("serialization leaves the heap unchanged") do dir
                       write(joinpath(@__DIR__, "result.txt"),
                             "type cache: \$(Wrap{Float64} === dropped)\\n",
                             "backedges: \$(after == before && all(map(===, after, before)))\\n",
-                            "inferred: \$(ci.inferred isa Core.CodeInfo)\\n")
+                            "inferred: \$(ci.inferred isa String)\\n")
                   end
               end
           end

@@ -630,15 +630,14 @@ end
 function discard_optimized_result(interp::AbstractInterpreter, mi::MethodInstance, inlining_cost::InlineCostType)
     may_discard_trees(interp) || return false
     inlining_cost == MAX_INLINE_COST || return false
-    precompile_keep_ir(interp) && return false
     keep_source_for_output(mi) && return false
     return true
 end
 
-# A cache without native code needs the source of every compileable signature, or
-# loading it means inferring them all again. Caches with native code drop it on save.
-# This decides for code inferred outside `precompile_keep_ir`, which keeps all source
-# until the code for the image is collected, and leaves the same decision to the save.
+# The source of every compileable signature is kept while generating output, so that
+# collecting the code for the image does not infer it again. A cache without native
+# code stores it, or loading it means inferring them all again. Caches with native
+# code drop it on save (see should_store_source in staticdata.c).
 keep_source_for_output(mi::MethodInstance) =
     ccall(:jl_generating_output, Cint, ()) != 0 && isa_compileable_sig(mi)
 
@@ -648,10 +647,6 @@ function maybe_compress_codeinfo(interp::AbstractInterpreter, mi::MethodInstance
     can_discard_trees = may_discard_trees(interp)
     inlineable = is_inlineable(ci)
     if can_discard_trees && !inlineable
-        # Precompile-keep-ir mode: retain non-inlineable IR as raw CodeInfo so
-        # irgen's typeinf_ext can reuse it instead of re-inferring.
-        # The image leaves it out.
-        precompile_keep_ir(interp) && return ci
         keep_source_for_output(mi) || return nothing
     end
     # TODO: do we want to augment edges here with any :invoke targets that we got from inlining (such that we didn't have a direct edge to it already)?

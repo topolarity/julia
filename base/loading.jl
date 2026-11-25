@@ -3692,11 +3692,6 @@ function include_package_for_output(pkg::PkgId, input::String, edition::Tuple{In
     end
 
     ccall(:jl_set_newly_inferred, Cvoid, (Any,), newly_inferred)
-    # Retain raw inferred IR on `CodeInstance.inferred` for the non-inlineable
-    # methods that would otherwise be discarded, so that collecting the code for
-    # the image can reuse it instead of re-inferring. An image with native code
-    # leaves it out; one without stores it compressed, for compileable signatures.
-    ccall(:jl_set_precompile_keep_ir, Cvoid, (Int8,), 1)
     # This one changes the parser behavior
     Core.set_edition(__toplevel__, edition)
     # This one is the compatibility marker for cache loading
@@ -3726,7 +3721,6 @@ function include_package_for_output(pkg::PkgId, input::String, edition::Tuple{In
                     " methods=", length(newly_inferred))
         end
         ccall(:jl_set_newly_inferred, Cvoid, (Any,), nothing)
-        ccall(:jl_set_precompile_keep_ir, Cvoid, (Int8,), 0)
     end
     # check that the package defined the expected module so we can give a nice error message if not
     m = maybe_root_module(pkg)

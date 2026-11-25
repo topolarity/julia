@@ -798,31 +798,6 @@ static int should_store_source(jl_code_instance_t *ci, jl_value_t *inferred, int
     return jl_isa_compileable_sig((jl_tupletype_t*)mi->specTypes, mi->sparam_vals, def);
 }
 
-// Whether `inferred` is source that the image stores compressed, but is not compressed
-// (see jl_precompile_keep_ir).
-static int is_uncompressed_source(jl_code_instance_t *ci, jl_value_t *inferred) JL_NOTSAFEPOINT
-{
-    jl_method_t *def = jl_get_ci_mi(ci)->def.method;
-    return jl_is_code_info(inferred) && jl_is_method(def) &&
-           ci->owner == jl_nothing && // other interpreters store theirs as they keep it
-           (def->source != NULL || def->generator != NULL); // and so do optimized opaque closures
-}
-
-// Compress the uncompressed source that the image stores. This adds roots to the
-// methods, so it is done before anything is queued, and only for source that is stored.
-static void jl_compress_stored_source(jl_array_t *cis, int incremental, int has_native) JL_CANSAFEPOINT JL_GC_DISABLED
-{
-    for (size_t i = 0; i < jl_array_nrows(cis); i++) {
-        jl_code_instance_t *ci = (jl_code_instance_t*)jl_array_ptr_ref(cis, i);
-        jl_value_t *inferred = jl_atomic_load_relaxed(&ci->inferred);
-        if (inferred == NULL || !is_uncompressed_source(ci, inferred) ||
-            !should_store_source(ci, inferred, incremental, has_native))
-            continue;
-        inferred = jl_compress_ir(jl_get_ci_mi(ci)->def.method, (jl_code_info_t*)inferred);
-        record_field_change((jl_value_t*)ci, (jl_value_t**)&ci->inferred, inferred);
-    }
-}
-
 // Anything that requires uniquing or fixing during deserialization needs to be "toplevel"
 // in serialization (i.e., have its own entry in `serialization_order`). Consequently,
 // objects that act as containers for other potentially-"problematic" objects must add such "children"
@@ -1058,14 +1033,11 @@ static void jl_insert_into_serialization_queue(jl_serializer_state *s, jl_value_
                 record_field_change((jl_value_t*)ci, (jl_value_t**)&ci->next, NULL);
             }
         }
-        jl_value_t *inferred = get_replaceable_field((jl_value_t**)&ci->inferred, 0);
+        jl_value_t *inferred = jl_atomic_load_relaxed(&ci->inferred);
         if (inferred && inferred != jl_nothing && !jl_is_uint8(inferred)) { // disregard if there is nothing here to delete (e.g. builtins, unspecialized)
             jl_method_t *def = mi->def.method;
             if (jl_is_method(def)) { // don't delete toplevel code
                 int discard = !should_store_source(ci, inferred, s->incremental, native_functions != NULL);
-                // what the image stores was compressed before (see jl_compress_stored_source)
-                if (image_code && is_uncompressed_source(ci, inferred))
-                    discard = 1;
                 if (discard) {
                     // keep only the inlining cost, so inference can later decide if it is worth getting the source back
                     if (jl_is_string(inferred) || jl_is_code_info(inferred))
@@ -3352,7 +3324,6 @@ static void jl_save_system_image_to_stream(ios_t *f, jl_array_t *mod_array,
         // CodeInstances selected for this image (see jl_rewrite_mi_caches).
         jl_array_t *ci_order = (jl_array_t*)jl_svecref(image_code, 1);
         jl_rewrite_mi_caches(jl_array_data(ci_order, jl_code_instance_t*), jl_array_nrows(ci_order));
-        jl_compress_stored_source(ci_order, worklist != NULL, native_functions != NULL);
     }
     if (native_functions) {
         size_t num_gvars, num_external_fns;
@@ -3880,8 +3851,6 @@ JL_DLLEXPORT uint32_t jl_create_system_image(void **_native_data, jl_array_t *wo
 
     jl_query_cache query_cache;
     init_query_cache(&query_cache);
-    // IR retained only to generate native code is not serialized (see jl_queue_for_serialization)
-    jl_set_precompile_keep_ir(0);
     jl_save_system_image_to_stream(f, mod_array, module_init_order, worklist, extext_methods, extext_records, new_ext, &query_cache);
     if (_native_data != NULL)
         native_functions = NULL;
