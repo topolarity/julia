@@ -798,6 +798,19 @@ static int should_store_source(jl_code_instance_t *ci, jl_value_t *inferred, int
     return jl_isa_compileable_sig((jl_tupletype_t*)mi->specTypes, mi->sparam_vals, def);
 }
 
+// Whether the image being generated will drop the source of a non-inlineable
+// CodeInstance of `def` with effects `ipo_effects`, cached by the native interpreter
+// (a case of should_store_source that inference can decide).
+JL_DLLEXPORT int jl_image_drops_source(jl_method_t *def, uint32_t ipo_effects)
+{
+    int has_native = jl_options.outputo || jl_options.outputbc || jl_options.outputunoptbc || jl_options.outputasm;
+    if (!has_native || jl_get_type_infer_preserve_ir())
+        return 0;
+    if (def->source == NULL && def->generator == NULL)
+        return 0;
+    return !effects_foldable(ipo_effects);
+}
+
 // Anything that requires uniquing or fixing during deserialization needs to be "toplevel"
 // in serialization (i.e., have its own entry in `serialization_order`). Consequently,
 // objects that act as containers for other potentially-"problematic" objects must add such "children"

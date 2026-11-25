@@ -168,7 +168,7 @@ function finish!(interp::AbstractInterpreter, caller::InferenceState, validation
                     resize!(inferred_result.slottypes::Vector{Any}, nslots)
                     resize!(inferred_result.slotnames, nslots)
                 end
-                inferred_result = maybe_compress_codeinfo(interp, mi, inferred_result)
+                inferred_result = maybe_compress_codeinfo(interp, mi, inferred_result, result.ipo_effects)
             elseif ci.owner === nothing
                 # The global cache can only handle objects that codegen understands (nothing or CodeInfo)
                 inferred_result = nothing
@@ -641,13 +641,19 @@ end
 keep_source_for_output(mi::MethodInstance) =
     ccall(:jl_generating_output, Cint, ()) != 0 && isa_compileable_sig(mi)
 
-function maybe_compress_codeinfo(interp::AbstractInterpreter, mi::MethodInstance, ci::CodeInfo)
+function maybe_compress_codeinfo(interp::AbstractInterpreter, mi::MethodInstance, ci::CodeInfo,
+                                 ipo_effects::Effects)
     def = mi.def
     isa(def, Method) || return ci # don't compress toplevel code
     can_discard_trees = may_discard_trees(interp)
     inlineable = is_inlineable(ci)
     if can_discard_trees && !inlineable
         keep_source_for_output(mi) || return nothing
+        # Compressing adds roots to the method, which the image keeps even if it drops
+        # the source, so keep source that it drops uncompressed.
+        cache_owner(interp) === nothing &&
+            ccall(:jl_image_drops_source, Cint, (Any, UInt32), def, encode_effects(ipo_effects)) != 0 &&
+            return ci
     end
     # TODO: do we want to augment edges here with any :invoke targets that we got from inlining (such that we didn't have a direct edge to it already)?
     may_compress(interp) && return ccall(:jl_compress_ir, String, (Any, Any), def, ci)
